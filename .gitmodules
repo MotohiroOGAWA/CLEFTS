@@ -1,0 +1,6 @@
+[submodule "clefts/libs/msentity"]
+	path = clefts/libs/msentity
+	url = https://github.com/MotohiroOGAWA/msentity.git
+[submodule "clefts/libs/mmkit"]
+	path = clefts/libs/mmkit
+	url = https://github.com/MotohiroOGAWA/mmkit.git
