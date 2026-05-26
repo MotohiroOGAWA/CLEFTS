@@ -129,7 +129,8 @@ class FragmentTreeBuilder:
         *,
         only_add_min_depth: bool = True,
         min_depth_only_from: int = 0,
-        timeout_seconds: float = float("inf"),
+        max_node: int = -1,
+        max_edge: int = -1,
         print_info: bool = False,
     ) -> FragmentTree:
         """Build a fragment tree without explicitly creating a builder.
@@ -147,8 +148,10 @@ class FragmentTreeBuilder:
             threshold.
         min_depth_only_from : int, optional
             Depth threshold used with ``only_add_min_depth``.
-        timeout_seconds : float, optional
-            Maximum wall-clock time allowed for tree generation.
+        max_node : int, optional
+            Maximum number of nodes to keep. Use ``-1`` for no limit.
+        max_edge : int, optional
+            Maximum number of edges to keep. Use ``-1`` for no limit.
         print_info : bool, optional
             If ``True``, print progress after each depth.
 
@@ -165,14 +168,14 @@ class FragmentTreeBuilder:
         )
         return builder.build(
             compound=compound,
-            timeout_seconds=timeout_seconds,
+            max_node=max_node,
+            max_edge=max_edge,
             print_info=print_info,
         )
 
     def cleave_all(
         self,
         compound: Compound,
-        check_timeout: Callable[[], None] = lambda: None,
     ) -> Tuple[CleavageResult, ...]:
         """Apply all matching cleavage patterns to a compound.
 
@@ -180,8 +183,6 @@ class FragmentTreeBuilder:
         ----------
         compound : Compound
             Molecule to cleave.
-        check_timeout : callable, optional
-            Callback invoked before each pattern application.
 
         Returns
         -------
@@ -190,7 +191,6 @@ class FragmentTreeBuilder:
         """
         fragment_group = []
         for pattern in self.cleavage_pattern_set.patterns:
-            check_timeout()
             fragment_result = pattern.fragment(compound)
             if fragment_result is not None and len(fragment_result.products) > 0:
                 fragment_group.append(fragment_result)
@@ -199,7 +199,8 @@ class FragmentTreeBuilder:
     def build(
         self,
         compound: Compound,
-        timeout_seconds: float = float("inf"),
+        max_node: int = -1,
+        max_edge: int = -1,
         print_info: bool = False,
     ) -> FragmentTree:
         """Build a :class:`FragmentTree` from a root compound.
@@ -208,8 +209,10 @@ class FragmentTreeBuilder:
         ----------
         compound : Compound
             Root molecule used as the starting point of the fragmentation tree.
-        timeout_seconds : float, optional
-            Maximum wall-clock time allowed for tree generation.
+        max_node : int, optional
+            Maximum number of nodes to keep. Use ``-1`` for no limit.
+        max_edge : int, optional
+            Maximum number of edges to keep. Use ``-1`` for no limit.
         print_info : bool, optional
             If ``True``, print progress after each depth.
 
@@ -220,15 +223,17 @@ class FragmentTreeBuilder:
 
         Raises
         ------
-        TimeoutError
-            If generation exceeds ``timeout_seconds``.
         """
         assert isinstance(compound, Compound), "compound must be a Compound instance."
+        assert isinstance(max_node, int) and (max_node == -1 or max_node > 0), "max_node must be -1 or a positive integer."
+        assert isinstance(max_edge, int) and max_edge >= -1, "max_edge must be -1 or a non-negative integer."
         start_time = time.time()
 
-        def check_timeout() -> None:
-            if (time.time() - start_time) > timeout_seconds:
-                raise TimeoutError("Fragmentation process timed out.")
+        def can_add_node() -> bool:
+            return max_node < 0 or len(nodes) < max_node
+
+        def can_add_edge() -> bool:
+            return max_edge < 0 or len(edges) < max_edge
 
         nodes: Dict[int, FragmentNode] = {}
         edges: Dict[Tuple[int, int], FragmentEdge] = {}
@@ -236,9 +241,11 @@ class FragmentTreeBuilder:
         processed_node_ids = set()
         node_depths: Dict[int, int] = {}
 
-        def get_or_create_node_id(smiles: str, depth: int) -> int:
+        def get_or_create_node_id(smiles: str, depth: int) -> Optional[int]:
             if smiles in smi_to_node_id:
                 return smi_to_node_id[smiles]
+            if not can_add_node():
+                return None
 
             node_id = len(nodes)
             nodes[node_id] = FragmentNode(node_id, smiles)
@@ -278,6 +285,9 @@ class FragmentTreeBuilder:
                 )
                 return edge.id
 
+            if not can_add_edge():
+                return None
+
             edge_id = len(edges)
             edges[edge_key] = FragmentEdge(
                 id=edge_id,
@@ -296,23 +306,29 @@ class FragmentTreeBuilder:
 
         root_compound = compound.copy()
         root_node_id = get_or_create_node_id(root_compound.smiles, depth=0)
+        if root_node_id is None:
+            raise ValueError("max_node must allow at least the root node.")
 
         next_node_ids = {root_node_id}
         for depth in range(1, self.max_depth + 1):
             if len(next_node_ids) == 0:
                 break
-            check_timeout()
 
             new_node_ids = set()
             for node_id in sorted(next_node_ids):
                 source_smiles = nodes[node_id].smiles
                 source_compound = Compound.from_smiles(source_smiles)
-                frag_group = self.cleave_all(source_compound, check_timeout)
+                frag_group = self.cleave_all(source_compound)
 
                 for frag_result in frag_group:
                     cleavage_id = self.cleavage_pattern_set.get_id(frag_result.cleavage)
                     for frag_product in frag_result.products:
+                        target_exists = frag_product.smiles in smi_to_node_id
+                        if not target_exists and (not can_add_node() or not can_add_edge()):
+                            continue
                         target_node_id = get_or_create_node_id(frag_product.smiles, depth=depth)
+                        if target_node_id is None:
+                            continue
                         edge_id = add_fragment_edge(
                             source_node_id=node_id,
                             target_node_id=target_node_id,
@@ -346,7 +362,8 @@ class FragmentTreeBuilder:
     def create_fragment_tree(
         self,
         compound: Compound,
-        timeout_seconds: float = float("inf"),
+        max_node: int = -1,
+        max_edge: int = -1,
         print_info: bool = False,
     ) -> FragmentTree:
         """Build a fragment tree.
@@ -355,7 +372,8 @@ class FragmentTreeBuilder:
         """
         return self.build(
             compound=compound,
-            timeout_seconds=timeout_seconds,
+            max_node=max_node,
+            max_edge=max_edge,
             print_info=print_info,
         )
 

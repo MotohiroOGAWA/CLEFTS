@@ -140,6 +140,36 @@ class TestFragmentTreeBuilder(unittest.TestCase):
         self.assertEqual(tree.get_in_edges(0), [])
         self.assertEqual(tree.get_out_edges(0), [])
 
+    def test_build_respects_max_node_limit(self):
+        pattern_set = self.make_pattern_set()
+        compound = Compound.from_smiles("CCCOCNCSCF")
+        builder = FragmentTreeBuilder(max_depth=2, cleavage_pattern_set=pattern_set)
+
+        tree = builder.build(compound, max_node=3)
+
+        self.assertLessEqual(tree.num_nodes, 3)
+        self.assertEqual(tree.smiles, compound.smiles)
+
+    def test_build_respects_max_edge_limit(self):
+        pattern_set = self.make_pattern_set()
+        compound = Compound.from_smiles("CCCOCNCSCF")
+        builder = FragmentTreeBuilder(max_depth=2, cleavage_pattern_set=pattern_set)
+
+        tree = builder.build(compound, max_edge=2)
+
+        self.assertLessEqual(tree.num_edges, 2)
+        self.assertEqual(tree.smiles, compound.smiles)
+
+    def test_build_with_zero_max_edge_returns_root_only(self):
+        pattern_set = self.make_pattern_set()
+        compound = Compound.from_smiles("CCCOCNCSCF")
+        builder = FragmentTreeBuilder(max_depth=2, cleavage_pattern_set=pattern_set)
+
+        tree = builder.build(compound, max_edge=0)
+
+        self.assertEqual(tree.num_nodes, 1)
+        self.assertEqual(tree.num_edges, 0)
+
 
 if __name__ == "__main__":
     unittest.main()
