@@ -1,4 +1,4 @@
-from typing import Tuple, List, Dict, Any
+from typing import Tuple, List, Dict, Any, Optional
 from rdkit import Chem
 from rdkit.Chem import AllChem
 from rdkit.Chem import rdChemReactions
@@ -12,20 +12,43 @@ from .CleavageResult import CleavageResult
 from .CleavageProduct import CleavageProduct
 
 class CleavagePattern:
+    """Define one user-configurable molecular cleavage rule.
+
+    A ``CleavagePattern`` stores a single SMIRKS reaction that describes how a
+    substructure should be cleaved. The reactant side is used as a SMARTS query
+    for substructure matching, and the reaction result is converted into
+    :class:`CleavageProduct` objects with atom-index mappings between the
+    original molecule and each product.
+
+    CLEFTS uses this class as the low-level representation of a cleavage rule.
+    Users can define arbitrary cleavage patterns as long as the SMIRKS is a
+    single-reactant, single-product reaction with atom map numbers on the atoms
+    that should be tracked.
+
+    Notes
+    -----
+    Equality and hashing ignore ``name`` by default. Two patterns are considered
+    identical when they have the same ``smirks`` and ``charge_mode``. Use
+    :meth:`equals` with ``include_name=True`` when the human-readable name should
+    also be part of the comparison.
+    """
+
     SUPPORTED_CHARGE_MODES = {"positive1", "negative1", "neutral", "any"}
     def __init__(self, smirks: str, name: str="", charge_mode: str="any"):
-        """
-        Define a cleavage pattern using a SMIRKS reaction.
-        Args:
-            smirks (str): SMIRKS reaction string.
-            name (str): Pattern name (e.g. "amide bond cleavage").
-            charge_mode (str): Allowed charge states (can be multiple separated by '|').
-                Examples:
-                    - "positive1"
-                    - "negative1"
-                    - "neutral"
-                    - "any"
-                    - "positive1|neutral"
+        """Create a cleavage pattern from a SMIRKS reaction.
+
+        Parameters
+        ----------
+        smirks : str
+            Single-reactant, single-product SMIRKS reaction. Atom map numbers
+            identify the reactant atoms and product atoms whose indices should
+            be reported in cleavage results.
+        name : str, optional
+            Human-readable pattern name, such as ``"amide bond cleavage"``.
+        charge_mode : str, optional
+            Product charge filter. Supported values are ``"positive1"``,
+            ``"negative1"``, ``"neutral"``, and ``"any"``. Multiple modes can
+            be joined with ``"|"``, for example ``"positive1|neutral"``.
         """
         self.version = 1.0
         self.smirks = smirks
@@ -71,46 +94,54 @@ class CleavagePattern:
         return f"{self.__class__.__name__}(name='{self.name}', smirks='{self.smirks}', charge_mode='{self.charge_mode}')"
     
     def key(self, include_name: bool = False) -> Tuple:
-        """
-        Generate a unique key for hashing or equality checks.
+        """Return the immutable identity key for this pattern.
 
-        Args:
-            include_name (bool): Whether to include the name field in comparison.
+        Parameters
+        ----------
+        include_name : bool, optional
+            If ``True``, include ``name`` in the returned key. By default, only
+            ``smirks`` and ``charge_mode`` define pattern identity.
 
-        Returns:
-            tuple: Key representing the essential identity of the pattern.
+        Returns
+        -------
+        tuple
+            Identity tuple suitable for equality checks, hashing, sorting, and
+            stable pattern-set ID assignment.
         """
         if include_name:
             return (self.smirks, self.charge_mode, self.name)
         return (self.smirks, self.charge_mode)
 
     def __eq__(self, other: 'CleavagePattern') -> bool:
-        """
-        Default equality check for CleavagePattern objects.
-        Compares SMIRKS and charge_mode by default (ignores name).
+        """Return whether two patterns have the same cleavage identity.
 
-        To include name, call self.equals(other, include_name=True).
+        The default comparison ignores ``name`` and compares only ``smirks`` and
+        ``charge_mode``.
         """
         if not isinstance(other, CleavagePattern):
             return False
         return self.key(False) == other.key(False)
     
     def __hash__(self) -> int:
-        """
-        Default hash based on key excluding name.
-        """
+        """Return a hash based on ``smirks`` and ``charge_mode``."""
         return hash(self.key(False))
 
     def equals(self, other: 'CleavagePattern', include_name: bool = False) -> bool:
-        """
-        Extended equality check with optional name inclusion.
+        """Compare this pattern with another pattern.
 
-        Args:
-            other (CleavagePattern): Another pattern to compare.
-            include_name (bool): If True, also compare name.
+        Parameters
+        ----------
+        other : CleavagePattern
+            Pattern to compare with this instance.
+        include_name : bool, optional
+            If ``True``, compare ``name`` in addition to ``smirks`` and
+            ``charge_mode``.
 
-        Returns:
-            bool: True if equivalent under the given criteria.
+        Returns
+        -------
+        bool
+            ``True`` when both patterns are equivalent under the selected
+            comparison rule.
         """
         if not isinstance(other, CleavagePattern):
             return False
@@ -134,28 +165,16 @@ class CleavagePattern:
 
     @property
     def num_reactant_atoms(self) -> int:
-        """
-        Get the number of atoms in the reactant template.
-        Returns:
-            int: Number of atoms in the reactant.
-        """
+        """Number of mapped atoms on the reactant side of the SMIRKS."""
         return len(self.react_idx_to_map)
 
     @property
     def num_product_atoms(self) -> int:
-        """
-        Get the number of atoms in the product template.
-        Returns:
-            int: Number of atoms in the product.
-        """
+        """Number of mapped atoms retained on the product side of the SMIRKS."""
         return len(self.prod_idx_to_map)
 
     def copy(self) -> 'CleavagePattern':
-        """
-        Create a copy of this CleavagePattern instance.
-        Returns:
-            CleavagePattern: A new instance with the same attributes.
-        """
+        """Return a new ``CleavagePattern`` with the same constructor values."""
         sig = inspect.signature(self.__init__)
         init_args = [p.name for p in sig.parameters.values() if p.name != "self"]
 
@@ -165,13 +184,17 @@ class CleavagePattern:
     
     @classmethod
     def parse(cls, pattern_str: str) -> 'CleavagePattern':
-        """
-        Parse a CleavagePattern from its string representation.
-        Args:
-            pattern_str (str): String representation of the pattern.
+        """Parse a pattern serialized by :meth:`__str__`.
 
-        Returns:
-            CleavagePattern: The parsed cleavage pattern.
+        Parameters
+        ----------
+        pattern_str : str
+            String representation produced by ``str(pattern)``.
+
+        Returns
+        -------
+        CleavagePattern
+            Reconstructed cleavage pattern.
         """
         # 1. Remove surrounding parentheses and class name
         if pattern_str.startswith("(") and pattern_str.endswith(")"):
@@ -206,9 +229,13 @@ class CleavagePattern:
 
     # -------------------------------------------------------------------------
     def to_dict(self) -> Dict[str, Any]:
-        """
-        Automatically convert only the constructor arguments (and version)
-        to a serializable dictionary.
+        """Serialize the pattern to a dictionary.
+
+        Returns
+        -------
+        dict
+            Dictionary containing constructor fields and the pattern version.
+            The result is suitable for YAML or JSON serialization.
         """
         sig = inspect.signature(self.__init__)
         arg_names = [p.name for p in sig.parameters.values() if p.name != "self"]
@@ -221,9 +248,18 @@ class CleavagePattern:
     # -------------------------------------------------------------------------
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "CleavagePattern":
-        """
-        Automatically construct an instance using only arguments
-        that exist in the constructor.
+        """Create a pattern from a serialized dictionary.
+
+        Parameters
+        ----------
+        data : dict
+            Dictionary containing at least the constructor fields accepted by
+            :class:`CleavagePattern`. Unknown keys are ignored.
+
+        Returns
+        -------
+        CleavagePattern
+            Reconstructed cleavage pattern.
         """
         sig = inspect.signature(cls.__init__)
         arg_names = [p.name for p in sig.parameters.values() if p.name != "self"]
@@ -237,29 +273,53 @@ class CleavagePattern:
         return obj
 
     def exists(self, compound: Compound) -> bool:
-        """
-        Check if the cleavage pattern exists in a molecule.
-        Returns:
-            bool: True if pattern is found, False otherwise.
+        """Return whether the reactant SMARTS matches a compound.
+
+        Parameters
+        ----------
+        compound : Compound
+            Molecule to search.
+
+        Returns
+        -------
+        bool
+            ``True`` if the cleavage pattern can match at least one
+            substructure in ``compound``.
         """
         if self.reactant_query is None:
             return False
         return compound.mol.HasSubstructMatch(self.reactant_query)
     
     def matches(self, compound: Compound) -> List[Tuple[int, ...]]:
-        """
-        Get all substructure matches of the cleavage pattern in a molecule.
-        Returns:
-            List[Tuple[int, ...]]: List of atom index tuples for each match.
+        """Return all reactant-side substructure matches.
+
+        Parameters
+        ----------
+        compound : Compound
+            Molecule to search.
+
+        Returns
+        -------
+        list of tuple of int
+            Atom-index tuples returned by RDKit for each match of the
+            reactant-side SMARTS query.
         """
         if self.reactant_query is None:
             return []
         return compound.mol.GetSubstructMatches(self.reactant_query)
 
     def is_applicable(self, compound: Compound) -> bool:
-        """
-        Check if this cleavage pattern should be applied to the given compound.
-        The decision is based on the compound's formal charge and charge_mode setting.
+        """Return whether a product passes this pattern's charge filter.
+
+        Parameters
+        ----------
+        compound : Compound
+            Candidate product molecule.
+
+        Returns
+        -------
+        bool
+            ``True`` when ``compound.charge`` is accepted by ``charge_mode``.
         """
         charge = compound.charge
         for cm in self.charge_mode.split("|"):
@@ -279,13 +339,25 @@ class CleavagePattern:
         return False
 
     # -------------------------------------------------------------------------
-    def fragment(self, compound: Compound) -> CleavageResult:
-        """
-        Apply the SMIRKS cleavage pattern and return mapped fragment information.
+    def fragment(self, compound: Compound) -> Optional[CleavageResult]:
+        """Apply this cleavage pattern to a compound.
 
-        Returns:
-            CleavageResult: Contains the original molecule SMILES, 
-                            cleavage SMIRKS, and per-product fragment mapping.
+        The method first checks whether the reactant-side SMARTS matches the
+        input molecule. If no match exists, ``None`` is returned. Otherwise, the
+        SMIRKS reaction is applied and each valid product is converted to a
+        :class:`CleavageProduct` with atom-index mappings.
+
+        Parameters
+        ----------
+        compound : Compound
+            Reactant molecule to cleave.
+
+        Returns
+        -------
+        CleavageResult or None
+            Cleavage result containing the original reactant SMILES and all
+            accepted products. Returns ``None`` when the pattern does not match
+            the input molecule.
         """
         if not self.exists(compound):
             return None
