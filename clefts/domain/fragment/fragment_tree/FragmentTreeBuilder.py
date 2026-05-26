@@ -8,6 +8,7 @@ from ....libs.mmkit.mmkit import Compound
 from ..cleavage.CleavagePattern import CleavagePattern
 from ..cleavage.CleavagePatternSet import CleavagePatternSet
 from ..cleavage.CleavageResult import CleavageResult
+from .CleavageEvent import CleavageEvent
 from .FragmentEdge import FragmentEdge
 from .FragmentNode import FragmentNode
 from .FragmentTree import FragmentTree
@@ -255,7 +256,9 @@ class FragmentTreeBuilder:
         def add_fragment_edge(
             source_node_id: int,
             target_node_id: int,
-            fragment_step_str: str,
+            cleavage_pattern_id: int,
+            react_indices: Tuple[int, ...],
+            prod_indices: Tuple[int, ...],
             depth: int,
         ) -> Optional[int]:
             if should_skip_edge(target_node_id, depth):
@@ -263,15 +266,31 @@ class FragmentTreeBuilder:
 
             edge_key = (source_node_id, target_node_id)
             if edge_key in edges:
-                edges[edge_key] = edges[edge_key].with_fragment_step(fragment_step_str)
-                return edges[edge_key].id
+                edge = edges[edge_key]
+                event_id = len(edge.events)
+                edges[edge_key] = edge.with_event(
+                    CleavageEvent(
+                        event_id=event_id,
+                        cleavage_pattern_id=cleavage_pattern_id,
+                        react_indices=react_indices,
+                        prod_indices=prod_indices,
+                    )
+                )
+                return edge.id
 
             edge_id = len(edges)
             edges[edge_key] = FragmentEdge(
                 id=edge_id,
                 source_id=source_node_id,
                 target_id=target_node_id,
-                fragment_step_strs=(fragment_step_str,),
+                events=(
+                    CleavageEvent(
+                        event_id=0,
+                        cleavage_pattern_id=cleavage_pattern_id,
+                        react_indices=react_indices,
+                        prod_indices=prod_indices,
+                    ),
+                ),
             )
             return edge_id
 
@@ -294,16 +313,12 @@ class FragmentTreeBuilder:
                     cleavage_id = self.cleavage_pattern_set.get_id(frag_result.cleavage)
                     for frag_product in frag_result.products:
                         target_node_id = get_or_create_node_id(frag_product.smiles, depth=depth)
-                        fragment_step_str = self._format_fragment_step(
-                            cleavage_id=cleavage_id,
-                            cleavage_pattern=frag_result.cleavage,
-                            react_indices=frag_product.reactant_indices,
-                            prod_indices=frag_product.product_indices,
-                        )
                         edge_id = add_fragment_edge(
                             source_node_id=node_id,
                             target_node_id=target_node_id,
-                            fragment_step_str=fragment_step_str,
+                            cleavage_pattern_id=cleavage_id,
+                            react_indices=frag_product.reactant_indices,
+                            prod_indices=frag_product.product_indices,
                             depth=depth,
                         )
                         if edge_id is not None:
@@ -344,21 +359,6 @@ class FragmentTreeBuilder:
             print_info=print_info,
         )
 
-    @staticmethod
-    def _format_fragment_step(
-        cleavage_id: int,
-        cleavage_pattern: CleavagePattern,
-        react_indices: Tuple[int, ...],
-        prod_indices: Tuple[int, ...],
-    ) -> str:
-        """Serialize one fragmentation step for storage on a tree edge."""
-        return (
-            "(FragmentStep;"
-            f"cleavage_id={cleavage_id};"
-            f"cleavage={str(cleavage_pattern)};"
-            f"react_indices={tuple(react_indices)};"
-            f"prod_indices={tuple(prod_indices)})"
-        )
 
     def copy(self) -> "FragmentTreeBuilder":
         """Create a copy of this builder configuration."""

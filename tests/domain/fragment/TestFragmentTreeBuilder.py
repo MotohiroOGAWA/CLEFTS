@@ -23,7 +23,7 @@ class TestFragmentTreeBuilder(unittest.TestCase):
     def edge_pairs(self, tree):
         return {
             (tree.get_node(edge.source_id).smiles, tree.get_node(edge.target_id).smiles)
-            for edge in (tree.get_edges(i) for i in range(tree.num_edges))
+            for edge in (tree.get_edge(i) for i in range(tree.num_edges))
         }
 
     def test_builds_fragment_tree_and_exposes_convenience_methods(self):
@@ -61,9 +61,9 @@ class TestFragmentTreeBuilder(unittest.TestCase):
         self.assertEqual(root_out_edges[0].source_id, 0)
 
         second_depth_edge = next(
-            tree.get_edges(edge_id)
+            tree.get_edge(edge_id)
             for edge_id in range(tree.num_edges)
-            if tree.get_edges(edge_id).source_id != 0
+            if tree.get_edge(edge_id).source_id != 0
         )
         self.assertGreaterEqual(len(tree.get_in_edges(second_depth_edge.target_id)), 1)
         self.assertIn(
@@ -75,10 +75,11 @@ class TestFragmentTreeBuilder(unittest.TestCase):
             tree.get_child_nodes(second_depth_edge.source_id),
         )
 
-        for step in second_depth_edge.fragment_step_strs:
-            self.assertIn("cleavage_id=", step)
-            self.assertIn("react_indices=", step)
-            self.assertIn("prod_indices=", step)
+        for event in second_depth_edge.events:
+            self.assertIsInstance(event.cleavage_pattern_id, int)
+            self.assertGreaterEqual(event.event_id, 0)
+            self.assertIsInstance(event.react_indices, tuple)
+            self.assertIsInstance(event.prod_indices, tuple)
 
         depths = tree.node_depths
         self.assertEqual(int(depths[0]), 0)
@@ -112,14 +113,14 @@ class TestFragmentTreeBuilder(unittest.TestCase):
 
                 pattern = next(p for p in pattern_set.patterns if p.name == pattern_name)
                 pattern_id = pattern_set.get_id(pattern)
-                root_steps = (
-                    step
+                root_events = (
+                    event
                     for edge_id in range(tree.num_edges)
-                    for step in tree.get_edges(edge_id).fragment_step_strs
-                    if tree.get_edges(edge_id).source_id == 0
+                    for event in tree.get_edge(edge_id).events
+                    if tree.get_edge(edge_id).source_id == 0
                 )
                 self.assertTrue(
-                    any(f"cleavage_id={pattern_id}" in step for step in root_steps),
+                    any(event.cleavage_pattern_id == pattern_id for event in root_events),
                     f"{pattern_name} was not applied at the root node.",
                 )
 
