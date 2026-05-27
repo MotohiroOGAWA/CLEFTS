@@ -456,6 +456,54 @@ footer {
     transform: scale(.85);
 }
 
+.clefts-dataframe-pager {
+    align-items: center !important;
+    display: grid !important;
+    grid-template-columns: 1fr auto 1fr !important;
+    gap: 10px !important;
+    margin-top: 8px !important;
+    width: 100% !important;
+}
+.clefts-dataframe-page-controls {
+    align-items: center !important;
+    display: inline-flex !important;
+    gap: 8px !important;
+    grid-column: 2 !important;
+    justify-content: center !important;
+}
+.clefts-dataframe-page-controls > div {
+    flex: 0 0 auto !important;
+}
+.clefts-dataframe-rows-control {
+    align-items: center !important;
+    display: inline-flex !important;
+    gap: 6px !important;
+    grid-column: 3 !important;
+    justify-self: end !important;
+}
+.clefts-dataframe-page-number input {
+    text-align: center !important;
+}
+.clefts-dataframe-page-count {
+    color: #52616d;
+    display: inline-flex;
+    min-width: 44px;
+}
+.clefts-dataframe-rows-label {
+    color: #52616d;
+    font-size: 13px;
+    white-space: nowrap;
+}
+.clefts-dataframe-rows-per-page {
+    min-width: 88px !important;
+}
+.clefts-dataframe-sort-column {
+    min-width: 132px !important;
+}
+.clefts-dataframe-sort-order {
+    min-width: 116px !important;
+}
+
 .clefts-form-panel button.primary {
     background: #1f5f8b !important;
     border-color: #1f5f8b !important;

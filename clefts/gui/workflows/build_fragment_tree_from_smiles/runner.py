@@ -1,26 +1,39 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 from uuid import uuid4
 
 import gradio as gr
+import pandas as pd
 
 from clefts.domain.fragment.fragment_tree.FragmentTreeBuilder import FragmentTreeBuilder
 from clefts.gui.components.cleavage_patterns_input_panel import json_to_pattern_set
+from clefts.gui.components.paginated_dataframe import page_updates_for_dataframe
 from clefts.libs.mmkit.mmkit import Compound
 
 
-MAX_PREVIEW_ROWS = 80
-_RESULT_STORE: dict[str, str] = {}
+NODE_HEADERS = ["ID", "Depth", "SMILES"]
+EDGE_HEADERS = ["ID", "Source", "Target", "Events"]
 
 
-def save_result(result: str) -> str:
+@dataclass(frozen=True)
+class FragmentTreeResult:
+    summary_markdown: str
+    node_dataframe: pd.DataFrame
+    edge_dataframe: pd.DataFrame
+
+
+_RESULT_STORE: dict[str, FragmentTreeResult] = {}
+
+
+def save_result(result: FragmentTreeResult) -> str:
     result_id = uuid4().hex
     _RESULT_STORE[result_id] = result
     return result_id
 
 
-def get_result(result_id: str | None) -> str | None:
+def get_result(result_id: str | None) -> FragmentTreeResult | None:
     if not result_id:
         return None
     return _RESULT_STORE.get(str(result_id))
@@ -40,14 +53,14 @@ def build_fragment_tree_and_store_result(*args: Any) -> str:
     )
 
 
-def load_result_from_request(request: gr.Request | None = None) -> str:
+def load_result_from_request(request: gr.Request | None = None):
     query_params = getattr(request, "query_params", {}) or {}
     result_id = query_params.get("result_id") if hasattr(query_params, "get") else None
     result = get_result(result_id)
     if result is None:
-        return _error_result("Result was not found. Please return to the input page and run the workflow again.")
-    return result
-
+        result_id = ""
+        result = _error_result("Result was not found. Please return to the input page and run the workflow again.")
+    return (str(result_id or ""), result.summary_markdown, *_node_page_updates(result, 1, 20), *_edge_page_updates(result, 1, 20))
 
 
 def build_fragment_tree_result(
@@ -58,7 +71,7 @@ def build_fragment_tree_result(
     max_node: int | float,
     max_edge: int | float,
     cleavage_patterns_json: str,
-) -> str:
+) -> FragmentTreeResult:
     try:
         if not str(smiles or "").strip():
             return _error_result("SMILES is required.")
@@ -76,7 +89,7 @@ def build_fragment_tree_result(
             max_node=int(max_node),
             max_edge=int(max_edge),
         )
-        
+
         return summarize_fragment_tree(
             tree=tree,
             max_depth=int(max_depth),
@@ -90,10 +103,10 @@ def build_fragment_tree_result(
         return _error_result(str(exc))
 
 
-def demo_result(smiles: str, *builder_values_and_patterns: Any) -> str:
+def demo_result(smiles: str, *builder_values_and_patterns: Any) -> FragmentTreeResult:
     if not builder_values_and_patterns:
-        from clefts.gui.workflows.build_fragment_tree_from_smiles.metadata import DEFAULT_CLEAVAGE_PATTERNS_PATH
         from clefts.gui.components.cleavage_patterns_input_panel import load_pattern_set_json_file, pattern_set_to_json
+        from clefts.gui.workflows.build_fragment_tree_from_smiles.metadata import DEFAULT_CLEAVAGE_PATTERNS_PATH
 
         return build_fragment_tree_result(
             smiles,
@@ -116,10 +129,8 @@ def summarize_fragment_tree(
     max_node: int,
     max_edge: int,
     cleavage_pattern_count: int,
-) -> str:
-    lines = [
-        "# Fragment Tree Result",
-        "",
+) -> FragmentTreeResult:
+    summary_markdown = "\n".join([
         "## Summary",
         f"- Root SMILES: `{tree.smiles}`",
         f"- Nodes: {tree.num_nodes}",
@@ -130,44 +141,101 @@ def summarize_fragment_tree(
         f"- min_depth_only_from: {min_depth_only_from}",
         f"- max_node: {_format_limit(max_node)}",
         f"- max_edge: {_format_limit(max_edge)}",
-        "",
-        "## Nodes",
-        "| ID | Depth | SMILES |",
-        "|---:|---:|---|",
-    ]
+    ])
 
     depths = tree.node_depths
-    for node_id, node_smiles in enumerate(tree.node_smiles[:MAX_PREVIEW_ROWS]):
-        lines.append(f"| {node_id} | {int(depths[node_id])} | `{node_smiles}` |")
-    if tree.num_nodes > MAX_PREVIEW_ROWS:
-        lines.append(f"| ... | ... | {tree.num_nodes - MAX_PREVIEW_ROWS} more nodes |")
-
-    lines.extend([
-        "",
-        "## Edges",
-        "| ID | Source | Target | Events |",
-        "|---:|---:|---:|---:|",
-    ])
-    edge_count = min(tree.num_edges, MAX_PREVIEW_ROWS)
-    for edge_id in range(edge_count):
+    node_dataframe = pd.DataFrame(
+        {
+            "ID": range(tree.num_nodes),
+            "Depth": [int(depths[node_id]) for node_id in range(tree.num_nodes)],
+            "SMILES": tree.node_smiles.tolist(),
+        },
+        columns=NODE_HEADERS,
+    )
+    edge_rows = []
+    for edge_id in range(tree.num_edges):
         edge = tree.get_edge(edge_id)
-        lines.append(
-            f"| {edge.id} | {edge.source_id} | {edge.target_id} | {len(edge.events)} |"
+        edge_rows.append(
+            {
+                "ID": edge.id,
+                "Source": edge.source_id,
+                "Target": edge.target_id,
+                "Events": len(edge.events),
+            }
         )
-    if tree.num_edges > MAX_PREVIEW_ROWS:
-        lines.append(f"| ... | ... | ... | {tree.num_edges - MAX_PREVIEW_ROWS} more edges |")
+    edge_dataframe = pd.DataFrame(edge_rows, columns=EDGE_HEADERS)
 
-    return "\n".join(lines)
+    return FragmentTreeResult(
+        summary_markdown=summary_markdown,
+        node_dataframe=node_dataframe,
+        edge_dataframe=edge_dataframe,
+    )
+
+
+def move_node_page(result_id: str, page: str, rows_per_page: int, delta: int):
+    result = get_result(result_id)
+    if result is None:
+        return _empty_page(NODE_HEADERS)
+    return _node_page_updates(result, _int_or_default(page, 1) + delta, rows_per_page)
+
+
+def set_node_page(result_id: str, page: str, rows_per_page: int):
+    result = get_result(result_id)
+    if result is None:
+        return _empty_page(NODE_HEADERS)
+    return _node_page_updates(result, page, rows_per_page)
+
+
+def move_edge_page(result_id: str, page: str, rows_per_page: int, delta: int):
+    result = get_result(result_id)
+    if result is None:
+        return _empty_page(EDGE_HEADERS)
+    return _edge_page_updates(result, _int_or_default(page, 1) + delta, rows_per_page)
+
+
+def set_edge_page(result_id: str, page: str, rows_per_page: int):
+    result = get_result(result_id)
+    if result is None:
+        return _empty_page(EDGE_HEADERS)
+    return _edge_page_updates(result, page, rows_per_page)
+
+
+def _node_page_updates(result: FragmentTreeResult, page: Any, rows_per_page: Any):
+    return page_updates_for_dataframe(
+        result.node_dataframe,
+        headers=NODE_HEADERS,
+        page=page,
+        rows_per_page=rows_per_page,
+    )
+
+
+def _edge_page_updates(result: FragmentTreeResult, page: Any, rows_per_page: Any):
+    return page_updates_for_dataframe(
+        result.edge_dataframe,
+        headers=EDGE_HEADERS,
+        page=page,
+        rows_per_page=rows_per_page,
+    )
+
+
+def _empty_page(headers: list[str]):
+    return pd.DataFrame(columns=headers), "1", "/ 1"
 
 
 def _format_limit(value: int) -> str:
     return "unlimited" if int(value) < 0 else str(int(value))
 
 
-def _error_result(message: str) -> str:
-    return "\n".join([
-        "# Fragment Tree Result",
-        "",
-        "## Error",
-        message,
-    ])
+def _error_result(message: str) -> FragmentTreeResult:
+    return FragmentTreeResult(
+        summary_markdown="\n".join(["## Error", message]),
+        node_dataframe=pd.DataFrame(columns=NODE_HEADERS),
+        edge_dataframe=pd.DataFrame(columns=EDGE_HEADERS),
+    )
+
+
+def _int_or_default(value: Any, default: int) -> int:
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default

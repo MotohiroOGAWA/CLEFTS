@@ -33,10 +33,10 @@ def create_input_app() -> gr.Blocks:
 def create_result_app() -> gr.Blocks:
     with gr.Blocks(title="Build Fragment Tree from SMILES Results") as app:
         with gr.Group(elem_classes="clefts-page"):
-            result_summary = render_result_page()
+            result_page = render_result_page()
             app.load(
                 fn=load_result_from_request,
-                outputs=[result_summary],
+                outputs=result_page.load_outputs,
             )
     return app
 
