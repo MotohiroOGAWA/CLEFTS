@@ -9,7 +9,7 @@ import pandas as pd
 
 from clefts.domain.fragment.fragment_tree.FragmentTreeBuilder import FragmentTreeBuilder
 from clefts.gui.components.cleavage_patterns_input_panel import json_to_pattern_set
-from clefts.gui.components.paginated_dataframe import page_updates_for_dataframe
+from clefts.gui.components.paginated_dataframe import make_page_html
 from clefts.libs.mmkit.mmkit import Compound
 
 
@@ -105,7 +105,6 @@ def build_fragment_tree_result(
 
 def demo_result(smiles: str, *builder_values_and_patterns: Any) -> FragmentTreeResult:
     if not builder_values_and_patterns:
-        from clefts.gui.components.cleavage_patterns_input_panel import load_pattern_set_json_file, pattern_set_to_json
         from clefts.gui.workflows.build_fragment_tree_from_smiles.metadata import DEFAULT_CLEAVAGE_PATTERNS_PATH
 
         return build_fragment_tree_result(
@@ -115,7 +114,7 @@ def demo_result(smiles: str, *builder_values_and_patterns: Any) -> FragmentTreeR
             0,
             -1,
             -1,
-            pattern_set_to_json(load_pattern_set_json_file(DEFAULT_CLEAVAGE_PATTERNS_PATH)),
+            DEFAULT_CLEAVAGE_PATTERNS_PATH.read_text(encoding="utf-8"),
         )
     return build_fragment_tree_result(smiles, *builder_values_and_patterns)
 
@@ -201,25 +200,23 @@ def set_edge_page(result_id: str, page: str, rows_per_page: int):
 
 
 def _node_page_updates(result: FragmentTreeResult, page: Any, rows_per_page: Any):
-    return page_updates_for_dataframe(
+    return make_page_html(
         result.node_dataframe,
-        headers=NODE_HEADERS,
         page=page,
         rows_per_page=rows_per_page,
     )
 
 
 def _edge_page_updates(result: FragmentTreeResult, page: Any, rows_per_page: Any):
-    return page_updates_for_dataframe(
+    return make_page_html(
         result.edge_dataframe,
-        headers=EDGE_HEADERS,
         page=page,
         rows_per_page=rows_per_page,
     )
 
 
 def _empty_page(headers: list[str]):
-    return pd.DataFrame(columns=headers), "1", "/ 1"
+    return make_page_html(pd.DataFrame(columns=headers), page=1, rows_per_page=20)
 
 
 def _format_limit(value: int) -> str:

@@ -3,11 +3,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import gradio as gr
+import json
 
-from clefts.gui.components.cleavage_patterns_input_panel import load_pattern_set_json_file, render_cleavage_patterns_input_panel
-from clefts.gui.components.fragment_tree_builder_input_panel import render_fragment_tree_builder_input_panel
-from clefts.gui.workflows.build_fragment_tree_from_smiles.metadata import DEFAULT_CLEAVAGE_PATTERNS_PATH, DEMO_SMILES, WORKFLOW_DESCRIPTION, WORKFLOW_TITLE
-from clefts.gui.workflows.build_fragment_tree_from_smiles.navigation import render_back_to_main_html
+from ....domain.fragment.cleavage.CleavagePatternSet import CleavagePatternSet
+from ...components.cleavage_patterns_input_panel import render_cleavage_patterns_input_panel
+from ...components.fragment_tree_builder_input_panel import render_fragment_tree_builder_input_panel
+from .metadata import DEFAULT_CLEAVAGE_PATTERNS_PATH, DEMO_SMILES, WORKFLOW_DESCRIPTION, WORKFLOW_TITLE
+from .navigation import render_back_to_main_html
 
 
 @dataclass(frozen=True)
@@ -36,7 +38,7 @@ def render_input_page() -> BuildFragmentTreeFromSmilesInputPage:
         smiles = gr.Textbox(label="SMILES", value=DEMO_SMILES)
         builder_panel = render_fragment_tree_builder_input_panel()
         cleavage_patterns_panel = render_cleavage_patterns_input_panel(
-            default_pattern_set=load_pattern_set_json_file(DEFAULT_CLEAVAGE_PATTERNS_PATH)
+            default_pattern_set=CleavagePatternSet.from_dict(json.load(DEFAULT_CLEAVAGE_PATTERNS_PATH.open())),
         )
         run_button = gr.Button("Run", variant="primary")
 

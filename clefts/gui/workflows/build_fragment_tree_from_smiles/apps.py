@@ -4,7 +4,7 @@ import gradio as gr
 
 from clefts.gui.workflows.build_fragment_tree_from_smiles.input_page import render_input_page
 from clefts.gui.workflows.build_fragment_tree_from_smiles.result_page import render_result_page
-from clefts.gui.workflows.build_fragment_tree_from_smiles.runner import build_fragment_tree_and_store_result_url, load_result_from_request
+from clefts.gui.workflows.build_fragment_tree_from_smiles.runner import build_fragment_tree_and_store_result_url
 
 
 def create_input_app() -> gr.Blocks:
@@ -35,7 +35,7 @@ def create_result_app() -> gr.Blocks:
         with gr.Group(elem_classes="clefts-page"):
             result_page = render_result_page()
             app.load(
-                fn=load_result_from_request,
+                fn=result_page.load_result_from_request,
                 outputs=result_page.load_outputs,
             )
     return app

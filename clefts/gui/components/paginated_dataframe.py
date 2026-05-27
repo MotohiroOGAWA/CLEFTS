@@ -26,7 +26,40 @@ class PaginatedDataframe:
     sort_column: gr.Dropdown
     sort_order: gr.Dropdown
 
+    @property
+    def page_outputs(self) -> list[gr.Component]:
+        return [self.dataframe, self.page_number, self.page_count]
 
+    @property
+    def data_outputs(self) -> list[gr.Component]:
+        return [self.source_dataframe, self.sorted_dataframe, self.dataframe, self.page_number, self.page_count]
+
+    def build_outputs(
+        self,
+        dataframe: pd.DataFrame,
+        *,
+        page: int = 1,
+    ) -> tuple:
+        sorted_df = sort_dataframe(
+            dataframe,
+            self.sort_column.value,
+            self.sort_order.value,
+        )
+
+        html_value, page_value, page_count = make_page_html(
+            sorted_df,
+            page=page,
+            rows_per_page=self.rows_per_page.value,
+        )
+
+        return (
+            dataframe,
+            sorted_df,
+            html_value,
+            page_value,
+            page_count,
+        )
+    
 def render_paginated_dataframe(
     dataframe: Any,
     *,
@@ -366,13 +399,24 @@ def _int_or_default(value: Any, default: int) -> int:
     except (TypeError, ValueError):
         return default
 
-def create_demo_app() -> gr.Blocks:
+# python -m clefts.gui.components.paginated_dataframe
+if __name__ == "__main__":
     import random
+
+    import gradio as gr
+    import pandas as pd
+
     rows = pd.DataFrame(
         {
             "ID": range(1, 201),
-            "Name": [f"row-{index}" for index in range(1, 201)],
-            "Value": [random.random() * 100 for index in range(1, 201)],
+            "Name": [
+                f"row-{index}"
+                for index in range(1, 201)
+            ],
+            "Value": [
+                random.random() * 100
+                for index in range(1, 201)
+            ],
         }
     ).astype(
         {
@@ -385,22 +429,23 @@ def create_demo_app() -> gr.Blocks:
     with gr.Blocks(
         title="Paginated HTML Dataframe Demo"
     ) as app:
+
         gr.Markdown(
             "# Paginated HTML Dataframe Demo"
         )
 
         render_paginated_dataframe(
             rows,
-            headers=["ID", "Name", "Value"],
+            headers=[
+                "ID",
+                "Name",
+                "Value",
+            ],
             rows_per_page=10,
             label="Demo Table",
             height=None,
         )
 
-    return app
-
-
-if __name__ == "__main__":
-    create_demo_app().launch(
-        css=PAGINATED_DATAFRAME_CSS
+    app.launch(
+        css=PAGINATED_DATAFRAME_CSS,
     )
