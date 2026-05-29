@@ -54,28 +54,28 @@ class FragmentTreeBuilder:
         assert isinstance(only_add_min_depth, bool), "only_add_min_depth must be a boolean."
         assert isinstance(min_depth_only_from, int) and min_depth_only_from >= 0, "min_depth_only_from must be a non-negative integer."
 
-        self.max_depth = max_depth
-        self.cleavage_pattern_set = cleavage_pattern_set
-        self.only_add_min_depth = only_add_min_depth
-        self.min_depth_only_from = min_depth_only_from
+        self._max_depth = max_depth
+        self._cleavage_pattern_set = cleavage_pattern_set
+        self._only_add_min_depth = only_add_min_depth
+        self._min_depth_only_from = min_depth_only_from
 
     @property
     def cleavage_patterns(self) -> Tuple[CleavagePattern, ...]:
         """Cleavage patterns used by this builder in stable ID order."""
-        return self.cleavage_pattern_set.patterns
+        return self._cleavage_pattern_set.patterns
 
     @property
     def name(self) -> str:
         """Human-readable name of the underlying cleavage pattern set."""
-        return self.cleavage_pattern_set.name
+        return self._cleavage_pattern_set.name
 
     def to_dict(self) -> Dict[str, object]:
         """Serialize this builder configuration to a dictionary."""
         return {
-            "max_depth": self.max_depth,
-            "cleavage_pattern_set": self.cleavage_pattern_set.to_dict(),
-            "only_add_min_depth": self.only_add_min_depth,
-            "min_depth_only_from": self.min_depth_only_from,
+            "max_depth": self._max_depth,
+            "cleavage_pattern_set": self._cleavage_pattern_set.to_dict(),
+            "only_add_min_depth": self._only_add_min_depth,
+            "min_depth_only_from": self._min_depth_only_from,
         }
 
     @classmethod
@@ -173,6 +173,38 @@ class FragmentTreeBuilder:
             print_info=print_info,
         )
 
+    def cleave_by_pattern(
+        self,
+        compound: Compound,
+        cleavage_pattern: CleavagePattern,
+    ) -> CleavageResult | None:
+        """Apply one cleavage pattern to a compound."""
+        assert isinstance(compound, Compound)
+        assert isinstance(cleavage_pattern, CleavagePattern)
+
+        result = cleavage_pattern.fragment(compound)
+
+        if result is None:
+            return None
+
+        if len(result.products) == 0:
+            return None
+
+        return result
+
+    def cleave_by_pattern_id(
+        self,
+        compound: Compound,
+        cleavage_pattern_id: int,
+    ) -> CleavageResult | None:
+        """Apply one cleavage pattern selected by pattern id."""
+        cleavage_pattern = self._cleavage_pattern_set.patterns[cleavage_pattern_id]
+
+        return self.cleave_by_pattern(
+            compound=compound,
+            cleavage_pattern=cleavage_pattern,
+        )
+
     def cleave_all(
         self,
         compound: Compound,
@@ -189,11 +221,17 @@ class FragmentTreeBuilder:
         tuple of CleavageResult
             Non-empty cleavage results in stable pattern ID order.
         """
-        fragment_group = []
-        for pattern in self.cleavage_pattern_set.patterns:
-            fragment_result = pattern.fragment(compound)
-            if fragment_result is not None and len(fragment_result.products) > 0:
+        fragment_group: list[CleavageResult] = []
+
+        for cleavage_pattern in self._cleavage_pattern_set.patterns:
+            fragment_result = self.cleave_by_pattern(
+                compound=compound,
+                cleavage_pattern=cleavage_pattern,
+            )
+
+            if fragment_result is not None:
                 fragment_group.append(fragment_result)
+
         return tuple(fragment_group)
 
     def build(
@@ -255,8 +293,8 @@ class FragmentTreeBuilder:
 
         def should_skip_edge(target_node_id: int, depth: int) -> bool:
             return (
-                self.only_add_min_depth
-                and depth > self.min_depth_only_from + 1
+                self._only_add_min_depth
+                and depth > self._min_depth_only_from + 1
                 and depth > node_depths[target_node_id]
             )
 
@@ -310,7 +348,7 @@ class FragmentTreeBuilder:
             raise ValueError("max_node must allow at least the root node.")
 
         next_node_ids = {root_node_id}
-        for depth in range(1, self.max_depth + 1):
+        for depth in range(1, self._max_depth + 1):
             if len(next_node_ids) == 0:
                 break
 
@@ -321,7 +359,7 @@ class FragmentTreeBuilder:
                 frag_group = self.cleave_all(source_compound)
 
                 for frag_result in frag_group:
-                    cleavage_id = self.cleavage_pattern_set.get_id(frag_result.cleavage)
+                    cleavage_id = self._cleavage_pattern_set.get_id(frag_result.cleavage)
                     for frag_product in frag_result.products:
                         target_exists = frag_product.smiles in smi_to_node_id
                         if not target_exists and (not can_add_node() or not can_add_edge()):
@@ -381,8 +419,8 @@ class FragmentTreeBuilder:
     def copy(self) -> "FragmentTreeBuilder":
         """Create a copy of this builder configuration."""
         return FragmentTreeBuilder(
-            max_depth=self.max_depth,
-            cleavage_pattern_set=self.cleavage_pattern_set.copy(),
-            only_add_min_depth=self.only_add_min_depth,
-            min_depth_only_from=self.min_depth_only_from,
+            max_depth=self._max_depth,
+            cleavage_pattern_set=self._cleavage_pattern_set.copy(),
+            only_add_min_depth=self._only_add_min_depth,
+            min_depth_only_from=self._min_depth_only_from,
         )
