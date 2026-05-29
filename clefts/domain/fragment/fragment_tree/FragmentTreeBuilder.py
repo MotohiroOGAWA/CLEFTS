@@ -237,6 +237,7 @@ class FragmentTreeBuilder:
     def build(
         self,
         compound: Compound,
+        *,
         max_node: int = -1,
         max_edge: int = -1,
         print_info: bool = False,
@@ -262,112 +263,60 @@ class FragmentTreeBuilder:
         Raises
         ------
         """
-        assert isinstance(compound, Compound), "compound must be a Compound instance."
-        assert isinstance(max_node, int) and (max_node == -1 or max_node > 0), "max_node must be -1 or a positive integer."
-        assert isinstance(max_edge, int) and max_edge >= -1, "max_edge must be -1 or a non-negative integer."
+        assert isinstance(compound, Compound)
+        assert isinstance(max_node, int) and (max_node == -1 or max_node > 0)
+        assert isinstance(max_edge, int) and max_edge >= -1
+
         start_time = time.time()
 
-        def can_add_node() -> bool:
-            return max_node < 0 or len(nodes) < max_node
-
-        def can_add_edge() -> bool:
-            return max_edge < 0 or len(edges) < max_edge
-
-        nodes: Dict[int, FragmentNode] = {}
-        edges: Dict[Tuple[int, int], FragmentEdge] = {}
-        smi_to_node_id: Dict[str, int] = {}
-        processed_node_ids = set()
-        node_depths: Dict[int, int] = {}
-
-        def get_or_create_node_id(smiles: str, depth: int) -> Optional[int]:
-            if smiles in smi_to_node_id:
-                return smi_to_node_id[smiles]
-            if not can_add_node():
-                return None
-
-            node_id = len(nodes)
-            nodes[node_id] = FragmentNode(node_id, smiles)
-            smi_to_node_id[smiles] = node_id
-            node_depths[node_id] = depth
-            return node_id
-
-        def should_skip_edge(target_node_id: int, depth: int) -> bool:
-            return (
-                self._only_add_min_depth
-                and depth > self._min_depth_only_from + 1
-                and depth > node_depths[target_node_id]
-            )
-
-        def add_fragment_edge(
-            source_node_id: int,
-            target_node_id: int,
-            cleavage_pattern_id: int,
-            react_indices: Tuple[int, ...],
-            prod_indices: Tuple[int, ...],
-            depth: int,
-        ) -> Optional[int]:
-            if should_skip_edge(target_node_id, depth):
-                return None
-
-            edge_key = (source_node_id, target_node_id)
-            if edge_key in edges:
-                edge = edges[edge_key]
-                event_id = len(edge.events)
-                edges[edge_key] = edge.with_event(
-                    CleavageEvent(
-                        event_id=event_id,
-                        cleavage_pattern_id=cleavage_pattern_id,
-                        react_indices=react_indices,
-                        prod_indices=prod_indices,
-                    )
-                )
-                return edge.id
-
-            if not can_add_edge():
-                return None
-
-            edge_id = len(edges)
-            edges[edge_key] = FragmentEdge(
-                id=edge_id,
-                source_id=source_node_id,
-                target_id=target_node_id,
-                events=(
-                    CleavageEvent(
-                        event_id=0,
-                        cleavage_pattern_id=cleavage_pattern_id,
-                        react_indices=react_indices,
-                        prod_indices=prod_indices,
-                    ),
-                ),
-            )
-            return edge_id
-
         root_compound = compound.copy()
-        root_node_id = get_or_create_node_id(root_compound.smiles, depth=0)
-        if root_node_id is None:
-            raise ValueError("max_node must allow at least the root node.")
 
-        next_node_ids = {root_node_id}
+        state = FragmentTreeBuildState(
+            root_smiles=root_compound.smiles,
+            max_node=max_node,
+            max_edge=max_edge,
+            only_add_min_depth=self._only_add_min_depth,
+            min_depth_only_from=self._min_depth_only_from,
+        )
+
         for depth in range(1, self._max_depth + 1):
-            if len(next_node_ids) == 0:
+            if len(state.next_node_ids) == 0:
                 break
 
-            new_node_ids = set()
-            for node_id in sorted(next_node_ids):
-                source_smiles = nodes[node_id].smiles
+            new_node_ids: set[int] = set()
+
+            for node_id in sorted(state.next_node_ids):
+                source_smiles = state.get_node_smiles(node_id)
                 source_compound = Compound.from_smiles(source_smiles)
+
                 frag_group = self.cleave_all(source_compound)
 
                 for frag_result in frag_group:
-                    cleavage_id = self._cleavage_pattern_set.get_id(frag_result.cleavage)
+                    cleavage_id = self._cleavage_pattern_set.get_id(
+                        frag_result.cleavage
+                    )
+
                     for frag_product in frag_result.products:
-                        target_exists = frag_product.smiles in smi_to_node_id
-                        if not target_exists and (not can_add_node() or not can_add_edge()):
+                        target_exists = state.node_exists(frag_product.smiles)
+
+                        if (
+                            not target_exists
+                            and (
+                                not state.can_add_node()
+                                or not state.can_add_edge()
+                            )
+                        ):
                             continue
-                        target_node_id = get_or_create_node_id(frag_product.smiles, depth=depth)
+
+                        target_node_id = state.get_or_create_node_id(
+                            smiles=frag_product.smiles,
+                            depth=depth,
+                        )
+
                         if target_node_id is None:
                             continue
-                        edge_id = add_fragment_edge(
+
+                        edge_id = state.add_fragment_edge(
                             source_node_id=node_id,
                             target_node_id=target_node_id,
                             cleavage_pattern_id=cleavage_id,
@@ -375,27 +324,24 @@ class FragmentTreeBuilder:
                             prod_indices=frag_product.product_indices,
                             depth=depth,
                         )
+
                         if edge_id is not None:
                             new_node_ids.add(target_node_id)
 
-                processed_node_ids.add(node_id)
+                state.mark_processed(node_id)
 
-            next_node_ids = new_node_ids - processed_node_ids
+            state.move_to_next_depth(new_node_ids)
 
             if print_info:
                 elapsed = time.time() - start_time
                 print(
                     f"Depth {depth} completed. "
                     f"New nodes: {len(new_node_ids)}. "
-                    f"Total nodes: {len(nodes)}. "
+                    f"Total nodes: {len(state.nodes)}. "
                     f"Time elapsed: {elapsed:.2f} seconds."
                 )
 
-        return FragmentTree.from_nodes_and_edges(
-            smiles=root_compound.smiles,
-            nodes=tuple(nodes[node_id] for node_id in sorted(nodes)),
-            edges=tuple(sorted(edges.values(), key=lambda edge: edge.id)),
-        )
+        return state.to_fragment_tree()
 
     def create_fragment_tree(
         self,
@@ -423,4 +369,176 @@ class FragmentTreeBuilder:
             cleavage_pattern_set=self._cleavage_pattern_set.copy(),
             only_add_min_depth=self._only_add_min_depth,
             min_depth_only_from=self._min_depth_only_from,
+        )
+
+class FragmentTreeBuildState:
+    """Temporary state for building a FragmentTree."""
+
+    def __init__(
+        self,
+        root_smiles: str,
+        *,
+        max_node: int = -1,
+        max_edge: int = -1,
+        only_add_min_depth: bool = True,
+        min_depth_only_from: int = 0,
+        create_node_id_func: Callable[[str, int], int] = None,
+    ) -> None:
+        self.root_smiles = root_smiles
+        self.max_node = max_node
+        self.max_edge = max_edge
+        self.only_add_min_depth = only_add_min_depth
+        self.min_depth_only_from = min_depth_only_from
+
+        self.nodes: Dict[int, FragmentNode] = {}
+        self.edges: Dict[Tuple[int, int], FragmentEdge] = {}
+        self.smi_to_node_id: Dict[str, int] = {}
+        self.processed_node_ids: set[int] = set()
+        self.node_depths: Dict[int, int] = {}
+
+        if create_node_id_func:
+            self.create_node_id_func = create_node_id_func
+        else:
+            self.create_node_id_func = lambda smiles, depth: len(self.nodes)
+
+        root_node_id = self.get_or_create_node_id(
+            smiles=root_smiles,
+            depth=0,
+        )
+
+        if root_node_id is None:
+            raise ValueError("max_node must allow at least the root node.")
+
+        self.root_node_id = root_node_id
+        self.next_node_ids: set[int] = {root_node_id}
+
+    def can_add_node(self) -> bool:
+        return self.max_node < 0 or len(self.nodes) < self.max_node
+
+    def can_add_edge(self) -> bool:
+        return self.max_edge < 0 or len(self.edges) < self.max_edge
+
+    def get_or_create_node_id(
+        self,
+        smiles: str,
+        depth: int,
+    ) -> Optional[int]:
+        if smiles in self.smi_to_node_id:
+            return self.smi_to_node_id[smiles]
+
+        if not self.can_add_node():
+            return None
+
+        node_id = self.create_node_id_func(smiles, depth)
+
+        self.nodes[node_id] = FragmentNode(
+            id=node_id,
+            smiles=smiles,
+        )
+        self.smi_to_node_id[smiles] = node_id
+        self.node_depths[node_id] = depth
+
+        return node_id
+
+    def node_exists(
+        self,
+        smiles: str,
+    ) -> bool:
+        return smiles in self.smi_to_node_id
+
+    def get_node_smiles(
+        self,
+        node_id: int,
+    ) -> str:
+        return self.nodes[node_id].smiles
+
+    def should_skip_edge(
+        self,
+        target_node_id: int,
+        depth: int,
+    ) -> bool:
+        return (
+            self.only_add_min_depth
+            and depth > self.min_depth_only_from + 1
+            and depth > self.node_depths[target_node_id]
+        )
+
+    def add_fragment_edge(
+        self,
+        source_node_id: int,
+        target_node_id: int,
+        cleavage_pattern_id: int,
+        react_indices: Tuple[int, ...],
+        prod_indices: Tuple[int, ...],
+        depth: int,
+    ) -> Optional[int]:
+        if self.should_skip_edge(
+            target_node_id=target_node_id,
+            depth=depth,
+        ):
+            return None
+
+        edge_key = (source_node_id, target_node_id)
+
+        if edge_key in self.edges:
+            edge = self.edges[edge_key]
+            event_id = len(edge.events)
+
+            self.edges[edge_key] = edge.with_event(
+                CleavageEvent(
+                    event_id=event_id,
+                    cleavage_pattern_id=cleavage_pattern_id,
+                    react_indices=react_indices,
+                    prod_indices=prod_indices,
+                )
+            )
+
+            return edge.id
+
+        if not self.can_add_edge():
+            return None
+
+        edge_id = len(self.edges)
+
+        self.edges[edge_key] = FragmentEdge(
+            id=edge_id,
+            source_id=source_node_id,
+            target_id=target_node_id,
+            events=(
+                CleavageEvent(
+                    event_id=0,
+                    cleavage_pattern_id=cleavage_pattern_id,
+                    react_indices=react_indices,
+                    prod_indices=prod_indices,
+                ),
+            ),
+        )
+
+        return edge_id
+
+    def mark_processed(
+        self,
+        node_id: int,
+    ) -> None:
+        self.processed_node_ids.add(node_id)
+
+    def move_to_next_depth(
+        self,
+        new_node_ids: set[int],
+    ) -> None:
+        self.next_node_ids = new_node_ids - self.processed_node_ids
+
+    def to_fragment_tree(self) -> FragmentTree:
+        return FragmentTree.from_nodes_and_edges(
+            smiles=self.root_smiles,
+            nodes=tuple(
+                self.nodes[node_id]
+                for node_id in sorted(self.nodes)
+            ),
+            edges=tuple(
+                sorted(
+                    self.edges.values(),
+                    key=lambda edge: edge.id,
+                )
+            ),
         )

@@ -19,8 +19,6 @@ from .tables import (
     CleavageEventTable,
     FormulaTable,
 )
-from .path import FragmentGraphProjectPath
-from .registration import FragmentEdgeRegistration
 
 
 class FragmentGraphRepository:
