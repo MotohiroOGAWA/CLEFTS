@@ -16,8 +16,9 @@ if str(APP_ROOT) not in sys.path:
 
 GUI_ROOT = Path(__file__).resolve().parent
 
-from clefts.gui.app import create_app as create_home_app
-from clefts.gui.workflows.build_fragment_tree_from_smiles.page import (
+from .app import create_app as create_home_app
+from .workflows.msentity.apps import create_app as create_msentity_app
+from .workflows.build_fragment_tree_from_smiles.page import (
     create_input_app as create_build_fragment_tree_from_smiles_input_app,
     create_result_app as create_build_fragment_tree_from_smiles_result_app,
 )
@@ -698,6 +699,14 @@ def create_server() -> FastAPI:
     @app.get("/build_fragment_tree_from_smiles/")
     def redirect_build_fragment_tree_from_smiles():
         return RedirectResponse(url="/build_fragment_tree_from_smiles/input/")
+
+    gr.mount_gradio_app(
+        app,
+        create_msentity_app(),
+        path="/msentity",
+        css=APP_CSS,
+        allowed_paths=[str(GUI_ROOT)],
+    )
 
     gr.mount_gradio_app(
         app,

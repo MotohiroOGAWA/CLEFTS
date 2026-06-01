@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from clefts.gui.workflows.build_fragment_tree_from_smiles.metadata import INPUT_PATH
+from .metadata import INPUT_PATH
 
 
 def render_back_to_main_html() -> str:

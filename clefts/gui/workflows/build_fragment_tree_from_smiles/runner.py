@@ -8,8 +8,8 @@ import gradio as gr
 import pandas as pd
 
 from clefts.domain.fragment.fragment_tree.FragmentTreeBuilder import FragmentTreeBuilder
-from clefts.gui.components.cleavage_patterns_input_panel import json_to_pattern_set
-from clefts.gui.components.paginated_dataframe import make_page_html
+from ...components.cleavage_patterns_input_panel import json_to_pattern_set
+from ...components.common.paginated_dataframe import make_page_html
 from clefts.libs.mmkit.mmkit import Compound
 
 

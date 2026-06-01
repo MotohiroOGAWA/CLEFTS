@@ -9,9 +9,9 @@ from typing import Any, Callable
 import gradio as gr
 import pandas as pd
 
-from clefts.gui.components.error_message import render_error_html
+from .error_message import render_error_html
 
-ICON_DIR = Path(__file__).resolve().parent / "icons"
+ICON_DIR = Path(__file__).resolve().parent.parent / "icons"
 
 
 @dataclass(frozen=True)

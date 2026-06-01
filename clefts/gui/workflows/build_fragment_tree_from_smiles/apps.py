@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import gradio as gr
 
-from clefts.gui.workflows.build_fragment_tree_from_smiles.input_page import render_input_page
-from clefts.gui.workflows.build_fragment_tree_from_smiles.result_page import render_result_page
-from clefts.gui.workflows.build_fragment_tree_from_smiles.runner import build_fragment_tree_and_store_result_url
+from .metadata import WORKFLOW_TITLE
+from .input_page import render_input_page
+from .result_page import render_result_page
+from .runner import build_fragment_tree_and_store_result_url
 
 
 def create_input_app() -> gr.Blocks:
-    with gr.Blocks(title="Build Fragment Tree from SMILES") as app:
+    with gr.Blocks(title=WORKFLOW_TITLE) as app:
         with gr.Group(elem_classes="clefts-page"):
             input_page = render_input_page()
             result_url = gr.Textbox(visible=False)

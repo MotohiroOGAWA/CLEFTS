@@ -6,9 +6,9 @@ from dataclasses import dataclass
 import gradio as gr
 import pandas as pd
 
-from clefts.gui.components.paginated_dataframe import PaginatedDataframe, render_paginated_dataframe
-from clefts.gui.workflows.build_fragment_tree_from_smiles.navigation import render_result_nav_html
-from clefts.gui.workflows.build_fragment_tree_from_smiles.runner import (
+from ...components.common.paginated_dataframe import PaginatedDataframe, render_paginated_dataframe
+from .navigation import render_result_nav_html
+from .runner import (
     EDGE_HEADERS,
     NODE_HEADERS,
     FragmentTreeResult,

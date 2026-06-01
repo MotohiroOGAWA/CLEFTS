@@ -8,7 +8,7 @@ import gradio as gr
 
 from ...domain.fragment.cleavage.CleavagePattern import CleavagePattern
 from ...domain.fragment.cleavage.CleavagePatternSet import CleavagePatternSet
-from .generic_table_input_panel import (
+from .common.generic_table_input_panel import (
     GenericTableColumn,
     GenericTableInputPanel,
     json_to_rows,
@@ -198,7 +198,7 @@ def render_cleavage_patterns_input_panel(
 
 # python -m clefts.gui.components.cleavage_patterns_input_panel
 if __name__ == "__main__":
-    from .styles import STYLES
+    from .common.styles import STYLES
 
     demo_pattern_set = CleavagePatternSet(
         patterns=[

@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import gradio as gr
 
-from clefts.gui.workflows.build_fragment_tree_from_smiles.page import render_workflow_item_html as render_build_fragment_tree_workflow_item_html
+from .workflows.msentity.page import render_workflow_item_html as render_msentity_workflow_item_html
+from .workflows.build_fragment_tree_from_smiles.page import render_workflow_item_html as render_build_fragment_tree_workflow_item_html
 
 
 def create_app() -> gr.Blocks:
@@ -31,5 +32,6 @@ def create_app() -> gr.Blocks:
                 </section>
                 """
             )
+            gr.HTML(render_msentity_workflow_item_html())
             gr.HTML(render_build_fragment_tree_workflow_item_html())
     return app

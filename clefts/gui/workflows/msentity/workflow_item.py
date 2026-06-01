@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from .metadata import INPUT_PATH, WORKFLOW_TITLE
+from .metadata import WORKFLOW_BASE_PATH, WORKFLOW_TITLE
 
 
 def render_workflow_item_html() -> str:
@@ -8,14 +8,14 @@ def render_workflow_item_html() -> str:
     <div class="clefts-tool-grid">
         <article class="clefts-tool-item">
             <h3>
-                <a href="{INPUT_PATH}">
+                <a href="{WORKFLOW_BASE_PATH}">
                     {WORKFLOW_TITLE}
                 </a>
             </h3>
             <ul>
-                <li>Start from a single molecular SMILES</li>
-                <li>Configure fragmentation constraints</li>
-                <li>Generate and inspect a fragment tree</li>
+                <li>Load MS datasets with msentity</li>
+                <li>Inspect spectrum metadata and peak data</li>
+                <li>Filter, sort, and export spectral records</li>
             </ul>
         </article>
     </div>
