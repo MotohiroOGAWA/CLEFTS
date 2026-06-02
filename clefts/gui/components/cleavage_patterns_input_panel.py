@@ -198,7 +198,6 @@ def render_cleavage_patterns_input_panel(
 
 # python -m clefts.gui.components.cleavage_patterns_input_panel
 if __name__ == "__main__":
-    from .common.styles import STYLES
 
     demo_pattern_set = CleavagePatternSet(
         patterns=[
@@ -226,7 +225,7 @@ if __name__ == "__main__":
         name="Demo Cleavage Patterns",
     )
 
-    with gr.Blocks(css=STYLES) as demo:
+    with gr.Blocks() as demo:
         gr.Markdown("# Cleavage Patterns Input Panel Demo")
 
         panel = render_cleavage_patterns_input_panel(

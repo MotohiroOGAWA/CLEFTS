@@ -9,6 +9,7 @@ import gradio as gr
 import pandas as pd
 
 from .styles import PAGINATED_DATAFRAME_CSS
+from ...style_registry import register_styles
 
 
 @dataclass(frozen=True)
@@ -71,6 +72,8 @@ def render_paginated_dataframe(
     show_index: bool = False,
     show_sort_controls: bool = True,
 ) -> PaginatedDataframe:
+    register_styles(PAGINATED_DATAFRAME_CSS)
+
     source_df = to_dataframe(dataframe, headers=headers)
     sorted_df = source_df.copy()
 

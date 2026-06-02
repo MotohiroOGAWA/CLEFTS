@@ -9,9 +9,11 @@ from typing import Any, Callable
 import gradio as gr
 import pandas as pd
 
-from .error_message import render_error_html
+from ..error_message import ERROR_MESSAGE_CSS, render_error_html
+from ...style_registry import register_styles
+from .styles import GENERIC_TABLE_INPUT_CSS
 
-ICON_DIR = Path(__file__).resolve().parent.parent / "icons"
+ICON_DIR = Path(__file__).resolve().parent.parent.parent / "icons"
 
 
 @dataclass(frozen=True)
@@ -357,6 +359,8 @@ def render_generic_table_input_panel(
     export_json_fn: Callable[[str], str] | None = None,
     import_json_fn: Callable[[str], list[dict[str, str]]] | None = None,
 ) -> GenericTableInputPanel:
+    register_styles(ERROR_MESSAGE_CSS, GENERIC_TABLE_INPUT_CSS)
+
     rows = normalize_rows(default_rows or [], columns)
 
     table_json = gr.Textbox(
@@ -629,7 +633,6 @@ def render_generic_table_input_panel(
 
 # python -m clefts.gui.components.generic_table_input_panel
 if __name__ == "__main__":
-    from .styles import STYLES
     demo_columns = [
         GenericTableColumn(
             key="name",
@@ -686,7 +689,7 @@ if __name__ == "__main__":
 
         return rows
 
-    with gr.Blocks(css=STYLES) as demo:
+    with gr.Blocks() as demo:
         gr.Markdown("## Generic Table Input Panel Demo")
 
         panel = render_generic_table_input_panel(

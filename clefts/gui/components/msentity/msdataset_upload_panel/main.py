@@ -6,8 +6,8 @@ from typing import Any
 
 import gradio as gr
 
-from ..common.file_upload_modal import FileUploadModal, render_file_upload_modal
-from ....libs.msentity.msentity import *
+from ...common.file_upload_modal import FileUploadModal, render_file_upload_modal
+from .....libs.msentity.msentity import *
 
 
 @dataclass(frozen=True)

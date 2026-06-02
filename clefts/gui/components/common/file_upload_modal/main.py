@@ -5,6 +5,9 @@ from typing import Sequence
 
 import gradio as gr
 
+from ...style_registry import register_styles
+from .styles import FILE_UPLOAD_MODAL_CSS
+
 
 @dataclass(frozen=True)
 class FileUploadModal:
@@ -29,6 +32,8 @@ def render_file_upload_modal(
     load_button_label: str = "Load",
     close_button_label: str = "Cancel",
 ) -> FileUploadModal:
+    register_styles(FILE_UPLOAD_MODAL_CSS)
+
     open_button = gr.Button(
         button_label,
         size="sm",

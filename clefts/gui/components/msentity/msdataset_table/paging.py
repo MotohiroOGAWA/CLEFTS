@@ -6,55 +6,6 @@ import gradio as gr
 
 from .....libs.msentity.msentity import MSDataset
 
-MSDATASET_PAGING_STYLE = """
-.msdataset-paging-row {
-    align-items: center;
-    gap: 6px;
-}
-
-.msdataset-paging-left {
-    flex-grow: 0 !important;
-    flex-wrap: nowrap !important;
-    align-items: center !important;
-    gap: 6px;
-}
-
-.msdataset-page-button {
-    width: 28px !important;
-    min-width: 28px !important;
-    height: 28px !important;
-    padding: 0 !important;
-}
-
-.msdataset-page-number input::-webkit-outer-spin-button,
-.msdataset-page-number input::-webkit-inner-spin-button {
-    -webkit-appearance: none;
-    margin: 0;
-}
-
-.msdataset-page-number input[type="number"] {
-    -moz-appearance: textfield;
-}
-
-.msdataset-page-count {
-    width: 28px !important;
-    min-width: 28px !important;
-    padding: 0 !important;
-}
-
-.msdataset-rows-per-page {
-    width: 72px !important;
-    min-width: 72px !important;
-}
-
-/* Dropdown の外枠を弱くする / 消す */
-.msdataset-rows-per-page input,
-.msdataset-rows-per-page .wrap,
-.msdataset-rows-per-page .container {
-    border: none !important;
-    box-shadow: none !important;
-}
-"""
 def calculate_page_count(
     dataset: MSDataset | None,
     *,
@@ -207,6 +158,7 @@ def render_paging(
     gr.Number,
     gr.HTML,
     gr.Button,
+    gr.Dropdown,
 ]:
     with gr.Row(elem_classes="msdataset-paging-row"):
         with gr.Row(
@@ -235,8 +187,8 @@ def render_paging(
 
             page_count = gr.HTML(
                 value="/ 1",
-                scale=0,
-                min_width=36,
+                # scale=0,
+                # min_width=36,
                 elem_classes="msdataset-page-count",
             )
 
@@ -248,7 +200,7 @@ def render_paging(
                 elem_classes="msdataset-page-button",
             )
 
-        gr.HTML("", scale=1)
+        gr.HTML("")
 
         rows_per_page_dropdown = gr.Dropdown(
             choices=rows_per_page_choices,

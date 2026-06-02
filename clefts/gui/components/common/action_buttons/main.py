@@ -5,7 +5,7 @@ from pathlib import Path
 
 import gradio as gr
 
-ICON_DIR = Path(__file__).resolve().parent.parent / "icons"
+ICON_DIR = Path(__file__).resolve().parent.parent.parent / "icons"
 
 
 @dataclass(frozen=True)

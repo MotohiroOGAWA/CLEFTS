@@ -5,17 +5,15 @@ from typing import Any, Sequence
 
 import gradio as gr
 
+from ...style_registry import register_styles
 from .models import MSDatasetTable
-from .table import render_table, render_dataset_html, MSDATASET_TABLE_STYLE
-from .paging import render_paging, render_page_count_html, update_paging, clamp_page, go_next_page, go_previous_page, MSDATASET_PAGING_STYLE
+from .table import render_table, render_dataset_html
+from .paging import render_paging, render_page_count_html, update_paging, clamp_page, go_next_page, go_previous_page
 from .download import render_download, export_dataset_to_hdf5_base64, MSDATASET_HDF5_DOWNLOAD_JS
+from .styles import MSDATASET_STYLE
 
 from .....libs.msentity.msentity import MSDataset
 
-MSDATASET_STYLE = "\n\n".join([
-    MSDATASET_TABLE_STYLE,
-    MSDATASET_PAGING_STYLE,
-])
 
 def set_msdataset_table_dataset(dataset: MSDataset | None, height: int | None = None, show_index: bool = True):
     return (
@@ -34,6 +32,8 @@ def render_msdataset_table(
     height: int | None = None,
     show_index: bool = True,
 ) -> MSDatasetTable:
+    register_styles(MSDATASET_STYLE)
+
     rows_per_page_choices = sorted(
         {
             int(choice)

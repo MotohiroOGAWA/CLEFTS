@@ -2,58 +2,13 @@ from __future__ import annotations
 
 from typing import Tuple
 import gradio as gr
+from pathlib import Path
 
 from .....libs.msentity.msentity import MSDataset
 
-MSDATASET_TABLE_STYLE = """
-.msdataset-table-container {
-    width: 100%;
-    max-width: 100%;
-    overflow-x: auto;
-    overflow-y: auto;
-}
+ICON_DIR = Path(__file__).resolve().parent.parent.parent / "icons"
+MS_ICON_SVG = (ICON_DIR / "ms.svg").read_text(encoding="utf-8")
 
-.msdataset-table {
-    width: max-content;
-    min-width: 100%;
-    border-collapse: collapse;
-    font-size: 14px;
-}
-
-/* Header */
-.msdataset-table thead th {
-    background-color: #4f81bd;
-    color: white;
-    font-weight: 600;
-    text-align: left;
-    padding: 8px 12px;
-    border: 1px solid #d0d7de;
-    position: sticky;
-    top: 0;
-    z-index: 1;
-}
-
-/* Cells */
-.msdataset-table td {
-    padding: 6px 12px;
-    border: 1px solid #e5e7eb;
-    white-space: nowrap;
-}
-
-/* Zebra stripes */
-.msdataset-table tbody tr:nth-child(odd) {
-    background-color: #ffffff;
-}
-
-.msdataset-table tbody tr:nth-child(even) {
-    background-color: #f3f4f6;
-}
-
-/* Hover */
-.msdataset-table tbody tr:hover {
-    background-color: #dbeafe;
-}
-"""
 
 def render_dataset_html(
     dataset: MSDataset | None,
@@ -77,9 +32,12 @@ def render_dataset_html(
         [
             (
                 f'<button '
+                f'type="button" '
                 f'class="msdataset-spectrum-button" '
-                f'data-spectrum-index="{start + i}">'
-                f'View'
+                f'data-spectrum-index="{start + i}" '
+                f'title="View spectrum" '
+                f'aria-label="View spectrum">'
+                f'{MS_ICON_SVG}'
                 f'</button>'
             )
             for i in range(len(metadata))
