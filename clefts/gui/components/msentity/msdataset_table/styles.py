@@ -89,7 +89,6 @@ MSDATASET_PAGING_STYLE = """
     min-width: 72px !important;
 }
 
-/* Dropdown の外枠を弱くする / 消す */
 .msdataset-rows-per-page input,
 .msdataset-rows-per-page .wrap,
 .msdataset-rows-per-page .container {

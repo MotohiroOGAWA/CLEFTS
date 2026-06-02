@@ -7,9 +7,10 @@ import gradio as gr
 
 from ...style_registry import register_styles
 from .models import MSDatasetTable
-from .table import render_table, render_dataset_html
+from .table import render_table, render_dataset_html, SPECTRUM_BUTTON_SCRIPT
 from .paging import render_paging, render_page_count_html, update_paging, clamp_page, go_next_page, go_previous_page
 from .download import render_download, export_dataset_to_hdf5_base64, MSDATASET_HDF5_DOWNLOAD_JS
+from .spectrum_window import open_spectrum_window
 from .styles import MSDATASET_STYLE
 
 from .....libs.msentity.msentity import MSDataset
@@ -44,13 +45,25 @@ def render_msdataset_table(
 
     download_button, exported_hdf5_base64, error_message = render_download()
 
-    source_dataset_state, dataset_state, dataframe = render_table(
-        dataset=dataset,
-        page=1,
-        rows_per_page=rows_per_page,
-        height=height,
-        show_index=show_index,
-    )
+    with gr.Blocks(
+        head=SPECTRUM_BUTTON_SCRIPT,
+    ) as table:
+        source_dataset_state, dataset_state, dataframe, selected_spectrum_index = render_table(
+            dataset=dataset,
+            page=1,
+            rows_per_page=rows_per_page,
+            height=height,
+            show_index=show_index,
+        )
+        
+        selected_spectrum_index.change(
+            fn=open_spectrum_window,
+            inputs=[
+                selected_spectrum_index,
+                dataset_state,
+            ],
+            outputs=[],
+        )
 
     previous_button, page_number, page_count, next_button, rows_per_page_dropdown = render_paging()
 

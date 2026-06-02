@@ -9,6 +9,49 @@ from .....libs.msentity.msentity import MSDataset
 ICON_DIR = Path(__file__).resolve().parent.parent.parent / "icons"
 MS_ICON_SVG = (ICON_DIR / "ms.svg").read_text(encoding="utf-8")
 
+SPECTRUM_BUTTON_SCRIPT = """
+<script>
+document.addEventListener("click", function(event) {
+    const button = event.target.closest(".msdataset-spectrum-button");
+
+    if (!button) {
+        return;
+    }
+
+    const spectrumIndex = button.getAttribute("data-spectrum-index");
+
+    const wrapper = document.querySelector("#selected-spectrum-index");
+
+    if (!wrapper) {
+        console.warn("selected-spectrum-index wrapper was not found.");
+        return;
+    }
+
+    const textbox =
+        wrapper.querySelector("textarea") ||
+        wrapper.querySelector("input");
+
+    if (!textbox) {
+        console.warn("textbox input was not found.");
+        return;
+    }
+
+    textbox.value = spectrumIndex;
+
+    textbox.dispatchEvent(
+        new Event("input", {
+            bubbles: true,
+        })
+    );
+
+    textbox.dispatchEvent(
+        new Event("change", {
+            bubbles: true,
+        })
+    );
+});
+</script>
+"""
 
 def render_dataset_html(
     dataset: MSDataset | None,
@@ -16,6 +59,7 @@ def render_dataset_html(
     rows_per_page: int,
     height: int | None = None,
     show_index: bool = True,
+    spectrum_input_elem_id: str = "selected-spectrum-index",
 ) -> str:
     if dataset is None:
         return ""
@@ -36,7 +80,23 @@ def render_dataset_html(
                 f'class="msdataset-spectrum-button" '
                 f'data-spectrum-index="{start + i}" '
                 f'title="View spectrum" '
-                f'aria-label="View spectrum">'
+                f'aria-label="View spectrum" '
+                f'onclick="'
+                f"const root = document.getElementById('{spectrum_input_elem_id}');"
+                f"const input = root ? root.querySelector('textarea, input') : null;"
+                f"if (input) {{"
+                f"const valueSetter = "
+                f"Object.getOwnPropertyDescriptor("
+                f"input instanceof HTMLTextAreaElement "
+                f"? HTMLTextAreaElement.prototype "
+                f": HTMLInputElement.prototype, "
+                f"'value'"
+                f").set;"
+                f"valueSetter.call(input, '{start + i}');"
+                f"input.dispatchEvent(new Event('input', {{ bubbles: true }}));"
+                f"input.dispatchEvent(new Event('change', {{ bubbles: true }}));"
+                f"}}"
+                f'">'
                 f'{MS_ICON_SVG}'
                 f'</button>'
             )
@@ -76,13 +136,21 @@ def render_table(
     rows_per_page: int = 20,
     height: int | None = None,
     show_index: bool = False,
+    spectrum_input_elem_id: str = "selected-spectrum-index",
 ) -> Tuple[
     gr.State,
     gr.State,
     gr.HTML,
+    gr.Textbox,
 ]:
     source_dataset_state = gr.State(dataset)
     dataset_state = gr.State(dataset)
+
+    selected_spectrum_index = gr.Textbox(
+        value="-1",
+        visible="hidden",
+        elem_id=spectrum_input_elem_id,
+    )
 
     dataframe = gr.HTML(
         value=render_dataset_html(
@@ -91,6 +159,7 @@ def render_table(
             rows_per_page=rows_per_page,
             height=height,
             show_index=show_index,
+            spectrum_input_elem_id=spectrum_input_elem_id,
         )
     )
 
@@ -98,4 +167,5 @@ def render_table(
         source_dataset_state,
         dataset_state,
         dataframe,
+        selected_spectrum_index,
     )
