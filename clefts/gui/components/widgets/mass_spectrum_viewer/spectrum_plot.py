@@ -9,6 +9,10 @@ def make_spectrum_figure(
     *,
     selected_peak_id: int | None = None,
     hovered_peak_id: int | None = None,
+    x_min: float | None = None,
+    x_max: float | None = None,
+    y_min: float | None = None,
+    y_max: float | None = None,
 ) -> go.Figure:
     fig = go.Figure()
 
@@ -76,6 +80,10 @@ def make_spectrum_figure(
 
     max_mz = float(peaks["mz"].max()) if len(peaks) else 1.0
     max_intensity = float(peaks["intensity"].max()) if len(peaks) else 1.0
+    x_min = x_min if x_min is not None else 0.0
+    x_max = x_max if x_max is not None else max_mz * 1.05
+    y_min = y_min if y_min is not None else 0.0
+    y_max = y_max if y_max is not None else max_intensity * 1.05
 
     fig.update_layout(
         autosize=True,
@@ -85,7 +93,7 @@ def make_spectrum_figure(
         paper_bgcolor="white",
         xaxis={
             "title": {"text": "<i>m/z</i>"},
-            "range": [0, max_mz * 1.05],
+            "range": [x_min, x_max],
             "showline": True,
             "linewidth": 1,
             "linecolor": "black",
@@ -94,7 +102,8 @@ def make_spectrum_figure(
         },
         yaxis={
             "title": {"text": "Intensity"},
-            "range": [0, max_intensity * 1.05],
+            "range": [y_min, y_max],
+            "fixedrange": True,
             "showline": True,
             "linewidth": 1,
             "linecolor": "black",

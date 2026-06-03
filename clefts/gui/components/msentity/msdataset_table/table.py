@@ -6,6 +6,8 @@ from pathlib import Path
 
 from .....libs.msentity.msentity import MSDataset
 
+from .spectrum_window import render_spectrum_window, open_spectrum_window
+
 ICON_DIR = Path(__file__).resolve().parent.parent.parent / "icons"
 MS_ICON_SVG = (ICON_DIR / "ms.svg").read_text(encoding="utf-8")
 
@@ -161,6 +163,19 @@ def render_table(
             show_index=show_index,
             spectrum_input_elem_id=spectrum_input_elem_id,
         )
+    )
+
+    spectrum_window = render_spectrum_window()
+    selected_spectrum_index.change(
+        fn=open_spectrum_window,
+        inputs=[
+            selected_spectrum_index,
+            dataset_state,
+        ],
+        outputs=[
+            spectrum_window.window.container,
+            spectrum_window.spectrum_record,
+        ],
     )
 
     return (
