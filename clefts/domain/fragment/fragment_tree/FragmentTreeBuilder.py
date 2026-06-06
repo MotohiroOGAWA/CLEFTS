@@ -5,7 +5,7 @@ from typing import Callable, Dict, Optional, Tuple
 import yaml
 
 from ....libs.mmkit.mmkit import Compound
-from ..cleavage.CleavagePattern import CleavagePattern
+from ..cleavage.CleavagePattern import _CleavagePattern
 from ..cleavage.CleavagePatternSet import CleavagePatternSet
 from ..cleavage.CleavageResult import CleavageResult
 from .CleavageEvent import CleavageEvent
@@ -60,7 +60,7 @@ class FragmentTreeBuilder:
         self._min_depth_only_from = min_depth_only_from
 
     @property
-    def cleavage_patterns(self) -> Tuple[CleavagePattern, ...]:
+    def cleavage_patterns(self) -> Tuple[_CleavagePattern, ...]:
         """Cleavage patterns used by this builder in stable ID order."""
         return self._cleavage_pattern_set.patterns
 
@@ -176,11 +176,11 @@ class FragmentTreeBuilder:
     def cleave_by_pattern(
         self,
         compound: Compound,
-        cleavage_pattern: CleavagePattern,
+        cleavage_pattern: _CleavagePattern,
     ) -> CleavageResult | None:
         """Apply one cleavage pattern to a compound."""
         assert isinstance(compound, Compound)
-        assert isinstance(cleavage_pattern, CleavagePattern)
+        assert isinstance(cleavage_pattern, _CleavagePattern)
 
         result = cleavage_pattern.fragment(compound)
 

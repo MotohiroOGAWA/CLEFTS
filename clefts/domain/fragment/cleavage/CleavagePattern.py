@@ -60,15 +60,15 @@ class CleavageProduct:
     cleaved_molecules: Tuple[CleavedMolecule, ...]
 
 @dataclass(frozen=True)
-class CleavageResult:
+class _CleavageResult:
     """Result of applying one CleavagePattern to one reactant molecule."""
 
-    cleavage: CleavagePattern
+    cleavage: _CleavagePattern
     reactant_smiles: str
     products: Tuple[CleavageProduct, ...]
 
 @dataclass(frozen=True)
-class CleavagePattern:
+class _CleavagePattern:
     """Compiled cleavage pattern.
 
     This dataclass itself does not perform heavy construction logic.
@@ -88,7 +88,7 @@ class CleavagePattern:
         reactant_smarts: str,
         products: Tuple[ProductRule, ...],
         name: str = "",
-    ) -> CleavagePattern:
+    ) -> _CleavagePattern:
         """Create a CleavagePattern from SMARTS and ProductRule objects.
 
         This method performs the heavy validation/compilation that was
@@ -99,9 +99,20 @@ class CleavagePattern:
         if reactant_query is None:
             raise ValueError(f"Invalid reactant SMARTS: {reactant_smarts}")
 
-        compiled_products: List[CompiledProductRule] = []
+        unique_product_by_smarts: Dict[str, ProductRule] = {}
 
         for product in products:
+            if product.smarts not in unique_product_by_smarts:
+                unique_product_by_smarts[product.smarts] = product
+
+        unique_products = tuple(
+            unique_product_by_smarts[smarts]
+            for smarts in sorted(unique_product_by_smarts)
+        )        
+
+        compiled_products: List[CompiledProductRule] = []
+
+        for product in unique_products:
             smirks = f"{reactant_smarts}>>{product.smarts}"
 
             rxn = rdChemReactions.ReactionFromSmarts(smirks)
@@ -178,7 +189,7 @@ class CleavagePattern:
         return cls(
             name=name,
             reactant_smarts=reactant_smarts,
-            products=products,
+            products=unique_products,
             reactant_query=reactant_query,
             compiled_products=tuple(compiled_products),
         )
@@ -243,13 +254,21 @@ class CleavagePattern:
             ")"
         )
 
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, _CleavagePattern):
+            return False
+        return self.key == other.key
+
+    def __hash__(self) -> int:
+        return hash(self.key)
+
     def exists(self, compound: Compound) -> bool:
         return compound.mol.HasSubstructMatch(self.reactant_query)
 
     def matches(self, compound: Compound) -> List[Tuple[int, ...]]:
         return list(compound.mol.GetSubstructMatches(self.reactant_query))
     
-    def fragment(self, compound: Compound) -> Optional[CleavageResult]:
+    def fragment(self, compound: Compound) -> Optional[_CleavageResult]:
         """Apply this cleavage pattern to a compound.
 
         This method applies each compiled ProductRule to the input molecule.
@@ -418,12 +437,24 @@ class CleavagePattern:
                     )
                 )
 
-        return CleavageResult(
+        return _CleavageResult(
             cleavage=self,
             reactant_smiles=compound.smiles,
             products=tuple(cleavage_products),
         )
     
+    @property
+    def key(self) -> str:
+        """Return a readable semantic key of this cleavage pattern.
+
+        The name is intentionally excluded because it is metadata.
+        """
+        product_smarts_key = "|".join(
+            product.smarts
+            for product in self.products
+        )
+
+        return f"{self.reactant_smarts}>>{product_smarts_key}"
 
 if __name__ == "__main__":
     reactant_smarts = "[#8:1]=[#6:2]1:[#6:3]:[#6:4](-[#6:5]2:[#6:6]:[#6:7]:[#6:8](-[#8:9]):[#6:10]:[#6:11]:2):[#8:12]:[#6:13]2:[#6:14]:[#6:15](-[#8:16]):[#6:17]:[#6:18](-[#8:19]):[#6:20]:1:2"
@@ -439,7 +470,7 @@ if __name__ == "__main__":
 
         ProductRule(name="0,4", smarts="[#6:5]1:[#6:6]:[#6:7]:[#6:8](-[#8-:9]):[#6:10]:[#6:11]:1"),
     )
-    cleavage_pattern = CleavagePattern.from_rules(
+    cleavage_pattern = _CleavagePattern.from_rules(
         reactant_smarts=reactant_smarts,
         products=product_rules,
         name="Example Cleavage",
