@@ -1,449 +1,465 @@
-from typing import Tuple, List, Dict, Any, Optional
-from rdkit import Chem
-from rdkit.Chem import AllChem
-from rdkit.Chem import rdChemReactions
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, List, Tuple, Dict, Optional
+
 from bidict import bidict
-import re
-import json
-import inspect
+from rdkit import Chem
+from rdkit.Chem import rdChemReactions
 
-from ....libs.mmkit.mmkit import Compound
-from .CleavageResult import CleavageResult
-from .CleavageProduct import CleavageProduct
+from clefts.libs.mmkit.mmkit import Compound
 
-class CleavagePattern:
-    """Define one user-configurable molecular cleavage rule.
 
-    A ``CleavagePattern`` stores a single SMIRKS reaction that describes how a
-    substructure should be cleaved. The reactant side is used as a SMARTS query
-    for substructure matching, and the reaction result is converted into
-    :class:`CleavageProduct` objects with atom-index mappings between the
-    original molecule and each product.
+@dataclass(frozen=True)
+class ProductRule:
+    """One product-side template.
 
-    CLEFTS uses this class as the low-level representation of a cleavage rule.
-    Users can define arbitrary cleavage patterns as long as the SMIRKS is a
-    single-reactant, single-product reaction with atom map numbers on the atoms
-    that should be tracked.
-
-    Notes
-    -----
-    Equality and hashing ignore ``name`` by default. Two patterns are considered
-    identical when they have the same ``smirks`` and ``charge_mode``. Use
-    :meth:`equals` with ``include_name=True`` when the human-readable name should
-    also be part of the comparison.
+    `smarts` is equivalent to the right-hand side of a SMIRKS rule.
+    It can contain one product or multiple products separated by ".".
     """
 
-    SUPPORTED_CHARGE_MODES = {"positive1", "negative1", "neutral", "any"}
-    def __init__(self, smirks: str, name: str="", charge_mode: str="any"):
-        """Create a cleavage pattern from a SMIRKS reaction.
+    name: str
+    smarts: str
 
-        Parameters
-        ----------
-        smirks : str
-            Single-reactant, single-product SMIRKS reaction. Atom map numbers
-            identify the reactant atoms and product atoms whose indices should
-            be reported in cleavage results.
-        name : str, optional
-            Human-readable pattern name, such as ``"amide bond cleavage"``.
-        charge_mode : str, optional
-            Product charge filter. Supported values are ``"positive1"``,
-            ``"negative1"``, ``"neutral"``, and ``"any"``. Multiple modes can
-            be joined with ``"|"``, for example ``"positive1|neutral"``.
-        """
-        self.version = 1.0
-        self.smirks = smirks
-        self.name = name
-        charge_modes = [cm.strip().lower() for cm in charge_mode.split("|")]
-        assert all(cm in self.SUPPORTED_CHARGE_MODES for cm in charge_modes), \
-            f"Unsupported charge_mode: {charge_mode}"
-        self.charge_mode = "|".join(set(charge_modes))
-        self.rxn = rdChemReactions.ReactionFromSmarts(smirks)
+    def __repr__(self) -> str:
+        return f"ProductRule(name={self.name}, smarts={self.smarts})"
 
-        # Extract the reactant SMARTS part to use for substructure matching
-        reactant_smarts = smirks.split(">>")[0]
-        product_smarts = smirks.split(">>")[1]
-        self.reactant_query = Chem.MolFromSmarts(reactant_smarts)
+    def __str__(self) -> str:
+        return f"(name={self.name}, smarts={self.smarts})"
 
-        # --- Basic validation (only single-reactant/product reactions are supported)
-        assert len(self.rxn.GetReactants()) == 1, "Only single-reactant patterns are supported."
-        assert len(self.rxn.GetProducts()) == 1, "Only single-reactant patterns are supported."
+@dataclass(frozen=True)
+class CompiledProductRule:
+    """Precompiled data for one ProductRule."""
 
-        # --- Initialize reactant and product templates
-        self.react_temp = self.rxn.GetReactants()[0]
-        self.prod_temp = self.rxn.GetProducts()[0]
+    source_rule: ProductRule
 
-        # --- Validate atom map numbers in reactants
-        react_map_nums = [a.GetAtomMapNum() for a in self.react_temp.GetAtoms() if a.GetAtomMapNum() > 0]
-        # assert all(x > 0 for x in react_map_nums), f"Invalid AtomMapNum: {react_map_nums}"
-        self.react_idx_to_map = bidict({i: amap for i, amap in enumerate(set(react_map_nums))})
+    smirks: str
+    rxn: rdChemReactions.ChemicalReaction
+    react_temp: Any
+    prod_temp: rdChemReactions.MOL_SPTR_VECT
 
-        # --- Validate atom map numbers in products
-        prod_map_nums = [a.GetAtomMapNum() for a in self.prod_temp.GetAtoms() if a.GetAtomMapNum() > 0]
-        # assert all(x > 0 for x in prod_map_nums), f"Invalid AtomMapNum: {prod_map_nums}"
-        self.prod_idx_to_map = bidict({i: amap for i, amap in enumerate(set(prod_map_nums))})
-        
+    react_idx_to_map: bidict[int, int]
+    prod_idx_to_maps: Tuple[bidict[int, int], ...]
 
-        missing_maps = set(react_map_nums) - set(prod_map_nums)
-        self.virtual_smirks = f"{reactant_smarts}>>{product_smarts}" + ("."+".".join(
-            [f"[*:{m}]" for m in missing_maps]
-        )) if len(missing_maps) > 0 else f""
-        self.virtual_rxn = rdChemReactions.ReactionFromSmarts(self.virtual_smirks)
-        pass
+    virtual_smirks: str
+    virtual_rxn: rdChemReactions.ChemicalReaction
 
-    def __repr__(self):
-        return f"{self.__class__.__name__}(name='{self.name}', smirks='{self.smirks}', charge_mode='{self.charge_mode}')"
-    
-    def key(self, include_name: bool = False) -> Tuple:
-        """Return the immutable identity key for this pattern.
+@dataclass(frozen=True)
+class CleavedMolecule:
+    """One product molecule generated by a cleavage event."""
 
-        Parameters
-        ----------
-        include_name : bool, optional
-            If ``True``, include ``name`` in the returned key. By default, only
-            ``smirks`` and ``charge_mode`` define pattern identity.
+    smiles: str
+    product_indices: Tuple[int, ...]
 
-        Returns
-        -------
-        tuple
-            Identity tuple suitable for equality checks, hashing, sorting, and
-            stable pattern-set ID assignment.
-        """
-        if include_name:
-            return (self.smirks, self.charge_mode, self.name)
-        return (self.smirks, self.charge_mode)
+@dataclass(frozen=True)
+class CleavageProduct:
+    """One cleavage event generated by one ProductRule."""
 
-    def __eq__(self, other: 'CleavagePattern') -> bool:
-        """Return whether two patterns have the same cleavage identity.
+    rule_name: str
+    reactant_indices: Tuple[int, ...]
+    cleaved_molecules: Tuple[CleavedMolecule, ...]
 
-        The default comparison ignores ``name`` and compares only ``smirks`` and
-        ``charge_mode``.
-        """
-        if not isinstance(other, CleavagePattern):
-            return False
-        return self.key(False) == other.key(False)
-    
-    def __hash__(self) -> int:
-        """Return a hash based on ``smirks`` and ``charge_mode``."""
-        return hash(self.key(False))
+@dataclass(frozen=True)
+class CleavageResult:
+    """Result of applying one CleavagePattern to one reactant molecule."""
 
-    def equals(self, other: 'CleavagePattern', include_name: bool = False) -> bool:
-        """Compare this pattern with another pattern.
+    cleavage: CleavagePattern
+    reactant_smiles: str
+    products: Tuple[CleavageProduct, ...]
 
-        Parameters
-        ----------
-        other : CleavagePattern
-            Pattern to compare with this instance.
-        include_name : bool, optional
-            If ``True``, compare ``name`` in addition to ``smirks`` and
-            ``charge_mode``.
+@dataclass(frozen=True)
+class CleavagePattern:
+    """Compiled cleavage pattern.
 
-        Returns
-        -------
-        bool
-            ``True`` when both patterns are equivalent under the selected
-            comparison rule.
-        """
-        if not isinstance(other, CleavagePattern):
-            return False
-        return self.key(include_name) == other.key(include_name)
+    This dataclass itself does not perform heavy construction logic.
+    Use `CleavagePattern.from_rules(...)` to validate SMARTS/SMIRKS
+    and create compiled RDKit reaction objects.
+    """
 
-    def __str__(self):
-        sig = inspect.signature(self.__init__)
-        arg_names = [p.name for p in sig.parameters.values() if p.name != "self"]
+    name: str
+    reactant_smarts: str
+    products: Tuple[ProductRule, ...]
+    reactant_query: Chem.Mol
+    compiled_products: Tuple[CompiledProductRule, ...]
 
-        fields = [f"v={self.version}"]
-        for name in arg_names:
-            if hasattr(self, name):
-                value = getattr(self, name)
-                if isinstance(value, str):
-                    value_str = f'"{value}"'
-                else:
-                    value_str = str(value)
-                fields.append(f"{name}={value_str}")
-
-        return f"({self.__class__.__name__};" + ";".join(fields) + ")"
-
-    @property
-    def num_reactant_atoms(self) -> int:
-        """Number of mapped atoms on the reactant side of the SMIRKS."""
-        return len(self.react_idx_to_map)
-
-    @property
-    def num_product_atoms(self) -> int:
-        """Number of mapped atoms retained on the product side of the SMIRKS."""
-        return len(self.prod_idx_to_map)
-
-    def copy(self) -> 'CleavagePattern':
-        """Return a new ``CleavagePattern`` with the same constructor values."""
-        sig = inspect.signature(self.__init__)
-        init_args = [p.name for p in sig.parameters.values() if p.name != "self"]
-
-        kwargs = {arg: getattr(self, arg) for arg in init_args if hasattr(self, arg)}
-
-        return self.__class__(**kwargs)
-    
     @classmethod
-    def parse(cls, pattern_str: str) -> 'CleavagePattern':
-        """Parse a pattern serialized by :meth:`__str__`.
+    def from_rules(
+        cls,
+        reactant_smarts: str,
+        products: Tuple[ProductRule, ...],
+        name: str = "",
+    ) -> CleavagePattern:
+        """Create a CleavagePattern from SMARTS and ProductRule objects.
 
-        Parameters
-        ----------
-        pattern_str : str
-            String representation produced by ``str(pattern)``.
-
-        Returns
-        -------
-        CleavagePattern
-            Reconstructed cleavage pattern.
+        This method performs the heavy validation/compilation that was
+        previously done in `__init__`.
         """
-        # 1. Remove surrounding parentheses and class name
-        if pattern_str.startswith("(") and pattern_str.endswith(")"):
-            pattern_str = pattern_str[1:-1].strip()
-        if pattern_str.startswith(cls.__name__):
-            pattern_str = pattern_str[len(cls.__name__):].lstrip(";")
 
-        # 2. Regex: match key=value pairs where value may be quoted and contain semicolons
-        # Example match groups: key="smirks", value="[C:1]-[O:2];[P:3]>>[C:1]"
-        pattern = re.compile(r'(\w+)=(".*?"|[^;]*)')
-        matches = pattern.findall(pattern_str)
+        reactant_query = Chem.MolFromSmarts(reactant_smarts)
+        if reactant_query is None:
+            raise ValueError(f"Invalid reactant SMARTS: {reactant_smarts}")
 
-        # 3. Build dict of key-value pairs
-        kwargs = {}
-        for key, value in matches:
-            value = value.strip()
-            # Remove surrounding quotes if present
-            if value.startswith('"') and value.endswith('"'):
-                value = value[1:-1]
-            # Try numeric conversion
-            if key in ("v", "version"):
-                try:
-                    value = float(value)
-                except ValueError:
-                    pass
-            kwargs[key] = value
+        compiled_products: List[CompiledProductRule] = []
 
-        # 4. Construct object from parsed values
-        obj = cls(**{k: v for k, v in kwargs.items() if k in cls.__init__.__code__.co_varnames})
-        obj.version = kwargs.get("v", kwargs.get("version", 1.0))
-        return obj
+        for product in products:
+            smirks = f"{reactant_smarts}>>{product.smarts}"
 
-    # -------------------------------------------------------------------------
-    def to_dict(self) -> Dict[str, Any]:
-        """Serialize the pattern to a dictionary.
+            rxn = rdChemReactions.ReactionFromSmarts(smirks)
+            if rxn is None:
+                raise ValueError(f"Invalid SMIRKS for product: {smirks}")
 
-        Returns
-        -------
-        dict
-            Dictionary containing constructor fields and the pattern version.
-            The result is suitable for YAML or JSON serialization.
+            if len(rxn.GetReactants()) != 1:
+                raise ValueError(
+                    "Only single-reactant patterns are supported: "
+                    f"{smirks}"
+                )
+
+            react_temp = rxn.GetReactants()[0]
+            prod_temps = rxn.GetProducts()
+
+            react_map_nums = cls._extract_unique_atom_maps(
+                mol=react_temp,
+                smarts=reactant_smarts,
+                side_name="reactant",
+            )
+
+            react_idx_to_map = bidict(
+                {idx: atom_map for idx, atom_map in enumerate(react_map_nums)}
+            )
+
+            existing_product_map_nums: set[int] = set()
+            prod_idx_to_map_list: List[bidict[int, int]] = []
+
+            for prod_temp in prod_temps:
+                product_map_nums = cls._extract_unique_atom_maps(
+                    mol=prod_temp,
+                    smarts=product.smarts,
+                    side_name="product",
+                )
+
+                existing_product_map_nums.update(product_map_nums)
+
+                prod_idx_to_map_list.append(
+                    bidict(
+                        {
+                            idx: atom_map
+                            for idx, atom_map in enumerate(product_map_nums)
+                        }
+                    )
+                )
+
+            virtual_smirks = cls._build_virtual_smirks(
+                reactant_smarts=reactant_smarts,
+                product_smarts=product.smarts,
+                react_map_nums=tuple(react_map_nums),
+                product_map_nums=tuple(existing_product_map_nums),
+            )
+
+            virtual_rxn = rdChemReactions.ReactionFromSmarts(virtual_smirks)
+            if virtual_rxn is None:
+                raise ValueError(
+                    f"Invalid virtual SMIRKS for product: {virtual_smirks}"
+                )
+
+            compiled_products.append(
+                CompiledProductRule(
+                    source_rule=product,
+                    smirks=smirks,
+                    rxn=rxn,
+                    react_temp=react_temp,
+                    prod_temp=prod_temps,
+                    react_idx_to_map=react_idx_to_map,
+                    prod_idx_to_maps=tuple(prod_idx_to_map_list),
+                    virtual_smirks=virtual_smirks,
+                    virtual_rxn=virtual_rxn,
+                )
+            )
+
+        return cls(
+            name=name,
+            reactant_smarts=reactant_smarts,
+            products=products,
+            reactant_query=reactant_query,
+            compiled_products=tuple(compiled_products),
+        )
+
+    @staticmethod
+    def _extract_unique_atom_maps(
+        mol: Chem.Mol,
+        smarts: str,
+        side_name: str,
+    ) -> Tuple[int, ...]:
+        """Extract atom-map numbers and validate that they are unique."""
+
+        atom_maps: List[int] = []
+
+        for atom in mol.GetAtoms():
+            atom_map = atom.GetAtomMapNum()
+
+            if atom_map <= 0:
+                raise ValueError(
+                    f"All atoms in {side_name} SMARTS must have atom maps: "
+                    f"{smarts}"
+                )
+
+            if atom_map in atom_maps:
+                raise ValueError(
+                    f"Duplicate atom map numbers in {side_name} SMARTS: "
+                    f"{smarts}"
+                )
+
+            atom_maps.append(atom_map)
+
+        return tuple(atom_maps)
+
+    @staticmethod
+    def _build_virtual_smirks(
+        reactant_smarts: str,
+        product_smarts: str,
+        react_map_nums: Tuple[int, ...],
+        product_map_nums: Tuple[int, ...],
+    ) -> str:
+        """Add dummy products for reactant atoms absent from the product side.
+
+        This makes RDKit preserve mapping information for atoms that disappear
+        from the actual product template.
         """
-        sig = inspect.signature(self.__init__)
-        arg_names = [p.name for p in sig.parameters.values() if p.name != "self"]
 
-        data = {name: getattr(self, name) for name in arg_names if hasattr(self, name)}
+        missing_maps = sorted(set(react_map_nums) - set(product_map_nums))
 
-        data["version"] = getattr(self, "version", 1.0)
-        return data
+        if not missing_maps:
+            return f"{reactant_smarts}>>{product_smarts}"
 
-    # -------------------------------------------------------------------------
-    @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "CleavagePattern":
-        """Create a pattern from a serialized dictionary.
+        dummy_products = ".".join(f"[*:{atom_map}]" for atom_map in missing_maps)
 
-        Parameters
-        ----------
-        data : dict
-            Dictionary containing at least the constructor fields accepted by
-            :class:`CleavagePattern`. Unknown keys are ignored.
+        return f"{reactant_smarts}>>{product_smarts}.{dummy_products}"
 
-        Returns
-        -------
-        CleavagePattern
-            Reconstructed cleavage pattern.
-        """
-        sig = inspect.signature(cls.__init__)
-        arg_names = [p.name for p in sig.parameters.values() if p.name != "self"]
-
-        init_kwargs = {k: v for k, v in data.items() if k in arg_names}
-        obj = cls(**init_kwargs)
-
-        if "version" in data:
-            obj.version = data["version"]
-
-        return obj
+    def __repr__(self) -> str:
+        return (
+            "CleavagePattern("
+            f"name={self.name}, "
+            f"reactant_smarts={self.reactant_smarts}, "
+            f"products={'.'.join(str(product) for product in self.products)}"
+            ")"
+        )
 
     def exists(self, compound: Compound) -> bool:
-        """Return whether the reactant SMARTS matches a compound.
-
-        Parameters
-        ----------
-        compound : Compound
-            Molecule to search.
-
-        Returns
-        -------
-        bool
-            ``True`` if the cleavage pattern can match at least one
-            substructure in ``compound``.
-        """
-        if self.reactant_query is None:
-            return False
         return compound.mol.HasSubstructMatch(self.reactant_query)
-    
+
     def matches(self, compound: Compound) -> List[Tuple[int, ...]]:
-        """Return all reactant-side substructure matches.
-
-        Parameters
-        ----------
-        compound : Compound
-            Molecule to search.
-
-        Returns
-        -------
-        list of tuple of int
-            Atom-index tuples returned by RDKit for each match of the
-            reactant-side SMARTS query.
-        """
-        if self.reactant_query is None:
-            return []
-        return compound.mol.GetSubstructMatches(self.reactant_query)
-
-    def is_applicable(self, compound: Compound) -> bool:
-        """Return whether a product passes this pattern's charge filter.
-
-        Parameters
-        ----------
-        compound : Compound
-            Candidate product molecule.
-
-        Returns
-        -------
-        bool
-            ``True`` when ``compound.charge`` is accepted by ``charge_mode``.
-        """
-        charge = compound.charge
-        for cm in self.charge_mode.split("|"):
-            if cm == "any":
-                return True
-            elif cm.startswith("positive"):
-                if charge == int(cm.replace("positive", "").strip()):
-                    return True
-            elif cm.startswith("negative"):
-                if charge == int(cm.replace("negative", "").strip()):
-                    return True
-            elif cm == "neutral":
-                if charge == 0:
-                    return True
-            else:
-                raise ValueError(f"Unsupported charge_mode: {cm}")
-        return False
-
-    # -------------------------------------------------------------------------
+        return list(compound.mol.GetSubstructMatches(self.reactant_query))
+    
     def fragment(self, compound: Compound) -> Optional[CleavageResult]:
         """Apply this cleavage pattern to a compound.
 
-        The method first checks whether the reactant-side SMARTS matches the
-        input molecule. If no match exists, ``None`` is returned. Otherwise, the
-        SMIRKS reaction is applied and each valid product is converted to a
-        :class:`CleavageProduct` with atom-index mappings.
-
-        Parameters
-        ----------
-        compound : Compound
-            Reactant molecule to cleave.
-
-        Returns
-        -------
-        CleavageResult or None
-            Cleavage result containing the original reactant SMILES and all
-            accepted products. Returns ``None`` when the pattern does not match
-            the input molecule.
+        This method applies each compiled ProductRule to the input molecule.
+        A single ProductRule may generate multiple product molecules, so each
+        valid reaction application is stored as one CleavageProduct containing
+        multiple CleavedMolecule objects.
         """
+
         if not self.exists(compound):
             return None
-        
+
         mol = Chem.Mol(compound._mol)
-        # Mapping: atom_map_number → atom_idx in the original molecule
+
+        # Mapping: original atom-map number -> atom index in canonical Compound
         old_atom_map_to_idx = compound.atom_map_to_index
-        # Mapping: atom_idx ↔ atom_map_number
-        idx_to_atom_map = bidict({a.GetIdx(): a.GetAtomMapNum() for a in mol.GetAtoms()})
 
-        # Apply the SMIRKS pattern to the molecule
-        product_sets = self.virtual_rxn.RunReactants((mol,))
-        # Identify all substructure matches corresponding to the reactant query
-        # reactant_matches = list(mol.GetSubstructMatches(self.reactant_query))
-
-        cleavage_products:List[CleavageProduct] = []
-
-        # Each product_set may contain multiple product molecules
-        for product_group in product_sets:
-            frag_info = {
-                'react': [-1] * len(self.react_idx_to_map),
-                'prod': [-1] * len(self.prod_idx_to_map),
+        # Mapping: RDKit atom index <-> atom-map number in the copied molecule
+        idx_to_atom_map = bidict(
+            {
+                atom.GetIdx(): atom.GetAtomMapNum()
+                for atom in mol.GetAtoms()
+                if atom.GetAtomMapNum() > 0
             }
-            atom_mapping_cache = {}
-            for product_mol in product_group:
+        )
 
-                # -----------------------------------------------------------------
-                # (1) Extract RDKit's atom-level correspondence from reaction result
-                for atom in product_mol.GetAtoms():
-                    if atom.HasProp("react_atom_idx") and atom.HasProp("old_mapno"):
+        cleavage_products: List[CleavageProduct] = []
+
+        for compiled_product in self.compiled_products:
+            product_rule = compiled_product.source_rule
+            virtual_rxn = compiled_product.virtual_rxn
+
+            real_product_count = len(compiled_product.prod_idx_to_maps)
+
+            product_sets = virtual_rxn.RunReactants((mol,))
+
+            for product_group in product_sets:
+                # product_group contains:
+                #   [real product 1, real product 2, ..., dummy product 1, ...]
+                real_product_mols = product_group[:real_product_count]
+
+                atom_mapping_cache: Dict[int, Dict[str, int]] = {}
+
+                # -------------------------------------------------------------
+                # 1. Collect atom mapping information from all real and dummy products
+                # -------------------------------------------------------------
+                for product_mol_index, product_mol in enumerate(product_group):
+                    for atom in product_mol.GetAtoms():
+                        if not (
+                            atom.HasProp("react_atom_idx")
+                            and atom.HasProp("old_mapno")
+                        ):
+                            continue
+
                         parent_idx = int(atom.GetProp("react_atom_idx"))
                         old_mapno = int(atom.GetProp("old_mapno"))
-                        if parent_idx in idx_to_atom_map:
-                            atom_map = idx_to_atom_map[parent_idx]
-                            react_idx = self.react_idx_to_map.inverse[old_mapno]
-                            if old_mapno in self.prod_idx_to_map.inverse:
-                                prod_idx = self.prod_idx_to_map.inverse[old_mapno]
-                            else:
-                                prod_idx = -1
-                            old_idx_in_canonical = old_atom_map_to_idx[atom_map]
 
-                            atom_mapping_cache[atom_map] = {
-                                'react_idx': react_idx,
-                                'prod_idx': prod_idx,
-                                'old_idx': old_idx_in_canonical
-                            }
-                            atom.SetAtomMapNum(idx_to_atom_map[parent_idx])
+                        if parent_idx not in idx_to_atom_map:
+                            continue
 
-            # -----------------------------------------------------------------
-            # (2) Build new compound and compute final index mapping
-            try:
-                new_compound = Compound(product_group[0])
-            except Exception as e:
-                continue
-            
-            if not self.is_applicable(new_compound):
-                continue
-            new_atom_map_to_idx = new_compound.atom_map_to_index
-            mapped_pairs = []
+                        if old_mapno not in compiled_product.react_idx_to_map.inverse:
+                            continue
 
-            for atom_map, info in atom_mapping_cache.items():
-                frag_info['react'][info['react_idx']] = info['old_idx']
-                if info['prod_idx'] != -1:
-                    new_idx = new_atom_map_to_idx[atom_map]
-                    frag_info['prod'][info['prod_idx']] = new_idx
-                    mapped_pairs.append((info['react_idx'], idx_to_atom_map.inverse[atom_map]))
+                        atom_map = idx_to_atom_map[parent_idx]
+                        react_idx = compiled_product.react_idx_to_map.inverse[old_mapno]
 
-            # -----------------------------------------------------------------
-            # (3) Consistency check
-            assert all(idx != -1 for idx in frag_info['react']), \
-                "Not all reactant indices were mapped."
-            assert all(idx != -1 for idx in frag_info['prod']), \
-                "Not all product indices were mapped."
+                        old_idx_in_canonical = old_atom_map_to_idx[atom_map]
 
-            # -----------------------------------------------------------------
-            # (4) Append the result
-            cleavage_products.append(
-                CleavageProduct(
-                    smiles=new_compound.smiles,
-                    reactant_indices=tuple(frag_info['react']),
-                    product_indices=tuple(frag_info['prod'])
+                        product_mol_no = -1
+                        product_idx = -1
+
+                        # Find which real product template contains this atom map.
+                        for real_idx, prod_idx_to_map in enumerate(
+                            compiled_product.prod_idx_to_maps
+                        ):
+                            if old_mapno in prod_idx_to_map.inverse:
+                                product_mol_no = real_idx
+                                product_idx = prod_idx_to_map.inverse[old_mapno]
+                                break
+
+                        atom_mapping_cache[atom_map] = {
+                            "react_idx": react_idx,
+                            "product_mol_no": product_mol_no,
+                            "product_idx": product_idx,
+                            "old_idx": old_idx_in_canonical,
+                        }
+
+                        # Restore original atom-map number to generated product atom.
+                        atom.SetAtomMapNum(atom_map)
+
+                # -------------------------------------------------------------
+                # 2. Convert real product molecules to Compound objects
+                # -------------------------------------------------------------
+                new_compounds: List[Compound] = []
+
+                try:
+                    for real_product_mol in real_product_mols:
+                        new_compounds.append(Compound(real_product_mol))
+                except Exception:
+                    continue
+
+                # -------------------------------------------------------------
+                # 3. Build reactant indices and product indices
+                # -------------------------------------------------------------
+                reactant_indices = [-1] * len(compiled_product.react_idx_to_map)
+
+                product_indices_list: List[List[int]] = [
+                    [-1] * len(prod_idx_to_map)
+                    for prod_idx_to_map in compiled_product.prod_idx_to_maps
+                ]
+
+                new_atom_map_to_idx_list = [
+                    new_compound.atom_map_to_index
+                    for new_compound in new_compounds
+                ]
+
+                for atom_map, info in atom_mapping_cache.items():
+                    reactant_indices[info["react_idx"]] = info["old_idx"]
+
+                    product_mol_no = info["product_mol_no"]
+                    product_idx = info["product_idx"]
+
+                    if product_mol_no == -1 or product_idx == -1:
+                        continue
+
+                    new_atom_map_to_idx = new_atom_map_to_idx_list[product_mol_no]
+
+                    if atom_map not in new_atom_map_to_idx:
+                        continue
+
+                    product_indices_list[product_mol_no][product_idx] = (
+                        new_atom_map_to_idx[atom_map]
+                    )
+
+                # -------------------------------------------------------------
+                # 4. Consistency check
+                # -------------------------------------------------------------
+                if not all(idx != -1 for idx in reactant_indices):
+                    continue
+
+                if not all(
+                    idx != -1
+                    for product_indices in product_indices_list
+                    for idx in product_indices
+                ):
+                    continue
+
+                # -------------------------------------------------------------
+                # 5. Store result
+                # -------------------------------------------------------------
+                cleaved_molecules = tuple(
+                    CleavedMolecule(
+                        smiles=new_compound.smiles,
+                        product_indices=tuple(product_indices),
+                    )
+                    for new_compound, product_indices in zip(
+                        new_compounds,
+                        product_indices_list,
+                    )
                 )
-            )
-        cleavage_result = CleavageResult(
-            cleavage=self.copy(),
+
+                cleavage_products.append(
+                    CleavageProduct(
+                        rule_name=product_rule.name,
+                        reactant_indices=tuple(reactant_indices),
+                        cleaved_molecules=cleaved_molecules,
+                    )
+                )
+
+        return CleavageResult(
+            cleavage=self,
             reactant_smiles=compound.smiles,
-            products=tuple(cleavage_products)
+            products=tuple(cleavage_products),
         )
-        return cleavage_result
+    
+
+if __name__ == "__main__":
+    reactant_smarts = "[#8:1]=[#6:2]1:[#6:3]:[#6:4](-[#6:5]2:[#6:6]:[#6:7]:[#6:8](-[#8:9]):[#6:10]:[#6:11]:2):[#8:12]:[#6:13]2:[#6:14]:[#6:15](-[#8:16]):[#6:17]:[#6:18](-[#8:19]):[#6:20]:1:2"
+    a_side_product_smarts  = "[#8:12]-[#6:13]1:[#6:14]:[#6:15](-[#8:16]):[#6:17]:[#6:18](-[#8:19]):[#6:20]:1"
+    b_side_product_smarts = "[#8:1]=[#6:2]-[#6:3]=[#6:4](-[#6:5]1:[#6:6]:[#6:7]:[#6:8](-[#8:9]):[#6:10]:[#6:11]:1)"
+    
+    product_rules = (
+        ProductRule(name="1,3", smarts="[#8:12]-[#6:13]1:[#6:14]:[#6:15](-[#8:16]):[#6:17]:[#6:18](-[#8-:19]):[#6:20]:1.[#8:1]=[#6:2]-[#6:3]=[#6:4](-[#6:5]1:[#6:6]:[#6:7]:[#6:8](-[#8:9]):[#6:10]:[#6:11]:1)"),
+
+        ProductRule(name="1,4", smarts="[#6:20]1:[#6:13]:[#6:14]:[#6:15](-[#8:16]):[#6:17]:[#6:18](-[#8-:19]):1.[#6:4](-[#6:5]1:[#6:6]:[#6:7]:[#6:8](-[#8:9]):[#6:10]:[#6:11]:1)=[#8:12]"),
+
+        ProductRule(name="1,2", smarts="[#6:4](-[#6:5]1:[#6:6]:[#6:7]:[#6:8](-[#8-:9]):[#6:10]:[#6:11]:1)=[#6:3]"),
+
+        ProductRule(name="0,4", smarts="[#6:5]1:[#6:6]:[#6:7]:[#6:8](-[#8-:9]):[#6:10]:[#6:11]:1"),
+    )
+    cleavage_pattern = CleavagePattern.from_rules(
+        reactant_smarts=reactant_smarts,
+        products=product_rules,
+        name="Example Cleavage",
+    )
+
+    compound = Compound.from_smiles("O=c1cc(-c2ccc(O)c(CCC)c2)oc2cc(O)cc(O)c12")
+    result = cleavage_pattern.fragment(compound)
+    
+    if result is not None and result.products:
+        print(f"Cleavage successful for {compound.smiles}:")
+
+        for product_index, product in enumerate(result.products, start=1):
+            print(f"  Product {product_index}:")
+            print(f"    Rule name: {product.rule_name}")
+            print(f"    Reactant indices: {product.reactant_indices}")
+
+            for molecule_index, molecule in enumerate(product.cleaved_molecules, start=1):
+                print(f"    Product molecule {molecule_index}:")
+                print(f"      Product SMILES: {molecule.smiles}")
+                print(f"      Product indices: {molecule.product_indices}")
+
+    else:
+        print(f"No cleavage match for {compound.smiles}.")
