@@ -6,89 +6,94 @@ from typing import Tuple
 from .CleavageEvent import CleavageEvent
 
 
-@dataclass(frozen=True, init=False)
+@dataclass(frozen=True)
 class FragmentEdge:
-    """Directed edge between two fragment nodes.
+    """Edge in a FragmentTree.
 
-    A ``FragmentEdge`` connects a source fragment to a product fragment in a
-    :class:`FragmentTree`. One edge can store multiple :class:`CleavageEvent`
-    objects when different cleavage events produce the same source-to-target
-    relationship.
+    Parameters
+    ----------
+    index:
+        Local edge index in the FragmentTree.
+
+    id:
+        Database edge ID.
+        This corresponds to fragment_edge.edge_id.
+
+    source_index:
+        Local index of the source FragmentNode in the FragmentTree.
+
+    target_index:
+        Local index of the target FragmentNode in the FragmentTree.
+
+    source_id:
+        Database fragment ID of the source node.
+        This corresponds to fragment_edge.source_id.
+
+    target_id:
+        Database fragment ID of the target node.
+        This corresponds to fragment_edge.target_id.
+
+    events:
+        Cleavage events associated with this edge.
     """
 
-    _id: int
-    _source_id: int
-    _target_id: int
-    _events: Tuple[CleavageEvent, ...]
+    index: int
+    id: int
+    source_index: int
+    target_index: int
+    source_id: int
+    target_id: int
+    events: Tuple[CleavageEvent, ...] = ()
 
-    def __init__(
-        self,
-        id: int,
-        source_id: int,
-        target_id: int,
-        events: Tuple[CleavageEvent, ...] = (),
-    ):
-        """Create a fragment edge.
+    def __post_init__(self) -> None:
 
-        Parameters
-        ----------
-        id : int
-            Edge identifier in the fragment tree.
-        source_id : int
-            Source node identifier.
-        target_id : int
-            Target node identifier.
-        events : tuple of CleavageEvent, optional
-            Cleavage events represented by this edge.
-        """
-        assert all(isinstance(event, CleavageEvent) for event in events), "events must contain only CleavageEvent instances."
-        object.__setattr__(self, "_id", int(id))
-        object.__setattr__(self, "_source_id", int(source_id))
-        object.__setattr__(self, "_target_id", int(target_id))
-        object.__setattr__(self, "_events", tuple(sorted(set(events), key=lambda event: event.event_id)))
+        if not all(isinstance(event, CleavageEvent) for event in self.events):
+            raise TypeError("events must contain only CleavageEvent instances.")
 
     @property
-    def id(self) -> int:
-        """Edge identifier."""
-        return self._id
-
-    @property
-    def source_id(self) -> int:
-        """Source node identifier."""
-        return self._source_id
-
-    @property
-    def target_id(self) -> int:
-        """Target node identifier."""
-        return self._target_id
-
-    @property
-    def events(self) -> Tuple[CleavageEvent, ...]:
-        """Cleavage events associated with this edge."""
-        return self._events
+    def edge_id(self) -> int:
+        """Alias for database edge ID."""
+        return self.id
 
     def with_event(self, event: CleavageEvent) -> "FragmentEdge":
         """Return a copy with one additional cleavage event."""
-        assert isinstance(event, CleavageEvent), "event must be a CleavageEvent instance."
+        if not isinstance(event, CleavageEvent):
+            raise TypeError("event must be a CleavageEvent instance.")
+
         if event in self.events:
             return self.copy()
+
         return FragmentEdge(
+            index=self.index,
             id=self.id,
+            source_index=self.source_index,
+            target_index=self.target_index,
             source_id=self.source_id,
             target_id=self.target_id,
             events=self.events + (event,),
         )
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return "FragmentEdge" + self.__str__()
 
-    def __str__(self):
-        return f"({self.id};{self.source_id} -> {self.target_id};events={len(self.events)})"
+    def __str__(self) -> str:
+        return (
+            f"(index={self.index}; "
+            f"id={self.id}; "
+            f"source_index={self.source_index}; "
+            f"target_index={self.target_index}; "
+            f"source_id={self.source_id}; "
+            f"target_id={self.target_id}; "
+            f"events={len(self.events)})"
+        )
 
     def copy(self) -> "FragmentEdge":
         """Return a copy of this fragment edge."""
         return FragmentEdge(
+            index=self.index,
             id=self.id,
+            source_index=self.source_index,
+            target_index=self.target_index,
             source_id=self.source_id,
             target_id=self.target_id,
             events=self.events,

@@ -7,33 +7,56 @@ import numpy as np
 from ..FragmentNode import FragmentNode
 
 
-@dataclass(frozen=True, init=False)
+@dataclass(frozen=True)
 class _FragmentNodeStore:
-    """Array-backed storage for fragment nodes."""
+    """Array-backed storage for fragment nodes.
 
-    _node_smiles: np.ndarray
+    node_ids:
+        Database fragment IDs.
 
-    def __init__(self, node_smiles: np.ndarray):
-        """Create node storage from a node SMILES array."""
-        node_smiles = np.asarray(node_smiles, dtype=object)
-        assert node_smiles.ndim == 1, "node_smiles must be a 1D array."
-        object.__setattr__(self, "_node_smiles", node_smiles)
+    node_smiles:
+        Canonical SMILES strings.
 
-    @property
-    def node_smiles(self) -> np.ndarray:
-        """Node SMILES array. The array index is the node ID."""
-        return self._node_smiles
+    The array position is the local node index in FragmentTree.
+    """
+
+    node_ids: np.ndarray
+    node_smiles: np.ndarray
+
+    def __post_init__(self) -> None:
+        node_ids = np.asarray(self.node_ids, dtype=np.int64)
+        node_smiles = np.asarray(self.node_smiles, dtype=object)
+
+        if node_ids.ndim != 1:
+            raise ValueError("node_ids must be a 1D array.")
+
+        if node_smiles.ndim != 1:
+            raise ValueError("node_smiles must be a 1D array.")
+
+        if len(node_ids) != len(node_smiles):
+            raise ValueError(
+                "node_ids and node_smiles must have the same length."
+            )
+
+        object.__setattr__(self, "node_ids", node_ids)
+        object.__setattr__(self, "node_smiles", node_smiles)
 
     @property
     def num_nodes(self) -> int:
-        """Number of nodes."""
-        return len(self._node_smiles)
+        return len(self.node_smiles)
 
-    def get_node(self, node_id: int) -> FragmentNode:
-        """Return a node object by ID."""
-        assert 0 <= node_id < self.num_nodes, "Invalid node ID."
-        return FragmentNode(id=int(node_id), smiles=str(self._node_smiles[node_id]))
+    def get_node(self, index: int) -> FragmentNode:
+        if not 0 <= index < self.num_nodes:
+            raise IndexError(f"Invalid node index: {index}")
+
+        return FragmentNode(
+            index=int(index),
+            id=int(self.node_ids[index]),
+            smiles=str(self.node_smiles[index]),
+        )
 
     def copy(self) -> "_FragmentNodeStore":
-        """Return copied node storage."""
-        return _FragmentNodeStore(node_smiles=self.node_smiles.copy())
+        return _FragmentNodeStore(
+            node_ids=self.node_ids.copy(),
+            node_smiles=self.node_smiles.copy(),
+        )
