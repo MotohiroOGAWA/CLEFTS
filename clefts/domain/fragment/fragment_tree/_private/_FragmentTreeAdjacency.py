@@ -6,145 +6,181 @@ from typing import Tuple
 import numpy as np
 
 
-@dataclass(frozen=True, init=False)
+@dataclass(frozen=True)
 class _FragmentTreeAdjacency:
-    """Incoming and outgoing edge adjacency in CSR form."""
+    """Incoming and outgoing edge adjacency in CSR form.
 
-    _in_edge_ids: np.ndarray
-    _in_edge_indptr: np.ndarray
-    _out_edge_ids: np.ndarray
-    _out_edge_indptr: np.ndarray
+    edge index is the array position in FragmentTree / _FragmentEdgeStore.
+    """
 
-    def __init__(
-        self,
-        in_edge_ids: np.ndarray,
-        in_edge_indptr: np.ndarray,
-        out_edge_ids: np.ndarray,
-        out_edge_indptr: np.ndarray,
-    ):
-        """Create validated CSR adjacency arrays."""
-        in_edge_ids = np.asarray(in_edge_ids, dtype=np.int32)
-        in_edge_indptr = np.asarray(in_edge_indptr, dtype=np.int64)
-        out_edge_ids = np.asarray(out_edge_ids, dtype=np.int32)
-        out_edge_indptr = np.asarray(out_edge_indptr, dtype=np.int64)
+    in_edge_indices: np.ndarray
+    in_edge_indptr: np.ndarray
+    out_edge_indices: np.ndarray
+    out_edge_indptr: np.ndarray
 
-        assert in_edge_indptr.shape == out_edge_indptr.shape, "Incoming and outgoing indptr arrays must have the same length."
-        assert self._valid_csr_arrays(in_edge_ids, in_edge_indptr), "Invalid incoming-edge CSR arrays."
-        assert self._valid_csr_arrays(out_edge_ids, out_edge_indptr), "Invalid outgoing-edge CSR arrays."
+    def __post_init__(self) -> None:
+        in_edge_indices = np.asarray(self.in_edge_indices, dtype=np.int64)
+        in_edge_indptr = np.asarray(self.in_edge_indptr, dtype=np.int64)
+        out_edge_indices = np.asarray(self.out_edge_indices, dtype=np.int64)
+        out_edge_indptr = np.asarray(self.out_edge_indptr, dtype=np.int64)
 
-        object.__setattr__(self, "_in_edge_ids", in_edge_ids)
-        object.__setattr__(self, "_in_edge_indptr", in_edge_indptr)
-        object.__setattr__(self, "_out_edge_ids", out_edge_ids)
-        object.__setattr__(self, "_out_edge_indptr", out_edge_indptr)
+        if not self._valid_csr_arrays(in_edge_indices, in_edge_indptr):
+            raise ValueError("Invalid incoming-edge CSR arrays.")
+
+        if not self._valid_csr_arrays(out_edge_indices, out_edge_indptr):
+            raise ValueError("Invalid outgoing-edge CSR arrays.")
+
+        if in_edge_indptr.shape != out_edge_indptr.shape:
+            raise ValueError(
+                "Incoming and outgoing indptr arrays must have the same length."
+            )
+
+        object.__setattr__(self, "in_edge_indices", in_edge_indices)
+        object.__setattr__(self, "in_edge_indptr", in_edge_indptr)
+        object.__setattr__(self, "out_edge_indices", out_edge_indices)
+        object.__setattr__(self, "out_edge_indptr", out_edge_indptr)
 
     @staticmethod
-    def _valid_csr_arrays(edge_ids: np.ndarray, indptr: np.ndarray) -> bool:
+    def _valid_csr_arrays(
+        edge_indices: np.ndarray,
+        indptr: np.ndarray,
+    ) -> bool:
         return (
-            edge_ids.ndim == 1
+            edge_indices.ndim == 1
             and indptr.ndim == 1
-            and indptr.shape[0] >= 1
+            and len(indptr) >= 1
             and indptr[0] == 0
-            and indptr[-1] == len(edge_ids)
+            and indptr[-1] == len(edge_indices)
             and np.all(indptr[1:] >= indptr[:-1])
         )
 
     @staticmethod
-    def from_edge_index(edge_index: np.ndarray, num_nodes: int) -> "_FragmentTreeAdjacency":
-        """Build incoming and outgoing edge adjacency from an edge-index array."""
-        edge_index = np.asarray(edge_index, dtype=np.int32)
+    def from_source_target_indices(
+        *,
+        source_indices: np.ndarray,
+        target_indices: np.ndarray,
+        num_nodes: int,
+    ) -> "_FragmentTreeAdjacency":
+        """Build incoming/outgoing adjacency from source and target node indices.
+
+        Parameters
+        ----------
+        source_indices:
+            Source node indices for each edge.
+
+        target_indices:
+            Target node indices for each edge.
+
+        num_nodes:
+            Number of nodes in the FragmentTree.
+        """
+        source_indices = np.asarray(source_indices, dtype=np.int64)
+        target_indices = np.asarray(target_indices, dtype=np.int64)
         num_nodes = int(num_nodes)
-        num_edges = int(edge_index.shape[0])
+
+        if source_indices.ndim != 1:
+            raise ValueError("source_indices must be a 1D array.")
+
+        if target_indices.ndim != 1:
+            raise ValueError("target_indices must be a 1D array.")
+
+        if len(source_indices) != len(target_indices):
+            raise ValueError(
+                "source_indices and target_indices must have the same length."
+            )
+
+        if num_nodes < 0:
+            raise ValueError("num_nodes must be non-negative.")
+
+        num_edges = len(source_indices)
 
         if num_edges == 0:
-            empty_ids = np.asarray([], dtype=np.int32)
+            empty_indices = np.asarray([], dtype=np.int64)
             empty_indptr = np.zeros(num_nodes + 1, dtype=np.int64)
+
             return _FragmentTreeAdjacency(
-                in_edge_ids=empty_ids,
+                in_edge_indices=empty_indices,
                 in_edge_indptr=empty_indptr,
-                out_edge_ids=empty_ids,
+                out_edge_indices=empty_indices,
                 out_edge_indptr=empty_indptr,
             )
 
-        src = edge_index[:, 0].astype(np.int32, copy=False)
-        dst = edge_index[:, 1].astype(np.int32, copy=False)
-        edge_ids = np.arange(num_edges, dtype=np.int32)
+        if np.any(source_indices < 0) or np.any(source_indices >= num_nodes):
+            raise ValueError("source_indices contain invalid node indices.")
 
-        order_in = np.argsort(dst, kind="mergesort")
-        in_edge_ids = edge_ids[order_in]
-        in_counts = np.bincount(dst[order_in], minlength=num_nodes).astype(np.int64)
-        in_indptr = np.empty(num_nodes + 1, dtype=np.int64)
-        in_indptr[0] = 0
-        np.cumsum(in_counts, out=in_indptr[1:])
+        if np.any(target_indices < 0) or np.any(target_indices >= num_nodes):
+            raise ValueError("target_indices contain invalid node indices.")
 
-        order_out = np.argsort(src, kind="mergesort")
-        out_edge_ids = edge_ids[order_out]
-        out_counts = np.bincount(src[order_out], minlength=num_nodes).astype(np.int64)
-        out_indptr = np.empty(num_nodes + 1, dtype=np.int64)
-        out_indptr[0] = 0
-        np.cumsum(out_counts, out=out_indptr[1:])
+        edge_indices = np.arange(num_edges, dtype=np.int64)
+
+        order_in = np.argsort(target_indices, kind="mergesort")
+        in_edge_indices = edge_indices[order_in]
+        in_counts = np.bincount(
+            target_indices[order_in],
+            minlength=num_nodes,
+        ).astype(np.int64)
+
+        in_edge_indptr = np.empty(num_nodes + 1, dtype=np.int64)
+        in_edge_indptr[0] = 0
+        np.cumsum(in_counts, out=in_edge_indptr[1:])
+
+        order_out = np.argsort(source_indices, kind="mergesort")
+        out_edge_indices = edge_indices[order_out]
+        out_counts = np.bincount(
+            source_indices[order_out],
+            minlength=num_nodes,
+        ).astype(np.int64)
+
+        out_edge_indptr = np.empty(num_nodes + 1, dtype=np.int64)
+        out_edge_indptr[0] = 0
+        np.cumsum(out_counts, out=out_edge_indptr[1:])
 
         return _FragmentTreeAdjacency(
-            in_edge_ids=in_edge_ids,
-            in_edge_indptr=in_indptr,
-            out_edge_ids=out_edge_ids,
-            out_edge_indptr=out_indptr,
+            in_edge_indices=in_edge_indices,
+            in_edge_indptr=in_edge_indptr,
+            out_edge_indices=out_edge_indices,
+            out_edge_indptr=out_edge_indptr,
         )
-
 
     @property
     def num_nodes(self) -> int:
         """Number of nodes inferred from CSR pointer arrays."""
-        return len(self._in_edge_indptr) - 1
+        return len(self.in_edge_indptr) - 1
 
     @property
     def in_edge_csr(self) -> Tuple[np.ndarray, np.ndarray]:
-        """Incoming edge adjacency as ``(edge_ids, indptr)``."""
-        return self._in_edge_ids, self._in_edge_indptr
+        """Incoming edge adjacency as (edge_indices, indptr)."""
+        return self.in_edge_indices, self.in_edge_indptr
 
     @property
     def out_edge_csr(self) -> Tuple[np.ndarray, np.ndarray]:
-        """Outgoing edge adjacency as ``(edge_ids, indptr)``."""
-        return self._out_edge_ids, self._out_edge_indptr
+        """Outgoing edge adjacency as (edge_indices, indptr)."""
+        return self.out_edge_indices, self.out_edge_indptr
 
-    def get_in_edge_ids(self, node_id: int) -> np.ndarray:
-        """Return incoming edge IDs for a node."""
-        assert 0 <= node_id < self.num_nodes, "Invalid node ID."
-        start = int(self._in_edge_indptr[node_id])
-        end = int(self._in_edge_indptr[node_id + 1])
-        return self._in_edge_ids[start:end]
+    def get_in_edge_indices(self, node_index: int) -> np.ndarray:
+        """Return incoming local edge indices for a node."""
+        if not 0 <= node_index < self.num_nodes:
+            raise IndexError(f"Invalid node index: {node_index}")
 
-    def get_out_edge_ids(self, node_id: int) -> np.ndarray:
-        """Return outgoing edge IDs for a node."""
-        assert 0 <= node_id < self.num_nodes, "Invalid node ID."
-        start = int(self._out_edge_indptr[node_id])
-        end = int(self._out_edge_indptr[node_id + 1])
-        return self._out_edge_ids[start:end]
+        start = int(self.in_edge_indptr[node_index])
+        end = int(self.in_edge_indptr[node_index + 1])
 
-    @property
-    def in_edge_ids(self) -> np.ndarray:
-        """Incoming edge IDs array."""
-        return self._in_edge_ids
+        return self.in_edge_indices[start:end]
 
-    @property
-    def in_edge_indptr(self) -> np.ndarray:
-        """Incoming edge pointer array."""
-        return self._in_edge_indptr
+    def get_out_edge_indices(self, node_index: int) -> np.ndarray:
+        """Return outgoing local edge indices for a node."""
+        if not 0 <= node_index < self.num_nodes:
+            raise IndexError(f"Invalid node index: {node_index}")
 
-    @property
-    def out_edge_ids(self) -> np.ndarray:
-        """Outgoing edge IDs array."""
-        return self._out_edge_ids
+        start = int(self.out_edge_indptr[node_index])
+        end = int(self.out_edge_indptr[node_index + 1])
 
-    @property
-    def out_edge_indptr(self) -> np.ndarray:
-        """Outgoing edge pointer array."""
-        return self._out_edge_indptr
+        return self.out_edge_indices[start:end]
 
     def copy(self) -> "_FragmentTreeAdjacency":
-        """Return copied adjacency arrays."""
         return _FragmentTreeAdjacency(
-            in_edge_ids=self._in_edge_ids.copy(),
-            in_edge_indptr=self._in_edge_indptr.copy(),
-            out_edge_ids=self._out_edge_ids.copy(),
-            out_edge_indptr=self._out_edge_indptr.copy(),
+            in_edge_indices=self.in_edge_indices.copy(),
+            in_edge_indptr=self.in_edge_indptr.copy(),
+            out_edge_indices=self.out_edge_indices.copy(),
+            out_edge_indptr=self.out_edge_indptr.copy(),
         )

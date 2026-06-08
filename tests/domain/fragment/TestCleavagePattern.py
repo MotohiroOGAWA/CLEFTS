@@ -4,7 +4,7 @@ from typing import Dict, Tuple
 from rdkit import Chem
 
 from clefts.domain.fragment.cleavage.CleavagePattern import (
-    CleavagePattern,
+    _CleavagePattern,
     ProductRule,
 )
 from clefts.libs.mmkit.mmkit import Compound
@@ -17,13 +17,13 @@ class TestCleavagePattern(unittest.TestCase):
         *,
         name: str = "test cleavage",
         rule_name: str = "test rule",
-    ) -> CleavagePattern:
+    ) -> _CleavagePattern:
         if ">>" not in smirks:
             raise ValueError(f"Invalid SMIRKS. Missing '>>': {smirks}")
 
         reactant_smarts, product_smarts = smirks.split(">>", maxsplit=1)
 
-        return CleavagePattern.from_rules(
+        return _CleavagePattern.from_rules(
             reactant_smarts=reactant_smarts,
             products=(ProductRule(name=rule_name, smarts=product_smarts),),
             name=name,
@@ -68,7 +68,7 @@ class TestCleavagePattern(unittest.TestCase):
     def assert_cleavage_product_atom_symbols_are_consistent(
         self,
         *,
-        pattern: CleavagePattern,
+        pattern: _CleavagePattern,
         cleavage_product,
         compound: Compound,
     ) -> None:
@@ -115,12 +115,12 @@ class TestCleavagePattern(unittest.TestCase):
         )
 
         self.assertEqual(
-            len(cleavage_product.cleaved_molecules),
+            len(cleavage_product.product_molecules),
             len(product_smarts_symbols_list),
         )
 
         for molecule, product_smarts_symbols in zip(
-            cleavage_product.cleaved_molecules,
+            cleavage_product.product_molecules,
             product_smarts_symbols_list,
         ):
             product_smiles_symbols = self.get_atom_symbols_from_smiles(
@@ -211,7 +211,7 @@ class TestCleavagePattern(unittest.TestCase):
                 )
 
                 cleavage_product = result.products[0]
-                molecule = cleavage_product.cleaved_molecules[0]
+                molecule = cleavage_product.product_molecules[0]
 
                 self.assertEqual(
                     molecule.smiles,
@@ -225,7 +225,7 @@ class TestCleavagePattern(unittest.TestCase):
                 )
 
     def test_fragment_multiple_product_molecules(self) -> None:
-        pattern = CleavagePattern.from_rules(
+        pattern = _CleavagePattern.from_rules(
             reactant_smarts="[C:1]-[O:2]-[C:3]",
             products=(
                 ProductRule(
@@ -246,11 +246,11 @@ class TestCleavagePattern(unittest.TestCase):
         cleavage_product = result.products[0]
 
         self.assertEqual(cleavage_product.rule_name, "split ether")
-        self.assertEqual(len(cleavage_product.cleaved_molecules), 2)
+        self.assertEqual(len(cleavage_product.product_molecules), 2)
 
         product_smiles = {
             molecule.smiles
-            for molecule in cleavage_product.cleaved_molecules
+            for molecule in cleavage_product.product_molecules
         }
 
         self.assertIn("CCC", product_smiles)
@@ -272,7 +272,7 @@ class TestCleavagePattern(unittest.TestCase):
             ProductRule(name="0,4", smarts="[#6:5]1:[#6:6]:[#6:7]:[#6:8](-[#8:9]):[#6:10]:[#6:11]:1"),
         )
 
-        pattern = CleavagePattern.from_rules(
+        pattern = _CleavagePattern.from_rules(
             reactant_smarts=reactant_smarts,
             products=product_rules,
             name="Example Cleavage",
@@ -307,7 +307,7 @@ class TestCleavagePattern(unittest.TestCase):
 
         self.assertTrue(
             any(
-                len(cleavage_product.cleaved_molecules) == 2
+                len(cleavage_product.product_molecules) == 2
                 for cleavage_product in multi_product_results
             )
         )
@@ -318,9 +318,9 @@ class TestCleavagePattern(unittest.TestCase):
                 all(index >= 0 for index in cleavage_product.reactant_indices)
             )
 
-            self.assertGreater(len(cleavage_product.cleaved_molecules), 0)
+            self.assertGreater(len(cleavage_product.product_molecules), 0)
 
-            for molecule in cleavage_product.cleaved_molecules:
+            for molecule in cleavage_product.product_molecules:
                 self.assertTrue(molecule.smiles)
                 self.assertGreater(len(molecule.product_indices), 0)
                 self.assertTrue(
@@ -332,3 +332,39 @@ class TestCleavagePattern(unittest.TestCase):
                 cleavage_product=cleavage_product,
                 compound=compound,
             )
+
+    def test_cleavage_pattern_deduplicates_products_by_smarts(self) -> None:
+        pattern = _CleavagePattern.from_rules(
+            reactant_smarts="[C:1]-[O:2]",
+            products=(
+                ProductRule(name="rule_1", smarts="[C:1]"),
+                ProductRule(name="rule_2", smarts="[C:1]"),
+                ProductRule(name="rule_3", smarts="[O:2]"),
+            ),
+            name="test",
+        )
+
+        self.assertEqual(len(pattern.products), 2)
+        self.assertEqual(len(pattern.cleavage_reactions), 2)
+
+        self.assertEqual(pattern.products[0].name, "rule_1")
+        self.assertEqual(pattern.products[0].smarts, "[C:1]")
+        self.assertEqual(pattern.products[1].name, "rule_3")
+        self.assertEqual(pattern.products[1].smarts, "[O:2]")
+
+
+    def test_cleavage_pattern_hash_and_eq_ignore_compiled_objects_and_name(self) -> None:
+        pattern_1 = _CleavagePattern.from_rules(
+            reactant_smarts="[C:1]-[O:2]",
+            products=(ProductRule(name="a", smarts="[C:1]"),),
+            name="pattern_a",
+        )
+
+        pattern_2 = _CleavagePattern.from_rules(
+            reactant_smarts="[C:1]-[O:2]",
+            products=(ProductRule(name="b", smarts="[C:1]"),),
+            name="pattern_b",
+        )
+
+        self.assertEqual(pattern_1, pattern_2)
+        self.assertEqual(hash(pattern_1), hash(pattern_2))

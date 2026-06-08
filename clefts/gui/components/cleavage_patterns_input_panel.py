@@ -6,7 +6,7 @@ from typing import Any
 
 import gradio as gr
 
-from ...domain.fragment.cleavage.CleavagePattern import CleavagePattern
+from ...domain.fragment.cleavage.CleavagePattern import _CleavagePattern
 from ...domain.fragment.cleavage.CleavagePatternSet import CleavagePatternSet
 from .common.generic_table_input_panel import (
     GenericTableColumn,
@@ -77,7 +77,7 @@ def rows_to_pattern_set(
     columns = get_cleavage_pattern_columns()
     normalized_rows = normalize_rows(rows, columns)
 
-    patterns: list[CleavagePattern] = []
+    patterns: list[_CleavagePattern] = []
 
     for row in normalized_rows:
         smirks = str(row.get("smirks", "")).strip()
@@ -85,7 +85,7 @@ def rows_to_pattern_set(
             continue
 
         patterns.append(
-            CleavagePattern(
+            _CleavagePattern(
                 name=str(row.get("name", "")).strip(),
                 smirks=smirks,
                 charge_mode=DEFAULT_CHARGE_MODE,
@@ -201,22 +201,22 @@ if __name__ == "__main__":
 
     demo_pattern_set = CleavagePatternSet(
         patterns=[
-            CleavagePattern(
+            _CleavagePattern(
                 name="amide cleavage",
                 smirks="[C:1](=[O:2])[N:3]>>[C:1](=[O:2])[OH]",
                 charge_mode="any",
             ),
-            CleavagePattern(
+            _CleavagePattern(
                 name="ester cleavage",
                 smirks="[C:1](=[O:2])[O:3][C:4]>>[C:1](=[O:2])[OH]",
                 charge_mode="any",
             ),
-            CleavagePattern(
+            _CleavagePattern(
                 name="c-c bond cleavage",
                 smirks="[C:1]-[C:2]>>[C:1]",
                 charge_mode="any",
             ),
-            CleavagePattern(
+            _CleavagePattern(
                 name="ring opening",
                 smirks="[C:1]1[C:2][C:3]1>>[C:1]",
                 charge_mode="any",

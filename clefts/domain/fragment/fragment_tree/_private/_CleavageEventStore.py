@@ -10,130 +10,215 @@ from ..CleavageEvent import CleavageEvent
 from ..FragmentEdge import FragmentEdge
 
 
-@dataclass(frozen=True, init=False)
+@dataclass(frozen=True)
 class _CleavageEventStore:
-    """Columnar storage for cleavage events attached to fragment edges."""
+    """Columnar storage for cleavage events.
 
-    _cleavage_pattern_ids: np.ndarray
-    _react_indices_strs: np.ndarray
-    _prod_indices_strs: np.ndarray
-    _edge_event_indptr: np.ndarray
+    The array position is the local event index in FragmentTree.
+    """
 
-    def __init__(
-        self,
-        cleavage_pattern_ids: np.ndarray,
-        react_indices_strs: np.ndarray,
-        prod_indices_strs: np.ndarray,
-        edge_event_indptr: np.ndarray,
-        num_edges: int,
-    ):
-        """Create event storage from column arrays and an edge pointer array."""
-        cleavage_pattern_ids = np.asarray(cleavage_pattern_ids, dtype=np.int32)
-        react_indices_strs = np.asarray(react_indices_strs, dtype=object)
-        prod_indices_strs = np.asarray(prod_indices_strs, dtype=object)
-        edge_event_indptr = np.asarray(edge_event_indptr, dtype=np.int64)
+    cleavage_pattern_ids: np.ndarray
+    reaction_ids: np.ndarray
+    product_molecule_ids: np.ndarray
+    event_ids: np.ndarray
+    reactant_indices_strs: np.ndarray
+    product_indices_strs: np.ndarray
+    edge_event_indptr: np.ndarray
 
-        n_events = len(cleavage_pattern_ids)
-        assert cleavage_pattern_ids.ndim == 1, "cleavage_pattern_ids must be a 1D array."
-        assert react_indices_strs.ndim == 1, "react_indices_strs must be a 1D array."
-        assert prod_indices_strs.ndim == 1, "prod_indices_strs must be a 1D array."
-        assert len(react_indices_strs) == n_events, "react_indices_strs must match cleavage_pattern_ids."
-        assert len(prod_indices_strs) == n_events, "prod_indices_strs must match cleavage_pattern_ids."
-        assert edge_event_indptr.ndim == 1, "edge_event_indptr must be a 1D array."
-        assert edge_event_indptr.shape[0] == int(num_edges) + 1, "edge_event_indptr must be length E+1."
-        assert edge_event_indptr[0] == 0, "edge_event_indptr must start at 0."
-        assert edge_event_indptr[-1] == n_events, "edge_event_indptr last element must equal the number of events."
-        assert np.all(edge_event_indptr[1:] >= edge_event_indptr[:-1]), "edge_event_indptr must be non-decreasing."
+    def __post_init__(self) -> None:
+        cleavage_pattern_ids = np.asarray(
+            self.cleavage_pattern_ids,
+            dtype=np.int64,
+        )
+        reaction_ids = np.asarray(self.reaction_ids, dtype=np.int64)
+        product_molecule_ids = np.asarray(
+            self.product_molecule_ids,
+            dtype=np.int64,
+        )
+        reactant_indices_strs = np.asarray(
+            self.reactant_indices_strs,
+            dtype=object,
+        )
+        product_indices_strs = np.asarray(
+            self.product_indices_strs,
+            dtype=object,
+        )
+        event_ids = np.asarray(self.event_ids, dtype=np.int64)
+        edge_event_indptr = np.asarray(
+            self.edge_event_indptr,
+            dtype=np.int64,
+        )
 
-        object.__setattr__(self, "_cleavage_pattern_ids", cleavage_pattern_ids)
-        object.__setattr__(self, "_react_indices_strs", react_indices_strs)
-        object.__setattr__(self, "_prod_indices_strs", prod_indices_strs)
-        object.__setattr__(self, "_edge_event_indptr", edge_event_indptr)
+        n_events = len(event_ids)
+
+        arrays = {
+            "cleavage_pattern_ids": cleavage_pattern_ids,
+            "reaction_ids": reaction_ids,
+            "product_molecule_ids": product_molecule_ids,
+            "event_ids": event_ids,
+            "reactant_indices_strs": reactant_indices_strs,
+            "product_indices_strs": product_indices_strs,
+        }
+
+        for name, array in arrays.items():
+            if array.ndim != 1:
+                raise ValueError(f"{name} must be a 1D array.")
+
+            if len(array) != n_events:
+                raise ValueError(
+                    f"{name} must have the same length as event_ids."
+                )
+
+        if edge_event_indptr.ndim != 1:
+            raise ValueError("edge_event_indptr must be a 1D array.")
+
+        if len(edge_event_indptr) == 0:
+            raise ValueError("edge_event_indptr must not be empty.")
+
+        if edge_event_indptr[0] != 0:
+            raise ValueError("edge_event_indptr must start at 0.")
+
+        if edge_event_indptr[-1] != n_events:
+            raise ValueError(
+                "edge_event_indptr last value must equal the number of events."
+            )
+
+        if not np.all(edge_event_indptr[1:] >= edge_event_indptr[:-1]):
+            raise ValueError("edge_event_indptr must be non-decreasing.")
+
+        object.__setattr__(
+            self,
+            "cleavage_pattern_ids",
+            cleavage_pattern_ids,
+        )
+        object.__setattr__(self, "reaction_ids", reaction_ids)
+        object.__setattr__(
+            self,
+            "product_molecule_ids",
+            product_molecule_ids,
+        )
+        object.__setattr__(self, "event_ids", event_ids)
+        object.__setattr__(
+            self,
+            "reactant_indices_strs",
+            reactant_indices_strs,
+        )
+        object.__setattr__(
+            self,
+            "product_indices_strs",
+            product_indices_strs,
+        )
+        object.__setattr__(self, "edge_event_indptr", edge_event_indptr)
+
+    @property
+    def num_events(self) -> int:
+        return len(self.event_ids)
+
+    @property
+    def num_edges(self) -> int:
+        return len(self.edge_event_indptr) - 1
 
     @staticmethod
     def empty(num_edges: int) -> "_CleavageEventStore":
-        """Create empty event storage for ``num_edges`` edges."""
         return _CleavageEventStore(
-            cleavage_pattern_ids=np.asarray([], dtype=np.int32),
-            react_indices_strs=np.asarray([], dtype=object),
-            prod_indices_strs=np.asarray([], dtype=object),
+            event_ids=np.asarray([], dtype=np.int64),
+            cleavage_pattern_ids=np.asarray([], dtype=np.int64),
+            reaction_ids=np.asarray([], dtype=np.int64),
+            product_molecule_ids=np.asarray([], dtype=np.int64),
+            reactant_indices_strs=np.asarray([], dtype=object),
+            product_indices_strs=np.asarray([], dtype=object),
             edge_event_indptr=np.zeros(int(num_edges) + 1, dtype=np.int64),
-            num_edges=int(num_edges),
         )
 
     @staticmethod
-    def from_edges(edges: Tuple[FragmentEdge, ...]) -> "_CleavageEventStore":
-        """Create event storage from edge objects.
+    def from_edges(
+        edges: Tuple[FragmentEdge, ...],
+    ) -> "_CleavageEventStore":
+        edges = tuple(sorted(edges, key=lambda edge: edge.index))
 
-        Event IDs are local to each edge when events are reconstructed, so the
-        stored columns keep only the cleavage pattern and atom-index mappings.
-        """
-        cleavage_pattern_ids = []
-        react_indices_strs = []
-        prod_indices_strs = []
+        event_ids: list[int] = []
+        cleavage_pattern_ids: list[int] = []
+        reaction_ids: list[int] = []
+        product_molecule_ids: list[int] = []
+        reactant_indices_strs: list[str] = []
+        product_indices_strs: list[str] = []
+
         edge_event_indptr = np.zeros(len(edges) + 1, dtype=np.int64)
 
         for edge_index, edge in enumerate(edges):
-            for event in edge.events:
+            events = tuple(sorted(edge.events, key=lambda event: event.index))
+
+            for event in events:
                 cleavage_pattern_ids.append(event.cleavage_pattern_id)
-                react_indices_strs.append(event.react_indices_str)
-                prod_indices_strs.append(event.prod_indices_str)
-            edge_event_indptr[edge_index + 1] = len(cleavage_pattern_ids)
+                reaction_ids.append(event.reaction_id)
+                product_molecule_ids.append(event.product_molecule_id)
+                event_ids.append(event.event_id)
+                reactant_indices_strs.append(event.reactant_indices_str)
+                product_indices_strs.append(event.product_indices_str)
+
+            edge_event_indptr[edge_index + 1] = len(event_ids)
 
         return _CleavageEventStore(
-            cleavage_pattern_ids=np.asarray(cleavage_pattern_ids, dtype=np.int32),
-            react_indices_strs=np.asarray(react_indices_strs, dtype=object),
-            prod_indices_strs=np.asarray(prod_indices_strs, dtype=object),
+            cleavage_pattern_ids=np.asarray(
+                cleavage_pattern_ids,
+                dtype=np.int64,
+            ),
+            reaction_ids=np.asarray(reaction_ids, dtype=np.int64),
+            product_molecule_ids=np.asarray(
+                product_molecule_ids,
+                dtype=np.int64,
+            ),
+            event_ids=np.asarray(event_ids, dtype=np.int64),
+            reactant_indices_strs=np.asarray(
+                reactant_indices_strs,
+                dtype=object,
+            ),
+            product_indices_strs=np.asarray(
+                product_indices_strs,
+                dtype=object,
+            ),
             edge_event_indptr=edge_event_indptr,
-            num_edges=len(edges),
         )
 
-    @property
-    def cleavage_pattern_ids(self) -> np.ndarray:
-        """Cleavage pattern ID for each stored event."""
-        return self._cleavage_pattern_ids
+    def get_events(self, edge_index: int) -> Tuple[CleavageEvent, ...]:
+        if not 0 <= edge_index < self.num_edges:
+            raise IndexError(f"Invalid edge index: {edge_index}")
 
-    @property
-    def react_indices_strs(self) -> np.ndarray:
-        """JSON string of source atom indices for each stored event."""
-        return self._react_indices_strs
+        start = int(self.edge_event_indptr[edge_index])
+        end = int(self.edge_event_indptr[edge_index + 1])
 
-    @property
-    def prod_indices_strs(self) -> np.ndarray:
-        """JSON string of product atom indices for each stored event."""
-        return self._prod_indices_strs
+        events: list[CleavageEvent] = []
 
-    @property
-    def edge_event_indptr(self) -> np.ndarray:
-        """Pointer array into event columns for each edge."""
-        return self._edge_event_indptr
-
-    def get_events(self, edge_id: int) -> Tuple[CleavageEvent, ...]:
-        """Return events associated with an edge.
-
-        ``event_id`` is assigned from zero within the requested edge.
-        """
-        assert 0 <= edge_id < len(self._edge_event_indptr) - 1, "Invalid edge ID."
-        start = int(self._edge_event_indptr[edge_id])
-        end = int(self._edge_event_indptr[edge_id + 1])
-        events = []
-        for local_event_id, flat_id in enumerate(range(start, end)):
+        for local_event_index, event_index in enumerate(range(start, end)):
             events.append(
                 CleavageEvent(
-                    event_id=local_event_id,
-                    cleavage_pattern_id=int(self._cleavage_pattern_ids[flat_id]),
-                    react_indices=json.loads(str(self._react_indices_strs[flat_id])),
-                    prod_indices=json.loads(str(self._prod_indices_strs[flat_id])),
+                    index=int(local_event_index),
+                    event_id=int(self.event_ids[event_index]),
+                    cleavage_pattern_id=int(
+                        self.cleavage_pattern_ids[event_index]
+                    ),
+                    reaction_id=int(self.reaction_ids[event_index]),
+                    product_molecule_id=int(
+                        self.product_molecule_ids[event_index]
+                    ),
+                    reactant_indices=json.loads(
+                        str(self.reactant_indices_strs[event_index])
+                    ),
+                    product_indices=json.loads(
+                        str(self.product_indices_strs[event_index])
+                    ),
                 )
             )
+
         return tuple(events)
 
     def copy(self) -> "_CleavageEventStore":
-        """Return copied event storage."""
         return _CleavageEventStore(
             cleavage_pattern_ids=self.cleavage_pattern_ids.copy(),
-            react_indices_strs=self.react_indices_strs.copy(),
-            prod_indices_strs=self.prod_indices_strs.copy(),
+            reaction_ids=self.reaction_ids.copy(),
+            product_molecule_ids=self.product_molecule_ids.copy(),
+            event_ids=self.event_ids.copy(),
+            reactant_indices_strs=self.reactant_indices_strs.copy(),
+            product_indices_strs=self.product_indices_strs.copy(),
             edge_event_indptr=self.edge_event_indptr.copy(),
-            num_edges=len(self.edge_event_indptr) - 1,
         )

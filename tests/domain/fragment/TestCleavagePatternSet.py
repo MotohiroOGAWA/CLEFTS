@@ -1,77 +1,344 @@
-# import unittest
+from __future__ import annotations
 
-# from clefts.domain.fragment.cleavage.CleavagePattern import CleavagePattern
-# from clefts.domain.fragment.cleavage.CleavagePatternSet import CleavagePatternSet
-# from clefts.libs.mmkit.mmkit import Compound
+import unittest
 
+from clefts.libs.mmkit.mmkit import Compound
 
-# class TestCleavagePatternSet(unittest.TestCase):
-#     def setUp(self):
-#         self.c_o = CleavagePattern(
-#             smirks="[C:1]-[O:2]>>[C:1]",
-#             name="c-o cleavage",
-#             charge_mode="any",
-#         )
-#         self.c_n = CleavagePattern(
-#             smirks="[C:1]-[N:2]>>[C:1]",
-#             name="c-n cleavage",
-#             charge_mode="any",
-#         )
-#         self.c_s = CleavagePattern(
-#             smirks="[C:1]-[S:2]>>[C:1]",
-#             name="c-s cleavage",
-#             charge_mode="any",
-#         )
-
-#     def test_assigns_same_ids_for_same_patterns_in_different_order(self):
-#         first = CleavagePatternSet([self.c_s, self.c_o, self.c_n], name="first")
-#         second = CleavagePatternSet([self.c_n, self.c_s, self.c_o], name="second")
-
-#         self.assertEqual(first, second)
-#         self.assertTrue(first.equals(second))
-#         self.assertFalse(first.equals(second, include_name=True))
-#         self.assertEqual(first.get_id(self.c_o), second.get_id(self.c_o))
-#         self.assertEqual(first.get_id(self.c_n), second.get_id(self.c_n))
-#         self.assertEqual(first.get_id(self.c_s), second.get_id(self.c_s))
-
-#     def test_ignores_duplicate_cleavage_patterns(self):
-#         pattern_set = CleavagePatternSet([self.c_o, self.c_n, self.c_o])
-
-#         self.assertEqual(len(pattern_set), 2)
-#         self.assertEqual(pattern_set.ids, (0, 1))
-
-#     def test_fragment_by_id_applies_the_selected_cleavage(self):
-#         pattern_set = CleavagePatternSet([self.c_o, self.c_n])
-#         compound = Compound.from_smiles("CCCN(CC)CC")
-
-#         result = pattern_set.fragment_by_id(pattern_set.get_id(self.c_n), compound)
-
-#         self.assertIsNotNone(result)
-#         self.assertEqual(result.cleavage, self.c_n)
-#         self.assertEqual(len(result.products), 3)
-#         self.assertEqual(result.products[0].smiles, "CCC")
-
-#     def test_fragment_all_applies_all_matching_cleavages(self):
-#         pattern_set = CleavagePatternSet([self.c_o, self.c_n, self.c_s])
-#         compound = Compound.from_smiles("CCCOCC")
-
-#         results = pattern_set.fragment_all(compound)
-
-#         self.assertEqual(len(results), 1)
-#         self.assertEqual(results[0].cleavage, self.c_o)
-#         self.assertEqual(len(results[0].products), 2)
-
-#     def test_round_trip_dict_keeps_ids_stable(self):
-#         pattern_set = CleavagePatternSet([self.c_s, self.c_o, self.c_n], name="test set")
-
-#         restored = CleavagePatternSet.from_dict(pattern_set.to_dict())
-
-#         self.assertEqual(restored, pattern_set)
-#         self.assertEqual(restored.name, "test set")
-#         self.assertEqual(restored.get_id(self.c_o), pattern_set.get_id(self.c_o))
-#         self.assertEqual(restored.get_id(self.c_n), pattern_set.get_id(self.c_n))
-#         self.assertEqual(restored.get_id(self.c_s), pattern_set.get_id(self.c_s))
+from clefts.domain.fragment.cleavage.CleavagePattern import (
+    _CleavagePattern,
+    ProductRule,
+)
+from clefts.domain.fragment.cleavage.CleavagePatternSet import (
+    CleavagePattern,
+    CleavagePatternSet,
+    CleavageResult,
+)
 
 
-# if __name__ == "__main__":
-#     unittest.main()
+class TestCleavagePatternSet(unittest.TestCase):
+    def make_pattern(
+        self,
+        *,
+        reactant_smarts: str,
+        product_smarts: str,
+        name: str,
+    ) -> _CleavagePattern:
+        return _CleavagePattern.from_rules(
+            reactant_smarts=reactant_smarts,
+            products=(
+                ProductRule(
+                    name=f"{name}_product",
+                    smarts=product_smarts,
+                ),
+            ),
+            name=name,
+        )
+
+    def test_from_patterns_assigns_stable_pattern_ids(self) -> None:
+        pattern_b = self.make_pattern(
+            reactant_smarts="[#6:1]-[#8:2]",
+            product_smarts="[#6:1].[#8:2]",
+            name="c_o_cleavage",
+        )
+
+        pattern_a = self.make_pattern(
+            reactant_smarts="[#6:1]-[#6:2]",
+            product_smarts="[#6:1].[#6:2]",
+            name="c_c_cleavage",
+        )
+
+        pattern_set = CleavagePatternSet.from_patterns(
+            patterns=(pattern_b, pattern_a),
+            name="test_patterns",
+        )
+
+        self.assertEqual(pattern_set.name, "test_patterns")
+        self.assertEqual(len(pattern_set), 2)
+        self.assertEqual(pattern_set.pattern_ids, (0, 1))
+
+        for pattern_id, pattern in enumerate(pattern_set.patterns):
+            self.assertIsInstance(pattern, CleavagePattern)
+            self.assertEqual(pattern.pattern_id, pattern_id)
+
+    def test_from_patterns_removes_duplicate_patterns(self) -> None:
+        pattern_1 = self.make_pattern(
+            reactant_smarts="[#6:1]-[#8:2]",
+            product_smarts="[#6:1].[#8:2]",
+            name="first_name",
+        )
+
+        pattern_2 = self.make_pattern(
+            reactant_smarts="[#6:1]-[#8:2]",
+            product_smarts="[#6:1].[#8:2]",
+            name="second_name",
+        )
+
+        pattern_set = CleavagePatternSet.from_patterns(
+            patterns=(pattern_1, pattern_2),
+            name="deduplicated_patterns",
+        )
+
+        self.assertEqual(len(pattern_set), 1)
+        self.assertEqual(pattern_set.pattern_ids, (0,))
+
+    def test_from_patterns_raises_type_error_when_invalid_pattern_is_given(self) -> None:
+        with self.assertRaises(TypeError):
+            CleavagePatternSet.from_patterns(
+                patterns=("not_a_pattern",),
+                name="invalid_patterns",
+            )
+
+    def test_iter_returns_patterns_in_id_order(self) -> None:
+        pattern_1 = self.make_pattern(
+            reactant_smarts="[#6:1]-[#8:2]",
+            product_smarts="[#6:1].[#8:2]",
+            name="c_o_cleavage",
+        )
+
+        pattern_2 = self.make_pattern(
+            reactant_smarts="[#6:1]-[#7:2]",
+            product_smarts="[#6:1].[#7:2]",
+            name="c_n_cleavage",
+        )
+
+        pattern_set = CleavagePatternSet.from_patterns(
+            patterns=(pattern_2, pattern_1),
+            name="test_patterns",
+        )
+
+        iterated_patterns = tuple(pattern_set)
+
+        self.assertEqual(iterated_patterns, pattern_set.patterns)
+        self.assertEqual(
+            tuple(pattern.pattern_id for pattern in iterated_patterns),
+            pattern_set.pattern_ids,
+        )
+
+    def test_contains_returns_true_for_equivalent_base_pattern(self) -> None:
+        pattern = self.make_pattern(
+            reactant_smarts="[#6:1]-[#8:2]",
+            product_smarts="[#6:1].[#8:2]",
+            name="c_o_cleavage",
+        )
+
+        equivalent_pattern = self.make_pattern(
+            reactant_smarts="[#6:1]-[#8:2]",
+            product_smarts="[#6:1].[#8:2]",
+            name="different_name",
+        )
+
+        pattern_set = CleavagePatternSet.from_patterns(
+            patterns=(pattern,),
+            name="test_patterns",
+        )
+
+        self.assertIn(equivalent_pattern, pattern_set)
+
+    def test_get_pattern_returns_pattern_by_id(self) -> None:
+        base_pattern = self.make_pattern(
+            reactant_smarts="[#6:1]-[#8:2]",
+            product_smarts="[#6:1].[#8:2]",
+            name="c_o_cleavage",
+        )
+
+        pattern_set = CleavagePatternSet.from_patterns(
+            patterns=(base_pattern,),
+            name="test_patterns",
+        )
+
+        pattern = pattern_set.get_pattern(0)
+
+        self.assertIsInstance(pattern, CleavagePattern)
+        self.assertEqual(pattern.pattern_id, 0)
+        self.assertEqual(pattern.key, base_pattern.key)
+
+    def test_get_pattern_raises_key_error_when_id_is_invalid(self) -> None:
+        base_pattern = self.make_pattern(
+            reactant_smarts="[#6:1]-[#8:2]",
+            product_smarts="[#6:1].[#8:2]",
+            name="c_o_cleavage",
+        )
+
+        pattern_set = CleavagePatternSet.from_patterns(
+            patterns=(base_pattern,),
+            name="test_patterns",
+        )
+
+        with self.assertRaises(KeyError):
+            pattern_set.get_pattern(999)
+
+    def test_get_pattern_id_returns_id_for_equivalent_pattern(self) -> None:
+        base_pattern = self.make_pattern(
+            reactant_smarts="[#6:1]-[#8:2]",
+            product_smarts="[#6:1].[#8:2]",
+            name="c_o_cleavage",
+        )
+
+        equivalent_pattern = self.make_pattern(
+            reactant_smarts="[#6:1]-[#8:2]",
+            product_smarts="[#6:1].[#8:2]",
+            name="different_name",
+        )
+
+        pattern_set = CleavagePatternSet.from_patterns(
+            patterns=(base_pattern,),
+            name="test_patterns",
+        )
+
+        pattern_id = pattern_set.get_pattern_id(equivalent_pattern)
+
+        self.assertEqual(pattern_id, 0)
+
+    def test_get_pattern_id_raises_key_error_when_pattern_is_missing(self) -> None:
+        base_pattern = self.make_pattern(
+            reactant_smarts="[#6:1]-[#8:2]",
+            product_smarts="[#6:1].[#8:2]",
+            name="c_o_cleavage",
+        )
+
+        missing_pattern = self.make_pattern(
+            reactant_smarts="[#6:1]-[#7:2]",
+            product_smarts="[#6:1].[#7:2]",
+            name="c_n_cleavage",
+        )
+
+        pattern_set = CleavagePatternSet.from_patterns(
+            patterns=(base_pattern,),
+            name="test_patterns",
+        )
+
+        with self.assertRaises(KeyError):
+            pattern_set.get_pattern_id(missing_pattern)
+
+    def test_fragment_by_id_returns_result_with_pattern_id(self) -> None:
+        base_pattern = self.make_pattern(
+            reactant_smarts="[#6:1]-[#8:2]",
+            product_smarts="[#6:1].[#8:2]",
+            name="c_o_cleavage",
+        )
+
+        pattern_set = CleavagePatternSet.from_patterns(
+            patterns=(base_pattern,),
+            name="test_patterns",
+        )
+
+        compound = Compound.from_smiles("CCO")
+
+        result = pattern_set.fragment_by_id(
+            pattern_id=0,
+            compound=compound,
+        )
+
+        self.assertIsNotNone(result)
+        self.assertIsInstance(result, CleavageResult)
+        self.assertEqual(result.pattern_id, 0)
+        self.assertEqual(result.cleavage.pattern_id, 0)
+        self.assertEqual(result.reactant_smiles, compound.smiles)
+        self.assertGreater(len(result.products), 0)
+
+    def test_fragment_by_id_returns_none_when_pattern_does_not_match(self) -> None:
+        base_pattern = self.make_pattern(
+            reactant_smarts="[#6:1]-[#7:2]",
+            product_smarts="[#6:1].[#7:2]",
+            name="c_n_cleavage",
+        )
+
+        pattern_set = CleavagePatternSet.from_patterns(
+            patterns=(base_pattern,),
+            name="test_patterns",
+        )
+
+        compound = Compound.from_smiles("CCO")
+
+        result = pattern_set.fragment_by_id(
+            pattern_id=0,
+            compound=compound,
+        )
+
+        self.assertIsNone(result)
+
+    def test_fragment_all_returns_only_matching_results(self) -> None:
+        matching_pattern = self.make_pattern(
+            reactant_smarts="[#6:1]-[#8:2]",
+            product_smarts="[#6:1].[#8:2]",
+            name="c_o_cleavage",
+        )
+
+        non_matching_pattern = self.make_pattern(
+            reactant_smarts="[#6:1]-[#7:2]",
+            product_smarts="[#6:1].[#7:2]",
+            name="c_n_cleavage",
+        )
+
+        pattern_set = CleavagePatternSet.from_patterns(
+            patterns=(matching_pattern, non_matching_pattern),
+            name="test_patterns",
+        )
+
+        compound = Compound.from_smiles("CCO")
+
+        results = pattern_set.fragment_all(compound)
+
+        self.assertEqual(len(results), 1)
+        self.assertIsInstance(results[0], CleavageResult)
+        self.assertIn(results[0].pattern_id, pattern_set.pattern_ids)
+        self.assertEqual(results[0].reactant_smiles, compound.smiles)
+        self.assertGreater(len(results[0].products), 0)
+
+    def test_identity_does_not_include_name(self) -> None:
+        pattern = self.make_pattern(
+            reactant_smarts="[#6:1]-[#8:2]",
+            product_smarts="[#6:1].[#8:2]",
+            name="c_o_cleavage",
+        )
+
+        pattern_set_1 = CleavagePatternSet.from_patterns(
+            patterns=(pattern,),
+            name="first_set_name",
+        )
+
+        pattern_set_2 = CleavagePatternSet.from_patterns(
+            patterns=(pattern,),
+            name="second_set_name",
+        )
+
+        self.assertEqual(
+            pattern_set_1.identity(),
+            pattern_set_2.identity(),
+        )
+
+    def test_to_dict_returns_serializable_metadata(self) -> None:
+        pattern = self.make_pattern(
+            reactant_smarts="[#6:1]-[#8:2]",
+            product_smarts="[#6:1].[#8:2]",
+            name="c_o_cleavage",
+        )
+
+        pattern_set = CleavagePatternSet.from_patterns(
+            patterns=(pattern,),
+            name="test_patterns",
+        )
+
+        data = pattern_set.to_dict()
+
+        self.assertEqual(data["name"], "test_patterns")
+        self.assertEqual(len(data["patterns"]), 1)
+
+        pattern_data = data["patterns"][0]
+
+        self.assertEqual(pattern_data["pattern_id"], 0)
+        self.assertEqual(pattern_data["name"], "c_o_cleavage")
+        self.assertEqual(pattern_data["reactant_smarts"], "[#6:1]-[#8:2]")
+        self.assertEqual(
+            pattern_data["products"],
+            [
+                {
+                    "name": "c_o_cleavage_product",
+                    "smarts": "[#6:1].[#8:2]",
+                }
+            ],
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

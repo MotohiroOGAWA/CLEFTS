@@ -5,98 +5,138 @@ from dataclasses import dataclass
 from typing import Iterable, Tuple
 
 
-@dataclass(frozen=True, init=False)
+@dataclass(frozen=True)
 class CleavageEvent:
-    """Cleavage event associated with one fragment edge.
+    """One cleavage event associated with a FragmentEdge.
 
-    ``CleavageEvent`` is the structured replacement for serialized fragment-step
-    strings. It records which cleavage pattern was applied, and how atom indices
-    map from source fragment to product fragment. The parent edge owns the
-    event, so ``edge_id`` belongs to the edge table rather than this value
-    object.
+    index:
+        Local event index in the FragmentTree.
+
+    cleavage_pattern_id:
+        ID of the cleavage pattern used for this event.
+
+    reaction_id:
+        ID of the reaction execution.
+        Events generated from the same reaction share the same reaction_id.
+
+    product_molecule_id:
+        Product molecule index within the reaction result.
+
+    event_id:
+        Event ID within the database event ID.
+
+    reactant_indices:
+        Atom indices in the reactant/source fragment.
+
+    product_indices:
+        Atom indices in the product/target fragment.
     """
 
-    _event_id: int
-    _cleavage_pattern_id: int
-    _react_indices: Tuple[int, ...]
-    _prod_indices: Tuple[int, ...]
+    index: int
+    cleavage_pattern_id: int
+    reaction_id: int
+    product_molecule_id: int
+    event_id: int
+    reactant_indices: Tuple[int, ...]
+    product_indices: Tuple[int, ...]
 
     def __init__(
         self,
-        event_id: int,
+        index: int,
         cleavage_pattern_id: int,
-        react_indices: Iterable[int],
-        prod_indices: Iterable[int],
-    ):
-        """Create a cleavage event.
+        reaction_id: int,
+        product_molecule_id: int,
+        event_id: int,
+        reactant_indices: Iterable[int],
+        product_indices: Iterable[int],
+    ) -> None:
+        object.__setattr__(self, "index", int(index))
+        object.__setattr__(self, "cleavage_pattern_id", int(cleavage_pattern_id))
+        object.__setattr__(self, "reaction_id", int(reaction_id))
+        object.__setattr__(self, "product_molecule_id", int(product_molecule_id))
+        object.__setattr__(self, "event_id", int(event_id))
+        object.__setattr__(
+            self,
+            "reactant_indices",
+            tuple(int(i) for i in reactant_indices),
+        )
+        object.__setattr__(
+            self,
+            "product_indices",
+            tuple(int(i) for i in product_indices),
+        )
 
-        Parameters
-        ----------
-        event_id : int
-            Event identifier, unique within the generated tree.
-        cleavage_pattern_id : int
-            Stable cleavage pattern identifier.
-        react_indices : iterable of int
-            Atom indices in the source fragment.
-        prod_indices : iterable of int
-            Atom indices in the target fragment.
-        """
-        object.__setattr__(self, "_event_id", int(event_id))
-        object.__setattr__(self, "_cleavage_pattern_id", int(cleavage_pattern_id))
-        object.__setattr__(self, "_react_indices", tuple(int(i) for i in react_indices))
-        object.__setattr__(self, "_prod_indices", tuple(int(i) for i in prod_indices))
+        self._validate()
 
-    @property
-    def event_id(self) -> int:
-        """Event identifier."""
-        return self._event_id
+    def _validate(self) -> None:
 
-    @property
-    def cleavage_pattern_id(self) -> int:
-        """Stable cleavage pattern identifier."""
-        return self._cleavage_pattern_id
+        if self.cleavage_pattern_id < 0:
+            raise ValueError("cleavage_pattern_id must be non-negative.")
 
-    @property
-    def react_indices(self) -> Tuple[int, ...]:
-        """Atom indices in the source fragment."""
-        return self._react_indices
+        if self.reaction_id < 0:
+            raise ValueError("reaction_id must be non-negative.")
 
-    @property
-    def prod_indices(self) -> Tuple[int, ...]:
-        """Atom indices in the target fragment."""
-        return self._prod_indices
+        if self.product_molecule_id < 0:
+            raise ValueError("product_molecule_id must be non-negative.")
 
     @property
-    def react_indices_str(self) -> str:
-        """JSON string representation of :attr:`react_indices`."""
-        return json.dumps(self.react_indices, separators=(",", ":"))
+    def reactant_indices_str(self) -> str:
+        """JSON string representation of reactant_indices."""
+        return json.dumps(self.reactant_indices, separators=(",", ":"))
 
     @property
-    def prod_indices_str(self) -> str:
-        """JSON string representation of :attr:`prod_indices`."""
-        return json.dumps(self.prod_indices, separators=(",", ":"))
+    def product_indices_str(self) -> str:
+        """JSON string representation of product_indices."""
+        return json.dumps(self.product_indices, separators=(",", ":"))
 
-    def to_record(self) -> Tuple[int, int, str, str]:
-        """Return a SQLite-friendly record tuple.
+    def to_record(self) -> tuple[int, int, int, int, int, str, str]:
+        """Return a database-friendly record tuple.
 
         Returns
         -------
         tuple
-            ``(event_id, cleavage_pattern_id, react_indices_str,
-            prod_indices_str)``.
+            (
+                index,
+                cleavage_pattern_id,
+                reaction_id,
+                product_molecule_id,
+                event_id,
+                reactant_indices_str,
+                product_indices_str,
+            )
         """
         return (
-            self.event_id,
+            self.index,
             self.cleavage_pattern_id,
-            self.react_indices_str,
-            self.prod_indices_str,
+            self.reaction_id,
+            self.product_molecule_id,
+            self.event_id,
+            self.reactant_indices_str,
+            self.product_indices_str,
+        )
+
+    def __repr__(self) -> str:
+        return "CleavageEvent" + self.__str__()
+
+    def __str__(self) -> str:
+        return (
+            f"(index={self.index}; "
+            f"cleavage_pattern_id={self.cleavage_pattern_id}; "
+            f"reaction_id={self.reaction_id}; "
+            f"product_molecule_id={self.product_molecule_id}; "
+            f"event_id={self.event_id}; "
+            f"reactant_indices={self.reactant_indices}; "
+            f"product_indices={self.product_indices})"
         )
 
     def copy(self) -> "CleavageEvent":
         """Return a copy of this cleavage event."""
         return CleavageEvent(
-            event_id=self.event_id,
+            index=self.index,
             cleavage_pattern_id=self.cleavage_pattern_id,
-            react_indices=self.react_indices,
-            prod_indices=self.prod_indices,
+            reaction_id=self.reaction_id,
+            product_molecule_id=self.product_molecule_id,
+            event_id=self.event_id,
+            reactant_indices=self.reactant_indices,
+            product_indices=self.product_indices,
         )
