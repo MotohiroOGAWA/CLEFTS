@@ -1,186 +1,74 @@
-import os
-import time
-from typing import Callable, Dict, Optional, Tuple
+from __future__ import annotations
 
-import yaml
+import time
+from dataclasses import dataclass
+from typing import Callable
 
 from ....libs.mmkit.mmkit import Compound
 from ..cleavage.CleavagePattern import _CleavagePattern
-from ..cleavage.CleavagePatternSet import CleavagePatternSet
-from ..cleavage.CleavageResult import CleavageResult
+from ..cleavage.CleavagePatternSet import CleavagePatternSet, CleavagePattern, CleavageResult
+from ..cleavage.CleavagePattern import _CleavageResult
 from .CleavageEvent import CleavageEvent
 from .FragmentEdge import FragmentEdge
 from .FragmentNode import FragmentNode
 from .FragmentTree import FragmentTree
 
 
+@dataclass(frozen=True)
 class FragmentTreeBuilder:
-    """Build a fragmentation tree from user-defined cleavage patterns.
+    """Build a FragmentTree from cleavage patterns.
 
-    ``FragmentTreeBuilder`` repeatedly applies a :class:`CleavagePatternSet` to
-    a root compound and to generated product fragments. Each unique product
-    SMILES becomes a :class:`FragmentNode`, and each cleavage relationship is
-    stored as a :class:`FragmentEdge`.
+    Notes
+    -----
+    This class only builds FragmentTree.
 
-    The builder is the main API for converting a ``Compound`` into a
-    :class:`FragmentTree`. Use :meth:`build` when you already have a configured
-    builder, or :meth:`from_compound` for one-shot construction.
+    Optional DB registration is delegated to fragment_tree.db.
+    The builder does not know SQLite table details.
     """
 
-    def __init__(
-        self,
-        max_depth: int,
-        cleavage_pattern_set: CleavagePatternSet,
-        *,
-        only_add_min_depth: bool = True,
-        min_depth_only_from: int = 0,
-    ):
-        """Create a fragment tree builder.
+    max_depth: int
+    cleavage_pattern_set: CleavagePatternSet
+    only_add_min_depth: bool = True
+    min_depth_only_from: int = 0
 
-        Parameters
-        ----------
-        max_depth : int
-            Maximum number of recursive cleavage rounds from the root compound.
-        cleavage_pattern_set : CleavagePatternSet
-            Cleavage patterns used to generate fragment products.
-        only_add_min_depth : bool, optional
-            If ``True``, suppress additional edges to nodes that were already
-            discovered at a shallower depth after ``min_depth_only_from``.
-        min_depth_only_from : int, optional
-            Depth threshold used with ``only_add_min_depth``.
-        """
-        assert isinstance(max_depth, int) and max_depth > 0, "max_depth must be a positive integer."
-        assert isinstance(cleavage_pattern_set, CleavagePatternSet), "cleavage_pattern_set must be an instance of CleavagePatternSet."
-        assert isinstance(only_add_min_depth, bool), "only_add_min_depth must be a boolean."
-        assert isinstance(min_depth_only_from, int) and min_depth_only_from >= 0, "min_depth_only_from must be a non-negative integer."
+    def __post_init__(self) -> None:
+        if not isinstance(self.max_depth, int) or self.max_depth <= 0:
+            raise ValueError("max_depth must be a positive integer.")
 
-        self._max_depth = max_depth
-        self._cleavage_pattern_set = cleavage_pattern_set
-        self._only_add_min_depth = only_add_min_depth
-        self._min_depth_only_from = min_depth_only_from
+        if not isinstance(self.cleavage_pattern_set, CleavagePatternSet):
+            raise TypeError(
+                "cleavage_pattern_set must be a CleavagePatternSet."
+            )
+
+        if not isinstance(self.only_add_min_depth, bool):
+            raise TypeError("only_add_min_depth must be a bool.")
+
+        if (
+            not isinstance(self.min_depth_only_from, int)
+            or self.min_depth_only_from < 0
+        ):
+            raise ValueError(
+                "min_depth_only_from must be a non-negative integer."
+            )
 
     @property
-    def cleavage_patterns(self) -> Tuple[_CleavagePattern, ...]:
-        """Cleavage patterns used by this builder in stable ID order."""
-        return self._cleavage_pattern_set.patterns
+    def cleavage_patterns(self) -> tuple[_CleavagePattern, ...]:
+        return self.cleavage_pattern_set.patterns
 
     @property
     def name(self) -> str:
-        """Human-readable name of the underlying cleavage pattern set."""
-        return self._cleavage_pattern_set.name
-
-    def to_dict(self) -> Dict[str, object]:
-        """Serialize this builder configuration to a dictionary."""
-        return {
-            "max_depth": self._max_depth,
-            "cleavage_pattern_set": self._cleavage_pattern_set.to_dict(),
-            "only_add_min_depth": self._only_add_min_depth,
-            "min_depth_only_from": self._min_depth_only_from,
-        }
-
-    @classmethod
-    def from_dict(cls, data: Dict[str, object]) -> "FragmentTreeBuilder":
-        """Create a builder from a serialized configuration dictionary."""
-        max_depth = int(data.get("max_depth", 1))
-        cleavage_pattern_set = CleavagePatternSet.from_dict(
-            data.get("cleavage_pattern_set", {})
-        )
-        only_add_min_depth = bool(data.get("only_add_min_depth", True))
-        min_depth_only_from = int(data.get("min_depth_only_from", 0))
-        return cls(
-            max_depth=max_depth,
-            cleavage_pattern_set=cleavage_pattern_set,
-            only_add_min_depth=only_add_min_depth,
-            min_depth_only_from=min_depth_only_from,
-        )
-
-    def to_yaml(self, path: str) -> None:
-        """Save this builder configuration to a YAML file.
-
-        Parameters
-        ----------
-        path : str
-            Output YAML path. Parent directories are created when needed.
-        """
-        dir_name = os.path.dirname(path)
-        if dir_name:
-            os.makedirs(dir_name, exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            yaml.safe_dump(
-                self.to_dict(),
-                f,
-                allow_unicode=True,
-                sort_keys=False,
-                indent=2,
-            )
-
-    @classmethod
-    def from_yaml(cls, path: str) -> "FragmentTreeBuilder":
-        """Load a builder configuration from a YAML file."""
-        with open(path, "r", encoding="utf-8") as f:
-            data = yaml.safe_load(f)
-        return cls.from_dict(data)
-
-    @staticmethod
-    def from_compound(
-        compound: Compound,
-        cleavage_pattern_set: CleavagePatternSet,
-        max_depth: int,
-        *,
-        only_add_min_depth: bool = True,
-        min_depth_only_from: int = 0,
-        max_node: int = -1,
-        max_edge: int = -1,
-        print_info: bool = False,
-    ) -> FragmentTree:
-        """Build a fragment tree without explicitly creating a builder.
-
-        Parameters
-        ----------
-        compound : Compound
-            Root molecule used as the starting point of the fragmentation tree.
-        cleavage_pattern_set : CleavagePatternSet
-            Cleavage patterns to apply recursively.
-        max_depth : int
-            Maximum number of recursive cleavage rounds.
-        only_add_min_depth : bool, optional
-            Whether to suppress deeper duplicate edges after the configured
-            threshold.
-        min_depth_only_from : int, optional
-            Depth threshold used with ``only_add_min_depth``.
-        max_node : int, optional
-            Maximum number of nodes to keep. Use ``-1`` for no limit.
-        max_edge : int, optional
-            Maximum number of edges to keep. Use ``-1`` for no limit.
-        print_info : bool, optional
-            If ``True``, print progress after each depth.
-
-        Returns
-        -------
-        FragmentTree
-            Fragmentation tree generated from ``compound``.
-        """
-        builder = FragmentTreeBuilder(
-            max_depth=max_depth,
-            cleavage_pattern_set=cleavage_pattern_set,
-            only_add_min_depth=only_add_min_depth,
-            min_depth_only_from=min_depth_only_from,
-        )
-        return builder.build(
-            compound=compound,
-            max_node=max_node,
-            max_edge=max_edge,
-            print_info=print_info,
-        )
+        return self.cleavage_pattern_set.name
 
     def cleave_by_pattern(
         self,
         compound: Compound,
         cleavage_pattern: _CleavagePattern,
-    ) -> CleavageResult | None:
-        """Apply one cleavage pattern to a compound."""
-        assert isinstance(compound, Compound)
-        assert isinstance(cleavage_pattern, _CleavagePattern)
+    ) -> _CleavageResult | None:
+        if not isinstance(compound, Compound):
+            raise TypeError("compound must be a Compound.")
+
+        if not isinstance(cleavage_pattern, _CleavagePattern):
+            raise TypeError("cleavage_pattern must be a _CleavagePattern.")
 
         result = cleavage_pattern.fragment(compound)
 
@@ -197,8 +85,9 @@ class FragmentTreeBuilder:
         compound: Compound,
         cleavage_pattern_id: int,
     ) -> CleavageResult | None:
-        """Apply one cleavage pattern selected by pattern id."""
-        cleavage_pattern = self._cleavage_pattern_set.patterns[cleavage_pattern_id]
+        cleavage_pattern = self.cleavage_pattern_set.patterns[
+            cleavage_pattern_id
+        ]
 
         return self.cleave_by_pattern(
             compound=compound,
@@ -208,31 +97,19 @@ class FragmentTreeBuilder:
     def cleave_all(
         self,
         compound: Compound,
-    ) -> Tuple[CleavageResult, ...]:
-        """Apply all matching cleavage patterns to a compound.
+    ) -> tuple[CleavageResult, ...]:
+        results: list[CleavageResult] = []
 
-        Parameters
-        ----------
-        compound : Compound
-            Molecule to cleave.
-
-        Returns
-        -------
-        tuple of CleavageResult
-            Non-empty cleavage results in stable pattern ID order.
-        """
-        fragment_group: list[CleavageResult] = []
-
-        for cleavage_pattern in self._cleavage_pattern_set.patterns:
-            fragment_result = self.cleave_by_pattern(
+        for cleavage_pattern in self.cleavage_pattern_set.patterns:
+            result = self.cleave_by_pattern(
                 compound=compound,
                 cleavage_pattern=cleavage_pattern,
             )
 
-            if fragment_result is not None:
-                fragment_group.append(fragment_result)
+            if result is not None:
+                results.append(result)
 
-        return tuple(fragment_group)
+        return tuple(results)
 
     def build(
         self,
@@ -242,137 +119,107 @@ class FragmentTreeBuilder:
         max_edge: int = -1,
         print_info: bool = False,
     ) -> FragmentTree:
-        """Build a :class:`FragmentTree` from a root compound.
+        if not isinstance(compound, Compound):
+            raise TypeError("compound must be a Compound.")
 
-        Parameters
-        ----------
-        compound : Compound
-            Root molecule used as the starting point of the fragmentation tree.
-        max_node : int, optional
-            Maximum number of nodes to keep. Use ``-1`` for no limit.
-        max_edge : int, optional
-            Maximum number of edges to keep. Use ``-1`` for no limit.
-        print_info : bool, optional
-            If ``True``, print progress after each depth.
+        if not isinstance(max_node, int) or not (
+            max_node == -1 or max_node > 0
+        ):
+            raise ValueError("max_node must be -1 or a positive integer.")
 
-        Returns
-        -------
-        FragmentTree
-            Fragmentation tree whose root node is ``compound``.
-
-        Raises
-        ------
-        """
-        assert isinstance(compound, Compound)
-        assert isinstance(max_node, int) and (max_node == -1 or max_node > 0)
-        assert isinstance(max_edge, int) and max_edge >= -1
+        if not isinstance(max_edge, int) or max_edge < -1:
+            raise ValueError("max_edge must be -1 or a non-negative integer.")
 
         start_time = time.time()
-
         root_compound = compound.copy()
 
-        state = FragmentTreeBuildState(
+        state = _FragmentTreeBuildState(
             root_smiles=root_compound.smiles,
             max_node=max_node,
             max_edge=max_edge,
-            only_add_min_depth=self._only_add_min_depth,
-            min_depth_only_from=self._min_depth_only_from,
+            only_add_min_depth=self.only_add_min_depth,
+            min_depth_only_from=self.min_depth_only_from,
         )
 
-        for depth in range(1, self._max_depth + 1):
-            if len(state.next_node_ids) == 0:
+        for depth in range(1, self.max_depth + 1):
+            if not state.next_node_indices:
                 break
 
-            new_node_ids: set[int] = set()
+            new_node_indices: set[int] = set()
 
-            for node_id in sorted(state.next_node_ids):
-                source_smiles = state.get_node_smiles(node_id)
+            for source_index in sorted(state.next_node_indices):
+                source_smiles = state.get_node_smiles(source_index)
                 source_compound = Compound.from_smiles(source_smiles)
 
-                frag_group = self.cleave_all(source_compound)
+                cleavage_results = self.cleave_all(source_compound)
 
-                for frag_result in frag_group:
-                    cleavage_id = self._cleavage_pattern_set.get_id(
-                        frag_result.cleavage
-                    )
+                for cleavage_result in cleavage_results:
+                    cleavage_pattern_id = cleavage_result.pattern_id
 
-                    for frag_product in frag_result.products:
-                        target_exists = state.node_exists(frag_product.smiles)
+                    for cleavage_product in cleavage_result.products:
+                        reaction_id = state.create_reaction_id()
 
-                        if (
-                            not target_exists
-                            and (
-                                not state.can_add_node()
-                                or not state.can_add_edge()
+                        for product_molecule in cleavage_product.product_molecules:
+                            target_exists = state.node_exists(product_molecule.smiles)
+
+                            if (
+                                not target_exists
+                                and (
+                                    not state.can_add_node()
+                                    or not state.can_add_edge()
+                                )
+                            ):
+                                continue
+
+                            target_index = state.get_or_create_node_index(
+                                smiles=product_molecule.smiles,
+                                depth=depth,
                             )
-                        ):
-                            continue
 
-                        target_node_id = state.get_or_create_node_id(
-                            smiles=frag_product.smiles,
-                            depth=depth,
-                        )
+                            if target_index is None:
+                                continue
 
-                        if target_node_id is None:
-                            continue
+                            edge_index = state.add_fragment_edge(
+                                source_index=source_index,
+                                target_index=target_index,
+                                cleavage_pattern_id=cleavage_pattern_id,
+                                reaction_id=reaction_id,
+                                product_molecule_id=product_molecule.id,
+                                reactant_indices=cleavage_product.reactant_indices,
+                                product_indices=product_molecule.product_indices,
+                                depth=depth,
+                            )
 
-                        edge_id = state.add_fragment_edge(
-                            source_node_id=node_id,
-                            target_node_id=target_node_id,
-                            cleavage_pattern_id=cleavage_id,
-                            react_indices=frag_product.reactant_indices,
-                            prod_indices=frag_product.product_indices,
-                            depth=depth,
-                        )
+                            if edge_index is not None:
+                                new_node_indices.add(target_index)
 
-                        if edge_id is not None:
-                            new_node_ids.add(target_node_id)
+                state.mark_processed(source_index)
 
-                state.mark_processed(node_id)
-
-            state.move_to_next_depth(new_node_ids)
+            state.move_to_next_depth(new_node_indices)
 
             if print_info:
                 elapsed = time.time() - start_time
                 print(
                     f"Depth {depth} completed. "
-                    f"New nodes: {len(new_node_ids)}. "
+                    f"New nodes: {len(new_node_indices)}. "
                     f"Total nodes: {len(state.nodes)}. "
+                    f"Total edges: {len(state.edges)}. "
                     f"Time elapsed: {elapsed:.2f} seconds."
                 )
 
         return state.to_fragment_tree()
 
-    def create_fragment_tree(
-        self,
-        compound: Compound,
-        max_node: int = -1,
-        max_edge: int = -1,
-        print_info: bool = False,
-    ) -> FragmentTree:
-        """Build a fragment tree.
-
-        This method is kept as a compatibility alias for :meth:`build`.
-        """
-        return self.build(
-            compound=compound,
-            max_node=max_node,
-            max_edge=max_edge,
-            print_info=print_info,
-        )
-
-
-    def copy(self) -> "FragmentTreeBuilder":
-        """Create a copy of this builder configuration."""
+    def copy(self) -> FragmentTreeBuilder:
         return FragmentTreeBuilder(
-            max_depth=self._max_depth,
-            cleavage_pattern_set=self._cleavage_pattern_set.copy(),
-            only_add_min_depth=self._only_add_min_depth,
-            min_depth_only_from=self._min_depth_only_from,
+            max_depth=self.max_depth,
+            cleavage_pattern_set=self.cleavage_pattern_set.copy(),
+            only_add_min_depth=self.only_add_min_depth,
+            min_depth_only_from=self.min_depth_only_from,
         )
 
-class FragmentTreeBuildState:
-    """Temporary state for building a FragmentTree."""
+
+class _FragmentTreeBuildState:
+    """Mutable build state used only by FragmentTreeBuilder."""
 
     def __init__(
         self,
@@ -382,7 +229,8 @@ class FragmentTreeBuildState:
         max_edge: int = -1,
         only_add_min_depth: bool = True,
         min_depth_only_from: int = 0,
-        create_node_id_func: Callable[[str, int], int] = None,
+        create_node_id_func: Callable[[str, int, int], int] | None = None,
+        create_edge_id_func: Callable[[int, int, int], int] | None = None,
     ) -> None:
         self.root_smiles = root_smiles
         self.max_node = max_node
@@ -390,27 +238,38 @@ class FragmentTreeBuildState:
         self.only_add_min_depth = only_add_min_depth
         self.min_depth_only_from = min_depth_only_from
 
-        self.nodes: Dict[int, FragmentNode] = {}
-        self.edges: Dict[Tuple[int, int], FragmentEdge] = {}
-        self.smi_to_node_id: Dict[str, int] = {}
-        self.processed_node_ids: set[int] = set()
-        self.node_depths: Dict[int, int] = {}
+        self.nodes: dict[int, FragmentNode] = {}
+        self.edges: dict[tuple[int, int], FragmentEdge] = {}
 
-        if create_node_id_func:
-            self.create_node_id_func = create_node_id_func
-        else:
-            self.create_node_id_func = lambda smiles, depth: len(self.nodes)
+        self.smiles_to_node_index: dict[str, int] = {}
+        self.processed_node_indices: set[int] = set()
+        self.node_depths: dict[int, int] = {}
 
-        root_node_id = self.get_or_create_node_id(
+        self._next_reaction_id = 0
+        self._next_event_id = 0
+
+        self.create_node_id_func = (
+            create_node_id_func
+            if create_node_id_func is not None
+            else lambda smiles, depth, index: index
+        )
+
+        self.create_edge_id_func = (
+            create_edge_id_func
+            if create_edge_id_func is not None
+            else lambda source_index, target_index, index: index
+        )
+
+        root_index = self.get_or_create_node_index(
             smiles=root_smiles,
             depth=0,
         )
 
-        if root_node_id is None:
+        if root_index is None:
             raise ValueError("max_node must allow at least the root node.")
 
-        self.root_node_id = root_node_id
-        self.next_node_ids: set[int] = {root_node_id}
+        self.root_index = root_index
+        self.next_node_indices: set[int] = {root_index}
 
     def can_add_node(self) -> bool:
         return self.max_node < 0 or len(self.nodes) < self.max_node
@@ -418,127 +277,155 @@ class FragmentTreeBuildState:
     def can_add_edge(self) -> bool:
         return self.max_edge < 0 or len(self.edges) < self.max_edge
 
-    def get_or_create_node_id(
+    def create_reaction_id(self) -> int:
+        reaction_id = self._next_reaction_id
+        self._next_reaction_id += 1
+        return reaction_id
+
+    def create_event_id(self) -> int:
+        event_id = self._next_event_id
+        self._next_event_id += 1
+        return event_id
+
+    def node_exists(self, smiles: str) -> bool:
+        return smiles in self.smiles_to_node_index
+
+    def get_node_smiles(self, node_index: int) -> str:
+        return self.nodes[node_index].smiles
+
+    def get_or_create_node_index(
         self,
         smiles: str,
         depth: int,
-    ) -> Optional[int]:
-        if smiles in self.smi_to_node_id:
-            return self.smi_to_node_id[smiles]
+    ) -> int | None:
+        if smiles in self.smiles_to_node_index:
+            return self.smiles_to_node_index[smiles]
 
         if not self.can_add_node():
             return None
 
-        node_id = self.create_node_id_func(smiles, depth)
+        node_index = len(self.nodes)
 
-        self.nodes[node_id] = FragmentNode(
+        node_id = self.create_node_id_func(
+            smiles,
+            depth,
+            node_index,
+        )
+
+        self.nodes[node_index] = FragmentNode(
+            index=node_index,
             id=node_id,
             smiles=smiles,
         )
-        self.smi_to_node_id[smiles] = node_id
-        self.node_depths[node_id] = depth
 
-        return node_id
+        self.smiles_to_node_index[smiles] = node_index
+        self.node_depths[node_index] = depth
 
-    def node_exists(
-        self,
-        smiles: str,
-    ) -> bool:
-        return smiles in self.smi_to_node_id
-
-    def get_node_smiles(
-        self,
-        node_id: int,
-    ) -> str:
-        return self.nodes[node_id].smiles
+        return node_index
 
     def should_skip_edge(
         self,
-        target_node_id: int,
+        target_index: int,
         depth: int,
     ) -> bool:
         return (
             self.only_add_min_depth
             and depth > self.min_depth_only_from + 1
-            and depth > self.node_depths[target_node_id]
+            and depth > self.node_depths[target_index]
         )
 
     def add_fragment_edge(
         self,
-        source_node_id: int,
-        target_node_id: int,
+        source_index: int,
+        target_index: int,
         cleavage_pattern_id: int,
-        react_indices: Tuple[int, ...],
-        prod_indices: Tuple[int, ...],
+        reaction_id: int,
+        product_molecule_id: int,
+        reactant_indices: tuple[int, ...],
+        product_indices: tuple[int, ...],
         depth: int,
-    ) -> Optional[int]:
+    ) -> int | None:
         if self.should_skip_edge(
-            target_node_id=target_node_id,
+            target_index=target_index,
             depth=depth,
         ):
             return None
 
-        edge_key = (source_node_id, target_node_id)
+        edge_key = (source_index, target_index)
+        reaction_id = self.create_reaction_id()
 
         if edge_key in self.edges:
             edge = self.edges[edge_key]
-            event_id = len(edge.events)
 
-            self.edges[edge_key] = edge.with_event(
-                CleavageEvent(
-                    event_id=event_id,
-                    cleavage_pattern_id=cleavage_pattern_id,
-                    react_indices=react_indices,
-                    prod_indices=prod_indices,
-                )
+            event = CleavageEvent(
+                index=len(edge.events),
+                cleavage_pattern_id=cleavage_pattern_id,
+                reaction_id=reaction_id,
+                product_molecule_id=product_molecule_id,
+                event_id=self.create_event_id(),
+                reactant_indices=reactant_indices,
+                product_indices=product_indices,
             )
 
-            return edge.id
+            self.edges[edge_key] = edge.with_event(event)
+
+            return edge.index
 
         if not self.can_add_edge():
             return None
 
-        edge_id = len(self.edges)
+        edge_index = len(self.edges)
 
-        self.edges[edge_key] = FragmentEdge(
-            id=edge_id,
-            source_id=source_node_id,
-            target_id=target_node_id,
-            events=(
-                CleavageEvent(
-                    event_id=0,
-                    cleavage_pattern_id=cleavage_pattern_id,
-                    react_indices=react_indices,
-                    prod_indices=prod_indices,
-                ),
-            ),
+        edge_id = self.create_edge_id_func(
+            source_index,
+            target_index,
+            edge_index,
         )
 
-        return edge_id
+        event = CleavageEvent(
+            index=0,
+            cleavage_pattern_id=cleavage_pattern_id,
+            reaction_id=reaction_id,
+            product_molecule_id=0,
+            event_id=self.create_event_id(),
+            reactant_indices=reactant_indices,
+            product_indices=product_indices,
+        )
 
-    def mark_processed(
-        self,
-        node_id: int,
-    ) -> None:
-        self.processed_node_ids.add(node_id)
+        self.edges[edge_key] = FragmentEdge(
+            index=edge_index,
+            id=edge_id,
+            source_index=source_index,
+            target_index=target_index,
+            source_id=self.nodes[source_index].id,
+            target_id=self.nodes[target_index].id,
+            events=(event,),
+        )
+
+        return edge_index
+
+    def mark_processed(self, node_index: int) -> None:
+        self.processed_node_indices.add(node_index)
 
     def move_to_next_depth(
         self,
-        new_node_ids: set[int],
+        new_node_indices: set[int],
     ) -> None:
-        self.next_node_ids = new_node_ids - self.processed_node_ids
+        self.next_node_indices = (
+            new_node_indices - self.processed_node_indices
+        )
 
     def to_fragment_tree(self) -> FragmentTree:
         return FragmentTree.from_nodes_and_edges(
             smiles=self.root_smiles,
             nodes=tuple(
-                self.nodes[node_id]
-                for node_id in sorted(self.nodes)
+                self.nodes[node_index]
+                for node_index in sorted(self.nodes)
             ),
             edges=tuple(
                 sorted(
                     self.edges.values(),
-                    key=lambda edge: edge.id,
+                    key=lambda edge: edge.index,
                 )
             ),
         )

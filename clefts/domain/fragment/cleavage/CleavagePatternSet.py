@@ -251,3 +251,10 @@ class CleavagePatternSet:
                 for pattern in self.patterns
             ],
         }
+    
+    def copy(self) -> CleavagePatternSet:
+        """Return a copy of this pattern set."""
+        return CleavagePatternSet(
+            name=self.name,
+            patterns=tuple(pattern.copy() for pattern in self.patterns),
+        )

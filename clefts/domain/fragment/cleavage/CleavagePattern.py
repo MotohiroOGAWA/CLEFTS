@@ -454,6 +454,20 @@ class _CleavagePattern:
 
         return f"{self.reactant_smarts}>>{product_smarts_key}"
 
+    def copy(self) -> _CleavagePattern:
+        """Return a copy of this cleavage pattern."""
+        return _CleavagePattern.from_rules(
+            reactant_smarts=self.reactant_smarts,
+            products=tuple(
+                ProductRule(
+                    name=cleavage_reaction.source_rule.name,
+                    smarts=cleavage_reaction.source_rule.smarts,
+                )
+                for cleavage_reaction in self.cleavage_reactions
+            ),
+            name=self.name,
+        )
+
 if __name__ == "__main__":
     reactant_smarts = "[#8:1]=[#6:2]1:[#6:3]:[#6:4](-[#6:5]2:[#6:6]:[#6:7]:[#6:8](-[#8:9]):[#6:10]:[#6:11]:2):[#8:12]:[#6:13]2:[#6:14]:[#6:15](-[#8:16]):[#6:17]:[#6:18](-[#8:19]):[#6:20]:1:2"
     a_side_product_smarts  = "[#8:12]-[#6:13]1:[#6:14]:[#6:15](-[#8:16]):[#6:17]:[#6:18](-[#8:19]):[#6:20]:1"
