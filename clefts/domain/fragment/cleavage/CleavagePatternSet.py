@@ -24,9 +24,8 @@ class CleavagePattern(_CleavagePattern):
             pattern_id=pattern_id,
             name=base.name,
             reactant_smarts=base.reactant_smarts,
-            products=base.products,
             reactant_query=base.reactant_query,
-            compiled_products=base.compiled_products,
+            cleavage_reactions=base.cleavage_reactions,
         )
 
     def fragment(

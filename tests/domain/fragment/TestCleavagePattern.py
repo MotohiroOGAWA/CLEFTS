@@ -115,12 +115,12 @@ class TestCleavagePattern(unittest.TestCase):
         )
 
         self.assertEqual(
-            len(cleavage_product.cleaved_molecules),
+            len(cleavage_product.product_molecules),
             len(product_smarts_symbols_list),
         )
 
         for molecule, product_smarts_symbols in zip(
-            cleavage_product.cleaved_molecules,
+            cleavage_product.product_molecules,
             product_smarts_symbols_list,
         ):
             product_smiles_symbols = self.get_atom_symbols_from_smiles(
@@ -211,7 +211,7 @@ class TestCleavagePattern(unittest.TestCase):
                 )
 
                 cleavage_product = result.products[0]
-                molecule = cleavage_product.cleaved_molecules[0]
+                molecule = cleavage_product.product_molecules[0]
 
                 self.assertEqual(
                     molecule.smiles,
@@ -246,11 +246,11 @@ class TestCleavagePattern(unittest.TestCase):
         cleavage_product = result.products[0]
 
         self.assertEqual(cleavage_product.rule_name, "split ether")
-        self.assertEqual(len(cleavage_product.cleaved_molecules), 2)
+        self.assertEqual(len(cleavage_product.product_molecules), 2)
 
         product_smiles = {
             molecule.smiles
-            for molecule in cleavage_product.cleaved_molecules
+            for molecule in cleavage_product.product_molecules
         }
 
         self.assertIn("CCC", product_smiles)
@@ -307,7 +307,7 @@ class TestCleavagePattern(unittest.TestCase):
 
         self.assertTrue(
             any(
-                len(cleavage_product.cleaved_molecules) == 2
+                len(cleavage_product.product_molecules) == 2
                 for cleavage_product in multi_product_results
             )
         )
@@ -318,9 +318,9 @@ class TestCleavagePattern(unittest.TestCase):
                 all(index >= 0 for index in cleavage_product.reactant_indices)
             )
 
-            self.assertGreater(len(cleavage_product.cleaved_molecules), 0)
+            self.assertGreater(len(cleavage_product.product_molecules), 0)
 
-            for molecule in cleavage_product.cleaved_molecules:
+            for molecule in cleavage_product.product_molecules:
                 self.assertTrue(molecule.smiles)
                 self.assertGreater(len(molecule.product_indices), 0)
                 self.assertTrue(
@@ -345,7 +345,7 @@ class TestCleavagePattern(unittest.TestCase):
         )
 
         self.assertEqual(len(pattern.products), 2)
-        self.assertEqual(len(pattern.compiled_products), 2)
+        self.assertEqual(len(pattern.cleavage_reactions), 2)
 
         self.assertEqual(pattern.products[0].name, "rule_1")
         self.assertEqual(pattern.products[0].smarts, "[C:1]")
