@@ -4,8 +4,8 @@ from dataclasses import dataclass
 from typing import Any
 
 from ....libs.mmkit.mmkit import Compound
-from ..fragment_tree.FragmentTreeBuilder import FragmentTreeBuilder
-from ..fragment_tree.FragmentTree import FragmentTree
+from ..tree.FragmentTreeBuilder import FragmentTreeBuilder
+from ..tree.FragmentTree import FragmentTree
 from .FragmentIonTree import FragmentIonTree
 from .FragmentIonAdductRuleSet import FragmentIonAdductRuleSet
 from ._private._FragmentIonStateStore import _FragmentIonStateStore

@@ -4,10 +4,10 @@ import unittest
 
 import numpy as np
 
-from clefts.domain.fragment.fragment_tree.FragmentNode import FragmentNode
-from clefts.domain.fragment.fragment_tree.FragmentTree import FragmentTree
-from clefts.domain.fragment.fragment_ion_tree.FragmentIonTree import FragmentIonTree
-from clefts.domain.fragment.fragment_ion_tree.FragmentIonAdductRuleSet import (
+from clefts.domain.fragment.tree.FragmentNode import FragmentNode
+from clefts.domain.fragment.tree.FragmentTree import FragmentTree
+from clefts.domain.fragment.ion_tree.FragmentIonTree import FragmentIonTree
+from clefts.domain.fragment.ion_tree.FragmentIonAdductRuleSet import (
     FragmentIonAdductRuleSet,
 )
 

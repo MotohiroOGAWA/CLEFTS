@@ -4,10 +4,10 @@ import unittest
 
 from clefts.libs.mmkit.mmkit import Compound
 
-from clefts.domain.fragment.fragment_ion_tree.FragmentIonTree import (
+from clefts.domain.fragment.ion_tree.FragmentIonTree import (
     FragmentIonTree,
 )
-from clefts.domain.fragment.fragment_ion_tree.FragmentIonTreeBuilder import (
+from clefts.domain.fragment.ion_tree.FragmentIonTreeBuilder import (
     FragmentIonTreeBuilder,
 )
 

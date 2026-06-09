@@ -8,7 +8,7 @@ import numpy as np
 
 from ....libs.mmkit.mmkit import Adduct, Compound
 
-from ..fragment_tree.FragmentTree import FragmentTree
+from ..tree.FragmentTree import FragmentTree
 from .FragmentIonAdductRule import FragmentIonAdductRule
 from ._private._FragmentIonStateStore import _FragmentIonStateStore
 from ._private._FragmentIonShiftStore import _FragmentIonShiftStore

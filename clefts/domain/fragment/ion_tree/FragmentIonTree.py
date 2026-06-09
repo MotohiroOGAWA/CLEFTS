@@ -5,7 +5,7 @@ from typing import Tuple
 
 import numpy as np
 
-from ..fragment_tree.FragmentTree import FragmentTree
+from ..tree.FragmentTree import FragmentTree
 from .IonShiftRule import IonShiftRule
 from .FragmentIonAdductRule import FragmentIonAdductRule
 from .FragmentIonAdductRuleSet import FragmentIonAdductRuleSet
