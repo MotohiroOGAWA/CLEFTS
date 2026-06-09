@@ -74,6 +74,22 @@ class FragmentIonTreeBuilder(FragmentTreeBuilder):
             ion_shift_store=ion_shift_store,
         )
 
+    def build_fragment_tree(
+        self,
+        compound: Compound,
+        *,
+        max_node: int = -1,
+        max_edge: int = -1,
+        print_info: bool = False,
+    ) -> FragmentTree:
+        """Build FragmentTree by calling FragmentTreeBuilder.build()."""
+        return super().build(
+            compound,
+            max_node=max_node,
+            max_edge=max_edge,
+            print_info=print_info,
+        )
+
     def _build_ion_state_store(
         self,
         *,
@@ -94,6 +110,29 @@ class FragmentIonTreeBuilder(FragmentTreeBuilder):
         return self.fragment_ion_adduct_rule_set.build_ion_shift_store(
             fragment_tree,
             fragment_compound_by_index=fragment_compound_by_index,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            **super().to_dict(),
+            "fragment_ion_adduct_rule_set": self.fragment_ion_adduct_rule_set.to_dict(),
+        }
+    
+    @classmethod
+    def from_dict(
+        cls,
+        data: dict[str, Any],
+    ) -> FragmentIonTreeBuilder:
+        return cls(
+            max_depth=data["max_depth"],
+            cleavage_pattern_set=FragmentTreeBuilder._parse_cleavage_pattern_set(
+                data["cleavage_pattern_set"]
+            ),
+            only_add_min_depth=data["only_add_min_depth"],
+            min_depth_only_from=data["min_depth_only_from"],
+            fragment_ion_adduct_rule_set=FragmentIonAdductRuleSet.from_dict(
+                data["fragment_ion_adduct_rule_set"]
+            ),
         )
 
     def copy(self) -> "FragmentIonTreeBuilder":

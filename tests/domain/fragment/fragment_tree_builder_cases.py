@@ -360,5 +360,4 @@ def _make_hydrogen_rearrangement_fragment_ion_adduct_rule_set(
 
     return FragmentIonAdductRuleSet.from_json(
         test_data_dir / "hydrogen_rearrangement_rule_set_pos.json",
-        name="hydrogen_rearrangement_rule_set_pos",
     )

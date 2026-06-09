@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Tuple
 import numpy as np
+import json
 
 from ....libs.mmkit.mmkit import Adduct, Compound
 
@@ -39,9 +39,6 @@ class FragmentIonAdductRuleSet:
         if not isinstance(self.name, str):
             raise TypeError("name must be a string.")
 
-        if not self.name:
-            raise ValueError("name must not be empty.")
-
         if not isinstance(self.adduct_rules, tuple):
             raise TypeError("adduct_rules must be a tuple.")
 
@@ -73,35 +70,16 @@ class FragmentIonAdductRuleSet:
     def from_dict(
         cls,
         data: Dict[str, Any],
-        *,
-        name: str,
     ) -> "FragmentIonAdductRuleSet":
         if not isinstance(data, dict):
             raise TypeError("data must be a dict.")
 
         return cls(
-            name=name,
+            name=data.get("name", ""),
             adduct_rules=tuple(
                 FragmentIonAdductRule.from_dict(rule_data)
                 for rule_data in data.get("adduct_rules", [])
             ),
-        )
-
-    @classmethod
-    def from_json(
-        cls,
-        path: str | Path,
-        *,
-        name: str | None = None,
-    ) -> "FragmentIonAdductRuleSet":
-        path = Path(path)
-
-        with path.open("r", encoding="utf-8") as f:
-            data = json.load(f)
-
-        return cls.from_dict(
-            data,
-            name=name or path.stem,
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -123,6 +101,21 @@ class FragmentIonAdductRuleSet:
                 ensure_ascii=False,
                 indent=2,
             )
+
+    @classmethod
+    def from_json(
+        cls,
+        path: str | Path,
+    ) -> "FragmentIonAdductRuleSet":
+        path = Path(path)
+
+        with path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        return cls.from_dict(
+            data,
+        )
+
 
     @property
     def rules(self) -> Tuple[FragmentIonAdductRule, ...]:

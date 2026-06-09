@@ -236,6 +236,26 @@ class FragmentTreeBuilder:
             "fragment_compound_by_index": fragment_compound_by_index,
         }
         return result
+    
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "max_depth": self.max_depth,
+            "cleavage_pattern_set": self.cleavage_pattern_set.to_dict(),
+            "only_add_min_depth": self.only_add_min_depth,
+            "min_depth_only_from": self.min_depth_only_from,
+        }
+
+    @classmethod
+    def from_dict(
+        cls,
+        data: dict[str, Any],
+    ) -> FragmentTreeBuilder:
+        return cls(
+            max_depth=data["max_depth"],
+            cleavage_pattern_set=CleavagePatternSet.from_dict(data["cleavage_pattern_set"]),
+            only_add_min_depth=bool(data["only_add_min_depth"]),
+            min_depth_only_from=int(data["min_depth_only_from"]),
+        )
 
     def copy(self) -> FragmentTreeBuilder:
         return FragmentTreeBuilder(

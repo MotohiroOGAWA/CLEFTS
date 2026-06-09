@@ -100,7 +100,6 @@ class TestFragmentIonTree(unittest.TestCase):
                     },
                 ],
             },
-            name="positive",
         )
 
     def test_from_fragment_tree_keeps_original_topology(self) -> None:
@@ -392,7 +391,6 @@ class TestFragmentIonTree(unittest.TestCase):
             {
                 "adduct_rules": [],
             },
-            name="empty",
         )
 
         fragment_ion_tree = FragmentIonTree.from_fragment_tree(
@@ -427,7 +425,6 @@ class TestFragmentIonTree(unittest.TestCase):
                     }
                 ],
             },
-            name="empty_shift",
         )
 
         fragment_ion_tree = FragmentIonTree.from_fragment_tree(
@@ -493,7 +490,6 @@ class TestFragmentIonTree(unittest.TestCase):
                     },
                 ],
             },
-            name="multiple_states",
         )
 
         fragment_ion_tree = FragmentIonTree.from_fragment_tree(
@@ -880,7 +876,6 @@ class TestFragmentIonTree(unittest.TestCase):
                     },
                 ],
             },
-            name="negative",
         )
 
         fragment_ion_tree = FragmentIonTree.from_fragment_tree(
