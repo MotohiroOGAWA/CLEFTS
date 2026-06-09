@@ -70,6 +70,8 @@ class FragmentIonTree(FragmentTree):
         fragment_tree: FragmentTree,
         *,
         fragment_ion_adduct_rule_set: FragmentIonAdductRuleSet,
+        ion_state_store: _FragmentIonStateStore | None = None,
+        ion_shift_store: _FragmentIonShiftStore | None = None,
     ) -> "FragmentIonTree":
         """Create FragmentIonTree from FragmentTree and rule set."""
 
@@ -85,17 +87,19 @@ class FragmentIonTree(FragmentTree):
                 "FragmentIonAdductRuleSet."
             )
 
-        ion_state_store = (
-            fragment_ion_adduct_rule_set.build_ion_state_store(
-                fragment_tree
+        if ion_state_store is None:
+            ion_state_store = (
+                fragment_ion_adduct_rule_set.build_ion_state_store(
+                    fragment_tree
+                )
             )
-        )
 
-        ion_shift_store = (
-            fragment_ion_adduct_rule_set.build_ion_shift_store(
-                fragment_tree
+        if ion_shift_store is None:
+            ion_shift_store = (
+                fragment_ion_adduct_rule_set.build_ion_shift_store(
+                    fragment_tree
+                )
             )
-        )
 
         return cls(
             smiles=fragment_tree.smiles,

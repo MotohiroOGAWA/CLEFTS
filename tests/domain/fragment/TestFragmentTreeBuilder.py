@@ -369,8 +369,15 @@ class TestFragmentTreeBuilder(unittest.TestCase):
 
         copied = builder.copy()
 
-        self.assertEqual(copied, builder)
         self.assertIsNot(copied, builder)
+        self.assertEqual(copied.max_depth, builder.max_depth)
+        self.assertEqual(copied.only_add_min_depth, builder.only_add_min_depth)
+        self.assertEqual(copied.min_depth_only_from, builder.min_depth_only_from)
+
+        self.assertIsNot(
+            copied.cleavage_pattern_set,
+            builder.cleavage_pattern_set,
+        )
 
     def _build_tree(
         self,

@@ -4,7 +4,7 @@ import unittest
 
 from clefts.libs.mmkit.mmkit import Compound
 
-from clefts.domain.fragment.cleavage.CleavagePattern import (
+from clefts.domain.fragment.cleavage._CleavagePattern import (
     _CleavagePattern,
     ProductRule,
 )
@@ -233,7 +233,7 @@ class TestCleavagePatternSet(unittest.TestCase):
         self.assertIsInstance(result, CleavageResult)
         self.assertEqual(result.pattern_id, 0)
         self.assertEqual(result.cleavage.pattern_id, 0)
-        self.assertEqual(result.reactant_smiles, compound.smiles)
+        self.assertEqual(result.reactant_compound.smiles, compound.smiles)
         self.assertGreater(len(result.products), 0)
 
     def test_fragment_by_id_returns_none_when_pattern_does_not_match(self) -> None:
@@ -282,7 +282,7 @@ class TestCleavagePatternSet(unittest.TestCase):
         self.assertEqual(len(results), 1)
         self.assertIsInstance(results[0], CleavageResult)
         self.assertIn(results[0].pattern_id, pattern_set.pattern_ids)
-        self.assertEqual(results[0].reactant_smiles, compound.smiles)
+        self.assertEqual(results[0].reactant_compound.smiles, compound.smiles)
         self.assertGreater(len(results[0].products), 0)
 
     def test_identity_does_not_include_name(self) -> None:

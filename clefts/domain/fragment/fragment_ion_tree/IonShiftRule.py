@@ -88,3 +88,10 @@ class IonShiftRule:
             return True
 
         return bool(set(self.atoms) & atom_symbols)
+    
+    def copy(self) -> "IonShiftRule":
+        """Return a deep copy of this IonShiftRule."""
+        return IonShiftRule(
+            ion_shift=self.ion_shift.copy(),
+            atoms=tuple(self.atoms),
+        )

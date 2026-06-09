@@ -213,6 +213,8 @@ class FragmentIonAdductRuleSet:
     def build_ion_state_store(
         self,
         fragment_tree: FragmentTree,
+        *,
+        fragment_compound_by_index: dict[int, Compound] | None = None,
     ) -> _FragmentIonStateStore:
         """Build node-wise unsaturation/radical state store."""
 
@@ -223,8 +225,11 @@ class FragmentIonAdductRuleSet:
         node_state_indptr: list[int] = [0]
 
         for node_index in range(fragment_tree.num_nodes):
-            node = fragment_tree.get_node(node_index)
-            compound = Compound.from_smiles(node.smiles)
+            compound = self._get_fragment_compound(
+                fragment_tree,
+                node_index,
+                fragment_compound_by_index=fragment_compound_by_index,
+            )
 
             node_states: set[tuple[int, int]] = set()
 
@@ -253,6 +258,8 @@ class FragmentIonAdductRuleSet:
     def build_ion_shift_store(
         self,
         fragment_tree: FragmentTree,
+        *,
+        fragment_compound_by_index: dict[int, Compound] | None = None,
     ) -> _FragmentIonShiftStore:
         """Build node-wise IonShiftRule applicability store."""
 
@@ -267,8 +274,11 @@ class FragmentIonAdductRuleSet:
         )
 
         for node_index in range(fragment_tree.num_nodes):
-            node = fragment_tree.get_node(node_index)
-            compound = Compound.from_smiles(node.smiles)
+            compound = self._get_fragment_compound(
+                fragment_tree,
+                node_index,
+                fragment_compound_by_index=fragment_compound_by_index,
+            )
 
             for shift_rule_index, (
                 adduct_rule_index,
@@ -288,6 +298,16 @@ class FragmentIonAdductRuleSet:
         return _FragmentIonShiftStore(
             shift_rule_indices=shift_rule_indices,
             node_shift_rule_mask=node_shift_rule_mask,
+        )
+    
+    def copy(self) -> FragmentIonAdductRuleSet:
+        """Return a deep copy of this FragmentIonAdductRuleSet."""
+        return FragmentIonAdductRuleSet(
+            name=self.name,
+            adduct_rules=tuple(
+                rule.copy()
+                for rule in self.adduct_rules
+            ),
         )
 
     def _build_shift_rule_indices(self) -> np.ndarray:
@@ -333,3 +353,19 @@ class FragmentIonAdductRuleSet:
             "adduct_type must be an Adduct or str. "
             f"Got {type(adduct_type).__name__}."
         )
+
+    def _get_fragment_compound(
+        self,
+        fragment_tree: FragmentTree,
+        node_index: int,
+        *,
+        fragment_compound_by_index: dict[int, Compound] | None = None,
+    ) -> Compound:
+        if fragment_compound_by_index is not None:
+            compound = fragment_compound_by_index.get(node_index)
+
+            if compound is not None:
+                return compound
+
+        node = fragment_tree.get_node(node_index)
+        return Compound.from_smiles(node.smiles)

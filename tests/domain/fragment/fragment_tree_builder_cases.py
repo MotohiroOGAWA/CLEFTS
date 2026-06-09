@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 
-from clefts.domain.fragment.cleavage.CleavagePattern import (
+from clefts.domain.fragment.cleavage._CleavagePattern import (
     ProductRule,
     _CleavagePattern,
 )
@@ -11,6 +12,12 @@ from clefts.domain.fragment.cleavage.CleavagePatternSet import (
 )
 from clefts.domain.fragment.fragment_tree.FragmentTreeBuilder import (
     FragmentTreeBuilder,
+)
+from clefts.domain.fragment.fragment_ion_tree.FragmentIonAdductRuleSet import (
+    FragmentIonAdductRuleSet,
+)
+from clefts.domain.fragment.fragment_ion_tree.FragmentIonTreeBuilder import (
+    FragmentIonTreeBuilder,
 )
 
 
@@ -37,6 +44,16 @@ class FragmentTreeBuilderCase:
     expected_num_edges: int
     expected_min_events: int
 
+    # Optional expectations for FragmentIonTreeBuilder.
+    # Key is fragment SMILES, not node index.
+    expected_ion_states_by_smiles: (
+        dict[str, tuple[tuple[int, int], ...]] | None
+    ) = None
+
+    expected_shift_rule_mask_by_smiles: (
+        dict[str, tuple[bool, ...]] | None
+    ) = None
+
 
 @dataclass(frozen=True)
 class FragmentTreeBuilderQuestion:
@@ -54,6 +71,7 @@ class FragmentTreeBuilderQuestion:
     builder: FragmentTreeBuilder
     cases: tuple[FragmentTreeBuilderCase, ...]
 
+    fragment_ion_adduct_rule_set: FragmentIonAdductRuleSet | None = None
 
 def make_fragment_tree_builder_questions(
 ) -> tuple[FragmentTreeBuilderQuestion, ...]:
@@ -75,6 +93,7 @@ def make_single_bond_cleavage_question(
         only_add_min_depth=True,
         min_depth_only_from=0,
     )
+    fragment_ion_adduct_rule_set = _make_hydrogen_rearrangement_fragment_ion_adduct_rule_set()
 
     cases = (
         FragmentTreeBuilderCase(
@@ -114,6 +133,36 @@ def make_single_bond_cleavage_question(
             expected_num_nodes=5,
             expected_num_edges=4,
             expected_min_events=4,
+
+            expected_ion_states_by_smiles={
+                "CCO": ((2, 1),),
+                "C": ((2, 1),),
+                "CO": ((2, 1),),
+                "CC": ((2, 1),),
+                "O": ((2, 1),),
+            },
+            expected_shift_rule_mask_by_smiles={
+                "CCO": (
+                    True, True, True, True, True,
+                    True, True, True, True, True,
+                ),
+                "C": (
+                    True, False, True, True, False,
+                    True, False, True, False, True,
+                ),
+                "CO": (
+                    True, True, True, True, True,
+                    True, True, True, True, True,
+                ),
+                "CC": (
+                    True, False, True, True, False,
+                    True, False, True, False, True,
+                ),
+                "O": (
+                    False, True, True, False, True,
+                    True, True, False, True, False,
+                ),
+            },
         ),
         FragmentTreeBuilderCase(
             name="1-propanol",
@@ -164,6 +213,46 @@ def make_single_bond_cleavage_question(
             expected_num_nodes=7,
             expected_num_edges=6,
             expected_min_events=6,
+
+            expected_ion_states_by_smiles={
+                "CCCO": ((2, 1),),
+                "C": ((2, 1),),
+                "CCO": ((2, 1),),
+                "CC": ((2, 1),),
+                "CO": ((2, 1),),
+                "CCC": ((2, 1),),
+                "O": ((2, 1),),
+            },
+            expected_shift_rule_mask_by_smiles={
+                "CCCO": (
+                    True, True, True, True, True,
+                    True, True, True, True, True,
+                ),
+                "C": (
+                    True, False, True, True, False,
+                    True, False, True, False, True,
+                ),
+                "CCO": (
+                    True, True, True, True, True,
+                    True, True, True, True, True,
+                ),
+                "CC": (
+                    True, False, True, True, False,
+                    True, False, True, False, True,
+                ),
+                "CO": (
+                    True, True, True, True, True,
+                    True, True, True, True, True,
+                ),
+                "CCC": (
+                    True, False, True, True, False,
+                    True, False, True, False, True,
+                ),
+                "O": (
+                    False, True, True, False, True,
+                    True, True, False, True, False,
+                ),
+            },
         ),
         FragmentTreeBuilderCase(
             name="diethyl_ether",
@@ -202,6 +291,36 @@ def make_single_bond_cleavage_question(
             expected_num_nodes=5,
             expected_num_edges=4,
             expected_min_events=8,
+
+            expected_ion_states_by_smiles={
+                "CCOCC": ((2, 1),),
+                "C": ((2, 1),),
+                "CCOC": ((2, 1),),
+                "CC": ((2, 1),),
+                "CCO": ((2, 1),),
+            },
+            expected_shift_rule_mask_by_smiles={
+                "CCOCC": (
+                    True, True, True, True, True,
+                    True, True, True, True, True,
+                ),
+                "C": (
+                    True, False, True, True, False,
+                    True, False, True, False, True,
+                ),
+                "CCOC": (
+                    True, True, True, True, True,
+                    True, True, True, True, True,
+                ),
+                "CC": (
+                    True, False, True, True, False,
+                    True, False, True, False, True,
+                ),
+                "CCO": (
+                    True, True, True, True, True,
+                    True, True, True, True, True,
+                ),
+            },
         ),
     )
 
@@ -209,6 +328,7 @@ def make_single_bond_cleavage_question(
         name="non_hydrogen_single_bond_cleavage",
         builder=builder,
         cases=cases,
+        fragment_ion_adduct_rule_set=fragment_ion_adduct_rule_set,
     )
 
 def _make_single_bond_cleavage_pattern(
@@ -232,4 +352,13 @@ def _make_single_bond_cleavage_pattern_set(
     return CleavagePatternSet.from_patterns(
         name="single_bond_cleavage_pattern_set",
         patterns=(pattern,),
+    )
+
+def _make_hydrogen_rearrangement_fragment_ion_adduct_rule_set(
+) -> FragmentIonAdductRuleSet:
+    test_data_dir = Path(__file__).parent / "test_data"
+
+    return FragmentIonAdductRuleSet.from_json(
+        test_data_dir / "hydrogen_rearrangement_rule_set_pos.json",
+        name="hydrogen_rearrangement_rule_set_pos",
     )

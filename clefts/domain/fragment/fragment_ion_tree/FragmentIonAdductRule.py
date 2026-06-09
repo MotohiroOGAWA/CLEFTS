@@ -190,6 +190,16 @@ class FragmentIonAdductRule:
 
         return ion_shift_rule.is_applicable_to_atoms(atom_symbols)
 
+    def copy(self) -> FragmentIonAdductRule:
+        return FragmentIonAdductRule(
+            name=self.name,
+            adduct_type=self.adduct_type.copy(),
+            radical=self.radical,
+            unsaturation=self.unsaturation,
+            radical_atoms=tuple(self.radical_atoms),
+            ion_shifts=tuple(ion_shift.copy() for ion_shift in self.ion_shifts),
+        )
+
     @staticmethod
     def _get_atom_symbols(compound: Compound) -> set[str]:
         mol = compound.mol

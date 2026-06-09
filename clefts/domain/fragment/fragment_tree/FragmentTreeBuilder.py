@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from typing import Callable
+from typing import Callable, Any, Dict, Tuple
 
 from ....libs.mmkit.mmkit import Compound
-from ..cleavage.CleavagePattern import _CleavagePattern
+from ..cleavage._CleavagePattern import _CleavagePattern
 from ..cleavage.CleavagePatternSet import CleavagePatternSet, CleavagePattern, CleavageResult
-from ..cleavage.CleavagePattern import _CleavageResult
+from ..cleavage._CleavagePattern import _CleavageResult
 from .CleavageEvent import CleavageEvent
 from .FragmentEdge import FragmentEdge
 from .FragmentNode import FragmentNode
@@ -52,7 +52,7 @@ class FragmentTreeBuilder:
             )
 
     @property
-    def cleavage_patterns(self) -> tuple[_CleavagePattern, ...]:
+    def cleavage_patterns(self) -> Tuple[_CleavagePattern, ...]:
         return self.cleavage_pattern_set.patterns
 
     @property
@@ -119,6 +119,22 @@ class FragmentTreeBuilder:
         max_edge: int = -1,
         print_info: bool = False,
     ) -> FragmentTree:
+        result = self._build_result(
+            compound,
+            max_node=max_node,
+            max_edge=max_edge,
+            print_info=print_info
+        )
+        return result['fragment_tree']
+
+    def _build_result(
+        self,
+        compound: Compound,
+        *,
+        max_node: int = -1,
+        max_edge: int = -1,
+        print_info: bool = False,
+    ) -> dict[str, Any]:
         if not isinstance(compound, Compound):
             raise TypeError("compound must be a Compound.")
 
@@ -131,7 +147,9 @@ class FragmentTreeBuilder:
             raise ValueError("max_edge must be -1 or a non-negative integer.")
 
         start_time = time.time()
+        fragment_compound_by_index: Dict[int, Compound] = {}
         root_compound = compound.copy()
+        fragment_compound_by_index[0] = root_compound
 
         state = _FragmentTreeBuildState(
             root_smiles=root_compound.smiles,
@@ -149,7 +167,11 @@ class FragmentTreeBuilder:
 
             for source_index in sorted(state.next_node_indices):
                 source_smiles = state.get_node_smiles(source_index)
-                source_compound = Compound.from_smiles(source_smiles)
+                if source_index not in fragment_compound_by_index:
+                    source_compound = Compound.from_smiles(source_smiles)
+                    fragment_compound_by_index[source_index] = source_compound
+                else:
+                    source_compound = fragment_compound_by_index[source_index]
 
                 cleavage_results = self.cleave_all(source_compound)
 
@@ -157,10 +179,10 @@ class FragmentTreeBuilder:
                     cleavage_pattern_id = cleavage_result.pattern_id
 
                     for cleavage_product in cleavage_result.products:
-                        reaction_id = state.create_reaction_id()
+                        reaction_id = cleavage_product.id
 
                         for product_molecule in cleavage_product.product_molecules:
-                            target_exists = state.node_exists(product_molecule.smiles)
+                            target_exists = state.node_exists(product_molecule.compound.smiles)
 
                             if (
                                 not target_exists
@@ -172,9 +194,11 @@ class FragmentTreeBuilder:
                                 continue
 
                             target_index = state.get_or_create_node_index(
-                                smiles=product_molecule.smiles,
+                                smiles=product_molecule.compound.smiles,
                                 depth=depth,
                             )
+                            fragment_compound_by_index[target_index] = product_molecule.compound
+
 
                             if target_index is None:
                                 continue
@@ -207,7 +231,11 @@ class FragmentTreeBuilder:
                     f"Time elapsed: {elapsed:.2f} seconds."
                 )
 
-        return state.to_fragment_tree()
+        result = {
+            "fragment_tree": state.to_fragment_tree(),
+            "fragment_compound_by_index": fragment_compound_by_index,
+        }
+        return result
 
     def copy(self) -> FragmentTreeBuilder:
         return FragmentTreeBuilder(
@@ -245,19 +273,16 @@ class _FragmentTreeBuildState:
         self.processed_node_indices: set[int] = set()
         self.node_depths: dict[int, int] = {}
 
-        self._next_reaction_id = 0
-        self._next_event_id = 0
-
         self.create_node_id_func = (
             create_node_id_func
             if create_node_id_func is not None
-            else lambda smiles, depth, index: index
+            else lambda smiles, depth, index: -1
         )
 
         self.create_edge_id_func = (
             create_edge_id_func
             if create_edge_id_func is not None
-            else lambda source_index, target_index, index: index
+            else lambda source_index, target_index, index: -1
         )
 
         root_index = self.get_or_create_node_index(
@@ -276,16 +301,6 @@ class _FragmentTreeBuildState:
 
     def can_add_edge(self) -> bool:
         return self.max_edge < 0 or len(self.edges) < self.max_edge
-
-    def create_reaction_id(self) -> int:
-        reaction_id = self._next_reaction_id
-        self._next_reaction_id += 1
-        return reaction_id
-
-    def create_event_id(self) -> int:
-        event_id = self._next_event_id
-        self._next_event_id += 1
-        return event_id
 
     def node_exists(self, smiles: str) -> bool:
         return smiles in self.smiles_to_node_index
@@ -352,17 +367,28 @@ class _FragmentTreeBuildState:
             return None
 
         edge_key = (source_index, target_index)
-        reaction_id = self.create_reaction_id()
 
         if edge_key in self.edges:
             edge = self.edges[edge_key]
 
-            event = CleavageEvent(
-                index=len(edge.events),
+            event_id = self._find_or_create_local_event_id(
+                edge=edge,
                 cleavage_pattern_id=cleavage_pattern_id,
                 reaction_id=reaction_id,
                 product_molecule_id=product_molecule_id,
-                event_id=self.create_event_id(),
+                reactant_indices=reactant_indices,
+                product_indices=product_indices,
+            )
+
+            if event_id is None:
+                return edge.index
+
+            event = CleavageEvent(
+                index=-1,
+                cleavage_pattern_id=cleavage_pattern_id,
+                reaction_id=reaction_id,
+                product_molecule_id=product_molecule_id,
+                event_id=event_id,
                 reactant_indices=reactant_indices,
                 product_indices=product_indices,
             )
@@ -383,11 +409,11 @@ class _FragmentTreeBuildState:
         )
 
         event = CleavageEvent(
-            index=0,
+            index=-1,
             cleavage_pattern_id=cleavage_pattern_id,
             reaction_id=reaction_id,
-            product_molecule_id=0,
-            event_id=self.create_event_id(),
+            product_molecule_id=product_molecule_id,
+            event_id=0,
             reactant_indices=reactant_indices,
             product_indices=product_indices,
         )
@@ -403,6 +429,48 @@ class _FragmentTreeBuildState:
         )
 
         return edge_index
+
+    def _find_or_create_local_event_id(
+        self,
+        *,
+        edge: FragmentEdge,
+        cleavage_pattern_id: int,
+        reaction_id: int,
+        product_molecule_id: int,
+        reactant_indices: tuple[int, ...],
+        product_indices: tuple[int, ...],
+    ) -> int | None:
+        """Return local event_id for one event group inside an edge.
+
+        Returns
+        -------
+        int | None
+            - Existing event_id if the same event already exists.
+            - New local event_id if the event is new.
+            - None if the exactly same event already exists and should not be added.
+        """
+
+        same_group_events = [
+            event
+            for event in edge.events
+            if (
+                event.cleavage_pattern_id == cleavage_pattern_id
+                and event.reaction_id == reaction_id
+                and event.product_molecule_id == product_molecule_id
+            )
+        ]
+
+        for event in same_group_events:
+            if (
+                event.reactant_indices == reactant_indices
+                and event.product_indices == product_indices
+            ):
+                return None
+
+        if not same_group_events:
+            return 0
+
+        return max(event.event_id for event in same_group_events) + 1
 
     def mark_processed(self, node_index: int) -> None:
         self.processed_node_indices.add(node_index)
