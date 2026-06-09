@@ -6,7 +6,7 @@ from typing import Any
 
 import gradio as gr
 
-from ...domain.fragment.cleavage.CleavagePattern import _CleavagePattern
+from ...domain.fragment.cleavage._CleavagePattern import _CleavagePattern
 from ...domain.fragment.cleavage.CleavagePatternSet import CleavagePatternSet
 from .common.generic_table_input_panel import (
     GenericTableColumn,

@@ -5,7 +5,7 @@ from typing import Iterable, Iterator, Tuple
 
 from clefts.libs.mmkit.mmkit import Compound
 
-from .CleavagePattern import _CleavagePattern, _CleavageResult
+from ._CleavagePattern import _CleavagePattern, _CleavageResult
 
 @dataclass(frozen=True)
 class CleavagePattern(_CleavagePattern):
@@ -47,11 +47,31 @@ class CleavagePattern(_CleavagePattern):
             base=result,
         )
 
+    def copy(self) -> CleavagePattern:
+        """Return a copy of this pattern."""
+        return CleavagePattern.from_base(
+            pattern_id=self.pattern_id,
+            base=super().copy(),
+        )
+
 @dataclass(frozen=True)
 class CleavageResult(_CleavageResult):
     """Public cleavage result with pattern ID."""
 
     pattern_id: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.pattern_id, int):
+            raise TypeError("pattern_id must be an integer")
+
+        if self.pattern_id < 0:
+            raise ValueError("pattern_id must be non-negative")
+        
+        if not isinstance(self.cleavage, CleavagePattern):
+            raise TypeError(
+                "cleavage must be a CleavagePattern. "
+                f"Got {type(self.cleavage).__name__}."
+            )
 
     @classmethod
     def from_base(
@@ -63,8 +83,16 @@ class CleavageResult(_CleavageResult):
         return cls(
             pattern_id=pattern_id,
             cleavage=cleavage,
-            reactant_smiles=base.reactant_smiles,
+            reactant_compound=base.reactant_compound,
             products=base.products,
+        )
+    
+    def copy(self) -> CleavageResult:
+        """Return a copy of this result."""
+        return CleavageResult.from_base(
+            pattern_id=self.pattern_id,
+            cleavage=self.cleavage,
+            base=super().copy(),
         )
 
 @dataclass(frozen=True)
@@ -251,3 +279,10 @@ class CleavagePatternSet:
                 for pattern in self.patterns
             ],
         }
+    
+    def copy(self) -> CleavagePatternSet:
+        """Return a copy of this pattern set."""
+        return CleavagePatternSet(
+            name=self.name,
+            patterns=tuple(pattern.copy() for pattern in self.patterns),
+        )

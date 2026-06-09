@@ -3,7 +3,7 @@ from typing import Dict, Tuple
 
 from rdkit import Chem
 
-from clefts.domain.fragment.cleavage.CleavagePattern import (
+from clefts.domain.fragment.cleavage._CleavagePattern import (
     _CleavagePattern,
     ProductRule,
 )
@@ -124,7 +124,7 @@ class TestCleavagePattern(unittest.TestCase):
             product_smarts_symbols_list,
         ):
             product_smiles_symbols = self.get_atom_symbols_from_smiles(
-                molecule.smiles
+                molecule.compound.smiles
             )
 
             self.assertEqual(
@@ -149,7 +149,7 @@ class TestCleavagePattern(unittest.TestCase):
                         f"actual_index={actual_index}, "
                         f"expected_symbol={expected_symbol}, "
                         f"actual_symbol={actual_symbol}, "
-                        f"molecule_smiles={molecule.smiles}"
+                        f"molecule_smiles={molecule.compound.smiles}"
                     ),
                 )
 
@@ -204,7 +204,7 @@ class TestCleavagePattern(unittest.TestCase):
                 result = pattern.fragment(compound)
 
                 self.assertIsNotNone(result)
-                self.assertEqual(result.reactant_smiles, compound.smiles)
+                self.assertEqual(result.reactant_compound.smiles, compound.smiles)
                 self.assertEqual(
                     len(result.products),
                     case["expected_product_count"],
@@ -214,7 +214,7 @@ class TestCleavagePattern(unittest.TestCase):
                 molecule = cleavage_product.product_molecules[0]
 
                 self.assertEqual(
-                    molecule.smiles,
+                    molecule.compound.smiles,
                     case["expected_first_product_smiles"],
                 )
 
@@ -249,7 +249,7 @@ class TestCleavagePattern(unittest.TestCase):
         self.assertEqual(len(cleavage_product.product_molecules), 2)
 
         product_smiles = {
-            molecule.smiles
+            molecule.compound.smiles
             for molecule in cleavage_product.product_molecules
         }
 
@@ -285,7 +285,7 @@ class TestCleavagePattern(unittest.TestCase):
         result = pattern.fragment(compound)
 
         self.assertIsNotNone(result)
-        self.assertEqual(result.reactant_smiles, compound.smiles)
+        self.assertEqual(result.reactant_compound.smiles, compound.smiles)
         self.assertGreater(len(result.products), 0)
 
         rule_names = {
@@ -321,7 +321,7 @@ class TestCleavagePattern(unittest.TestCase):
             self.assertGreater(len(cleavage_product.product_molecules), 0)
 
             for molecule in cleavage_product.product_molecules:
-                self.assertTrue(molecule.smiles)
+                self.assertTrue(molecule.compound.smiles)
                 self.assertGreater(len(molecule.product_indices), 0)
                 self.assertTrue(
                     all(index >= 0 for index in molecule.product_indices)
