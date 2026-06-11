@@ -210,10 +210,8 @@ class _FragmentHydrogenStateCandidateStore:
         states: list[tuple[int, int]] = []
 
         for current_unsaturation in range(unsaturation_value + 1):
-            states.append((current_unsaturation, 0))
-
-        if radical_value == 1:
-            states.append((unsaturation_value, 1))
+            for current_radical in range(radical_value + 1):
+                states.append((current_unsaturation, current_radical))
 
         return np.asarray(states, dtype=np.int16)
 

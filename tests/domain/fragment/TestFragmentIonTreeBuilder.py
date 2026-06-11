@@ -433,11 +433,11 @@ class TestFragmentIonTreeBuilder(unittest.TestCase):
 
             states: list[tuple[int, int]] = []
 
-            for current_unsaturation in range(unsaturation + 1):
-                states.append((current_unsaturation, 0))
+            max_radical = 1 if radical else 0
 
-            if radical:
-                states.append((unsaturation, 1))
+            for current_unsaturation in range(unsaturation + 1):
+                for current_radical in range(max_radical + 1):
+                    states.append((current_unsaturation, current_radical))
 
             expected[str(rule.adduct_type)] = tuple(states)
 

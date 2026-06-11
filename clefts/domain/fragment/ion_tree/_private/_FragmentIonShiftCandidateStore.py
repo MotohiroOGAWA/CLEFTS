@@ -19,7 +19,7 @@ class _FragmentIonShiftCandidateStore:
     Actual IonShiftRule objects are not duplicated.
 
     adduct_types:
-        Adduct types in adduct-rule order.
+        Main adduct types in adduct-rule order.
 
     adduct_shift_rule_indptr:
         Pointer array from adduct rule index to shift rule range.
@@ -27,6 +27,10 @@ class _FragmentIonShiftCandidateStore:
     shift_rule_indices:
         Shape is (num_shift_rules, 2).
         Columns are [adduct_rule_index, ion_shift_index].
+
+    ion_shift_adduct_types:
+        Ion-shift adduct type for each shift rule.
+        Shape is (num_shift_rules,).
 
     node_shift_rule_mask:
         Shape is (num_nodes, num_shift_rules).
@@ -36,12 +40,18 @@ class _FragmentIonShiftCandidateStore:
     adduct_types: Tuple[Adduct, ...]
     adduct_shift_rule_indptr: np.ndarray
     shift_rule_indices: np.ndarray
+    ion_shift_adduct_types: Tuple[Adduct, ...]
     node_shift_rule_mask: np.ndarray
 
     def __post_init__(self) -> None:
         adduct_types = tuple(
             self._normalize_adduct_type(adduct_type)
             for adduct_type in self.adduct_types
+        )
+
+        ion_shift_adduct_types = tuple(
+            self._normalize_adduct_type(adduct_type)
+            for adduct_type in self.ion_shift_adduct_types
         )
 
         adduct_shift_rule_indptr = np.asarray(
@@ -107,6 +117,11 @@ class _FragmentIonShiftCandidateStore:
                 "the number of shift rules."
             )
 
+        if len(ion_shift_adduct_types) != shift_rule_indices.shape[0]:
+            raise ValueError(
+                "ion_shift_adduct_types must have one value per shift rule."
+            )
+
         if len(adduct_types) == 0 and shift_rule_indices.shape[0] != 0:
             raise ValueError(
                 "shift_rule_indices must be empty when adduct_types is empty."
@@ -145,6 +160,11 @@ class _FragmentIonShiftCandidateStore:
             self,
             "shift_rule_indices",
             shift_rule_indices,
+        )
+        object.__setattr__(
+            self,
+            "ion_shift_adduct_types",
+            ion_shift_adduct_types,
         )
         object.__setattr__(
             self,
@@ -189,6 +209,7 @@ class _FragmentIonShiftCandidateStore:
 
         adduct_types: list[Adduct] = []
         shift_rule_positions: list[tuple[int, int]] = []
+        ion_shift_adduct_types: list[Adduct] = []
         indptr: list[int] = [0]
 
         for adduct_rule_index, adduct_rule in enumerate(
@@ -196,12 +217,13 @@ class _FragmentIonShiftCandidateStore:
         ):
             adduct_types.append(adduct_rule.adduct_type)
 
-            for ion_shift_index, _ion_shift_rule in enumerate(
+            for ion_shift_index, ion_shift_rule in enumerate(
                 adduct_rule.ion_shifts
             ):
                 shift_rule_positions.append(
                     (adduct_rule_index, ion_shift_index)
                 )
+                ion_shift_adduct_types.append(ion_shift_rule.ion_shift)
 
             indptr.append(len(shift_rule_positions))
 
@@ -248,6 +270,7 @@ class _FragmentIonShiftCandidateStore:
             adduct_types=tuple(adduct_types),
             adduct_shift_rule_indptr=np.asarray(indptr, dtype=np.int64),
             shift_rule_indices=shift_rule_indices,
+            ion_shift_adduct_types=tuple(ion_shift_adduct_types),
             node_shift_rule_mask=node_shift_rule_mask,
         )
 
@@ -269,6 +292,7 @@ class _FragmentIonShiftCandidateStore:
             adduct_types=tuple(),
             adduct_shift_rule_indptr=np.zeros(1, dtype=np.int64),
             shift_rule_indices=np.empty((0, 2), dtype=np.int64),
+            ion_shift_adduct_types=tuple(),
             node_shift_rule_mask=np.zeros((num_nodes, 0), dtype=bool),
         )
 
@@ -362,7 +386,7 @@ class _FragmentIonShiftCandidateStore:
         self,
         adduct_rule_index: int,
     ) -> Adduct:
-        """Return adduct type for one adduct_rule_index."""
+        """Return main adduct type for one adduct_rule_index."""
 
         self._validate_adduct_rule_index(adduct_rule_index)
         return self.adduct_types[adduct_rule_index]
@@ -371,10 +395,19 @@ class _FragmentIonShiftCandidateStore:
         self,
         shift_rule_index: int,
     ) -> Adduct:
-        """Return adduct type for one shift_rule_index."""
+        """Return main adduct type for one shift_rule_index."""
 
         adduct_rule_index = self.get_adduct_rule_index(shift_rule_index)
         return self.adduct_types[adduct_rule_index]
+
+    def get_ion_shift_adduct_type(
+        self,
+        shift_rule_index: int,
+    ) -> Adduct:
+        """Return ion-shift adduct type for one shift_rule_index."""
+
+        self._validate_shift_rule_index(shift_rule_index)
+        return self.ion_shift_adduct_types[shift_rule_index]
 
     def get_shift_rule_position(
         self,
@@ -440,7 +473,7 @@ class _FragmentIonShiftCandidateStore:
         self,
         adduct_type: Adduct | str,
     ) -> int:
-        """Return adduct_rule_index for one adduct type."""
+        """Return adduct_rule_index for one main adduct type."""
 
         key = str(self._normalize_adduct_type(adduct_type))
 
@@ -454,7 +487,7 @@ class _FragmentIonShiftCandidateStore:
         self,
         adduct_type: Adduct | str,
     ) -> np.ndarray:
-        """Return all shift_rule_indices belonging to one adduct type."""
+        """Return all shift_rule_indices belonging to one main adduct type."""
 
         adduct_rule_index = self.get_adduct_rule_index_by_adduct_type(
             adduct_type
@@ -477,11 +510,7 @@ class _FragmentIonShiftCandidateStore:
         self,
         node_index: int,
     ) -> np.ndarray:
-        """Return adduct-type applicability values for one node.
-
-        True means the node has at least one applicable shift rule
-        belonging to that adduct type.
-        """
+        """Return main-adduct-type applicability values for one node."""
 
         self._validate_node_index(node_index)
 
@@ -506,6 +535,43 @@ class _FragmentIonShiftCandidateStore:
 
         return mask
 
+    def get_applicable_ion_shift_adduct_types_for_adduct_rule(
+        self,
+        *,
+        node_index: int,
+        adduct_rule_index: int,
+    ) -> Tuple[Adduct, ...]:
+        """Return applicable ion-shift adduct types for one node and main rule."""
+
+        shift_rule_indices = (
+            self.get_applicable_shift_rule_indices_for_adduct_rule(
+                node_index=node_index,
+                adduct_rule_index=adduct_rule_index,
+            )
+        )
+
+        return tuple(
+            self.ion_shift_adduct_types[shift_rule_index]
+            for shift_rule_index in shift_rule_indices
+        )
+
+    def get_applicable_ion_shift_adduct_types_for_adduct_type(
+        self,
+        *,
+        node_index: int,
+        adduct_type: Adduct | str,
+    ) -> Tuple[Adduct, ...]:
+        """Return applicable ion-shift adduct types for one node and main adduct."""
+
+        adduct_rule_index = self.get_adduct_rule_index_by_adduct_type(
+            adduct_type
+        )
+
+        return self.get_applicable_ion_shift_adduct_types_for_adduct_rule(
+            node_index=node_index,
+            adduct_rule_index=adduct_rule_index,
+        )
+
     def is_shift_applicable(
         self,
         *,
@@ -527,7 +593,7 @@ class _FragmentIonShiftCandidateStore:
         node_index: int,
         adduct_rule_index: int,
     ) -> bool:
-        """Return whether one adduct type has any applicable shift."""
+        """Return whether one main adduct type has any applicable shift."""
 
         self._validate_node_index(node_index)
         self._validate_adduct_rule_index(adduct_rule_index)
@@ -566,7 +632,7 @@ class _FragmentIonShiftCandidateStore:
         node_index: int,
         adduct_rule_index: int,
     ) -> np.ndarray:
-        """Return applicable shift rules for one node and one adduct rule."""
+        """Return applicable shift rules for one node and one main adduct rule."""
 
         self._validate_node_index(node_index)
         self._validate_adduct_rule_index(adduct_rule_index)
@@ -587,7 +653,7 @@ class _FragmentIonShiftCandidateStore:
         node_index: int,
         adduct_type: Adduct | str,
     ) -> np.ndarray:
-        """Return applicable shift rules for one node and one adduct type."""
+        """Return applicable shift rules for one node and one main adduct type."""
 
         adduct_rule_index = self.get_adduct_rule_index_by_adduct_type(
             adduct_type
@@ -603,6 +669,7 @@ class _FragmentIonShiftCandidateStore:
             adduct_types=tuple(self.adduct_types),
             adduct_shift_rule_indptr=self.adduct_shift_rule_indptr.copy(),
             shift_rule_indices=self.shift_rule_indices.copy(),
+            ion_shift_adduct_types=tuple(self.ion_shift_adduct_types),
             node_shift_rule_mask=self.node_shift_rule_mask.copy(),
         )
 

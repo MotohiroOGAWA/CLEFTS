@@ -219,6 +219,16 @@ class FragmentIonTree(FragmentTree):
             .get_candidate_delta_h_by_adduct_type(adduct_type)
         )
 
+    def get_hydrogen_state_candidate_delta_h_adduct_for_adduct_type(
+        self,
+        adduct_type: str,
+    ) -> Tuple[Adduct, ...]:
+        """Return hydrogen delta candidates for one adduct type."""
+
+        delta_h = self.hydrogen_state_candidate_store.get_candidate_delta_h_by_adduct_type(adduct_type)
+        adducts = tuple(Adduct.from_dict({"H": int(delta_h_i)}) for delta_h_i in delta_h)
+        return adducts
+
     def get_node_shift_rule_mask(
         self,
         node_index: int,
@@ -449,7 +459,7 @@ class FragmentIonTree(FragmentTree):
         for adduct_rule_index, adduct_rule in enumerate(
             self.fragment_ion_adduct_rule_set.adduct_rules
         ):
-            expected_adduct_type = str(adduct_rule.adduct_type)
+            expected_adduct_type = adduct_rule.adduct_type
             actual_adduct_type = store.adduct_types[adduct_rule_index]
 
             if actual_adduct_type != expected_adduct_type:

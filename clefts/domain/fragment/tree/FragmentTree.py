@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict
+from typing import Dict, List, Optional, Tuple, Union, Iterable, Set
+from collections import deque, defaultdict
 
 import numpy as np
 
@@ -477,3 +478,207 @@ class FragmentTree:
                 else self.depths.copy()
             ),
         )
+
+    def collect_shortest_paths_to_parents(
+        self,
+        child_index: int,
+        parent_indices: Iterable[int],
+        *,
+        max_depthes: Optional[Dict[int, Optional[int]]] = None,
+        use_cache: bool = True,
+    ) -> Dict[int, list[tuple[Union[FragmentNode, FragmentEdge], ...]]]:
+        """Collect all shortest paths from parent nodes to a child node.
+
+        This performs one reverse BFS from child_index toward parent_indices.
+
+        Parameters
+        ----------
+        child_index:
+            Local child node index.
+
+        parent_indices:
+            Local parent node indices.
+
+        max_depthes:
+            Optional per-parent depth limit.
+
+            The key is a local parent node index.
+            The value is the maximum number of edges allowed.
+            None means unlimited.
+
+        use_cache:
+            If True, cached paths are reused.
+
+        Returns
+        -------
+        Dict[int, list[tuple[Union[FragmentNode, FragmentEdge], ...]]]
+            Mapping from parent local node index to shortest path candidates.
+
+            Each path is represented as:
+
+            node(parent), edge, node, edge, ..., node(child)
+        """
+        n = self.num_nodes
+
+        if not 0 <= child_index < n:
+            raise ValueError(f"Invalid child_index: {child_index}")
+
+        parent_set = {int(parent_index) for parent_index in parent_indices}
+        if not parent_set:
+            return {}
+
+        if any(not 0 <= parent_index < n for parent_index in parent_set):
+            raise ValueError("All parent_indices must be valid local node indices.")
+
+        limits: Dict[int, Optional[int]] = {}
+        if max_depthes is None:
+            for parent_index in parent_set:
+                limits[parent_index] = None
+        else:
+            for parent_index in parent_set:
+                limits[parent_index] = max_depthes.get(parent_index, None)
+
+        def within_limit(parent_index: int, depth: int) -> bool:
+            limit = limits.get(parent_index, None)
+            if limit is None:
+                return True
+            return depth <= limit
+
+        result: Dict[
+            int,
+            list[tuple[Union[FragmentNode, FragmentEdge], ...]],
+        ] = {}
+
+        remaining: Set[int] = set()
+
+        if use_cache:
+            for parent_index in parent_set:
+                cache_key = (
+                    int(child_index),
+                    int(parent_index),
+                    limits[parent_index],
+                )
+
+                if cache_key in self._path_cache:
+                    result[parent_index] = self._path_cache[cache_key]
+                else:
+                    remaining.add(parent_index)
+        else:
+            remaining = set(parent_set)
+
+        if not remaining:
+            return result
+
+        dist = np.full(n, -1, dtype=np.int32)
+        dist[child_index] = 0
+
+        queue = deque([child_index])
+
+        # nexts[parent] = [(next_node, edge), ...]
+        # parent --edge--> next_node
+        # This stores only shortest-path transitions.
+        nexts: Dict[int, list[tuple[int, FragmentEdge]]] = defaultdict(list)
+
+        found_dist: Dict[int, int] = {}
+
+        if child_index in remaining and within_limit(child_index, 0):
+            found_dist[child_index] = 0
+
+        stop_depth: Optional[int] = None
+
+        while queue:
+            current = int(queue.popleft())
+            current_depth = int(dist[current])
+
+            if stop_depth is not None and current_depth >= stop_depth:
+                continue
+
+            for edge in self.get_in_edges(current):
+                parent = int(edge.source_index)
+                next_depth = current_depth + 1
+
+                if dist[parent] == -1:
+                    dist[parent] = next_depth
+                    queue.append(parent)
+
+                if dist[parent] == next_depth:
+                    nexts[parent].append((current, edge))
+
+                if (
+                    parent in remaining
+                    and parent not in found_dist
+                    and within_limit(parent, next_depth)
+                ):
+                    found_dist[parent] = next_depth
+
+            if stop_depth is None:
+                unresolved: list[int] = []
+
+                for parent_index in remaining:
+                    if parent_index in found_dist:
+                        continue
+
+                    limit = limits.get(parent_index, None)
+                    if limit is None:
+                        unresolved.append(parent_index)
+                    else:
+                        if current_depth < limit:
+                            unresolved.append(parent_index)
+
+                if not unresolved:
+                    stop_depth = (
+                        max(found_dist.values())
+                        if found_dist
+                        else 0
+                    )
+
+        def build_paths_for_parent(
+            parent_index: int,
+        ) -> list[tuple[Union[FragmentNode, FragmentEdge], ...]]:
+            if dist[parent_index] == -1:
+                return []
+
+            if not within_limit(parent_index, int(dist[parent_index])):
+                return []
+
+            paths: list[
+                tuple[Union[FragmentNode, FragmentEdge], ...]
+            ] = []
+
+            def dfs(
+                current: int,
+                acc: list[Union[FragmentNode, FragmentEdge]],
+            ) -> None:
+                if current == child_index:
+                    paths.append(tuple(acc))
+                    return
+
+                for next_node, edge in nexts.get(current, []):
+                    if dist[current] == dist[next_node] + 1:
+                        dfs(
+                            next_node,
+                            acc + [edge, self.get_node(next_node)],
+                        )
+
+            dfs(parent_index, [self.get_node(parent_index)])
+
+            return paths
+
+        for parent_index in remaining:
+            if parent_index == child_index and within_limit(parent_index, 0):
+                paths = [(self.get_node(child_index),)]
+            else:
+                paths = build_paths_for_parent(parent_index)
+
+            if paths:
+                result[parent_index] = paths
+
+            if use_cache:
+                cache_key = (
+                    int(child_index),
+                    int(parent_index),
+                    limits[parent_index],
+                )
+                self._path_cache[cache_key] = paths
+
+        return result

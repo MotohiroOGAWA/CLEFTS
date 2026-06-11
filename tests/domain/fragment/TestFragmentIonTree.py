@@ -138,7 +138,7 @@ class TestFragmentIonTree(unittest.TestCase):
         store = fragment_ion_tree.hydrogen_state_candidate_store
 
         self.assertEqual(store.num_adduct_types, 4)
-        self.assertEqual(store.num_candidate_states, 16)
+        self.assertEqual(store.num_candidate_states, 24)
 
         self.assertEqual(
             tuple(str(adduct_type) for adduct_type in store.adduct_types),
@@ -168,7 +168,9 @@ class TestFragmentIonTree(unittest.TestCase):
         expected_candidates_for_one_adduct = np.asarray(
             [
                 [0, 0],
+                [0, 1],
                 [1, 0],
+                [1, 1],
                 [2, 0],
                 [2, 1],
             ],
@@ -183,7 +185,7 @@ class TestFragmentIonTree(unittest.TestCase):
 
             np.testing.assert_array_equal(
                 store.get_candidate_delta_h(adduct_index),
-                np.asarray([0, -2, -4, -5], dtype=np.int16),
+                np.asarray([0, -1, -2, -3, -4, -5], dtype=np.int16),
             )
 
     def test_from_fragment_tree_builds_shift_candidate_store(self) -> None:
@@ -521,7 +523,9 @@ class TestFragmentIonTree(unittest.TestCase):
             np.asarray(
                 [
                     [0, 0],
+                    [0, 1],
                     [1, 0],
+                    [1, 1],
                     [2, 0],
                     [2, 1],
                 ],
@@ -549,7 +553,9 @@ class TestFragmentIonTree(unittest.TestCase):
             np.asarray(
                 [
                     [0, 0],
+                    [0, 1],
                     [1, 0],
+                    [1, 1],
                     [2, 0],
                     [2, 1],
                 ],
