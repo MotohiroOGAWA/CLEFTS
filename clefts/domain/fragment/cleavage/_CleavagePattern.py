@@ -61,6 +61,19 @@ class ProductRule:
     def __str__(self) -> str:
         return f"(name={self.name}, smarts={self.smarts})"
 
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "name": self.name,
+            "smarts": self.smarts,
+        }
+    
+    @classmethod
+    def from_dict(cls, data: dict[str, str]) -> ProductRule:
+        return cls(
+            name=data["name"],
+            smarts=data["smarts"],
+        )
+
 @dataclass(frozen=True)
 class CleavageReaction:
 

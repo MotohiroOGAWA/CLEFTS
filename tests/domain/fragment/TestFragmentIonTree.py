@@ -4,11 +4,19 @@ import unittest
 
 import numpy as np
 
-from clefts.domain.fragment.fragment_tree.FragmentNode import FragmentNode
-from clefts.domain.fragment.fragment_tree.FragmentTree import FragmentTree
-from clefts.domain.fragment.fragment_ion_tree.FragmentIonTree import FragmentIonTree
-from clefts.domain.fragment.fragment_ion_tree.FragmentIonAdductRuleSet import (
+from clefts.libs.mmkit.mmkit import Compound
+
+from clefts.domain.fragment.tree.FragmentNode import FragmentNode
+from clefts.domain.fragment.tree.FragmentTree import FragmentTree
+from clefts.domain.fragment.ion_tree.FragmentIonTree import FragmentIonTree
+from clefts.domain.fragment.ion_tree.FragmentIonAdductRuleSet import (
     FragmentIonAdductRuleSet,
+)
+from clefts.domain.fragment.ion_tree._private._FragmentHydrogenStateCandidateStore import (
+    _FragmentHydrogenStateCandidateStore,
+)
+from clefts.domain.fragment.ion_tree._private._FragmentIonShiftCandidateStore import (
+    _FragmentIonShiftCandidateStore,
 )
 
 
@@ -100,14 +108,10 @@ class TestFragmentIonTree(unittest.TestCase):
                     },
                 ],
             },
-            name="positive",
         )
 
     def test_from_fragment_tree_keeps_original_topology(self) -> None:
-        fragment_ion_tree = FragmentIonTree.from_fragment_tree(
-            self.fragment_tree,
-            fragment_ion_adduct_rule_set=self.rule_set,
-        )
+        fragment_ion_tree = self._make_fragment_ion_tree()
 
         self.assertEqual(fragment_ion_tree.smiles, self.fragment_tree.smiles)
         self.assertEqual(fragment_ion_tree.num_nodes, self.fragment_tree.num_nodes)
@@ -128,59 +132,85 @@ class TestFragmentIonTree(unittest.TestCase):
         self.assertEqual(fragment_ion_tree.get_node(2).smiles, "[NH4+]")
         self.assertEqual(fragment_ion_tree.get_node(3).smiles, "Cl")
 
-    def test_from_fragment_tree_builds_ion_state_store(self) -> None:
-        fragment_ion_tree = FragmentIonTree.from_fragment_tree(
-            self.fragment_tree,
-            fragment_ion_adduct_rule_set=self.rule_set,
-        )
+    def test_from_fragment_tree_builds_hydrogen_state_candidate_store(self) -> None:
+        fragment_ion_tree = self._make_fragment_ion_tree()
+
+        store = fragment_ion_tree.hydrogen_state_candidate_store
+
+        self.assertEqual(store.num_adduct_types, 4)
+        self.assertEqual(store.num_candidate_states, 24)
 
         self.assertEqual(
-            fragment_ion_tree.ion_state_store.num_nodes,
-            self.fragment_tree.num_nodes,
+            tuple(str(adduct_type) for adduct_type in store.adduct_types),
+            (
+                "[M+H]+",
+                "[M+Na]+",
+                "[M+H4N]+",
+                "[2M+H]+",
+            ),
         )
 
-        self.assertEqual(
-            len(fragment_ion_tree.node_state_indptr),
-            self.fragment_tree.num_nodes + 1,
+        expected_declared_states = np.asarray(
+            [
+                [2, 1],
+                [2, 1],
+                [2, 1],
+                [2, 1],
+            ],
+            dtype=np.int16,
         )
 
-        # All rules have the same ion state:
-        # unsaturation = 2, radical = True.
-        # Therefore each node should have one deduplicated state: [2, 1].
-        for node_index in range(fragment_ion_tree.num_nodes):
-            node_states = fragment_ion_tree.get_node_ion_states(node_index)
+        np.testing.assert_array_equal(
+            store.declared_states,
+            expected_declared_states,
+        )
 
-            self.assertEqual(node_states.shape, (1, 2))
+        expected_candidates_for_one_adduct = np.asarray(
+            [
+                [0, 0],
+                [0, 1],
+                [1, 0],
+                [1, 1],
+                [2, 0],
+                [2, 1],
+            ],
+            dtype=np.int16,
+        )
+
+        for adduct_index in range(store.num_adduct_types):
             np.testing.assert_array_equal(
-                node_states,
-                np.asarray([[2, 1]], dtype=np.int16),
+                store.get_candidate_states(adduct_index),
+                expected_candidates_for_one_adduct,
             )
 
-            node_delta_h = fragment_ion_tree.get_node_ion_state_delta_h(
-                node_index
-            )
-
-            # delta_h = -2 * unsaturation - radical
-            #         = -2 * 2 - 1
-            #         = -5
             np.testing.assert_array_equal(
-                node_delta_h,
-                np.asarray([-5], dtype=np.int16),
+                store.get_candidate_delta_h(adduct_index),
+                np.asarray([0, -1, -2, -3, -4, -5], dtype=np.int16),
             )
 
-    def test_from_fragment_tree_builds_shift_store(self) -> None:
-        fragment_ion_tree = FragmentIonTree.from_fragment_tree(
-            self.fragment_tree,
-            fragment_ion_adduct_rule_set=self.rule_set,
-        )
+    def test_from_fragment_tree_builds_shift_candidate_store(self) -> None:
+        fragment_ion_tree = self._make_fragment_ion_tree()
+
+        store = fragment_ion_tree.ion_shift_candidate_store
+
+        self.assertEqual(store.num_nodes, self.fragment_tree.num_nodes)
+        self.assertEqual(store.num_adduct_types, 4)
+        self.assertEqual(store.num_shift_rules, 10)
 
         self.assertEqual(
-            fragment_ion_tree.ion_shift_store.num_nodes,
-            self.fragment_tree.num_nodes,
+            tuple(str(adduct_type) for adduct_type in store.adduct_types),
+            (
+                "[M+H]+",
+                "[M+Na]+",
+                "[M+H4N]+",
+                "[2M+H]+",
+            ),
         )
 
-        # The JSON has 10 IonShiftRule entries in total.
-        self.assertEqual(fragment_ion_tree.num_shift_rules, 10)
+        np.testing.assert_array_equal(
+            store.adduct_shift_rule_indptr,
+            np.asarray([0, 2, 5, 8, 10], dtype=np.int64),
+        )
 
         expected_shift_rule_indices = np.asarray(
             [
@@ -208,40 +238,51 @@ class TestFragmentIonTree(unittest.TestCase):
             (self.fragment_tree.num_nodes, 10),
         )
 
-    def test_node_shift_rule_mask_respects_atoms_and_charge(self) -> None:
-        fragment_ion_tree = FragmentIonTree.from_fragment_tree(
-            self.fragment_tree,
-            fragment_ion_adduct_rule_set=self.rule_set,
+    def test_node_adduct_type_mask_respects_shift_ranges(self) -> None:
+        fragment_ion_tree = self._make_fragment_ion_tree()
+
+        np.testing.assert_array_equal(
+            fragment_ion_tree.get_node_adduct_type_mask(0),
+            np.asarray([True, True, True, True], dtype=bool),
         )
 
-        # node 0: CCO
-        # Contains C and O.
-        # Therefore C/P/S rules and P/S/N/O rules are applicable.
-        # Generic [M+Na]+ and [M+NH4]+ are also applicable.
+        np.testing.assert_array_equal(
+            fragment_ion_tree.get_node_adduct_type_mask(1),
+            np.asarray([True, True, True, True], dtype=bool),
+        )
+
+        np.testing.assert_array_equal(
+            fragment_ion_tree.get_node_adduct_type_mask(2),
+            np.asarray([False, False, False, False], dtype=bool),
+        )
+
+        np.testing.assert_array_equal(
+            fragment_ion_tree.get_node_adduct_type_mask(3),
+            np.asarray([False, True, True, False], dtype=bool),
+        )
+
+    def test_node_shift_rule_mask_respects_atoms_and_charge(self) -> None:
+        fragment_ion_tree = self._make_fragment_ion_tree()
+
         np.testing.assert_array_equal(
             fragment_ion_tree.get_node_shift_rule_mask(0),
             np.asarray(
                 [
-                    True,   # rule 0, shift 0: C/P/S -> [M-H]+
-                    True,   # rule 0, shift 1: P/S/N/O -> [M+H]+
-                    True,   # rule 1, shift 0: generic [M+Na]+
-                    True,   # rule 1, shift 1: C/P/S -> [M-H]+
-                    True,   # rule 1, shift 2: P/S/N/O -> [M+H]+
-                    True,   # rule 2, shift 0: generic [M+NH4]+
-                    True,   # rule 2, shift 1: P/S/N/O -> [M+H]+
-                    True,   # rule 2, shift 2: C/P/S -> [M-H]+
-                    True,   # rule 3, shift 0: P/S/N/O -> [M+H]+
-                    True,   # rule 3, shift 1: C/P/S -> [M-H]+
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
                 ],
                 dtype=bool,
             ),
         )
 
-        # node 1: CC
-        # Contains C only.
-        # C/P/S rules are applicable.
-        # P/S/N/O rules are not applicable.
-        # Generic rules are applicable.
         np.testing.assert_array_equal(
             fragment_ion_tree.get_node_shift_rule_mask(1),
             np.asarray(
@@ -261,31 +302,11 @@ class TestFragmentIonTree(unittest.TestCase):
             ),
         )
 
-        # node 2: [NH4+]
-        # Already charged.
-        # No ion shift should be applicable.
         np.testing.assert_array_equal(
             fragment_ion_tree.get_node_shift_rule_mask(2),
-            np.asarray(
-                [
-                    False,
-                    False,
-                    False,
-                    False,
-                    False,
-                    False,
-                    False,
-                    False,
-                    False,
-                    False,
-                ],
-                dtype=bool,
-            ),
+            np.zeros(10, dtype=bool),
         )
 
-        # node 3: Cl
-        # Neutral, but Cl is not in any atom-specific rule.
-        # Only generic [M+Na]+ and [M+NH4]+ rules are applicable.
         np.testing.assert_array_equal(
             fragment_ion_tree.get_node_shift_rule_mask(3),
             np.asarray(
@@ -306,20 +327,8 @@ class TestFragmentIonTree(unittest.TestCase):
         )
 
     def test_get_applicable_shift_rule_indices_for_adduct_rule(self) -> None:
-        fragment_ion_tree = FragmentIonTree.from_fragment_tree(
-            self.fragment_tree,
-            fragment_ion_adduct_rule_set=self.rule_set,
-        )
+        fragment_ion_tree = self._make_fragment_ion_tree()
 
-        # node 1: CC
-        # adduct_rule_index 1: [M+Na]+
-        #
-        # [M+Na]+ rule has shift_rule_index:
-        #   2 -> generic [M+Na]+
-        #   3 -> C/P/S [M-H]+
-        #   4 -> P/S/N/O [M+H]+
-        #
-        # CC allows 2 and 3, but not 4.
         shift_rule_indices = (
             fragment_ion_tree
             .get_applicable_shift_rule_indices_for_adduct_rule(
@@ -345,11 +354,24 @@ class TestFragmentIonTree(unittest.TestCase):
         self.assertEqual(str(ion_shift_rules[0].ion_shift), "[M+Na]+")
         self.assertEqual(str(ion_shift_rules[1].ion_shift), "[M-H]+")
 
-    def test_get_ion_shift_rule_by_shift_rule_index(self) -> None:
-        fragment_ion_tree = FragmentIonTree.from_fragment_tree(
-            self.fragment_tree,
-            fragment_ion_adduct_rule_set=self.rule_set,
+    def test_get_applicable_shift_rule_indices_for_adduct_type(self) -> None:
+        fragment_ion_tree = self._make_fragment_ion_tree()
+
+        shift_rule_indices = (
+            fragment_ion_tree
+            .get_applicable_shift_rule_indices_for_adduct_type(
+                node_index=1,
+                adduct_type="[M+Na]+",
+            )
         )
+
+        np.testing.assert_array_equal(
+            shift_rule_indices,
+            np.asarray([2, 3], dtype=np.int64),
+        )
+
+    def test_get_ion_shift_rule_by_shift_rule_index(self) -> None:
+        fragment_ion_tree = self._make_fragment_ion_tree()
 
         adduct_rule_index, ion_shift_index = (
             fragment_ion_tree.get_shift_rule_position(4)
@@ -357,56 +379,44 @@ class TestFragmentIonTree(unittest.TestCase):
 
         self.assertEqual(adduct_rule_index, 1)
         self.assertEqual(ion_shift_index, 2)
+        self.assertEqual(
+            str(fragment_ion_tree.get_shift_rule_adduct_type(4)),
+            "[M+Na]+",
+        )
 
         ion_shift_rule = fragment_ion_tree.get_ion_shift_rule(4)
 
         self.assertEqual(str(ion_shift_rule.ion_shift), "[M+H]+")
         self.assertEqual(ion_shift_rule.atoms, ("P", "S", "N", "O"))
 
-    def test_invalid_adduct_rule_index_raises(self) -> None:
-        fragment_ion_tree = FragmentIonTree.from_fragment_tree(
-            self.fragment_tree,
-            fragment_ion_adduct_rule_set=self.rule_set,
-        )
-
-        with self.assertRaises(IndexError):
-            fragment_ion_tree.get_adduct_rule(-1)
-
-        with self.assertRaises(IndexError):
-            fragment_ion_tree.get_adduct_rule(100)
-
-    def test_invalid_node_index_raises_from_store(self) -> None:
-        fragment_ion_tree = FragmentIonTree.from_fragment_tree(
-            self.fragment_tree,
-            fragment_ion_adduct_rule_set=self.rule_set,
-        )
-
-        with self.assertRaises(IndexError):
-            fragment_ion_tree.get_node_ion_states(-1)
-
-        with self.assertRaises(IndexError):
-            fragment_ion_tree.get_node_shift_rule_mask(100)
-
     def test_empty_rule_set_builds_empty_stores(self) -> None:
         empty_rule_set = FragmentIonAdductRuleSet.from_dict(
             {
                 "adduct_rules": [],
             },
-            name="empty",
         )
 
-        fragment_ion_tree = FragmentIonTree.from_fragment_tree(
-            self.fragment_tree,
-            fragment_ion_adduct_rule_set=empty_rule_set,
+        fragment_ion_tree = self._make_fragment_ion_tree(
+            rule_set=empty_rule_set,
         )
 
         self.assertEqual(fragment_ion_tree.num_adduct_rules, 0)
         self.assertEqual(fragment_ion_tree.num_shift_rules, 0)
-        self.assertEqual(fragment_ion_tree.num_ion_states, 0)
+        self.assertEqual(fragment_ion_tree.num_hydrogen_state_candidates, 0)
+
+        self.assertEqual(
+            fragment_ion_tree.hydrogen_state_candidates.shape,
+            (0, 2),
+        )
 
         np.testing.assert_array_equal(
-            fragment_ion_tree.node_state_indptr,
-            np.zeros(self.fragment_tree.num_nodes + 1, dtype=np.int64),
+            fragment_ion_tree.adduct_state_indptr,
+            np.zeros(1, dtype=np.int64),
+        )
+
+        np.testing.assert_array_equal(
+            fragment_ion_tree.ion_shift_candidate_store.adduct_shift_rule_indptr,
+            np.zeros(1, dtype=np.int64),
         )
 
         self.assertEqual(
@@ -427,34 +437,43 @@ class TestFragmentIonTree(unittest.TestCase):
                     }
                 ],
             },
-            name="empty_shift",
         )
 
-        fragment_ion_tree = FragmentIonTree.from_fragment_tree(
-            self.fragment_tree,
-            fragment_ion_adduct_rule_set=rule_set,
-        )
+        fragment_ion_tree = self._make_fragment_ion_tree(rule_set=rule_set)
 
         self.assertEqual(fragment_ion_tree.num_adduct_rules, 1)
         self.assertEqual(fragment_ion_tree.num_shift_rules, 0)
 
-        for node_index in range(fragment_ion_tree.num_nodes):
-            np.testing.assert_array_equal(
-                fragment_ion_tree.get_node_ion_states(node_index),
-                np.asarray([[1, 0]], dtype=np.int16),
-            )
+        np.testing.assert_array_equal(
+            fragment_ion_tree.ion_shift_candidate_store.adduct_shift_rule_indptr,
+            np.asarray([0, 0], dtype=np.int64),
+        )
 
-            np.testing.assert_array_equal(
-                fragment_ion_tree.get_node_ion_state_delta_h(node_index),
-                np.asarray([-2], dtype=np.int16),
-            )
+        np.testing.assert_array_equal(
+            fragment_ion_tree.get_hydrogen_state_candidates_for_adduct_rule(0),
+            np.asarray(
+                [
+                    [0, 0],
+                    [1, 0],
+                ],
+                dtype=np.int16,
+            ),
+        )
+
+        np.testing.assert_array_equal(
+            fragment_ion_tree
+            .get_hydrogen_state_candidate_delta_h_for_adduct_rule(0),
+            np.asarray([0, -2], dtype=np.int16),
+        )
 
         self.assertEqual(
             fragment_ion_tree.node_shift_rule_mask.shape,
             (self.fragment_tree.num_nodes, 0),
         )
 
-    def test_multiple_ion_states_are_deduplicated_and_sorted(self) -> None:
+    def test_multiple_hydrogen_state_candidates_are_grouped_by_adduct_type(
+        self,
+    ) -> None:
         rule_set = FragmentIonAdductRuleSet.from_dict(
             {
                 "adduct_rules": [
@@ -481,7 +500,7 @@ class TestFragmentIonTree(unittest.TestCase):
                         ],
                     },
                     {
-                        "name": "pos_NH4_r1_u2_duplicate_state",
+                        "name": "pos_NH4_r1_u2",
                         "adduct_type": "[M+NH4]+",
                         "radical": True,
                         "unsaturation": 2,
@@ -493,49 +512,60 @@ class TestFragmentIonTree(unittest.TestCase):
                     },
                 ],
             },
-            name="multiple_states",
         )
 
-        fragment_ion_tree = FragmentIonTree.from_fragment_tree(
-            self.fragment_tree,
-            fragment_ion_adduct_rule_set=rule_set,
+        fragment_ion_tree = self._make_fragment_ion_tree(rule_set=rule_set)
+
+        np.testing.assert_array_equal(
+            fragment_ion_tree.get_hydrogen_state_candidates_for_adduct_type(
+                "[M+H]+"
+            ),
+            np.asarray(
+                [
+                    [0, 0],
+                    [0, 1],
+                    [1, 0],
+                    [1, 1],
+                    [2, 0],
+                    [2, 1],
+                ],
+                dtype=np.int16,
+            ),
         )
 
-        expected_states = np.asarray(
-            [
-                [1, 0],
-                [2, 1],
-            ],
-            dtype=np.int16,
+        np.testing.assert_array_equal(
+            fragment_ion_tree.get_hydrogen_state_candidates_for_adduct_type(
+                "[M+Na]+"
+            ),
+            np.asarray(
+                [
+                    [0, 0],
+                    [1, 0],
+                ],
+                dtype=np.int16,
+            ),
         )
 
-        expected_delta_h = np.asarray(
-            [
-                -2,
-                -5,
-            ],
-            dtype=np.int16,
+        np.testing.assert_array_equal(
+            fragment_ion_tree.get_hydrogen_state_candidates_for_adduct_type(
+                "[M+NH4]+"
+            ),
+            np.asarray(
+                [
+                    [0, 0],
+                    [0, 1],
+                    [1, 0],
+                    [1, 1],
+                    [2, 0],
+                    [2, 1],
+                ],
+                dtype=np.int16,
+            ),
         )
-
-        for node_index in range(fragment_ion_tree.num_nodes):
-            np.testing.assert_array_equal(
-                fragment_ion_tree.get_node_ion_states(node_index),
-                expected_states,
-            )
-
-            np.testing.assert_array_equal(
-                fragment_ion_tree.get_node_ion_state_delta_h(node_index),
-                expected_delta_h,
-            )
 
     def test_generic_ion_shift_is_false_for_charged_fragment(self) -> None:
-        fragment_ion_tree = FragmentIonTree.from_fragment_tree(
-            self.fragment_tree,
-            fragment_ion_adduct_rule_set=self.rule_set,
-        )
+        fragment_ion_tree = self._make_fragment_ion_tree()
 
-        # node 2 is [NH4+].
-        # Even generic ion shifts should be False because the fragment is charged.
         np.testing.assert_array_equal(
             fragment_ion_tree.get_node_shift_rule_mask(2),
             np.zeros(fragment_ion_tree.num_shift_rules, dtype=bool),
@@ -551,18 +581,15 @@ class TestFragmentIonTree(unittest.TestCase):
             edges=(),
         )
 
-        fragment_ion_tree = FragmentIonTree.from_fragment_tree(
-            fragment_tree,
-            fragment_ion_adduct_rule_set=self.rule_set,
+        fragment_ion_tree = self._make_fragment_ion_tree(
+            fragment_tree=fragment_tree,
         )
 
-        # node 0: [O-], charged, all shifts disabled.
         np.testing.assert_array_equal(
             fragment_ion_tree.get_node_shift_rule_mask(0),
             np.zeros(fragment_ion_tree.num_shift_rules, dtype=bool),
         )
 
-        # node 1: O, neutral, P/S/N/O rules and generic rules enabled.
         self.assertTrue(
             np.any(fragment_ion_tree.get_node_shift_rule_mask(1))
         )
@@ -581,14 +608,10 @@ class TestFragmentIonTree(unittest.TestCase):
             edges=(),
         )
 
-        fragment_ion_tree = FragmentIonTree.from_fragment_tree(
-            fragment_tree,
-            fragment_ion_adduct_rule_set=self.rule_set,
+        fragment_ion_tree = self._make_fragment_ion_tree(
+            fragment_tree=fragment_tree,
         )
 
-        # C:
-        # C/P/S rules are True.
-        # P/S/N/O rules are False.
         np.testing.assert_array_equal(
             fragment_ion_tree.get_node_shift_rule_mask(0),
             np.asarray(
@@ -608,9 +631,6 @@ class TestFragmentIonTree(unittest.TestCase):
             ),
         )
 
-        # O:
-        # C/P/S rules are False.
-        # P/S/N/O rules are True.
         np.testing.assert_array_equal(
             fragment_ion_tree.get_node_shift_rule_mask(1),
             np.asarray(
@@ -630,8 +650,6 @@ class TestFragmentIonTree(unittest.TestCase):
             ),
         )
 
-        # N:
-        # Same as O for this rule set.
         np.testing.assert_array_equal(
             fragment_ion_tree.get_node_shift_rule_mask(2),
             np.asarray(
@@ -651,22 +669,16 @@ class TestFragmentIonTree(unittest.TestCase):
             ),
         )
 
-        # S:
-        # S is included in both C/P/S and P/S/N/O.
         np.testing.assert_array_equal(
             fragment_ion_tree.get_node_shift_rule_mask(3),
             np.ones(10, dtype=bool),
         )
 
-        # P:
-        # P is included in both C/P/S and P/S/N/O.
         np.testing.assert_array_equal(
             fragment_ion_tree.get_node_shift_rule_mask(4),
             np.ones(10, dtype=bool),
         )
 
-        # Cl:
-        # Only generic [M+Na]+ and [M+NH4]+ rules are True.
         np.testing.assert_array_equal(
             fragment_ion_tree.get_node_shift_rule_mask(5),
             np.asarray(
@@ -687,41 +699,30 @@ class TestFragmentIonTree(unittest.TestCase):
         )
 
     def test_get_applicable_adduct_rule_indices_for_each_node(self) -> None:
-        fragment_ion_tree = FragmentIonTree.from_fragment_tree(
-            self.fragment_tree,
-            fragment_ion_adduct_rule_set=self.rule_set,
-        )
+        fragment_ion_tree = self._make_fragment_ion_tree()
 
-        # node 0: CCO, all adduct rules have at least one applicable shift.
         np.testing.assert_array_equal(
             fragment_ion_tree.get_applicable_adduct_rule_indices(0),
             np.asarray([0, 1, 2, 3], dtype=np.int64),
         )
 
-        # node 1: CC, all adduct rules still have at least one applicable shift.
         np.testing.assert_array_equal(
             fragment_ion_tree.get_applicable_adduct_rule_indices(1),
             np.asarray([0, 1, 2, 3], dtype=np.int64),
         )
 
-        # node 2: [NH4+], no shifts are applicable.
         np.testing.assert_array_equal(
             fragment_ion_tree.get_applicable_adduct_rule_indices(2),
             np.asarray([], dtype=np.int64),
         )
 
-        # node 3: Cl, only adduct rules with generic shifts are applicable:
-        # [M+Na]+ and [M+NH4]+.
         np.testing.assert_array_equal(
             fragment_ion_tree.get_applicable_adduct_rule_indices(3),
             np.asarray([1, 2], dtype=np.int64),
         )
 
     def test_has_applicable_shift_for_adduct_rule(self) -> None:
-        fragment_ion_tree = FragmentIonTree.from_fragment_tree(
-            self.fragment_tree,
-            fragment_ion_adduct_rule_set=self.rule_set,
-        )
+        fragment_ion_tree = self._make_fragment_ion_tree()
 
         self.assertTrue(
             fragment_ion_tree.has_applicable_shift_for_adduct_rule(
@@ -751,11 +752,17 @@ class TestFragmentIonTree(unittest.TestCase):
             )
         )
 
+    def test_invalid_adduct_rule_index_raises(self) -> None:
+        fragment_ion_tree = self._make_fragment_ion_tree()
+
+        with self.assertRaises(IndexError):
+            fragment_ion_tree.get_adduct_rule(-1)
+
+        with self.assertRaises(IndexError):
+            fragment_ion_tree.get_adduct_rule(100)
+
     def test_invalid_shift_rule_index_raises(self) -> None:
-        fragment_ion_tree = FragmentIonTree.from_fragment_tree(
-            self.fragment_tree,
-            fragment_ion_adduct_rule_set=self.rule_set,
-        )
+        fragment_ion_tree = self._make_fragment_ion_tree()
 
         with self.assertRaises(IndexError):
             fragment_ion_tree.get_shift_rule_position(-1)
@@ -773,11 +780,27 @@ class TestFragmentIonTree(unittest.TestCase):
                 fragment_ion_tree.num_shift_rules
             )
 
+    def test_invalid_node_index_for_shift_raises(self) -> None:
+        fragment_ion_tree = self._make_fragment_ion_tree()
+
+        with self.assertRaises(IndexError):
+            fragment_ion_tree.get_node_shift_rule_mask(-1)
+
+        with self.assertRaises(IndexError):
+            fragment_ion_tree.get_node_shift_rule_mask(
+                fragment_ion_tree.num_nodes
+            )
+
+        with self.assertRaises(IndexError):
+            fragment_ion_tree.get_applicable_shift_rule_indices(-1)
+
+        with self.assertRaises(IndexError):
+            fragment_ion_tree.get_applicable_shift_rule_indices(
+                fragment_ion_tree.num_nodes
+            )
+
     def test_invalid_adduct_rule_index_for_applicable_shift_raises(self) -> None:
-        fragment_ion_tree = FragmentIonTree.from_fragment_tree(
-            self.fragment_tree,
-            fragment_ion_adduct_rule_set=self.rule_set,
-        )
+        fragment_ion_tree = self._make_fragment_ion_tree()
 
         with self.assertRaises(IndexError):
             fragment_ion_tree.get_applicable_shift_rule_indices_for_adduct_rule(
@@ -792,18 +815,7 @@ class TestFragmentIonTree(unittest.TestCase):
             )
 
     def test_invalid_node_index_for_applicable_shift_raises(self) -> None:
-        fragment_ion_tree = FragmentIonTree.from_fragment_tree(
-            self.fragment_tree,
-            fragment_ion_adduct_rule_set=self.rule_set,
-        )
-
-        with self.assertRaises(IndexError):
-            fragment_ion_tree.get_applicable_shift_rule_indices(-1)
-
-        with self.assertRaises(IndexError):
-            fragment_ion_tree.get_applicable_shift_rule_indices(
-                fragment_ion_tree.num_nodes
-            )
+        fragment_ion_tree = self._make_fragment_ion_tree()
 
         with self.assertRaises(IndexError):
             fragment_ion_tree.get_applicable_shift_rule_indices_for_adduct_rule(
@@ -822,6 +834,15 @@ class TestFragmentIonTree(unittest.TestCase):
             FragmentIonTree.from_fragment_tree(
                 object(),
                 fragment_ion_adduct_rule_set=self.rule_set,
+                hydrogen_state_candidate_store=(
+                    self._make_hydrogen_state_candidate_store(self.rule_set)
+                ),
+                ion_shift_candidate_store=(
+                    self._make_ion_shift_candidate_store(
+                        fragment_tree=self.fragment_tree,
+                        rule_set=self.rule_set,
+                    )
+                ),
             )
 
     def test_invalid_rule_set_argument_raises(self) -> None:
@@ -829,6 +850,15 @@ class TestFragmentIonTree(unittest.TestCase):
             FragmentIonTree.from_fragment_tree(
                 self.fragment_tree,
                 fragment_ion_adduct_rule_set=object(),
+                hydrogen_state_candidate_store=(
+                    self._make_hydrogen_state_candidate_store(self.rule_set)
+                ),
+                ion_shift_candidate_store=(
+                    self._make_ion_shift_candidate_store(
+                        fragment_tree=self.fragment_tree,
+                        rule_set=self.rule_set,
+                    )
+                ),
             )
 
     def test_invalid_smiles_raises(self) -> None:
@@ -841,10 +871,7 @@ class TestFragmentIonTree(unittest.TestCase):
         )
 
         with self.assertRaises(ValueError):
-            FragmentIonTree.from_fragment_tree(
-                fragment_tree,
-                fragment_ion_adduct_rule_set=self.rule_set,
-            )
+            self._make_fragment_ion_tree(fragment_tree=fragment_tree)
 
     def test_negative_rule_set(self) -> None:
         negative_rule_set = FragmentIonAdductRuleSet.from_dict(
@@ -880,12 +907,10 @@ class TestFragmentIonTree(unittest.TestCase):
                     },
                 ],
             },
-            name="negative",
         )
 
-        fragment_ion_tree = FragmentIonTree.from_fragment_tree(
-            self.fragment_tree,
-            fragment_ion_adduct_rule_set=negative_rule_set,
+        fragment_ion_tree = self._make_fragment_ion_tree(
+            rule_set=negative_rule_set,
         )
 
         self.assertEqual(fragment_ion_tree.num_adduct_rules, 2)
@@ -905,33 +930,112 @@ class TestFragmentIonTree(unittest.TestCase):
             expected_shift_rule_indices,
         )
 
-        # node 0: CCO
-        # shift 0: C/P/S/N/O -> True
-        # shift 1: P/S/N/O -> True by O
-        # shift 2: C/P/S -> True by C
         np.testing.assert_array_equal(
             fragment_ion_tree.get_node_shift_rule_mask(0),
             np.asarray([True, True, True], dtype=bool),
         )
 
-        # node 1: CC
-        # shift 0 True by C, shift 1 False, shift 2 True by C.
         np.testing.assert_array_equal(
             fragment_ion_tree.get_node_shift_rule_mask(1),
             np.asarray([True, False, True], dtype=bool),
         )
 
-        # node 2: [NH4+], charged, all False.
         np.testing.assert_array_equal(
             fragment_ion_tree.get_node_shift_rule_mask(2),
             np.asarray([False, False, False], dtype=bool),
         )
 
-        # node 3: Cl, no matching atoms.
         np.testing.assert_array_equal(
             fragment_ion_tree.get_node_shift_rule_mask(3),
             np.asarray([False, False, False], dtype=bool),
         )
+
+    def _make_fragment_ion_tree(
+        self,
+        *,
+        fragment_tree: FragmentTree | None = None,
+        rule_set: FragmentIonAdductRuleSet | None = None,
+    ) -> FragmentIonTree:
+        fragment_tree = self.fragment_tree if fragment_tree is None else fragment_tree
+        rule_set = self.rule_set if rule_set is None else rule_set
+
+        hydrogen_state_candidate_store = (
+            self._make_hydrogen_state_candidate_store(rule_set)
+        )
+
+        ion_shift_candidate_store = self._make_ion_shift_candidate_store(
+            fragment_tree=fragment_tree,
+            rule_set=rule_set,
+        )
+
+        return FragmentIonTree.from_fragment_tree(
+            fragment_tree,
+            fragment_ion_adduct_rule_set=rule_set,
+            hydrogen_state_candidate_store=hydrogen_state_candidate_store,
+            ion_shift_candidate_store=ion_shift_candidate_store,
+        )
+
+    def _make_hydrogen_state_candidate_store(
+        self,
+        rule_set: FragmentIonAdductRuleSet,
+    ) -> _FragmentHydrogenStateCandidateStore:
+        return _FragmentHydrogenStateCandidateStore.from_adduct_rule_set(
+            rule_set
+        )
+
+    def _make_ion_shift_candidate_store(
+        self,
+        *,
+        fragment_tree: FragmentTree,
+        rule_set: FragmentIonAdductRuleSet,
+    ) -> _FragmentIonShiftCandidateStore:
+        node_atom_symbols: list[frozenset[str]] = []
+        node_charges: list[int] = []
+
+        for node_index in range(fragment_tree.num_nodes):
+            node = fragment_tree.get_node(node_index)
+            compound = Compound.from_smiles(node.smiles)
+            mol = self._get_mol_from_compound(compound)
+
+            node_atom_symbols.append(
+                frozenset(
+                    atom.GetSymbol()
+                    for atom in mol.GetAtoms()
+                )
+            )
+
+            node_charges.append(
+                int(
+                    sum(
+                        atom.GetFormalCharge()
+                        for atom in mol.GetAtoms()
+                    )
+                )
+            )
+
+        return _FragmentIonShiftCandidateStore.from_adduct_rule_set(
+            adduct_rule_set=rule_set,
+            node_atom_symbols=tuple(node_atom_symbols),
+            node_charges=tuple(node_charges),
+        )
+
+    @staticmethod
+    def _get_mol_from_compound(
+        compound: Compound,
+    ):
+        if hasattr(compound, "mol"):
+            return compound.mol
+
+        if hasattr(compound, "rdmol"):
+            return compound.rdmol
+
+        if hasattr(compound, "to_mol"):
+            return compound.to_mol()
+
+        raise TypeError(
+            "Compound must expose mol, rdmol, or to_mol()."
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

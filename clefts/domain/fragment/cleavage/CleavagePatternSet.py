@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable, Iterator, Tuple
+from typing import Iterable, Iterator, Tuple, Any
 
 from clefts.libs.mmkit.mmkit import Compound
 
-from ._CleavagePattern import _CleavagePattern, _CleavageResult
+from ._CleavagePattern import _CleavagePattern, _CleavageResult, ProductRule
 
 @dataclass(frozen=True)
 class CleavagePattern(_CleavagePattern):
@@ -46,6 +46,36 @@ class CleavagePattern(_CleavagePattern):
             cleavage=self,
             base=result,
         )
+    
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "pattern_id": self.pattern_id,
+            "name": self.name,
+            "reactant_smarts": self.reactant_smarts,
+            "products": [
+                reaction.source_rule.to_dict()
+                for reaction in self.cleavage_reactions
+            ],
+        }
+    
+    @classmethod
+    def from_dict(
+        cls,
+        data: dict[str, Any],
+    ) -> CleavagePattern:
+        return cls.from_base(
+            pattern_id=int(data["pattern_id"]),
+            base=_CleavagePattern.from_rules(
+                name=data["name"],
+                reactant_smarts=data["reactant_smarts"],
+                products=tuple(
+                    ProductRule.from_dict(product_data)
+                    for product_data in data["products"]
+                )
+
+            )
+        )
+    
 
     def copy(self) -> CleavagePattern:
         """Return a copy of this pattern."""
@@ -264,21 +294,26 @@ class CleavagePatternSet:
         return {
             "name": self.name,
             "patterns": [
-                {
-                    "pattern_id": pattern.pattern_id,
-                    "name": pattern.name,
-                    "reactant_smarts": pattern.reactant_smarts,
-                    "products": [
-                        {
-                            "name": product.name,
-                            "smarts": product.smarts,
-                        }
-                        for product in pattern.products
-                    ],
-                }
+                pattern.to_dict()
                 for pattern in self.patterns
             ],
         }
+
+    @classmethod
+    def from_dict(
+        cls,
+        data: dict[str, object],
+    ) -> CleavagePatternSet:
+        """Deserialize a pattern set from a dictionary."""
+        patterns = tuple(
+            CleavagePattern.from_dict(pattern_data)
+            for pattern_data in data["patterns"]
+        )
+
+        return cls(
+            name=data["name"],
+            patterns=patterns,
+        )
     
     def copy(self) -> CleavagePatternSet:
         """Return a copy of this pattern set."""

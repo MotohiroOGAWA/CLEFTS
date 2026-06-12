@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import unittest
 
-from clefts.domain.fragment.fragment_tree.FragmentTree import FragmentTree
-from clefts.domain.fragment.fragment_tree.FragmentTreeBuilder import (
+from clefts.domain.fragment.tree.FragmentTree import FragmentTree
+from clefts.domain.fragment.tree.FragmentTreeBuilder import (
     FragmentTreeBuilder,
 )
 from clefts.libs.mmkit.mmkit import Compound

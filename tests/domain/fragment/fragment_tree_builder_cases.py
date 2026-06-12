@@ -10,13 +10,13 @@ from clefts.domain.fragment.cleavage._CleavagePattern import (
 from clefts.domain.fragment.cleavage.CleavagePatternSet import (
     CleavagePatternSet,
 )
-from clefts.domain.fragment.fragment_tree.FragmentTreeBuilder import (
+from clefts.domain.fragment.tree.FragmentTreeBuilder import (
     FragmentTreeBuilder,
 )
-from clefts.domain.fragment.fragment_ion_tree.FragmentIonAdductRuleSet import (
+from clefts.domain.fragment.ion_tree.FragmentIonAdductRuleSet import (
     FragmentIonAdductRuleSet,
 )
-from clefts.domain.fragment.fragment_ion_tree.FragmentIonTreeBuilder import (
+from clefts.domain.fragment.ion_tree.FragmentIonTreeBuilder import (
     FragmentIonTreeBuilder,
 )
 
@@ -360,5 +360,4 @@ def _make_hydrogen_rearrangement_fragment_ion_adduct_rule_set(
 
     return FragmentIonAdductRuleSet.from_json(
         test_data_dir / "hydrogen_rearrangement_rule_set_pos.json",
-        name="hydrogen_rearrangement_rule_set_pos",
     )

@@ -7,7 +7,7 @@ from uuid import uuid4
 import gradio as gr
 import pandas as pd
 
-from clefts.domain.fragment.fragment_tree.FragmentTreeBuilder import FragmentTreeBuilder
+from clefts.domain.fragment.tree.FragmentTreeBuilder import FragmentTreeBuilder
 from ...components.cleavage_patterns_input_panel import json_to_pattern_set
 from ...components.common.paginated_dataframe import make_page_html
 from clefts.libs.mmkit.mmkit import Compound

@@ -4,23 +4,23 @@ import unittest
 
 import numpy as np
 
-from clefts.domain.fragment.fragment_tree.CleavageEvent import CleavageEvent
-from clefts.domain.fragment.fragment_tree.FragmentEdge import FragmentEdge
-from clefts.domain.fragment.fragment_tree.FragmentNode import FragmentNode
-from clefts.domain.fragment.fragment_tree.FragmentTree import FragmentTree
-from clefts.domain.fragment.fragment_tree._private._CleavageEventStore import (
+from clefts.domain.fragment.tree.CleavageEvent import CleavageEvent
+from clefts.domain.fragment.tree.FragmentEdge import FragmentEdge
+from clefts.domain.fragment.tree.FragmentNode import FragmentNode
+from clefts.domain.fragment.tree.FragmentTree import FragmentTree
+from clefts.domain.fragment.tree._private._CleavageEventStore import (
     _CleavageEventStore,
 )
-from clefts.domain.fragment.fragment_tree._private._FragmentEdgeStore import (
+from clefts.domain.fragment.tree._private._FragmentEdgeStore import (
     _FragmentEdgeStore,
 )
-from clefts.domain.fragment.fragment_tree._private._FragmentNodeStore import (
+from clefts.domain.fragment.tree._private._FragmentNodeStore import (
     _FragmentNodeStore,
 )
-from clefts.domain.fragment.fragment_tree._private._FragmentTreeAdjacency import (
+from clefts.domain.fragment.tree._private._FragmentTreeAdjacency import (
     _FragmentTreeAdjacency,
 )
-from clefts.domain.fragment.fragment_tree._private._FragmentTreeDepths import (
+from clefts.domain.fragment.tree._private._FragmentTreeDepths import (
     _FragmentTreeDepths,
 )
 
