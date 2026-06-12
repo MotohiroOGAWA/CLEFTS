@@ -63,7 +63,7 @@ class CleavagePattern(_CleavagePattern):
         cls,
         data: dict[str, Any],
     ) -> CleavagePattern:
-        cls.from_base(
+        return cls.from_base(
             pattern_id=int(data["pattern_id"]),
             base=_CleavagePattern.from_rules(
                 name=data["name"],

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple, Union, Iterable, Set
+from typing import Dict, List, Optional, Tuple, Union, Iterable, Set, Mapping
 from collections import deque, defaultdict
 
 import numpy as np
@@ -479,206 +479,311 @@ class FragmentTree:
             ),
         )
 
-    def collect_shortest_paths_to_parents(
+    def collect_shortest_node_paths_to_child(
         self,
-        child_index: int,
-        parent_indices: Iterable[int],
+        parent_depths: Mapping[int, int],
+        child_id: int,
+        max_depth: int,
         *,
-        max_depthes: Optional[Dict[int, Optional[int]]] = None,
-        use_cache: bool = True,
-    ) -> Dict[int, list[tuple[Union[FragmentNode, FragmentEdge], ...]]]:
-        """Collect all shortest paths from parent nodes to a child node.
-
-        This performs one reverse BFS from child_index toward parent_indices.
+        include_unreachable: bool = False,
+    ) -> Dict[int, Tuple[Tuple[int, ...], ...]]:
+        """Collect shortest node-edge paths from parent nodes to one child node.
 
         Parameters
         ----------
-        child_index:
-            Local child node index.
+        parent_depths:
+            Mapping from parent node ID to its current depth from the root.
+            The keys are treated as parent node IDs.
+        child_id:
+            Target child node ID.
+        max_depth:
+            Maximum allowed total depth from the root.
+            A route is valid only when:
 
-        parent_indices:
-            Local parent node indices.
+                parent_depth + path_depth <= max_depth
 
-        max_depthes:
-            Optional per-parent depth limit.
-
-            The key is a local parent node index.
-            The value is the maximum number of edges allowed.
-            None means unlimited.
-
-        use_cache:
-            If True, cached paths are reused.
+            where path_depth is the number of edges from the parent node to child_id.
+        include_unreachable:
+            If True, unreachable or depth-exceeded parent nodes are included with
+            an empty tuple.
 
         Returns
         -------
-        Dict[int, list[tuple[Union[FragmentNode, FragmentEdge], ...]]]
-            Mapping from parent local node index to shortest path candidates.
+        Dict[int, Tuple[Tuple[int, ...], ...]]
+            Mapping from parent node ID to shortest node-edge paths.
 
-            Each path is represented as:
+            Each path is represented as an alternating sequence of
+            node_index and edge_index:
 
-            node(parent), edge, node, edge, ..., node(child)
+                node_index, edge_index, node_index, edge_index, ..., node_index
         """
-        n = self.num_nodes
 
-        if not 0 <= child_index < n:
-            raise ValueError(f"Invalid child_index: {child_index}")
+        if max_depth < 0:
+            raise ValueError(f"max_depth must be non-negative: {max_depth}")
 
-        parent_set = {int(parent_index) for parent_index in parent_indices}
-        if not parent_set:
-            return {}
+        parent_depths = dict(parent_depths)
+        parent_ids_tuple = tuple(dict.fromkeys(parent_depths.keys()))
 
-        if any(not 0 <= parent_index < n for parent_index in parent_set):
-            raise ValueError("All parent_indices must be valid local node indices.")
+        result: Dict[int, Tuple[Tuple[int, ...], ...]] = {}
 
-        limits: Dict[int, Optional[int]] = {}
-        if max_depthes is None:
-            for parent_index in parent_set:
-                limits[parent_index] = None
-        else:
-            for parent_index in parent_set:
-                limits[parent_index] = max_depthes.get(parent_index, None)
-
-        def within_limit(parent_index: int, depth: int) -> bool:
-            limit = limits.get(parent_index, None)
-            if limit is None:
-                return True
-            return depth <= limit
-
-        result: Dict[
-            int,
-            list[tuple[Union[FragmentNode, FragmentEdge], ...]],
-        ] = {}
-
-        remaining: Set[int] = set()
-
-        if use_cache:
-            for parent_index in parent_set:
-                cache_key = (
-                    int(child_index),
-                    int(parent_index),
-                    limits[parent_index],
-                )
-
-                if cache_key in self._path_cache:
-                    result[parent_index] = self._path_cache[cache_key]
-                else:
-                    remaining.add(parent_index)
-        else:
-            remaining = set(parent_set)
-
-        if not remaining:
+        if not parent_ids_tuple:
             return result
 
-        dist = np.full(n, -1, dtype=np.int32)
-        dist[child_index] = 0
+        for parent_id, parent_depth in parent_depths.items():
+            if parent_depth < 0:
+                raise ValueError(
+                    f"parent depth must be non-negative: "
+                    f"parent_id={parent_id}, depth={parent_depth}"
+                )
 
-        queue = deque([child_index])
+        parent_id_set = set(parent_ids_tuple)
 
-        # nexts[parent] = [(next_node, edge), ...]
-        # parent --edge--> next_node
-        # This stores only shortest-path transitions.
-        nexts: Dict[int, list[tuple[int, FragmentEdge]]] = defaultdict(list)
+        # For each parent, the allowed additional depth from that parent to child.
+        max_path_depths: Dict[int, int] = {
+            parent_id: max_depth - parent_depth
+            for parent_id, parent_depth in parent_depths.items()
+        }
 
-        found_dist: Dict[int, int] = {}
+        # Parents already deeper than max_depth cannot have valid paths.
+        reachable_parent_ids = {
+            parent_id
+            for parent_id, max_path_depth in max_path_depths.items()
+            if max_path_depth >= 0
+        }
 
-        if child_index in remaining and within_limit(child_index, 0):
-            found_dist[child_index] = 0
+        if not reachable_parent_ids:
+            if include_unreachable:
+                return {
+                    parent_id: tuple()
+                    for parent_id in parent_ids_tuple
+                }
+            return result
 
-        stop_depth: Optional[int] = None
+        # We never need to search deeper than the largest allowed path depth.
+        global_max_path_depth = max(
+            max_path_depths[parent_id]
+            for parent_id in reachable_parent_ids
+        )
+
+        # child itself is reachable from child with path depth 0.
+        distances: Dict[int, int] = {
+            child_id: 0,
+        }
+
+        # paths_to_child[node_id] stores shortest node-edge paths from node_id to child_id.
+        paths_to_child: Dict[int, Tuple[Tuple[int, ...], ...]] = {
+            child_id: ((child_id,),),
+        }
+
+        queue: deque[int] = deque([child_id])
 
         while queue:
-            current = int(queue.popleft())
-            current_depth = int(dist[current])
+            current_id = queue.popleft()
+            current_path_depth = distances[current_id]
 
-            if stop_depth is not None and current_depth >= stop_depth:
+            if current_path_depth >= global_max_path_depth:
                 continue
 
-            for edge in self.get_in_edges(current):
-                parent = int(edge.source_index)
-                next_depth = current_depth + 1
+            # Traverse incoming edges:
+            # source_index --edge_index--> current_id
+            for edge_index in self.adjacency.get_in_edge_indices(current_id):
+                source_index = int(self.edge_store.source_indices[edge_index])
+                next_path_depth = current_path_depth + 1
 
-                if dist[parent] == -1:
-                    dist[parent] = next_depth
-                    queue.append(parent)
+                if next_path_depth > global_max_path_depth:
+                    continue
 
-                if dist[parent] == next_depth:
-                    nexts[parent].append((current, edge))
+                new_paths = tuple(
+                    (source_index, edge_index, *path)
+                    for path in paths_to_child[current_id]
+                )
 
-                if (
-                    parent in remaining
-                    and parent not in found_dist
-                    and within_limit(parent, next_depth)
-                ):
-                    found_dist[parent] = next_depth
+                old_path_depth = distances.get(source_index)
 
-            if stop_depth is None:
-                unresolved: list[int] = []
+                if old_path_depth is None:
+                    distances[source_index] = next_path_depth
+                    paths_to_child[source_index] = new_paths
+                    queue.append(source_index)
 
-                for parent_index in remaining:
-                    if parent_index in found_dist:
-                        continue
-
-                    limit = limits.get(parent_index, None)
-                    if limit is None:
-                        unresolved.append(parent_index)
-                    else:
-                        if current_depth < limit:
-                            unresolved.append(parent_index)
-
-                if not unresolved:
-                    stop_depth = (
-                        max(found_dist.values())
-                        if found_dist
-                        else 0
+                elif next_path_depth == old_path_depth:
+                    # Another shortest route to the same node.
+                    paths_to_child[source_index] = (
+                        *paths_to_child[source_index],
+                        *new_paths,
                     )
 
-        def build_paths_for_parent(
-            parent_index: int,
-        ) -> list[tuple[Union[FragmentNode, FragmentEdge], ...]]:
-            if dist[parent_index] == -1:
-                return []
+        for parent_id in parent_ids_tuple:
+            max_path_depth = max_path_depths[parent_id]
 
-            if not within_limit(parent_index, int(dist[parent_index])):
-                return []
-
-            paths: list[
-                tuple[Union[FragmentNode, FragmentEdge], ...]
-            ] = []
-
-            def dfs(
-                current: int,
-                acc: list[Union[FragmentNode, FragmentEdge]],
-            ) -> None:
-                if current == child_index:
-                    paths.append(tuple(acc))
-                    return
-
-                for next_node, edge in nexts.get(current, []):
-                    if dist[current] == dist[next_node] + 1:
-                        dfs(
-                            next_node,
-                            acc + [edge, self.get_node(next_node)],
-                        )
-
-            dfs(parent_index, [self.get_node(parent_index)])
-
-            return paths
-
-        for parent_index in remaining:
-            if parent_index == child_index and within_limit(parent_index, 0):
-                paths = [(self.get_node(child_index),)]
+            if max_path_depth < 0:
+                paths = tuple()
             else:
-                paths = build_paths_for_parent(parent_index)
-
-            if paths:
-                result[parent_index] = paths
-
-            if use_cache:
-                cache_key = (
-                    int(child_index),
-                    int(parent_index),
-                    limits[parent_index],
+                paths = tuple(
+                    path
+                    for path in paths_to_child.get(parent_id, ())
+                    if (len(path) - 1) // 2 <= max_path_depth
                 )
-                self._path_cache[cache_key] = paths
+
+            if paths or include_unreachable:
+                result[parent_id] = paths
 
         return result
+    
+    def collect_global_shortest_node_paths_from_root_via(
+        self,
+        target_node_index: int,
+        via_node_indices: Iterable[int],
+        max_depth: int,
+        max_via_depth: int,
+    ) -> Tuple[Tuple[int, ...], ...]:
+        """Return globally shortest paths from root to target via any via node.
+
+        The via condition is OR condition:
+
+            root(0) -> ... -> via -> ... -> target_node_index
+
+        A path is valid only when:
+
+            root_to_target_depth <= max_depth
+            root_to_via_depth <= max_via_depth
+
+        Parameters
+        ----------
+        target_node_index:
+            Target node index.
+        via_node_indices:
+            Candidate via node indices.
+            A returned path must pass through at least one of them.
+        max_depth:
+            Maximum allowed total path depth in edges from root to target.
+        max_via_depth:
+            Maximum allowed path depth in edges from root to via node.
+
+        Returns
+        -------
+        Tuple[Tuple[int, ...], ...]
+            All globally shortest valid node-edge paths.
+
+            Each path is represented as an alternating sequence of
+            node_index and edge_index:
+
+                node_index, edge_index, node_index, edge_index, ..., node_index
+        """
+
+        if max_depth < 0:
+            return tuple()
+
+        if max_via_depth < 0:
+            return tuple()
+
+        root_index = 0
+        via_node_set = set(via_node_indices)
+
+        if not via_node_set:
+            return tuple()
+
+        # Special case:
+        # root == target.
+        # The only path is (0,), and it is valid only if root is a via node.
+        if target_node_index == root_index:
+            if root_index in via_node_set:
+                return ((root_index,),)
+            return tuple()
+
+        # Collect shortest paths:
+        #
+        #     root -> ... -> via
+        #
+        # These prefix paths are also used to compute the current depth of each
+        # via node from the root.
+        prefix_paths_by_via: Dict[int, Tuple[Tuple[int, ...], ...]] = {}
+        parent_depths: Dict[int, int] = {}
+
+        for via_node_index in via_node_set:
+            if via_node_index == root_index:
+                prefix_paths = ((root_index,),)
+            else:
+                root_to_via_paths_by_root = self.collect_shortest_node_paths_to_child(
+                    parent_depths={root_index: 0},
+                    child_id=via_node_index,
+                    max_depth=max_via_depth,
+                    include_unreachable=False,
+                )
+
+                prefix_paths = root_to_via_paths_by_root.get(root_index, tuple())
+
+            if not prefix_paths:
+                continue
+
+            # All prefix paths for the same via node are shortest paths,
+            # so they should have the same depth.
+            prefix_depth = (len(prefix_paths[0]) - 1) // 2
+
+            if prefix_depth > max_via_depth:
+                continue
+
+            if prefix_depth > max_depth:
+                continue
+
+            prefix_paths_by_via[via_node_index] = prefix_paths
+            parent_depths[via_node_index] = prefix_depth
+
+        if not parent_depths:
+            return tuple()
+
+        # Collect shortest paths:
+        #
+        #     via -> ... -> target
+        #
+        # The parent_depths mapping lets collect_shortest_node_paths_to_child()
+        # prune routes where:
+        #
+        #     root_to_via_depth + via_to_target_depth > max_depth
+        via_to_target_paths = self.collect_shortest_node_paths_to_child(
+            parent_depths=parent_depths,
+            child_id=target_node_index,
+            max_depth=max_depth,
+            include_unreachable=False,
+        )
+
+        if not via_to_target_paths:
+            return tuple()
+
+        candidate_paths: List[Tuple[int, ...]] = []
+
+        for via_node_index, suffix_paths in via_to_target_paths.items():
+            if not suffix_paths:
+                continue
+
+            prefix_paths = prefix_paths_by_via.get(via_node_index, tuple())
+
+            if not prefix_paths:
+                continue
+
+            for prefix_path in prefix_paths:
+                for suffix_path in suffix_paths:
+                    # Avoid duplicating the via node.
+                    full_path = prefix_path + suffix_path[1:]
+                    full_depth = (len(full_path) - 1) // 2
+
+                    if full_depth > max_depth:
+                        continue
+
+                    candidate_paths.append(full_path)
+
+        if not candidate_paths:
+            return tuple()
+
+        min_depth = min(
+            (len(path) - 1) // 2
+            for path in candidate_paths
+        )
+
+        globally_shortest_paths = (
+            path
+            for path in candidate_paths
+            if (len(path) - 1) // 2 == min_depth
+        )
+
+        # Remove duplicates while preserving order.
+        return tuple(dict.fromkeys(globally_shortest_paths))

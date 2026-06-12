@@ -54,6 +54,39 @@ class FragmentPathwayGroup:
         return cls(pathways=tuple(pathways))
 
     @property
+    def shortest(self) -> FragmentPathwayGroup:
+        """Return a group containing only the shortest pathways."""
+
+        if self.is_empty:
+            return self.empty()
+
+        min_depth = min(
+            len(pathway)
+            for pathway in self.pathways
+        )
+
+        return self.__class__(
+            pathways=tuple(
+                pathway
+                for pathway in self.pathways
+                if len(pathway) == min_depth
+            )
+        )
+
+
+    @property
+    def with_precursor(self) -> FragmentPathwayGroup:
+        """Return a group containing only pathways that have a precursor node."""
+
+        return self.__class__(
+            pathways=tuple(
+                pathway
+                for pathway in self.pathways
+                if pathway.has_precursor_node
+            )
+        )
+
+    @property
     def is_empty(self) -> bool:
         return len(self.pathways) == 0
 
@@ -86,15 +119,22 @@ class FragmentPathwayGroup:
         ]
 
     @classmethod
-    def from_list(cls, data: list[Any]) -> FragmentPathwayGroup:
-        if not isinstance(data, list):
-            raise TypeError("FragmentPathwayGroup data must be a list.")
-
+    def from_list(cls, data: Iterable[Any]) -> FragmentPathwayGroup:
         return cls(
             pathways=tuple(
-                FragmentPathway.from_list(pathway_data)
-                for pathway_data in data
+                item if isinstance(item, FragmentPathway)
+                else FragmentPathway.from_list(item)
+                for item in data
             )
+        )
+
+    def to_pathways(self) -> Tuple[FragmentPathway, ...]:
+        return tuple(p.copy() for p in self.pathways)
+
+    @classmethod
+    def from_pathways(cls, fragment_pathways: Iterable[FragmentPathway]) -> FragmentPathwayGroup:
+        return cls(
+            pathways=tuple(fragment_pathways)
         )
 
     def to_json_str(self) -> str:

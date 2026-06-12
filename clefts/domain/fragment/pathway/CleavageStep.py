@@ -90,3 +90,12 @@ class CleavageStep:
     @classmethod
     def from_json_str(cls, text: str) -> CleavageStep:
         return cls.parse(text)
+
+    def copy(self) -> CleavageStep:
+        return CleavageStep(
+            cleavage_pattern_id=self.cleavage_pattern_id,
+            reaction_id=self.reaction_id,
+            product_molecule_id=self.product_molecule_id,
+            reactant_indices=tuple(self.reactant_indices),
+            product_indices=tuple(self.product_indices),
+        )

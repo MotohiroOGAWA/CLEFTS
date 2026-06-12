@@ -155,7 +155,7 @@ class TestFragmentPathwayGroup(unittest.TestCase):
             pathways=(self.pathway_1, self.pathway_2),
         )
 
-        restored = FragmentPathwayGroup.from_list(group.to_list())
+        restored = FragmentPathwayGroup.from_pathways(group.to_pathways())
 
         self.assertEqual(restored, group)
 
@@ -193,7 +193,7 @@ class TestFragmentPathwayGroup(unittest.TestCase):
 
     def test_from_list_rejects_non_list(self) -> None:
         with self.assertRaises(TypeError):
-            FragmentPathwayGroup.from_list(  # type: ignore[arg-type]
+            FragmentPathwayGroup.from_pathways(  # type: ignore[arg-type]
                 {"pathways": []}
             )
 

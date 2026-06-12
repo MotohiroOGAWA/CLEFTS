@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Tuple
+from dataclasses import dataclass, field
+from typing import Tuple, Dict
 import numpy as np
 
 from ....libs.mmkit.mmkit import Adduct
@@ -10,12 +10,9 @@ from ..tree.FragmentTree import FragmentTree
 from .FragmentIonAdductRule import FragmentIonAdductRule
 from .FragmentIonAdductRuleSet import FragmentIonAdductRuleSet
 from .IonShiftRule import IonShiftRule
-from ._private._FragmentHydrogenStateCandidateStore import (
-    _FragmentHydrogenStateCandidateStore,
-)
-from ._private._FragmentIonShiftCandidateStore import (
-    _FragmentIonShiftCandidateStore,
-)
+from ._private._FragmentHydrogenStateCandidateStore import _FragmentHydrogenStateCandidateStore
+from ._private._FragmentIonShiftCandidateStore import _FragmentIonShiftCandidateStore
+from ._private._FragmentIonFormulaCandidateGroup import _FragmentIonFormulaCandidateGroup
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -35,6 +32,7 @@ class FragmentIonTree(FragmentTree):
     fragment_ion_adduct_rule_set: FragmentIonAdductRuleSet
     hydrogen_state_candidate_store: _FragmentHydrogenStateCandidateStore
     ion_shift_candidate_store: _FragmentIonShiftCandidateStore
+    formula_candidate_groups: Dict[Adduct, _FragmentIonFormulaCandidateGroup] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -56,6 +54,8 @@ class FragmentIonTree(FragmentTree):
                 "hydrogen_state_candidate_store must be a "
                 "_FragmentHydrogenStateCandidateStore."
             )
+        self._validate_hydrogen_state_candidate_store()
+
 
         if not isinstance(
             self.ion_shift_candidate_store,
@@ -65,15 +65,19 @@ class FragmentIonTree(FragmentTree):
                 "ion_shift_candidate_store must be a "
                 "_FragmentIonShiftCandidateStore."
             )
-
         if self.ion_shift_candidate_store.num_nodes != self.num_nodes:
             raise ValueError(
                 "ion_shift_candidate_store.num_nodes must match "
                 "FragmentTree.num_nodes."
             )
-
-        self._validate_hydrogen_state_candidate_store()
         self._validate_ion_shift_candidate_store()
+
+
+        if not isinstance(self.formula_candidate_groups, dict):
+            raise TypeError(
+                "formula_candidate_groups must be a dict."
+            )
+        self._validate_formula_candidate_groups()
 
     @classmethod
     def from_fragment_tree(
@@ -228,6 +232,30 @@ class FragmentIonTree(FragmentTree):
         delta_h = self.hydrogen_state_candidate_store.get_candidate_delta_h_by_adduct_type(adduct_type)
         adducts = tuple(Adduct.from_dict({"H": int(delta_h_i)}) for delta_h_i in delta_h)
         return adducts
+
+    def get_adduct_rule_index_by_adduct_type(
+        self,
+        adduct_type: Adduct | str,
+    ) -> int:
+        """Return adduct rule index by main adduct type."""
+
+        if isinstance(adduct_type, Adduct):
+            target_key = str(adduct_type)
+        elif isinstance(adduct_type, str):
+            target_key = str(Adduct.parse(adduct_type))
+        else:
+            raise TypeError(
+                "adduct_type must be an Adduct or str. "
+                f"Got {type(adduct_type).__name__}."
+            )
+
+        for adduct_rule_index, adduct_rule in enumerate(
+            self.fragment_ion_adduct_rule_set.adduct_rules
+        ):
+            if str(adduct_rule.adduct_type) == target_key:
+                return adduct_rule_index
+
+        raise KeyError(f"Unknown adduct_type: {target_key}")
 
     def get_node_shift_rule_mask(
         self,
@@ -445,6 +473,39 @@ class FragmentIonTree(FragmentTree):
             for shift_rule_index in shift_rule_indices
         )
 
+    def get_formula_candidate_group(
+        self,
+        adduct_type: Adduct | str,
+    ) -> _FragmentIonFormulaCandidateGroup:
+        """Return formula candidate group for one main adduct type."""
+
+        return self._ensure_formula_candidate_group(adduct_type)
+
+    def get_node_formula_candidates(
+        self,
+        *,
+        adduct_type: Adduct | str,
+        formula: object,
+    ) -> tuple[tuple[int, Adduct], ...]:
+        """Return (node_index, candidate_adduct) candidates by formula."""
+
+        group = self._ensure_formula_candidate_group(adduct_type)
+
+        return group.get_candidates_by_formula(formula)
+
+    def copy(self) -> FragmentIonTree:
+        """Return a copy of this FragmentIonTree.
+
+        formula_candidate_groups is a lazy cache, so it is intentionally
+        not copied.
+        """
+        return self.from_fragment_tree(
+            fragment_tree=super().copy(),
+            fragment_ion_adduct_rule_set=self.fragment_ion_adduct_rule_set,
+            hydrogen_state_candidate_store=self.hydrogen_state_candidate_store.copy(),
+            ion_shift_candidate_store=self.ion_shift_candidate_store.copy(),
+        )
+
     def _validate_hydrogen_state_candidate_store(self) -> None:
         """Validate hydrogen candidate store against the adduct rule set."""
 
@@ -570,3 +631,69 @@ class FragmentIonTree(FragmentTree):
                 f"[0, {self.num_adduct_rules}). "
                 f"Got {adduct_rule_index}."
             )
+
+
+    def _validate_formula_candidate_groups(self) -> None:
+        """Validate existing formula candidate groups.
+
+        This does not require all adduct types to be present because
+        groups are built lazily per adduct type.
+        """
+
+        groups = self.formula_candidate_groups
+
+        for adduct_type, group in groups.items():
+            if not isinstance(group, _FragmentIonFormulaCandidateGroup):
+                raise TypeError(
+                    "formula_candidate_groups values must be "
+                    "_FragmentIonFormulaCandidateGroup."
+                )
+
+            adduct_rule_index = self._get_adduct_rule_index_by_adduct_type(
+                adduct_type
+            )
+
+            expected_adduct_type = (
+                self.fragment_ion_adduct_rule_set
+                .adduct_rules[adduct_rule_index]
+                .adduct_type
+            )
+
+            if str(group.adduct_type) != str(expected_adduct_type):
+                raise ValueError(
+                    "formula candidate group adduct_type does not match "
+                    "the corresponding adduct rule. "
+                    f"expected={expected_adduct_type}, "
+                    f"actual={group.adduct_type}"
+                )
+
+            if group.num_candidates > 0:
+                if np.any(group.node_indices >= self.num_nodes):
+                    raise ValueError(
+                        "formula candidate group contains out-of-range "
+                        "node indices."
+                    )
+        
+    def _ensure_formula_candidate_group(
+        self,
+        adduct_type: Adduct | str,
+    ) -> _FragmentIonFormulaCandidateGroup:
+        """Build one formula candidate group lazily."""
+
+        adduct_rule_index = self.get_adduct_rule_index_by_adduct_type(adduct_type)
+        adduct_rule = self.fragment_ion_adduct_rule_set.adduct_rules[adduct_rule_index]
+
+        normalized_adduct_type = adduct_rule.adduct_type
+        groups = self.formula_candidate_groups
+
+        if normalized_adduct_type in groups:
+            return groups[normalized_adduct_type]
+
+        group = _FragmentIonFormulaCandidateGroup.from_fragment_ion_tree(
+            fragment_ion_tree=self,
+            adduct_rule_index=adduct_rule_index,
+        )
+
+        groups[normalized_adduct_type] = group
+
+        return group

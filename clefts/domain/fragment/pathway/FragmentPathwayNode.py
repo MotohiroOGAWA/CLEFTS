@@ -94,3 +94,9 @@ class FragmentPathwayNode:
 
     def to_compound(self) -> Compound:
         return Compound.from_smiles(self.smiles)
+    
+    def copy(self) -> FragmentPathwayNode:
+        return FragmentPathwayNode(
+            smiles=self.smiles,
+            precursor_adduct_type=self.precursor_adduct_type.copy() if self.precursor_adduct_type is not None else None,
+        )

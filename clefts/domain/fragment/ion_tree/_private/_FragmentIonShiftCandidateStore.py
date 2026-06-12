@@ -406,7 +406,7 @@ class _FragmentIonShiftCandidateStore:
     ) -> Adduct:
         """Return ion-shift adduct type for one shift_rule_index."""
 
-        self._validate_shift_rule_index(shift_rule_index)
+        # self._validate_shift_rule_index(shift_rule_index)
         return self.ion_shift_adduct_types[shift_rule_index]
 
     def get_shift_rule_position(

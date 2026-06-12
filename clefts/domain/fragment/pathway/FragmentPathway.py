@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Optional, Tuple, Union
+from typing import Any, Optional, Tuple, Union, Iterable
 import json
 
 from ....libs.mmkit.mmkit import Adduct, Formula
@@ -97,6 +97,10 @@ class FragmentPathway:
             if node.is_precursor:
                 return node
         return None
+    
+    @property
+    def has_precursor_node(self) -> bool:
+        return self.precursor_node is not None
 
     def get_node(self, index: int) -> FragmentPathwayNode:
         return self.nodes[index]
@@ -127,10 +131,7 @@ class FragmentPathway:
         ]
 
     @classmethod
-    def from_list(cls, data: list[Any]) -> FragmentPathway:
-        if not isinstance(data, list):
-            raise TypeError("FragmentPathway data must be a list.")
-
+    def from_list(cls, data: Iterable[Any]) -> FragmentPathway:
         if len(data) != 2:
             raise ValueError(
                 "FragmentPathway list must have 2 elements: "
@@ -194,3 +195,9 @@ class FragmentPathway:
     @classmethod
     def from_json_str(cls, text: str) -> FragmentPathway:
         return cls.parse(text)
+
+    def copy(self) -> FragmentPathway:
+        return FragmentPathway(
+            elements=tuple(e.copy() for e in self.elements),
+            adduct=self.adduct.copy(),
+        )

@@ -67,3 +67,8 @@ class FragmentPathwayEdge:
     @classmethod
     def from_json_str(cls, text: str) -> FragmentPathwayEdge:
         return cls.parse(text)
+    
+    def copy(self) -> FragmentPathwayEdge:
+        return FragmentPathwayEdge(
+            steps=tuple(step.copy() for step in self.steps)
+        )
