@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from typing import Tuple, List, Dict, Iterable
 from pathlib import Path
 import tempfile
 import unittest
@@ -299,14 +300,121 @@ class TestFragmenter(unittest.TestCase):
                 self.assertEqual(copied.name, fragmenter.name)
                 self.assertEqual(copied.tree_max_depth, fragmenter.tree_max_depth)
 
-    def test_build_fragment_pathways_by_peak_finds_pathways_for_all_peaks(self) -> None:
-        """Build fragment pathways for multiple adduct types and peak m/z lists."""
+    def test_assign_fragment_pathways_to_peaks_finds_pathways_for_all_peaks(
+        self,
+    ) -> None:
+        """Assign fragment pathways for each peak m/z list."""
 
         compound = Compound.from_smiles(
             "CC(=O)N[C@@H](CC1=CC=CC=C1)C2=CC(=CC(=O)O2)OC"
         )
 
-        test_case_groups = [
+        for group in self._make_fragment_pathway_assignment_test_case_groups():
+            with self.subTest(group=group["name"]):
+                fragmenter = Fragmenter.from_json(group["fragmenter_json"])
+
+                fragment_ion_tree = fragmenter.build_fragment_ion_tree(
+                    compound,
+                    max_node=-1,
+                    max_edge=-1,
+                    print_info=False,
+                    _include_fragment_compound_cache=True,
+                )
+
+                for case in group["test_cases"]:
+                    with self.subTest(group=group["name"], case=case["name"]):
+                        self._assert_fragment_pathways_by_peak(
+                            fragmenter=fragmenter,
+                            fragment_ion_tree=fragment_ion_tree,
+                            compound=compound,
+                            precursor_type=case["precursor_type"],
+                            peak_mz_list=case["peak_mz_list"],
+                            expected_precursor_formula=case[
+                                "expected_precursor_formula"
+                            ],
+                            expected_precursor_pathway_length=case.get(
+                                "precursor_pathway_length",
+                                1,
+                            ),
+                            expected_precursor_main_adduct_type=case.get(
+                                "precursor_main_adduct_type",
+                                case["precursor_type"],
+                            ),
+                        )
+
+    def test_assign_fragment_pathways_to_peak_sets_finds_pathways_for_all_peaks(
+        self,
+    ) -> None:
+        """Assign fragment pathways to multiple peak sets at once."""
+
+        compound = Compound.from_smiles(
+            "CC(=O)N[C@@H](CC1=CC=CC=C1)C2=CC(=CC(=O)O2)OC"
+        )
+
+        for group in self._make_fragment_pathway_assignment_test_case_groups():
+            with self.subTest(group=group["name"]):
+                fragmenter = Fragmenter.from_json(group["fragmenter_json"])
+
+                fragment_ion_tree = fragmenter.build_fragment_ion_tree(
+                    compound,
+                    max_node=-1,
+                    max_edge=-1,
+                    print_info=False,
+                    _include_fragment_compound_cache=True,
+                )
+
+                peak_sets = tuple(
+                    (
+                        case["precursor_type"],
+                        case["peak_mz_list"],
+                    )
+                    for case in group["test_cases"]
+                )
+
+                assigned_results = fragmenter.assign_fragment_pathways_to_peak_sets(
+                    fragment_ion_tree=fragment_ion_tree,
+                    peak_sets=peak_sets,
+                )
+
+                self.assertEqual(
+                    len(assigned_results),
+                    len(group["test_cases"]),
+                )
+
+                for case, assigned_result in zip(
+                    group["test_cases"],
+                    assigned_results,
+                ):
+                    with self.subTest(group=group["name"], case=case["name"]):
+                        (
+                            precursor_fragment_pathways,
+                            fragment_pathways_by_peak,
+                        ) = assigned_result
+
+                        self._assert_assigned_fragment_pathways_by_peak(
+                            fragmenter=fragmenter,
+                            compound=compound,
+                            precursor_type=case["precursor_type"],
+                            peak_mz_list=case["peak_mz_list"],
+                            precursor_fragment_pathways=precursor_fragment_pathways,
+                            fragment_pathways_by_peak=fragment_pathways_by_peak,
+                            expected_precursor_formula=case[
+                                "expected_precursor_formula"
+                            ],
+                            expected_precursor_pathway_length=case.get(
+                                "precursor_pathway_length",
+                                1,
+                            ),
+                            expected_precursor_main_adduct_type=case.get(
+                                "precursor_main_adduct_type",
+                                case["precursor_type"],
+                            ),
+                        )
+
+    def _make_fragment_pathway_assignment_test_case_groups(self):
+        """Create common test cases for fragment pathway assignment tests."""
+
+        return [
             {
                 "name": "positive",
                 "fragmenter_json": "clefts/domain/fragment/presets/fragmenter_pos.json",
@@ -378,7 +486,7 @@ class TestFragmenter(unittest.TestCase):
                         ],
                         "expected_precursor_formula": Formula.parse("C10H12NO4+"),
                         "precursor_pathway_length": 2,
-                        "precusor_main_adduct_type": Adduct.parse("[M+H]+"),
+                        "precursor_main_adduct_type": Adduct.parse("[M-H]+"),
                     },
                 ],
             },
@@ -417,37 +525,6 @@ class TestFragmenter(unittest.TestCase):
                 ],
             },
         ]
-
-        for group in test_case_groups:
-            with self.subTest(group=group["name"]):
-                fragmenter = Fragmenter.from_json(group["fragmenter_json"])
-
-                fragment_ion_tree = fragmenter.build_fragment_ion_tree(
-                    compound,
-                    max_node=-1,
-                    max_edge=-1,
-                    print_info=False,
-                    _include_fragment_compound_cache=True,
-                )
-
-                for case in group["test_cases"]:
-                    with self.subTest(group=group["name"], case=case["name"]):
-                        self._assert_fragment_pathways_by_peak(
-                            fragmenter=fragmenter,
-                            fragment_ion_tree=fragment_ion_tree,
-                            compound=compound,
-                            precursor_type=case["precursor_type"],
-                            peak_mz_list=case["peak_mz_list"],
-                            expected_precursor_formula=case["expected_precursor_formula"],
-                            expected_precursor_pathway_length=case.get(
-                                "precursor_pathway_length",
-                                1,
-                            ),
-                            expected_precursor_main_adduct_type=case.get(
-                                "precusor_main_adduct_type",
-                                case["precursor_type"],
-                            ),
-                        )
 
     def _make_fragmenter(
         self,
@@ -492,7 +569,7 @@ class TestFragmenter(unittest.TestCase):
         """Assert that fragment pathways are found for all given peaks."""
         pass
         precursor_fragment_pathways, fragment_pathways_by_peak = (
-            fragmenter.build_fragment_pathways_by_peak(
+            fragmenter.assign_fragment_pathways_to_peaks(
                 fragment_ion_tree=fragment_ion_tree,
                 precursor_type=precursor_type,
                 peaks_mz=peak_mz_list,
@@ -605,6 +682,79 @@ class TestFragmenter(unittest.TestCase):
                                 f"tolerance={fragmenter.mass_tolerance}"
                             ),
                         )
+
+    def _assert_assigned_fragment_pathways_by_peak(
+        self,
+        *,
+        fragmenter: Fragmenter,
+        compound: Compound,
+        precursor_type: Adduct,
+        peak_mz_list: Iterable[float],
+        precursor_fragment_pathways: FragmentPathwayGroup,
+        fragment_pathways_by_peak: Tuple[FragmentPathwayGroup, ...],
+        expected_precursor_formula: Formula,
+        expected_precursor_pathway_length: int = 1,
+        expected_precursor_main_adduct_type: Adduct | None = None,
+    ) -> None:
+        peak_mz_list = tuple(peak_mz_list)
+
+        if expected_precursor_main_adduct_type is None:
+            expected_precursor_main_adduct_type = precursor_type
+
+        self.assertEqual(
+            len(fragment_pathways_by_peak),
+            len(peak_mz_list),
+        )
+
+        self.assertGreater(
+            len(precursor_fragment_pathways.pathways),
+            0,
+        )
+
+        for precursor_pathway in precursor_fragment_pathways.pathways:
+            self.assertEqual(
+                precursor_pathway.formula,
+                expected_precursor_formula,
+            )
+            self.assertEqual(
+                precursor_pathway.adduct,
+                expected_precursor_main_adduct_type,
+            )
+            self.assertEqual(
+                len(precursor_pathway),
+                expected_precursor_pathway_length,
+            )
+
+        for peak_mz, fragment_pathway_group in zip(
+            peak_mz_list,
+            fragment_pathways_by_peak,
+        ):
+            with self.subTest(peak_mz=peak_mz):
+                self.assertGreater(
+                    len(fragment_pathway_group.pathways),
+                    0,
+                )
+
+                for fragment_pathway in fragment_pathway_group.pathways:
+                    mz_error = fragmenter.mass_tolerance.error(
+                        observed=peak_mz,
+                        theoretical=fragment_pathway.formula.exact_mass,
+                    )
+
+                    self.assertTrue(
+                        fragmenter.mass_tolerance.within(
+                            observed=peak_mz,
+                            theoretical=fragment_pathway.formula.exact_mass,
+                        ),
+                        msg=(
+                            f"Peak m/z {peak_mz} was assigned to "
+                            f"{fragment_pathway.formula} "
+                            f"with exact mass "
+                            f"{fragment_pathway.formula.exact_mass}. "
+                            f"m/z error: {mz_error} "
+                            f"{fragmenter.mass_tolerance.unit}"
+                        ),
+                    )
 
 if __name__ == "__main__":
     unittest.main()
