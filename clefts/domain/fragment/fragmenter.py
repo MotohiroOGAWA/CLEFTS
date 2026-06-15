@@ -45,6 +45,15 @@ class Fragmenter:
     def name(self) -> str:
         return self.fragment_ion_tree_builder.name
 
+    def get_index_by_adduct_type(self, adduct_type: Adduct) -> int:
+        main_adduct_type = self._resolve_main_adduct_type(adduct_type)
+        mapper = self.adduct_rule_set.adduct_type_to_index
+        if main_adduct_type not in mapper:
+            raise ValueError(
+                f"Adduct type not supported by this fragmenter: {adduct_type}"
+            )
+        return mapper[main_adduct_type]
+
     def build_fragment_tree(
         self,
         compound: Compound,
@@ -249,26 +258,6 @@ class Fragmenter:
                 reference_adducts=self.adduct_types,
             )
         )
-
-        if sum(matched_adduct_flags) == 0:
-            if precursor_type.charge == 1:
-                fallback_main_adduct_type = Adduct.parse("[M+H]+")
-                residual_component_adduct = residual_component_adduct.add_prefer_self(
-                    Adduct.parse("[M-H]")
-                )
-
-            else:
-                fallback_main_adduct_type = Adduct.parse("[M-H]-")
-                residual_component_adduct = residual_component_adduct.add_prefer_self(
-                    Adduct.parse("[M+H]+")
-                )
-
-            if fallback_main_adduct_type in self.adduct_types:
-                matched_adduct_flags = list(matched_adduct_flags)
-                matched_adduct_flags[
-                    self.adduct_types.index(fallback_main_adduct_type)
-                ] = True
-                matched_adduct_flags = tuple(matched_adduct_flags)
 
         if sum(matched_adduct_flags) == 0:
             raise ValueError(

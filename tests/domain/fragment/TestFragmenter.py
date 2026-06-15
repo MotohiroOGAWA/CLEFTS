@@ -477,7 +477,7 @@ class TestFragmenter(unittest.TestCase):
                     },
                     {
                         "name": "benzene_loss",
-                        "precursor_type": Adduct.parse("[M-C6H5]+"),
+                        "precursor_type": Adduct.parse("[M+H-C6H6]+"),
                         "peak_mz_list": [
                             125.0233,
                             154.0499,
