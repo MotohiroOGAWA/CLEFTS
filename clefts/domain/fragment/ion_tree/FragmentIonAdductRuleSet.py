@@ -234,10 +234,10 @@ class FragmentIonAdductRuleSet:
         adduct_type: Adduct | str,
     ) -> str:
         if isinstance(adduct_type, Adduct):
-            return str(adduct_type)
+            return adduct_type
 
         if isinstance(adduct_type, str):
-            return str(Adduct.parse(adduct_type))
+            return Adduct.parse(adduct_type)
 
         raise TypeError(
             "adduct_type must be an Adduct or str. "
