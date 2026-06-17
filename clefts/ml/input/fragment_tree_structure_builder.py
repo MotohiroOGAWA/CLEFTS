@@ -10,8 +10,10 @@ import numpy as np
 
 from ...libs.mmkit.mmkit import Compound, Adduct
 from ...libs.msentity.msentity import SpectrumRecord
+from ...domain.fragment.cleavage import CleavageResult
+from ...domain.fragment.tree import FragmentEdge
 from ...domain.fragment.ion_tree import FragmentIonTree
-from ...domain.fragment.pathway import FragmentPathway, FragmentPathwayGroup, FragmentPathwayNode, FragmentPathwayEdge
+from ...domain.fragment.pathway import FragmentPathway, FragmentPathwayGroup, FragmentPathwayNode, FragmentPathwayEdge, CleavageStep
 from ..specgen import CleftsSpecGen
 from .fragment_tree_structure import FragmentTreeStructure
 
@@ -431,6 +433,246 @@ class FragmentTreeStructureBuilder:
             sample_precursor_path_index=sample_precursor_path_index,
         )
 
+    def add_same_smiles_dataset_first_cleavage(
+        self,
+        dataset,
+        *,
+        precursor_mz_column: str = "PrecursorMZ",
+        adduct_type_column: str = "AdductType",
+        collision_energy_column: str = "CollisionEnergy",
+        smiles_column: str = "SMILES",
+        instrument_column: Optional[str] = None,
+    ) -> np.ndarray:
+        """
+        Add multiple spectrum records with the same SMILES as samples.
+
+        This method:
+            - validates that all records have the same SMILES
+            - builds FragmentIonTree only once
+            - caches precursor FragmentPathwayGroup by adduct type
+            - registers precursor / first-cleavage fragment nodes
+            - registers first-cleavage edges and cleavage events
+            - adds each record as one FragmentTreeSample
+
+        Returns
+        -------
+        np.ndarray
+            Added sample indexes.
+        """
+        if len(dataset) == 0:
+            raise ValueError("dataset must not be empty.")
+
+        smiles = dataset[smiles_column].unique()
+        if len(smiles) != 1:
+            raise ValueError(
+                "All records in the dataset must have the same SMILES. "
+                f"Got unique SMILES: {smiles}"
+            )
+        smiles = str(smiles[0])
+
+        compound = Compound.from_smiles(smiles)
+
+        # -------------------------
+        # Build shared FragmentIonTree only once
+        # -------------------------
+        fragment_ion_tree = self._model._fragmenter.build_fragment_ion_tree(
+            compound=compound,
+            max_depth=self._model.precursor_candidate_max_depth,
+            _include_fragment_compound_cache=True,
+        )
+
+        fragment_compound_by_index = fragment_ion_tree._fragment_compound_by_index if hasattr(fragment_ion_tree, "_fragment_compound_by_index") else None
+        fragment_compound_by_smiles = {}
+        tree_node_index_by_smiles: Dict[str, int] = {}
+        src_smiles_to_outgoing_fragment_edges: Dict[str, List[Tuple[str, FragmentPathwayEdge]]] = {}
+        cleavage_results_by_smiles: Dict[str, List[CleavageResult]] = {}
+        if fragment_compound_by_index is not None:
+            for node_index, compound in fragment_compound_by_index.items():
+                fragment_compound_by_smiles[compound.smiles] = compound
+                tree_node_index_by_smiles[compound.smiles] = node_index
+
+        def get_compound_by_smiles(smiles: str) -> Compound:
+            compound = fragment_compound_by_smiles.get(smiles)
+            if compound is None:
+                compound = Compound.from_smiles(smiles)
+                fragment_compound_by_smiles[smiles] = compound
+            return compound
+        def get_tree_node_index_by_smiles(smiles: str) -> Optional[int]:
+            tree_node_index = tree_node_index_by_smiles.get(smiles)
+            if tree_node_index is None:
+                tree_node = fragment_ion_tree.get_node_by_smiles(smiles)
+                if tree_node is not None:
+                    tree_node_index = int(tree_node.index)
+                    tree_node_index_by_smiles[smiles] = tree_node_index
+                else:
+                    tree_node_index = None
+            return tree_node_index
+        def get_cleavage_results_by_smiles(smiles: str) -> List[CleavageResult]:
+            cleavage_results = cleavage_results_by_smiles.get(smiles)
+            if cleavage_results is None:
+                compound = get_compound_by_smiles(smiles)
+                cleavage_results = self._model.fragmenter.cleavage_pattern_set.fragment_all(compound)
+                cleavage_results_by_smiles[smiles] = cleavage_results
+            return cleavage_results
+        def get_outgoing_fragment_edges_by_src_smiles(
+            src_smiles: str,
+            fragment_ion_tree: FragmentIonTree,
+        ) -> List[Tuple[str, FragmentPathwayEdge]]:
+            dst_smiles_and_edge_list = src_smiles_to_outgoing_fragment_edges.get(
+                src_smiles
+            )
+
+            if dst_smiles_and_edge_list is None:
+                dst_smiles_and_edge_list = []
+                src_node = fragment_ion_tree.get_node_by_smiles(src_smiles)
+                if src_node is None:
+                    raise ValueError(
+                        f"Source SMILES {src_smiles!r} not found in fragment ion tree."
+                    )
+                src_node_index = int(src_node.index)
+                out_edges = fragment_ion_tree.get_out_edges(src_node_index)
+                if len(out_edges) > 0:
+                    for out_edge in out_edges:
+                        dst_node_index = out_edge.target_index
+                        dst_node = fragment_ion_tree.get_node(dst_node_index)
+                        dst_smiles = dst_node.smiles
+                        fragment_pathway_edge = FragmentPathwayEdge.from_fragment_edge(out_edge)
+                        dst_smiles_and_edge_list.append(
+                            (
+                                dst_smiles,
+                                fragment_pathway_edge,
+                            )
+                        )
+                else:
+                    dst_smiles_to_cleavage_steps: Dict[str, List[CleavageStep]] = {}
+
+                    cleavage_results = get_cleavage_results_by_smiles(src_smiles)
+
+                    for cleavage_result in cleavage_results:
+                        for product in cleavage_result.products:
+                            for product_molecule in product.product_molecules:
+                                dst_smiles = product_molecule.compound.smiles
+
+                                if dst_smiles not in dst_smiles_to_cleavage_steps:
+                                    dst_smiles_to_cleavage_steps[dst_smiles] = []
+
+                                cleavage_step = CleavageStep(
+                                    cleavage_pattern_id=cleavage_result.pattern_id,
+                                    reaction_id=product.id,
+                                    product_molecule_id=product_molecule.id,
+                                    reactant_indices=tuple(product.reactant_indices),
+                                    product_indices=tuple(product_molecule.product_indices),
+                                )
+
+                                dst_smiles_to_cleavage_steps[dst_smiles].append(
+                                    cleavage_step
+                                )
+
+                    for dst_smiles, cleavage_steps in dst_smiles_to_cleavage_steps.items():
+                        dst_smiles_and_edge_list.append(
+                            (
+                                dst_smiles,
+                                FragmentPathwayEdge(cleavage_steps),
+                            )
+                        )
+
+                src_smiles_to_outgoing_fragment_edges[src_smiles] = list(
+                    dst_smiles_and_edge_list
+                )
+
+            return dst_smiles_and_edge_list
+
+        # -------------------------
+        # Cache precursor pathways by adduct type
+        # -------------------------
+        precursor_fragment_pathways_by_adduct: Dict[str, FragmentPathwayGroup] = {}
+
+        sample_indexes: List[int] = []
+
+        for record_index in range(len(dataset)):
+            record = dataset[record_index]
+            try:
+                (
+                    smiles,
+                    precursor_mz,
+                    adduct_type,
+                    adduct_type_index,
+                    ce_value,
+                    instrument,
+                ) = self._parse_record_info(
+                    record,
+                    precursor_mz_column=precursor_mz_column,
+                    adduct_type_column=adduct_type_column,
+                    collision_energy_column=collision_energy_column,
+                    smiles_column=smiles_column,
+                    instrument_column=instrument_column,
+                )
+            except Exception as e:
+                sample_indexes.append(-1)
+                continue
+
+            sample_index = len(self.samples)
+
+            adduct_type_key = str(adduct_type)
+
+            if adduct_type_key not in precursor_fragment_pathways_by_adduct:
+                precursor_fragment_pathways, _ = (
+                    self._model.fragmenter.assign_fragment_pathways_to_peaks(
+                        fragment_ion_tree=fragment_ion_tree,
+                        precursor_type=adduct_type,
+                        peaks_mz=[],
+                    )
+                )
+
+                precursor_fragment_pathways_by_adduct[adduct_type_key] = (
+                    precursor_fragment_pathways
+                )
+
+            precursor_fragment_pathways = (
+                precursor_fragment_pathways_by_adduct[adduct_type_key]
+            )
+
+            sample = FragmentTreeSample(
+                adduct_type_index=int(adduct_type_index),
+                ce_value=float(ce_value),
+            )
+
+            precursor_edge_index_paths = self._fragment_pathway_group_to_edge_index_paths(
+                fragment_pathway_group=precursor_fragment_pathways,
+                padding_length=self._model.fragmenter.precursor_candidate_max_depth,
+                fragment_compound_by_smiles=fragment_compound_by_smiles,
+            )
+            sample.precursor_edge_indexes.update(precursor_edge_index_paths)
+
+            # -------------------------
+            # Add first-cleavage edges for this sample
+            # -------------------------
+            for precursor_node in precursor_fragment_pathways.precursor_nodes:
+                tree_precursor_node = fragment_ion_tree.get_node_by_smiles(
+                    precursor_node.smiles
+                )
+
+                if tree_precursor_node is None:
+                    raise ValueError(
+                        f"Precursor node SMILES {precursor_node.smiles!r} "
+                        "not found in fragment ion tree."
+                    )
+
+                for dst_smiles, fp_edge in get_outgoing_fragment_edges_by_src_smiles(precursor_node.smiles, fragment_ion_tree):
+                    edge_index = self._ensure_get_edge_index(precursor_node.smiles, dst_smiles, fp_edge)
+
+                    if edge_index is None:
+                        continue
+
+                    edge_index = int(edge_index)
+
+                    sample.edge_indexes.add(edge_index)
+
+                self.samples[int(sample_index)] = sample
+                sample_indexes.append(int(sample_index))
+
+        return np.asarray(sample_indexes, dtype=int)
+
     # -------------------------
     # internal helpers
     # -------------------------
@@ -840,6 +1082,56 @@ class FragmentTreeStructureBuilder:
 
         return edge_index_paths
         
-        
+    def _parse_record_info(
+        self,
+        record: SpectrumRecord,
+        *,
+        precursor_mz_column: str,
+        adduct_type_column: str,
+        collision_energy_column: str,
+        smiles_column: str = "smiles",
+        instrument_column: Optional[str] = None,
+    ) -> Tuple[str, float, Adduct, int, float, Optional[str]]:
+        """
+        Parse commonly used metadata from one spectrum record.
+
+        This method extracts:
+            - precursor m/z
+            - adduct type
+            - adduct type index
+            - collision energy in eV
+            - SMILES
+            - optional instrument
+        """
+        precursor_mz = float(record[precursor_mz_column])
+
+        adduct_type_str = str(record[adduct_type_column])
+        adduct_type = Adduct.parse(adduct_type_str)
+
+        ce_value_raw = record[collision_energy_column]
+
+        instrument = None
+        if instrument_column is not None:
+            instrument = record[instrument_column]
+
+        adduct_type_index = self._model.get_index_by_adduct_type(adduct_type)
+
+        ce_value = CleftsSpecGen.parse_ce_to_ev(
+            ce_value_raw,
+            precursor_mz=precursor_mz,
+            instrument=instrument,
+        )
+
+        if ce_value is None:
+            raise ValueError(
+                f"Failed to parse collision energy: {ce_value_raw!r} "
+                f"for SMILES={record[smiles_column]!r}, "
+                f"precursor_mz={precursor_mz}, "
+                f"adduct_type={adduct_type}."
+            )
+
+        smiles = str(record[smiles_column])
+
+        return smiles, precursor_mz, adduct_type, adduct_type_index, ce_value, instrument
 
         

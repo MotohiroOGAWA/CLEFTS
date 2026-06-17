@@ -27,6 +27,7 @@ class CleftsSpecGen(ModelBase):
         self._fragmenter = Fragmenter.from_dict(fragmenter_params)
 
         pass
+    
 
     @property
     def mol_atom_dim(self) -> int:
@@ -35,6 +36,22 @@ class CleftsSpecGen(ModelBase):
     @property
     def mol_graph_dim(self) -> int:
         return self._mol_encoder._graph_dim
+
+    @property
+    def tree_max_depth(self) -> int:
+        return self._fragmenter.tree_max_depth
+
+    @property
+    def precursor_candidate_max_depth(self) -> int:
+        return self._fragmenter.precursor_candidate_max_depth
+
+    @property
+    def mol_encoder(self) -> MolEncoder:
+        return self._mol_encoder
+    
+    @property
+    def fragmenter(self) -> Fragmenter:
+        return self._fragmenter
 
     def get_index_by_adduct_type(self, adduct_type: Adduct) -> int:
         return self._fragmenter.get_index_by_adduct_type(adduct_type)

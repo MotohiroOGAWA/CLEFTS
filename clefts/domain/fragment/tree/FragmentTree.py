@@ -397,6 +397,10 @@ class FragmentTree:
         """Return a node by local node index."""
         return self.node_store.get_node(index)
 
+    def get_node_by_smiles(self, smiles: str) -> FragmentNode | None:
+        """Return FragmentNode with the given SMILES, or None if not found."""
+        return self.node_store.get_node_by_smiles(smiles)
+
     def get_edge(self, index: int) -> FragmentEdge:
         """Return an edge by local edge index."""
         return self.edge_store.get_edge(index)

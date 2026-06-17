@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Tuple
+from typing import Any, Tuple, List
 import json
 
 from ..tree.FragmentEdge import FragmentEdge
@@ -93,7 +93,7 @@ class FragmentPathwayEdge:
                 for event in edge.events
             )
         )
-    
+
     def copy(self) -> FragmentPathwayEdge:
         return FragmentPathwayEdge(
             steps=tuple(step.copy() for step in self.steps)

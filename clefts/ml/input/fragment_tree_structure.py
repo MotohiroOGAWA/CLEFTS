@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Sequence, Optional
 
 import numpy as np
 import torch
@@ -127,3 +127,302 @@ class FragmentTreeStructure:
                 self.sample_precursor_path_index.to(device)
             ),
         )
+
+    @classmethod
+    def from_structures(
+        cls,
+        structures: Sequence["FragmentTreeStructure"],
+        device: Optional[torch.device] = None,
+    ) -> FragmentTreeStructure:
+        """
+        Combine multiple FragmentTreeStructure objects into one batched structure.
+
+        Parameters
+        ----------
+        structures:
+            FragmentTreeStructure objects to combine.
+
+        device:
+            Optional target device. If provided, all tensor fields and node_graph
+            are moved to this device.
+
+        Returns
+        -------
+        batched:
+            Combined FragmentTreeStructure.
+
+        Notes
+        -----
+        Offset handling:
+            - node indices are shifted by cumulative num_nodes.
+            - edge indices are shifted by cumulative num_edges.
+            - sample indices are shifted by cumulative num_samples.
+            - atom indices in cleavage atom index dictionaries are shifted by
+            cumulative atom count.
+
+        Important
+        ---------
+        cleavage_event[:, 3] and cleavage_event[:, 4] are kept unchanged.
+        This is because the tuple_length key needed to offset these row indices
+        is not stored in cleavage_event itself.
+        """
+        if len(structures) == 0:
+            raise ValueError("structures must not be empty")
+
+        if device is not None:
+            structures = [structure.to(device) for structure in structures]
+
+        first = structures[0]
+        tensor_device = first.edge_index.device
+
+        # -------------------------
+        # Node SMILES
+        # -------------------------
+        node_smiles = np.concatenate(
+            [structure.node_smiles for structure in structures],
+            axis=0,
+        )
+
+        # -------------------------
+        # Node molecular graphs
+        # -------------------------
+        node_graph_data_list = []
+        for structure in structures:
+            node_graph_data_list.extend(structure.node_graph.to_data_list())
+
+        node_graph = Batch.from_data_list(node_graph_data_list)
+        if device is not None:
+            node_graph = node_graph.to(device)
+
+        # -------------------------
+        # node_graph_offset
+        # -------------------------
+        node_graph_offset_parts = []
+        atom_offset = 0
+
+        for structure in structures:
+            offset = structure.node_graph_offset.to(tensor_device)
+
+            # Use all offsets except the final total.
+            node_graph_offset_parts.append(offset[:-1] + atom_offset)
+            atom_offset += int(offset[-1].item())
+
+        node_graph_offset = torch.cat(
+            node_graph_offset_parts
+            + [
+                torch.tensor(
+                    [atom_offset],
+                    dtype=first.node_graph_offset.dtype,
+                    device=tensor_device,
+                )
+            ],
+            dim=0,
+        )
+
+        # -------------------------
+        # Fragment tree edge_index
+        # -------------------------
+        edge_index_parts = []
+        node_offset = 0
+
+        for structure in structures:
+            edge_index_parts.append(
+                structure.edge_index.to(tensor_device) + node_offset
+            )
+            node_offset += structure.num_nodes
+
+        edge_index = torch.cat(edge_index_parts, dim=1)
+
+        # -------------------------
+        # cleavage_event_edge_index
+        # -------------------------
+        cleavage_event_edge_index_parts = []
+        edge_offset = 0
+
+        for structure in structures:
+            cleavage_event_edge_index_parts.append(
+                structure.cleavage_event_edge_index.to(tensor_device) + edge_offset
+            )
+            edge_offset += structure.num_edges
+
+        cleavage_event_edge_index = torch.cat(
+            cleavage_event_edge_index_parts,
+            dim=0,
+        )
+
+        # -------------------------
+        # cleavage_event
+        # -------------------------
+        cleavage_event = torch.cat(
+            [
+                structure.cleavage_event.to(tensor_device)
+                for structure in structures
+            ],
+            dim=0,
+        )
+
+        # -------------------------
+        # cleavage atom index dictionaries
+        # -------------------------
+        cleavage_reactant_atom_idxs = cls._concat_atom_index_dicts_with_atom_offset(
+            structures=structures,
+            field_name="cleavage_reactant_atom_idxs",
+            device=tensor_device,
+        )
+
+        cleavage_product_atom_idxs = cls._concat_atom_index_dicts_with_atom_offset(
+            structures=structures,
+            field_name="cleavage_product_atom_idxs",
+            device=tensor_device,
+        )
+
+        # -------------------------
+        # sample-level information
+        # -------------------------
+        sample_adduct_type_index = torch.cat(
+            [
+                structure.sample_adduct_type_index.to(tensor_device)
+                for structure in structures
+            ],
+            dim=0,
+        )
+
+        sample_ce_value = torch.cat(
+            [
+                structure.sample_ce_value.to(tensor_device)
+                for structure in structures
+            ],
+            dim=0,
+        )
+
+        # -------------------------
+        # sample_edge_index
+        # -------------------------
+        sample_edge_index_parts = []
+
+        sample_offset = 0
+        edge_offset = 0
+
+        for structure in structures:
+            sample_edge_index = structure.sample_edge_index.to(tensor_device).clone()
+
+            if sample_edge_index.numel() > 0:
+                sample_edge_index[0, :] += sample_offset
+                sample_edge_index[1, :] += edge_offset
+
+            sample_edge_index_parts.append(sample_edge_index)
+
+            sample_offset += structure.num_samples
+            edge_offset += structure.num_edges
+
+        sample_edge_index = torch.cat(sample_edge_index_parts, dim=1)
+
+        # -------------------------
+        # sample_precursor_edge_index_path
+        # -------------------------
+        sample_precursor_edge_index_path_parts = []
+
+        edge_offset = 0
+
+        for structure in structures:
+            path = structure.sample_precursor_edge_index_path.to(tensor_device)
+
+            # Keep negative padding values such as -1 unchanged.
+            shifted_path = torch.where(
+                path >= 0,
+                path + edge_offset,
+                path,
+            )
+
+            sample_precursor_edge_index_path_parts.append(shifted_path)
+            edge_offset += structure.num_edges
+
+        sample_precursor_edge_index_path = torch.cat(
+            sample_precursor_edge_index_path_parts,
+            dim=0,
+        )
+
+        # -------------------------
+        # sample_precursor_path_index
+        # -------------------------
+        sample_precursor_path_index_parts = []
+
+        sample_offset = 0
+
+        for structure in structures:
+            path_index = structure.sample_precursor_path_index.to(tensor_device)
+
+            shifted_path_index = torch.where(
+                path_index >= 0,
+                path_index + sample_offset,
+                path_index,
+            )
+
+            sample_precursor_path_index_parts.append(shifted_path_index)
+            sample_offset += structure.num_samples
+
+        sample_precursor_path_index = torch.cat(
+            sample_precursor_path_index_parts,
+            dim=0,
+        )
+
+        return cls(
+            node_smiles=node_smiles,
+            node_graph=node_graph,
+            node_graph_offset=node_graph_offset,
+            edge_index=edge_index,
+            cleavage_event_edge_index=cleavage_event_edge_index,
+            cleavage_event=cleavage_event,
+            cleavage_reactant_atom_idxs=cleavage_reactant_atom_idxs,
+            cleavage_product_atom_idxs=cleavage_product_atom_idxs,
+            sample_adduct_type_index=sample_adduct_type_index,
+            sample_ce_value=sample_ce_value,
+            sample_edge_index=sample_edge_index,
+            sample_precursor_edge_index_path=sample_precursor_edge_index_path,
+            sample_precursor_path_index=sample_precursor_path_index,
+        )
+    
+    @staticmethod
+    def _concat_atom_index_dicts_with_atom_offset(
+        *,
+        structures: Sequence["FragmentTreeStructure"],
+        field_name: str,
+        device: torch.device,
+    ) -> Dict[int, Tensor]:
+        """
+        Concatenate atom index dictionaries with cumulative atom offsets.
+
+        Each dictionary has:
+            tuple_length -> [num_rows, tuple_length]
+
+        Atom indices are assumed to be global atom indices inside each structure's
+        node_graph. They are shifted by the cumulative atom count of previous
+        structures.
+        """
+        output: Dict[int, list[Tensor]] = {}
+
+        atom_offset = 0
+
+        for structure in structures:
+            atom_index_dict = getattr(structure, field_name)
+
+            for tuple_length, atom_idxs in atom_index_dict.items():
+                if tuple_length not in output:
+                    output[tuple_length] = []
+
+                atom_idxs = atom_idxs.to(device)
+
+                shifted_atom_idxs = torch.where(
+                    atom_idxs >= 0,
+                    atom_idxs + atom_offset,
+                    atom_idxs,
+                )
+
+                output[tuple_length].append(shifted_atom_idxs)
+
+            atom_offset += int(structure.node_graph_offset[-1].item())
+
+        return {
+            tuple_length: torch.cat(parts, dim=0)
+            for tuple_length, parts in output.items()
+        }
