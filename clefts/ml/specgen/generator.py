@@ -23,13 +23,21 @@ class CleftsSpecGen(ModelBase):
 
         mol_encoder_params = mol_encoder_params.copy()
         mol_encoder_params['dropout'] = dropout
-        self.mol_encoder = MolEncoder(**mol_encoder_params)
-        self.fragmenter = Fragmenter.from_dict(fragmenter_params)
+        self._mol_encoder = MolEncoder(**mol_encoder_params)
+        self._fragmenter = Fragmenter.from_dict(fragmenter_params)
 
         pass
 
+    @property
+    def mol_atom_dim(self) -> int:
+        return self._mol_encoder._node_dim
+    
+    @property
+    def mol_graph_dim(self) -> int:
+        return self._mol_encoder._graph_dim
+
     def get_index_by_adduct_type(self, adduct_type: Adduct) -> int:
-        return self.fragmenter.get_index_by_adduct_type(adduct_type)
+        return self._fragmenter.get_index_by_adduct_type(adduct_type)
 
     @staticmethod
     def parse_ce_to_ev(ce: str, precursor_mz: float, instrument: str = None) -> Optional[float]:
@@ -38,5 +46,5 @@ class CleftsSpecGen(ModelBase):
     
     def forward(self, structure: FragmentTreeStructure):
         if isinstance(structure, FragmentTreeStructure):
-            mol_graph = self.mol_encoder(structure.node_graph)
+            mol_graph = self._mol_encoder(structure.node_graph)
             pass

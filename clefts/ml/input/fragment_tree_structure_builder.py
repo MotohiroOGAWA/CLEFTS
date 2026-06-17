@@ -435,7 +435,7 @@ class FragmentTreeStructureBuilder:
     # internal helpers
     # -------------------------
     def _get_mol_graph(self, smiles: str, compound: Optional[Compound] = None) -> Data:
-        builder = self._model.mol_encoder.graph_builder if self._model is not None else None
+        builder = self._model._mol_encoder.graph_builder if self._model is not None else None
         if builder is None:
             raise ValueError(
                 "mol_graph_builder is not set. "

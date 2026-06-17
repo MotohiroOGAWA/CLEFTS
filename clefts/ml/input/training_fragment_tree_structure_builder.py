@@ -85,7 +85,7 @@ class TrainingFragmentTreeStructureBuilder(FragmentTreeStructureBuilder):
         smiles = str(record[smiles_column])
         if fragment_ion_tree is None:
             compound = Compound.from_smiles(smiles)
-            fragment_ion_tree = self._model.fragmenter.build_fragment_ion_tree(
+            fragment_ion_tree = self._model._fragmenter.build_fragment_ion_tree(
                 compound=compound,
                 max_node=max_node,
                 max_edge=max_edge,
@@ -94,7 +94,7 @@ class TrainingFragmentTreeStructureBuilder(FragmentTreeStructureBuilder):
         if precursor_fragment_pathways is None or fragment_pathways_by_peaks is None:
             peaks_mz = [peak.mz for peak in record.peaks]
             precursor_fragment_pathways, fragment_pathways_by_peaks = \
-                self._model.fragmenter.assign_fragment_pathways_to_peaks(
+                self._model._fragmenter.assign_fragment_pathways_to_peaks(
                     fragment_ion_tree=fragment_ion_tree,
                     precursor_type=adduct_type,
                     peaks_mz=peaks_mz,
@@ -119,7 +119,7 @@ class TrainingFragmentTreeStructureBuilder(FragmentTreeStructureBuilder):
         precursor_edge_indexes = self._fragment_pathway_group_to_edge_index_paths(
             fragment_pathway_group=precursor_fragment_pathways,
             fragment_compound_by_smiles=fragment_compound_by_smiles,
-            padding_length=self._model.fragmenter.precursor_candidate_max_depth,
+            padding_length=self._model._fragmenter.precursor_candidate_max_depth,
         )
 
         edge_indexes = set()

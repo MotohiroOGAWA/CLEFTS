@@ -41,12 +41,13 @@ class MolEncoder(nn.Module):
         bond_dim = self.graph_builder.bond_dim
 
         self._node_dim = node_dim
-        self._graph_dim = graph_dim
+        self._num_graph_tokens = graph_dim // node_dim
+        self._graph_dim = self._num_graph_tokens * node_dim
 
         self.encoder = GraphormerEncoder(
             in_dim=atom_dim,
             dim=node_dim,
-            graph_dim=graph_dim,
+            num_graph_tokens=self._num_graph_tokens,
             edge_dim=bond_dim,
             num_heads=num_heads,
             num_layers=num_layers,

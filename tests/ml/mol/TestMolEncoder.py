@@ -18,7 +18,7 @@ class TestMolEncoder(unittest.TestCase):
         encoder = MolEncoder(
             symbols=("C", "H", "O", "N"),
             node_dim=16,
-            graph_dim=32,
+            graph_dim=40,
             num_layers=1,
             num_heads=4,
             max_degree=4,
