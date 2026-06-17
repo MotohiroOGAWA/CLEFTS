@@ -18,6 +18,7 @@ class TestMolEncoder(unittest.TestCase):
         encoder = MolEncoder(
             symbols=("C", "H", "O", "N"),
             node_dim=16,
+            graph_dim=32,
             num_layers=1,
             num_heads=4,
             max_degree=4,
@@ -33,6 +34,9 @@ class TestMolEncoder(unittest.TestCase):
         self.assertEqual(data.edge_index.shape[0], 2)
         self.assertEqual(data.edge_attr.shape[1], encoder.bond_dim)
 
+        self.assertEqual(encoder.node_dim, 16)
+        self.assertEqual(encoder.graph_dim, 32)
+
     def test_forward_batch_returns_node_and_graph_embeddings(self) -> None:
         torch.manual_seed(0)
 
@@ -44,6 +48,7 @@ class TestMolEncoder(unittest.TestCase):
         encoder = MolEncoder(
             symbols=("C", "H", "O", "N"),
             node_dim=16,
+            graph_dim=32,
             num_layers=1,
             num_heads=4,
             max_degree=6,
@@ -64,7 +69,7 @@ class TestMolEncoder(unittest.TestCase):
 
         self.assertEqual(encoded_batch.x.shape, (total_atoms, 16))
         self.assertTrue(hasattr(encoded_batch, "embeddings"))
-        self.assertEqual(encoded_batch.embeddings.shape, (2, 16))
+        self.assertEqual(encoded_batch.embeddings.shape, (2, 32))
 
         self.assertTrue(torch.isfinite(encoded_batch.x).all())
         self.assertTrue(torch.isfinite(encoded_batch.embeddings).all())
@@ -77,6 +82,7 @@ class TestMolEncoder(unittest.TestCase):
         encoder = MolEncoder(
             symbols=("C", "H", "O", "N"),
             node_dim=16,
+            graph_dim=32,
             num_layers=1,
             num_heads=4,
             max_degree=4,
@@ -88,8 +94,10 @@ class TestMolEncoder(unittest.TestCase):
         data = encoder.encode(compound)
 
         self.assertIsNotNone(data)
+        assert data is not None
+
         self.assertEqual(data.x.shape, (3, 16))
-        self.assertEqual(data.embedding.shape, (16,))
+        self.assertEqual(data.embedding.shape, (32,))
         self.assertIs(data.compound, compound)
 
         self.assertTrue(torch.isfinite(data.x).all())
@@ -106,6 +114,7 @@ class TestMolEncoder(unittest.TestCase):
         encoder = MolEncoder(
             symbols=("C", "H", "O", "N"),
             node_dim=16,
+            graph_dim=32,
             num_layers=1,
             num_heads=4,
             max_degree=6,
@@ -118,9 +127,12 @@ class TestMolEncoder(unittest.TestCase):
 
         self.assertIsNotNone(batch)
         self.assertIsNotNone(valid_indices)
+        assert batch is not None
+        assert valid_indices is not None
 
         self.assertEqual(valid_indices.tolist(), [0, 1])
-        self.assertEqual(batch.embeddings.shape, (2, 16))
+        self.assertEqual(batch.x.size(1), 16)
+        self.assertEqual(batch.embeddings.shape, (2, 32))
 
     def test_encode_batch_skips_invalid_symbol(self) -> None:
         torch.manual_seed(0)
@@ -133,6 +145,7 @@ class TestMolEncoder(unittest.TestCase):
         encoder = MolEncoder(
             symbols=("C", "H", "O", "N"),
             node_dim=16,
+            graph_dim=32,
             num_layers=1,
             num_heads=4,
             max_degree=4,
@@ -145,10 +158,13 @@ class TestMolEncoder(unittest.TestCase):
 
         self.assertIsNotNone(batch)
         self.assertIsNotNone(valid_indices)
+        assert batch is not None
+        assert valid_indices is not None
 
         # The second compound contains Cl, which is unsupported by symbols.
         self.assertEqual(valid_indices.tolist(), [0])
-        self.assertEqual(batch.embeddings.shape, (1, 16))
+        self.assertEqual(batch.x.size(1), 16)
+        self.assertEqual(batch.embeddings.shape, (1, 32))
 
     def test_backward_can_be_called(self) -> None:
         torch.manual_seed(0)
@@ -161,6 +177,7 @@ class TestMolEncoder(unittest.TestCase):
         encoder = MolEncoder(
             symbols=("C", "H", "O", "N"),
             node_dim=16,
+            graph_dim=32,
             num_layers=1,
             num_heads=4,
             max_degree=6,

@@ -6,12 +6,14 @@ from typing import Dict, Optional, Tuple, List, Set, Sequence
 import torch
 from torch import Tensor
 from torch_geometric.data import Batch, Data
+import numpy as np
 
 from ...libs.mmkit.mmkit import Compound, Adduct
 from ...libs.msentity.msentity import SpectrumRecord
 from ...domain.fragment.ion_tree import FragmentIonTree
 from ...domain.fragment.pathway import FragmentPathway, FragmentPathwayGroup, FragmentPathwayNode, FragmentPathwayEdge
 from ..specgen import CleftsSpecGen
+from .fragment_tree_structure import FragmentTreeStructure
 
 @dataclass
 class FragmentTreeSample:
@@ -254,6 +256,180 @@ class FragmentTreeStructureBuilder:
                 "_model must be an instance of CleftsSpecGen, "
                 f"but got {type(self._model).__name__}."
             )
+
+    def to_structure(self) -> FragmentTreeStructure:
+        """Convert this builder into a torch-ready FragmentTreeStructure."""
+
+        if len(self.node_graph) == 0:
+            raise ValueError("Cannot build FragmentTreeStructure with no nodes.")
+
+        # -------------------------
+        # Node graphs
+        # -------------------------
+        node_smiles = np.asarray(
+            self.node_smiles,
+            dtype=object,
+        )
+
+        node_graph = Batch.from_data_list(self.node_graph)
+
+        node_graph_offset = torch.tensor(
+            self._node_graph_offset,
+            dtype=torch.long,
+        )
+
+        # -------------------------
+        # Fragment-tree edges
+        # -------------------------
+        if len(self.edge_src) > 0:
+            edge_index = torch.tensor(
+                [self.edge_src, self.edge_dst],
+                dtype=torch.long,
+            )
+        else:
+            edge_index = torch.empty(
+                (2, 0),
+                dtype=torch.long,
+            )
+
+        # -------------------------
+        # Cleavage events
+        # -------------------------
+        cleavage_event_edge_index = torch.tensor(
+            self.cleavage_event_edge_index,
+            dtype=torch.long,
+        )
+
+        if len(self.cleavage_event) > 0:
+            cleavage_event = torch.tensor(
+                self.cleavage_event,
+                dtype=torch.long,
+            )
+        else:
+            cleavage_event = torch.empty(
+                (0, 5),
+                dtype=torch.long,
+            )
+
+        cleavage_reactant_atom_idxs = {
+            tuple_length: torch.tensor(rows, dtype=torch.long)
+            for tuple_length, rows in self.cleavage_reactant_atom_idxs.items()
+        }
+
+        cleavage_product_atom_idxs = {
+            tuple_length: torch.tensor(rows, dtype=torch.long)
+            for tuple_length, rows in self.cleavage_product_atom_idxs.items()
+        }
+
+        # -------------------------
+        # Samples
+        # -------------------------
+        sample_indexes = sorted(self.samples.keys())
+
+        sample_index_remap = {
+            old_sample_index: new_sample_index
+            for new_sample_index, old_sample_index in enumerate(sample_indexes)
+        }
+
+        sample_adduct_type_index = torch.tensor(
+            [
+                int(self.samples[sample_index].adduct_type_index)
+                for sample_index in sample_indexes
+            ],
+            dtype=torch.long,
+        )
+
+        sample_ce_value = torch.tensor(
+            [
+                float(self.samples[sample_index].ce_value)
+                for sample_index in sample_indexes
+            ],
+            dtype=torch.float32,
+        )
+
+        sample_edge_pairs: list[tuple[int, int]] = []
+
+        for old_sample_index in sample_indexes:
+            new_sample_index = sample_index_remap[old_sample_index]
+            sample = self.samples[old_sample_index]
+
+            for edge_index_value in sorted(sample.edge_indexes):
+                if edge_index_value < 0:
+                    continue
+
+                sample_edge_pairs.append(
+                    (
+                        int(new_sample_index),
+                        int(edge_index_value),
+                    )
+                )
+
+        if len(sample_edge_pairs) > 0:
+            sample_edge_index = torch.tensor(
+                sample_edge_pairs,
+                dtype=torch.long,
+            ).t().contiguous()
+        else:
+            sample_edge_index = torch.empty(
+                (2, 0),
+                dtype=torch.long,
+            )
+
+        precursor_paths: list[tuple[int, ...]] = []
+        precursor_path_sample_indexes: list[int] = []
+
+        for old_sample_index in sample_indexes:
+            new_sample_index = sample_index_remap[old_sample_index]
+            sample = self.samples[old_sample_index]
+
+            for edge_index_path in sorted(sample.precursor_edge_indexes):
+                precursor_paths.append(
+                    tuple(int(edge_index) for edge_index in edge_index_path)
+                )
+                precursor_path_sample_indexes.append(int(new_sample_index))
+
+        if len(precursor_paths) > 0:
+            path_lengths = {len(path) for path in precursor_paths}
+            if len(path_lengths) != 1:
+                raise ValueError(
+                    "All precursor edge-index paths must have the same length. "
+                    f"Got lengths: {sorted(path_lengths)}"
+                )
+
+            sample_precursor_edge_index_path = torch.tensor(
+                precursor_paths,
+                dtype=torch.long,
+            )
+
+            sample_precursor_path_index = torch.tensor(
+                precursor_path_sample_indexes,
+                dtype=torch.long,
+            )
+        else:
+            sample_precursor_edge_index_path = torch.empty(
+                (0, 0),
+                dtype=torch.long,
+            )
+            sample_precursor_path_index = torch.empty(
+                (0,),
+                dtype=torch.long,
+            )
+
+        return FragmentTreeStructure(
+            node_smiles=node_smiles,
+            node_graph=node_graph,
+            node_graph_offset=node_graph_offset,
+            edge_index=edge_index,
+            cleavage_event_edge_index=cleavage_event_edge_index,
+            cleavage_event=cleavage_event,
+            cleavage_reactant_atom_idxs=cleavage_reactant_atom_idxs,
+            cleavage_product_atom_idxs=cleavage_product_atom_idxs,
+            sample_adduct_type_index=sample_adduct_type_index,
+            sample_ce_value=sample_ce_value,
+            sample_edge_index=sample_edge_index,
+            sample_precursor_edge_index_path=sample_precursor_edge_index_path,
+            sample_precursor_path_index=sample_precursor_path_index,
+        )
 
     # -------------------------
     # internal helpers

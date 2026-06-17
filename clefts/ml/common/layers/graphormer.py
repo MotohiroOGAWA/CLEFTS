@@ -964,22 +964,20 @@ class GraphormerEncoder(nn.Module):
         max_degree: int,
         max_spatial_dist: int,
         max_edge_dist: int,
+        graph_dim: Optional[int] = None, 
         dropout: float = 0.0,
         add_virtual_node: bool = False,
-        undirected_for_spd: bool = True, # Whether to treat SPD as undirected
-        undirected_for_path: bool = True, # Whether to treat shortest path distances as undirected
+        undirected_for_spd: bool = True,
+        undirected_for_path: bool = True,
         start_cap: int = 64,
         cap_growth: float = 2.0,
     ):
         super().__init__()
         assert dim % num_heads == 0
-        if max_spatial_dist <= 0:
-            raise ValueError("max_spatial_dist must be positive")
-        if max_edge_dist <= 0:
-            raise ValueError("max_edge_dist must be positive")
-        assert max_edge_dist <= max_spatial_dist, "max_edge_dist must be <= max_spatial_dist"
 
         self.dim = dim
+        self.graph_dim = graph_dim if graph_dim is not None else dim
+
         self.num_heads = num_heads
         self.num_layers = num_layers
         self.max_spatial_dist = max_spatial_dist
@@ -989,16 +987,39 @@ class GraphormerEncoder(nn.Module):
         self.add_virtual_node = add_virtual_node
         self.undirected_for_spd = undirected_for_spd
         self.undirected_for_path = undirected_for_path
-        
+
         self.start_cap = start_cap
         self.cap_growth = cap_growth
 
-        # Project raw node features into model dimension (this replaces NodeNet).
         self.in_proj = nn.Identity() if in_dim == dim else nn.Linear(in_dim, dim, bias=False)
+
+        # graph_repr_dim -> token_dim
+        self.graph_to_token = (
+            nn.Identity()
+            if self.graph_dim == dim
+            else nn.Linear(self.graph_dim, dim, bias=False)
+        )
+
+        # token_dim -> graph_repr_dim
+        self.token_to_graph = (
+            nn.Identity()
+            if self.graph_dim == dim
+            else nn.Linear(dim, self.graph_dim, bias=False)
+        )
 
         self.centrality = CentralityEncoding(dim=dim, max_degree=max_degree)
         self.spatial = SpatialEncoding(num_heads=num_heads, max_dist=max_spatial_dist)
-        self.edge_enc = EdgeEncoding(edge_dim=edge_dim, num_heads=num_heads, max_dist=max_edge_dist, undirected=undirected_for_path) if edge_dim > 0 else None
+
+        self.edge_enc = (
+            EdgeEncoding(
+                edge_dim=edge_dim,
+                num_heads=num_heads,
+                max_dist=max_edge_dist,
+                undirected=undirected_for_path,
+            )
+            if edge_dim > 0
+            else None
+        )
 
         self.blocks = nn.ModuleList([
             GraphormerBlock(dim=dim, num_heads=num_heads, dropout=dropout)
@@ -1025,7 +1046,10 @@ class GraphormerEncoder(nn.Module):
 
         # 2) graph outputs (same order as graphs in `data`)
         num_graphs = int(data.num_graphs) if hasattr(data, "num_graphs") and data.num_graphs is not None else int(data.batch.max().item() + 1)
-        out_graph_repr = data.x.new_zeros((num_graphs, self.dim))  # [G, dim]
+        out_graph_repr = data.x.new_zeros((num_graphs, self.graph_dim))  # [G, graph_dim]
+        if graph_repr is not None:
+            assert graph_repr.size(0) == data.num_graphs, "graph_repr batch size mismatch"
+            assert graph_repr.size(1) == self.graph_dim, "graph_repr feature size mismatch"
 
         for bucket, ids in zip(bucket_list, ids_list):
             # ids: original graph indices for this bucket, shape [B]
@@ -1041,13 +1065,18 @@ class GraphormerEncoder(nn.Module):
 
             # Add vnode (prepend)
             if self.add_virtual_node:
+                if graph_repr is not None:
+                    vnode_input = self.graph_to_token(graph_repr[ids])  # [B, dim]
+                else:
+                    vnode_input = None
+
                 h, node_mask, dist_bias, edge_bias = self._add_virtual_node(
                     h=h,
                     node_mask=node_mask,
                     num_heads=self.num_heads,
                     dist_bias=dist_bias,
                     edge_bias=edge_bias,
-                    vnode=graph_repr[ids] if graph_repr is not None else None,
+                    vnode=vnode_input,
                 )
 
             # Blocks
@@ -1055,9 +1084,10 @@ class GraphormerEncoder(nn.Module):
                 h = blk(h, node_mask=node_mask, dist_bias=dist_bias, edge_bias=edge_bias)
 
             # Remove vnode and obtain graph repr
-            node_h, node_mask_wo_vnode, local_graph_repr = self._remove_virtual_node_and_readout(
+            node_h, node_mask_wo_vnode, local_graph_token  = self._remove_virtual_node_and_readout(
                 h=h, node_mask=node_mask
             )  # node_h: [B,cap,dim], graph_repr: [B,dim]
+            local_graph_repr = self.token_to_graph(local_graph_token)  # [B, graph_dim]
 
             # ---- (A) graph repr: place by original graph ids ----
             # graph_repr is vnode embedding for each graph in bucket

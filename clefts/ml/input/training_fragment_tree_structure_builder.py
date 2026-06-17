@@ -101,9 +101,12 @@ class TrainingFragmentTreeStructureBuilder(FragmentTreeStructureBuilder):
                 )
         fragment_compound_by_index = fragment_ion_tree._fragment_compound_by_index if hasattr(fragment_ion_tree, "_fragment_compound_by_index") else None
         fragment_compound_by_smiles = {}
+        smiles_to_tree_node_index: Dict[str, int] = {}
         if fragment_compound_by_index is not None:
             for node_index, compound in fragment_compound_by_index.items():
                 fragment_compound_by_smiles[compound.smiles] = compound
+        for node_index, smiles in enumerate(fragment_ion_tree.node_smiles):
+            smiles_to_tree_node_index[smiles] = node_index
         if len(precursor_fragment_pathways) == 0:
             raise ValueError(
                 f"No precursor fragment pathways assigned."
@@ -119,9 +122,31 @@ class TrainingFragmentTreeStructureBuilder(FragmentTreeStructureBuilder):
             padding_length=self._model.fragmenter.precursor_candidate_max_depth,
         )
 
+        edge_indexes = set()
+        for peak_index, fragment_pathways in enumerate(fragment_pathways_by_peaks):
+            for fragment_pathway in fragment_pathways:
+                has_precursor_node = False
+                p_length = len(fragment_pathway)
+                for p_idx, p_node in enumerate(fragment_pathway.nodes):
+                    if p_node.is_precursor:
+                        has_precursor_node = True
+                    if p_idx >= p_length - 1:
+                        break
+                    
+                    src_smiles = p_node.smiles
+                    src_node_index = smiles_to_tree_node_index.get(src_smiles)
+                    for out_edge in fragment_ion_tree.get_out_edges(src_node_index):
+                        dst_node_index = out_edge.target_index
+                        dst_smiles = fragment_ion_tree.node_smiles[dst_node_index]
+                        fragment_pathway_edge = FragmentPathwayEdge.from_fragment_edge(out_edge)
+                        edge_index = self._ensure_get_edge_index(src_smiles, dst_smiles, fragment_pathway_edge)
+                        edge_indexes.add(edge_index)
+                    
+
         self.samples[sample_index] = TrainingFragmentTreeSample(
             adduct_type_index=adduct_type_index,
             ce_value=ce_value,
+            edge_indexes=edge_indexes,
             precursor_edge_indexes=precursor_edge_indexes,
             peak_mz=[peak.mz for peak in record.peaks],
             peak_intensity=[peak.intensity for peak in record.peaks],

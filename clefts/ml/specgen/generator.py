@@ -6,6 +6,8 @@ from ...libs.mmkit.mmkit import Adduct
 from ...domain.fragment import Fragmenter
 from ...domain.mass import parse_ce_to_ev
 from ..common.torch_utils.model_base import ModelBase
+from ..input.fragment_tree_structure import FragmentTreeStructure
+
 from ..mol import MolEncoder
 
 class CleftsSpecGen(ModelBase):
@@ -33,3 +35,8 @@ class CleftsSpecGen(ModelBase):
     def parse_ce_to_ev(ce: str, precursor_mz: float, instrument: str = None) -> Optional[float]:
         ev = parse_ce_to_ev(ce, precursor_mz, instrument)
         return ev
+    
+    def forward(self, structure: FragmentTreeStructure):
+        if isinstance(structure, FragmentTreeStructure):
+            mol_graph = self.mol_encoder(structure.node_graph)
+            pass

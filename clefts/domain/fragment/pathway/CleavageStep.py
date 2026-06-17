@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from typing import Any, Tuple
 import json
 
+from ..tree.CleavageEvent import CleavageEvent
+
 
 @dataclass(frozen=True)
 class CleavageStep:
@@ -90,6 +92,27 @@ class CleavageStep:
     @classmethod
     def from_json_str(cls, text: str) -> CleavageStep:
         return cls.parse(text)
+
+    @classmethod
+    def from_cleavage_event(cls, event: CleavageEvent) -> "CleavageStep":
+        """Create a CleavageStep from a CleavageEvent.
+
+        Notes
+        -----
+        CleavageEvent.index and CleavageEvent.event_id are not copied because
+        FragmentPathwayEdge represents the pathway operation, not database event identity.
+        """
+
+        if not isinstance(event, CleavageEvent):
+            raise TypeError("event must be a CleavageEvent instance.")
+
+        return cls(
+            cleavage_pattern_id=event.cleavage_pattern_id,
+            reaction_id=event.reaction_id,
+            product_molecule_id=event.product_molecule_id,
+            reactant_indices=event.reactant_indices,
+            product_indices=event.product_indices,
+        )
 
     def copy(self) -> CleavageStep:
         return CleavageStep(
