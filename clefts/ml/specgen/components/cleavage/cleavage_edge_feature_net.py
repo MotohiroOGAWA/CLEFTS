@@ -9,6 +9,7 @@ from clefts.domain.fragment.cleavage import CleavagePatternSet
 from .cleavage_fnet import CleavageFNetInput, CleavageFNet
 from ....common.layers.set_transformer import SetTransformer
 from ....input.fragment_tree_features import FragmentTreeFeatures
+from ....input.fragment_tree_structure import FragmentTreeStructure
 
 
 class CleavageEdgeFeatureNet(nn.Module):
@@ -60,15 +61,19 @@ class CleavageEdgeFeatureNet(nn.Module):
                 reaction_id = int(reaction.id)
                 num_reactant_atoms = len(reaction.react_idx_to_map)
 
-                reactant_key = (pattern_id, reaction_id)
+                reactant_key = (
+                    pattern_id,
+                    reaction_id,
+                )
 
                 if reactant_key in reactant_tuple_length_by_event_type:
                     prev = reactant_tuple_length_by_event_type[reactant_key]
+
                     if prev != num_reactant_atoms:
                         raise ValueError(
                             "Inconsistent reactant tuple length for "
                             f"(pattern_id, reaction_id)={reactant_key}: "
-                            f"{prev} vs {num_reactant_atoms}"
+                            f"{prev} vs {num_reactant_atoms}."
                         )
 
                 reactant_tuple_length_by_event_type[reactant_key] = (
@@ -96,7 +101,7 @@ class CleavageEdgeFeatureNet(nn.Module):
                     if module_key in cleavage_fnet_dict:
                         raise ValueError(
                             "Duplicated CleavageFNet module key: "
-                            f"{module_key} for event_type={event_type}"
+                            f"{module_key} for event_type={event_type}."
                         )
 
                     product_tuple_length_by_event_type[event_type] = (
@@ -176,7 +181,7 @@ class CleavageEdgeFeatureNet(nn.Module):
             return SetTransformer(**aggregation_model_params)
 
         raise ValueError(
-            f"Unsupported aggregation model: {aggregation_model_name}"
+            f"Unsupported aggregation model: {aggregation_model_name}."
         )
 
     @property
@@ -208,13 +213,13 @@ class CleavageEdgeFeatureNet(nn.Module):
     def event_types(self) -> Tuple[Tuple[int, int, int], ...]:
         return tuple(self.module_key_by_event_type.keys())
 
-    def forward(self, fp_features: FragmentTreeFeatures) -> torch.Tensor:
+    def forward(self, ft_features: FragmentTreeFeatures) -> torch.Tensor:
         """
         Encode edge features.
 
         Parameters
         ----------
-        fp_features:
+        ft_features:
             FragmentTreeFeatures for a batch of fragment trees.
 
         Returns
@@ -222,27 +227,28 @@ class CleavageEdgeFeatureNet(nn.Module):
         edge_attr:
             [E, feature_dim]
         """
-        structure = fp_features.structure
+        structure = ft_features.structure
         num_edges = int(structure.edge_index.size(1))
 
         all_event_edge_ids = []
         all_event_feats = []
 
         for event_edge_id, event_type, cleavage_fnet_input in (
-            self._iter_cleavage_fnet_batches(fp_features)
+            self._iter_cleavage_fnet_batches(ft_features)
         ):
             if event_edge_id.size(0) != cleavage_fnet_input.batch_size:
                 raise ValueError(
                     "event_edge_id and cleavage_fnet_input size mismatch: "
                     f"event_edge_id.size(0)={event_edge_id.size(0)}, "
                     f"cleavage_fnet_input.batch_size="
-                    f"{cleavage_fnet_input.batch_size}"
+                    f"{cleavage_fnet_input.batch_size}."
                 )
 
             if event_edge_id.size(0) == 0:
                 continue
 
             module_key = self._get_cleavage_fnet_key(event_type)
+
             event_feat = self.cleavage_fnet_dict[module_key](
                 cleavage_fnet_input
             )
@@ -255,7 +261,7 @@ class CleavageEdgeFeatureNet(nn.Module):
             return self._empty_edge_attr(
                 num_edges=num_edges,
                 device=structure.edge_index.device,
-                dtype=fp_features.mol_x.dtype,
+                dtype=ft_features.mol_x.dtype,
             )
 
         event_feat = torch.cat(all_event_feats, dim=0)
@@ -296,7 +302,7 @@ class CleavageEdgeFeatureNet(nn.Module):
 
         if event_type not in self.module_key_by_event_type:
             raise KeyError(
-                f"Unknown cleavage event type: {event_type}"
+                f"Unknown cleavage event type: {event_type}."
             )
 
         return self.module_key_by_event_type[event_type]
@@ -349,7 +355,7 @@ class CleavageEdgeFeatureNet(nn.Module):
 
     def _iter_cleavage_fnet_batches(
         self,
-        fp_features: FragmentTreeFeatures,
+        ft_features: FragmentTreeFeatures,
     ) -> Iterable[Tuple[torch.Tensor, Tuple[int, int, int], CleavageFNetInput]]:
         """
         Iterate over CleavageFNet mini-batches grouped by event type.
@@ -369,15 +375,15 @@ class CleavageEdgeFeatureNet(nn.Module):
         cleavage_fnet_input:
             CleavageFNetInput for this event group.
         """
-        structure = fp_features.structure
+        structure = ft_features.structure
 
         if structure.num_cleavage_events == 0:
             return
 
-        node_mol_feats = fp_features.mol_x
+        node_mol_feats = ft_features.mol_x
         # [N, mol_dim]
 
-        atom_feats_global = fp_features.node_graphs.x
+        atom_feats_global = ft_features.node_graphs.x
         # [A, atom_dim]
 
         event_edge_id_all = structure.cleavage_event_edge_index
@@ -410,7 +416,7 @@ class CleavageEdgeFeatureNet(nn.Module):
         )
         # [M]
 
-        for event_type, module_key in self.module_key_by_event_type.items():
+        for event_type in self.module_key_by_event_type.keys():
             cleavage_pattern_id, reaction_id, product_molecule_id = event_type
 
             mask = (
@@ -455,19 +461,19 @@ class CleavageEdgeFeatureNet(nn.Module):
                 product_molecule_id=product_molecule_id,
             )
 
-            reactant_atom_index_table = (
-                structure.cleavage_reactant_atom_idxs[
-                    num_reactant_atoms
-                ]
+            reactant_atom_index_table = self._get_atom_index_table(
+                structure=structure,
+                tuple_length=num_reactant_atoms,
+                table_name="reactant_atom_index_table",
             )
-            # [R_len, num_reactant_atoms]
+            # [A_len, num_reactant_atoms]
 
-            product_atom_index_table = (
-                structure.cleavage_product_atom_idxs[
-                    num_product_atoms
-                ]
+            product_atom_index_table = self._get_atom_index_table(
+                structure=structure,
+                tuple_length=num_product_atoms,
+                table_name="product_atom_index_table",
             )
-            # [P_len, num_product_atoms]
+            # [A_len, num_product_atoms]
 
             cleavage_fnet_input = self._build_cleavage_fnet_input_for_events(
                 src_node=src_node,
@@ -476,6 +482,7 @@ class CleavageEdgeFeatureNet(nn.Module):
                 product_row_index=product_row_index,
                 node_mol_feats=node_mol_feats,
                 atom_feats_global=atom_feats_global,
+                node_graph_offset=structure.node_graph_offset,
                 reactant_atom_index_table=reactant_atom_index_table,
                 product_atom_index_table=product_atom_index_table,
             )
@@ -500,7 +507,7 @@ class CleavageEdgeFeatureNet(nn.Module):
         if key not in self.reactant_tuple_length_by_event_type:
             raise KeyError(
                 "Unknown reactant event type: "
-                f"(cleavage_pattern_id, reaction_id)={key}"
+                f"(cleavage_pattern_id, reaction_id)={key}."
             )
 
         return self.reactant_tuple_length_by_event_type[key]
@@ -522,10 +529,62 @@ class CleavageEdgeFeatureNet(nn.Module):
             raise KeyError(
                 "Unknown product event type: "
                 "(cleavage_pattern_id, reaction_id, product_molecule_id)="
-                f"{key}"
+                f"{key}."
             )
 
         return self.product_tuple_length_by_event_type[key]
+
+    @staticmethod
+    def _get_atom_index_table(
+        *,
+        structure: FragmentTreeStructure,
+        tuple_length: int,
+        table_name: str,
+    ) -> torch.Tensor:
+        """
+        Get a shared atom-index tuple table from FragmentTreeStructure.
+
+        Parameters
+        ----------
+        structure:
+            FragmentTreeStructure.
+
+        tuple_length:
+            Atom tuple length.
+
+        table_name:
+            Name used only for error messages.
+
+        Returns
+        -------
+        atom_index_table:
+            [A_len, tuple_length]
+        """
+        tuple_length = int(tuple_length)
+
+        if tuple_length not in structure.cleavage_atom_idxs:
+            raise KeyError(
+                f"{table_name} requires tuple_length={tuple_length}, "
+                "but structure.cleavage_atom_idxs does not contain that key. "
+                f"Available tuple lengths: "
+                f"{sorted(structure.cleavage_atom_idxs.keys())}."
+            )
+
+        atom_index_table = structure.cleavage_atom_idxs[tuple_length]
+
+        if atom_index_table.dim() != 2:
+            raise ValueError(
+                f"{table_name} must be 2D, "
+                f"got shape {tuple(atom_index_table.shape)}."
+            )
+
+        if atom_index_table.size(1) != tuple_length:
+            raise ValueError(
+                f"{table_name} has invalid tuple length: "
+                f"got {atom_index_table.size(1)}, expected {tuple_length}."
+            )
+
+        return atom_index_table
 
     def _build_cleavage_fnet_input_for_events(
         self,
@@ -536,6 +595,7 @@ class CleavageEdgeFeatureNet(nn.Module):
         product_row_index: torch.Tensor,
         node_mol_feats: torch.Tensor,
         atom_feats_global: torch.Tensor,
+        node_graph_offset: torch.Tensor,
         reactant_atom_index_table: torch.Tensor,
         product_atom_index_table: torch.Tensor,
     ) -> CleavageFNetInput:
@@ -563,10 +623,10 @@ class CleavageEdgeFeatureNet(nn.Module):
             [A, atom_dim] Global atom-level features.
 
         reactant_atom_index_table:
-            [R_len, num_reactant_atoms]
+            [A_len, num_reactant_atoms]
 
         product_atom_index_table:
-            [P_len, num_product_atoms]
+            [A_len, num_product_atoms]
 
         Returns
         -------
@@ -589,14 +649,26 @@ class CleavageEdgeFeatureNet(nn.Module):
             name="product_row_index",
         )
 
-        reactant_atom_indices = reactant_atom_index_table[
+        reactant_local_atom_indices = reactant_atom_index_table[
             reactant_row_index
         ]
         # [B, num_reactant_atoms]
 
-        product_atom_indices = product_atom_index_table[
+        product_local_atom_indices = product_atom_index_table[
             product_row_index
         ]
+        # [B, num_product_atoms]
+
+        reactant_atom_indices = (
+            reactant_local_atom_indices
+            + node_graph_offset[src_node].view(-1, 1)
+        )
+        # [B, num_reactant_atoms]
+
+        product_atom_indices = (
+            product_local_atom_indices
+            + node_graph_offset[dst_node].view(-1, 1)
+        )
         # [B, num_product_atoms]
 
         reactant_atom_indices = reactant_atom_indices.long()

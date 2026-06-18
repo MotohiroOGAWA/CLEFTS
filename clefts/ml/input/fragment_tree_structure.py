@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, Tuple, Sequence, Optional
 
 import numpy as np
@@ -25,6 +25,12 @@ class FragmentTreeStructure:
 
     node_graph_offset: Tensor
     # [N + 1] Prefix-sum atom offsets.
+    #
+    # For a fragment node with node_index:
+    #     global_atom_index = local_atom_index + node_graph_offset[node_index]
+    #
+    # The atom index range of node_index is:
+    #     [node_graph_offset[node_index], node_graph_offset[node_index + 1])
 
     # -------------------------
     # Fragment tree edges
@@ -40,6 +46,9 @@ class FragmentTreeStructure:
     # -------------------------
     cleavage_event_edge_index: Tensor
     # [M]
+    #
+    # cleavage_event_edge_index[m] = edge index associated with
+    # cleavage_event[m].
 
     cleavage_event: Tensor
     # [M, 5]
@@ -48,14 +57,50 @@ class FragmentTreeStructure:
     #   0: cleavage_id
     #   1: reaction_id
     #   2: product_molecule_id
-    #   3: reactant_row_index
-    #   4: product_row_index
+    #   3: reactant_atom_row_index
+    #   4: product_atom_row_index
+    #
+    # Important:
+    #   cleavage_event[:, 3] and cleavage_event[:, 4] both refer to
+    #   cleavage_atom_idxs[tuple_length].
+    #
+    #   The tuple_length is not stored in cleavage_event.
+    #   It must be inferred from:
+    #       reactant: (cleavage_id, reaction_id)
+    #       product:  (cleavage_id, reaction_id, product_molecule_id)
 
-    cleavage_reactant_atom_idxs: Dict[int, Tensor]
-    # tuple_length -> [R_len, tuple_length]
+    cleavage_atom_idxs: Dict[int, Tensor]
+    # tuple_length -> [A_len, tuple_length]
+    #
+    # Shared atom-index tuple table.
+    #
+    # Both reactant-side and product-side atom tuples are stored here.
+    #
+    # cleavage_event[:, 3]:
+    #     row index for the reactant atom tuple.
+    #
+    # cleavage_event[:, 4]:
+    #     row index for the product atom tuple.
+    #
+    # The corresponding tuple_length is determined outside this class from
+    # cleavage_id / reaction_id / product_molecule_id.
 
-    cleavage_product_atom_idxs: Dict[int, Tensor]
-    # tuple_length -> [P_len, tuple_length]
+    reactant_tuple_length_table: Tensor
+    # [R, 3]
+    #
+    # columns:
+    #   0: cleavage_id
+    #   1: reaction_id
+    #   2: reactant_tuple_length
+
+    product_tuple_length_table: Tensor
+    # [P, 4]
+    #
+    # columns:
+    #   0: cleavage_id
+    #   1: reaction_id
+    #   2: product_molecule_id
+    #   3: product_tuple_length
 
     # -------------------------
     # Sample-level information
@@ -74,9 +119,20 @@ class FragmentTreeStructure:
 
     sample_precursor_edge_index_path: Tensor
     # [P, D]
+    #
+    # P:
+    #     Number of precursor paths.
+    #
+    # D:
+    #     Padded path length.
+    #
+    # Negative values such as -1 are treated as padding.
 
     sample_precursor_path_index: Tensor
     # [P]
+    #
+    # sample_precursor_path_index[p] = sample index associated with
+    # sample_precursor_edge_index_path[p].
 
     @property
     def num_nodes(self) -> int:
@@ -93,27 +149,27 @@ class FragmentTreeStructure:
     @property
     def num_samples(self) -> int:
         return int(self.sample_adduct_type_index.numel())
-    
+
     @property
     def cleavage_pattern_ids(self) -> Tensor:
-        return self.cleavage_event[:, 0] # [M]
+        return self.cleavage_event[:, 0]  # [M]
 
     @property
     def cleavage_reaction_ids(self) -> Tensor:
-        return self.cleavage_event[:, 1] # [M]
-    
+        return self.cleavage_event[:, 1]  # [M]
+
     @property
     def cleavage_product_molecule_ids(self) -> Tensor:
-        return self.cleavage_event[:, 2] # [M]
+        return self.cleavage_event[:, 2]  # [M]
 
     @property
     def cleavage_reactant_row_indices(self) -> Tensor:
-        return self.cleavage_event[:, 3] # [M]
-    
+        return self.cleavage_event[:, 3]  # [M]
+
     @property
     def cleavage_product_row_indices(self) -> Tensor:
-        return self.cleavage_event[:, 4] # [M]
-    
+        return self.cleavage_event[:, 4]  # [M]
+
     @property
     def device(self) -> torch.device:
         return self.edge_index.device
@@ -133,13 +189,9 @@ class FragmentTreeStructure:
             edge_index=self.edge_index.to(device),
             cleavage_event_edge_index=self.cleavage_event_edge_index.to(device),
             cleavage_event=self.cleavage_event.to(device),
-            cleavage_reactant_atom_idxs={
-                k: v.to(device)
-                for k, v in self.cleavage_reactant_atom_idxs.items()
-            },
-            cleavage_product_atom_idxs={
-                k: v.to(device)
-                for k, v in self.cleavage_product_atom_idxs.items()
+            cleavage_atom_idxs={
+                int(tuple_length): atom_idxs.to(device)
+                for tuple_length, atom_idxs in self.cleavage_atom_idxs.items()
             },
             sample_adduct_type_index=self.sample_adduct_type_index.to(device),
             sample_ce_value=self.sample_ce_value.to(device),
@@ -150,48 +202,42 @@ class FragmentTreeStructure:
             sample_precursor_path_index=(
                 self.sample_precursor_path_index.to(device)
             ),
+            reactant_tuple_length_table=(
+                self.reactant_tuple_length_table.to(device)
+            ),
+            product_tuple_length_table=(
+                self.product_tuple_length_table.to(device)
+            ),
         )
-
+        
     @classmethod
     def from_structures(
         cls,
         structures: Sequence["FragmentTreeStructure"],
         device: Optional[torch.device] = None,
-    ) -> FragmentTreeStructure:
+    ) -> "FragmentTreeStructure":
         """
         Combine multiple FragmentTreeStructure objects into one batched structure.
 
-        Parameters
-        ----------
-        structures:
-            FragmentTreeStructure objects to combine.
-
-        device:
-            Optional target device. If provided, all tensor fields and node_graph
-            are moved to this device.
-
-        Returns
-        -------
-        batched:
-            Combined FragmentTreeStructure.
-
         Notes
         -----
+        This method keeps cleavage_atom_idxs as local atom indices.
+
+        Therefore:
+            - cleavage_atom_idxs values are NOT shifted by atom offsets.
+            - cleavage_atom_idxs are merged uniquely by their values.
+            - cleavage_event[:, 3] and cleavage_event[:, 4] are remapped to
+              the merged cleavage_atom_idxs rows.
+
         Offset handling:
             - node indices are shifted by cumulative num_nodes.
             - edge indices are shifted by cumulative num_edges.
             - sample indices are shifted by cumulative num_samples.
-            - atom indices in cleavage atom index dictionaries are shifted by
-            cumulative atom count.
-
-        Important
-        ---------
-        cleavage_event[:, 3] and cleavage_event[:, 4] are kept unchanged.
-        This is because the tuple_length key needed to offset these row indices
-        is not stored in cleavage_event itself.
+            - precursor edge paths are shifted by cumulative num_edges.
+            - cleavage atom tuples are not shifted.
         """
         if len(structures) == 0:
-            raise ValueError("structures must not be empty")
+            raise ValueError("structures must not be empty.")
 
         if device is not None:
             structures = [structure.to(device) for structure in structures]
@@ -211,10 +257,14 @@ class FragmentTreeStructure:
         # Node molecular graphs
         # -------------------------
         node_graph_data_list = []
+
         for structure in structures:
-            node_graph_data_list.extend(structure.node_graph.to_data_list())
+            node_graph_data_list.extend(
+                structure.node_graph.to_data_list()
+            )
 
         node_graph = Batch.from_data_list(node_graph_data_list)
+
         if device is not None:
             node_graph = node_graph.to(device)
 
@@ -227,7 +277,12 @@ class FragmentTreeStructure:
         for structure in structures:
             offset = structure.node_graph_offset.to(tensor_device)
 
-            # Use all offsets except the final total.
+            if offset.dim() != 1:
+                raise ValueError(
+                    "node_graph_offset must be 1D, "
+                    f"got shape {tuple(offset.shape)}."
+                )
+
             node_graph_offset_parts.append(offset[:-1] + atom_offset)
             atom_offset += int(offset[-1].item())
 
@@ -250,9 +305,20 @@ class FragmentTreeStructure:
         node_offset = 0
 
         for structure in structures:
-            edge_index_parts.append(
-                structure.edge_index.to(tensor_device) + node_offset
-            )
+            edge_index = structure.edge_index.to(tensor_device)
+
+            if edge_index.dim() != 2 or edge_index.size(0) != 2:
+                raise ValueError(
+                    "edge_index must have shape [2, E], "
+                    f"got shape {tuple(edge_index.shape)}."
+                )
+
+            shifted_edge_index = edge_index.clone()
+
+            if shifted_edge_index.numel() > 0:
+                shifted_edge_index = shifted_edge_index + node_offset
+
+            edge_index_parts.append(shifted_edge_index)
             node_offset += structure.num_nodes
 
         edge_index = torch.cat(edge_index_parts, dim=1)
@@ -264,9 +330,20 @@ class FragmentTreeStructure:
         edge_offset = 0
 
         for structure in structures:
-            cleavage_event_edge_index_parts.append(
-                structure.cleavage_event_edge_index.to(tensor_device) + edge_offset
-            )
+            event_edge_index = structure.cleavage_event_edge_index.to(
+                tensor_device
+            ).clone()
+
+            if event_edge_index.dim() != 1:
+                raise ValueError(
+                    "cleavage_event_edge_index must be 1D, "
+                    f"got shape {tuple(event_edge_index.shape)}."
+                )
+
+            if event_edge_index.numel() > 0:
+                event_edge_index = event_edge_index + edge_offset
+
+            cleavage_event_edge_index_parts.append(event_edge_index)
             edge_offset += structure.num_edges
 
         cleavage_event_edge_index = torch.cat(
@@ -275,29 +352,45 @@ class FragmentTreeStructure:
         )
 
         # -------------------------
+        # tuple-length tables
+        # -------------------------
+        reactant_tuple_length_table = cls._merge_tuple_length_tables(
+            structures=structures,
+            field_name="reactant_tuple_length_table",
+            width=3,
+            key_width=2,
+            device=tensor_device,
+        )
+
+        product_tuple_length_table = cls._merge_tuple_length_tables(
+            structures=structures,
+            field_name="product_tuple_length_table",
+            width=4,
+            key_width=3,
+            device=tensor_device,
+        )
+
+        # -------------------------
+        # cleavage atom index dictionary
+        # -------------------------
+        (
+            cleavage_atom_idxs,
+            atom_row_index_remaps,
+        ) = cls._merge_unique_atom_index_dicts(
+            structures=structures,
+            field_name="cleavage_atom_idxs",
+            device=tensor_device,
+        )
+
+        # -------------------------
         # cleavage_event
         # -------------------------
-        cleavage_event = torch.cat(
-            [
-                structure.cleavage_event.to(tensor_device)
-                for structure in structures
-            ],
-            dim=0,
-        )
-
-        # -------------------------
-        # cleavage atom index dictionaries
-        # -------------------------
-        cleavage_reactant_atom_idxs = cls._concat_atom_index_dicts_with_atom_offset(
+        cleavage_event = cls._concat_cleavage_events_with_atom_row_remap(
             structures=structures,
-            field_name="cleavage_reactant_atom_idxs",
             device=tensor_device,
-        )
-
-        cleavage_product_atom_idxs = cls._concat_atom_index_dicts_with_atom_offset(
-            structures=structures,
-            field_name="cleavage_product_atom_idxs",
-            device=tensor_device,
+            atom_row_index_remaps=atom_row_index_remaps,
+            reactant_tuple_length_table=reactant_tuple_length_table,
+            product_tuple_length_table=product_tuple_length_table,
         )
 
         # -------------------------
@@ -328,7 +421,15 @@ class FragmentTreeStructure:
         edge_offset = 0
 
         for structure in structures:
-            sample_edge_index = structure.sample_edge_index.to(tensor_device).clone()
+            sample_edge_index = structure.sample_edge_index.to(
+                tensor_device
+            ).clone()
+
+            if sample_edge_index.dim() != 2 or sample_edge_index.size(0) != 2:
+                raise ValueError(
+                    "sample_edge_index must have shape [2, L], "
+                    f"got shape {tuple(sample_edge_index.shape)}."
+                )
 
             if sample_edge_index.numel() > 0:
                 sample_edge_index[0, :] += sample_offset
@@ -339,31 +440,19 @@ class FragmentTreeStructure:
             sample_offset += structure.num_samples
             edge_offset += structure.num_edges
 
-        sample_edge_index = torch.cat(sample_edge_index_parts, dim=1)
+        sample_edge_index = torch.cat(
+            sample_edge_index_parts,
+            dim=1,
+        )
 
         # -------------------------
         # sample_precursor_edge_index_path
         # -------------------------
-        sample_precursor_edge_index_path_parts = []
-
-        edge_offset = 0
-
-        for structure in structures:
-            path = structure.sample_precursor_edge_index_path.to(tensor_device)
-
-            # Keep negative padding values such as -1 unchanged.
-            shifted_path = torch.where(
-                path >= 0,
-                path + edge_offset,
-                path,
+        sample_precursor_edge_index_path = (
+            cls._concat_sample_precursor_edge_index_paths(
+                structures=structures,
+                device=tensor_device,
             )
-
-            sample_precursor_edge_index_path_parts.append(shifted_path)
-            edge_offset += structure.num_edges
-
-        sample_precursor_edge_index_path = torch.cat(
-            sample_precursor_edge_index_path_parts,
-            dim=0,
         )
 
         # -------------------------
@@ -374,7 +463,15 @@ class FragmentTreeStructure:
         sample_offset = 0
 
         for structure in structures:
-            path_index = structure.sample_precursor_path_index.to(tensor_device)
+            path_index = structure.sample_precursor_path_index.to(
+                tensor_device
+            ).clone()
+
+            if path_index.dim() != 1:
+                raise ValueError(
+                    "sample_precursor_path_index must be 1D, "
+                    f"got shape {tuple(path_index.shape)}."
+                )
 
             shifted_path_index = torch.where(
                 path_index >= 0,
@@ -397,56 +494,546 @@ class FragmentTreeStructure:
             edge_index=edge_index,
             cleavage_event_edge_index=cleavage_event_edge_index,
             cleavage_event=cleavage_event,
-            cleavage_reactant_atom_idxs=cleavage_reactant_atom_idxs,
-            cleavage_product_atom_idxs=cleavage_product_atom_idxs,
+            cleavage_atom_idxs=cleavage_atom_idxs,
             sample_adduct_type_index=sample_adduct_type_index,
             sample_ce_value=sample_ce_value,
             sample_edge_index=sample_edge_index,
             sample_precursor_edge_index_path=sample_precursor_edge_index_path,
             sample_precursor_path_index=sample_precursor_path_index,
+            reactant_tuple_length_table=reactant_tuple_length_table,
+            product_tuple_length_table=product_tuple_length_table,
         )
-    
+
     @staticmethod
-    def _concat_atom_index_dicts_with_atom_offset(
+    def _merge_tuple_length_tables(
+        *,
+        structures: Sequence["FragmentTreeStructure"],
+        field_name: str,
+        width: int,
+        key_width: int,
+        device: torch.device,
+    ) -> Tensor:
+        """
+        Merge tuple-length tables and keep unique keys.
+
+        Parameters
+        ----------
+        structures:
+            FragmentTreeStructure objects.
+
+        field_name:
+            Name of the tuple-length table field.
+
+            Expected values:
+                - "reactant_tuple_length_table"
+                - "product_tuple_length_table"
+
+        width:
+            Number of columns.
+
+            reactant_tuple_length_table:
+                3 columns:
+                    cleavage_id,
+                    reaction_id,
+                    reactant_tuple_length
+
+            product_tuple_length_table:
+                4 columns:
+                    cleavage_id,
+                    reaction_id,
+                    product_molecule_id,
+                    product_tuple_length
+
+        key_width:
+            Number of columns used as key.
+
+            reactant:
+                2 columns:
+                    cleavage_id,
+                    reaction_id
+
+            product:
+                3 columns:
+                    cleavage_id,
+                    reaction_id,
+                    product_molecule_id
+
+        device:
+            Target device.
+
+        Returns
+        -------
+        Tensor
+            Merged tuple-length table.
+        """
+        row_by_key: Dict[Tuple[int, ...], Tuple[int, ...]] = {}
+
+        for structure in structures:
+            table = getattr(structure, field_name).to(device).long()
+
+            if table.numel() == 0:
+                continue
+
+            if table.dim() != 2 or table.size(1) != width:
+                raise ValueError(
+                    f"{field_name} must have shape [N, {width}], "
+                    f"got shape {tuple(table.shape)}."
+                )
+
+            for row in table.tolist():
+                row_tuple = tuple(int(value) for value in row)
+                key = row_tuple[:key_width]
+
+                if key in row_by_key:
+                    previous = row_by_key[key]
+
+                    if previous != row_tuple:
+                        raise ValueError(
+                            f"Inconsistent {field_name} for key={key}: "
+                            f"{previous} vs {row_tuple}."
+                        )
+                else:
+                    row_by_key[key] = row_tuple
+
+        rows = list(row_by_key.values())
+        rows.sort()
+
+        if len(rows) == 0:
+            return torch.empty(
+                (0, width),
+                dtype=torch.long,
+                device=device,
+            )
+
+        return torch.tensor(
+            rows,
+            dtype=torch.long,
+            device=device,
+        )
+
+    @staticmethod
+    def _merge_unique_atom_index_dicts(
         *,
         structures: Sequence["FragmentTreeStructure"],
         field_name: str,
         device: torch.device,
-    ) -> Dict[int, Tensor]:
+    ) -> Tuple[Dict[int, Tensor], list[Dict[int, Tensor]]]:
         """
-        Concatenate atom index dictionaries with cumulative atom offsets.
+        Merge atom-index dictionaries and make rows unique.
 
-        Each dictionary has:
-            tuple_length -> [num_rows, tuple_length]
+        Important
+        ---------
+        Atom indices in cleavage_atom_idxs are local atom indices within each
+        fragment SMILES. Therefore, atom offsets must NOT be added here.
 
-        Atom indices are assumed to be global atom indices inside each structure's
-        node_graph. They are shifted by the cumulative atom count of previous
-        structures.
+        Parameters
+        ----------
+        structures:
+            FragmentTreeStructure objects.
+
+        field_name:
+            Usually "cleavage_atom_idxs".
+
+        device:
+            Target device.
+
+        Returns
+        -------
+        merged_atom_idxs:
+            Dict[tuple_length, Tensor]
+
+            tuple_length -> [A_unique, tuple_length]
+
+        atom_row_index_remaps:
+            list[Dict[int, Tensor]]
+
+            atom_row_index_remaps[structure_index][tuple_length][old_row_index]
+            gives new_row_index in merged_atom_idxs[tuple_length].
         """
-        output: Dict[int, list[Tensor]] = {}
+        rows_by_tuple_length: Dict[int, list[Tuple[int, ...]]] = {}
+        row_index_by_tuple_length_and_atom_idxs: Dict[
+            int,
+            Dict[Tuple[int, ...], int],
+        ] = {}
 
-        atom_offset = 0
+        atom_row_index_remaps: list[Dict[int, Tensor]] = []
 
         for structure in structures:
             atom_index_dict = getattr(structure, field_name)
 
+            structure_remap: Dict[int, Tensor] = {}
+
             for tuple_length, atom_idxs in atom_index_dict.items():
-                if tuple_length not in output:
-                    output[tuple_length] = []
+                tuple_length = int(tuple_length)
+                atom_idxs = atom_idxs.to(device).long()
 
-                atom_idxs = atom_idxs.to(device)
+                if atom_idxs.numel() == 0:
+                    structure_remap[tuple_length] = torch.empty(
+                        (0,),
+                        dtype=torch.long,
+                        device=device,
+                    )
+                    continue
 
-                shifted_atom_idxs = torch.where(
-                    atom_idxs >= 0,
-                    atom_idxs + atom_offset,
-                    atom_idxs,
+                if atom_idxs.dim() != 2:
+                    raise ValueError(
+                        f"{field_name}[{tuple_length}] must be 2D, "
+                        f"got shape {tuple(atom_idxs.shape)}."
+                    )
+
+                if atom_idxs.size(1) != tuple_length:
+                    raise ValueError(
+                        f"{field_name}[{tuple_length}] has invalid width: "
+                        f"got {atom_idxs.size(1)}, expected {tuple_length}."
+                    )
+
+                if tuple_length not in rows_by_tuple_length:
+                    rows_by_tuple_length[tuple_length] = []
+
+                if tuple_length not in row_index_by_tuple_length_and_atom_idxs:
+                    row_index_by_tuple_length_and_atom_idxs[tuple_length] = {}
+
+                row_index_by_atom_idxs = (
+                    row_index_by_tuple_length_and_atom_idxs[tuple_length]
                 )
 
-                output[tuple_length].append(shifted_atom_idxs)
+                old_to_new = torch.empty(
+                    (atom_idxs.size(0),),
+                    dtype=torch.long,
+                    device=device,
+                )
 
-            atom_offset += int(structure.node_graph_offset[-1].item())
+                for old_row_index in range(atom_idxs.size(0)):
+                    row = atom_idxs[old_row_index]
 
-        return {
-            tuple_length: torch.cat(parts, dim=0)
-            for tuple_length, parts in output.items()
-        }
+                    atom_idx_tuple = tuple(
+                        int(value)
+                        for value in row.tolist()
+                    )
+
+                    if atom_idx_tuple in row_index_by_atom_idxs:
+                        new_row_index = row_index_by_atom_idxs[atom_idx_tuple]
+                    else:
+                        new_row_index = len(rows_by_tuple_length[tuple_length])
+                        rows_by_tuple_length[tuple_length].append(atom_idx_tuple)
+                        row_index_by_atom_idxs[atom_idx_tuple] = new_row_index
+
+                    old_to_new[old_row_index] = int(new_row_index)
+
+                structure_remap[tuple_length] = old_to_new
+
+            atom_row_index_remaps.append(structure_remap)
+
+        merged_atom_idxs: Dict[int, Tensor] = {}
+
+        for tuple_length, rows in rows_by_tuple_length.items():
+            tuple_length = int(tuple_length)
+
+            if len(rows) == 0:
+                merged_atom_idxs[tuple_length] = torch.empty(
+                    (0, tuple_length),
+                    dtype=torch.long,
+                    device=device,
+                )
+            else:
+                merged_atom_idxs[tuple_length] = torch.tensor(
+                    rows,
+                    dtype=torch.long,
+                    device=device,
+                )
+
+        return merged_atom_idxs, atom_row_index_remaps
+
+    @staticmethod
+    def _concat_cleavage_events_with_atom_row_remap(
+        *,
+        structures: Sequence["FragmentTreeStructure"],
+        device: torch.device,
+        atom_row_index_remaps: Sequence[Dict[int, Tensor]],
+        reactant_tuple_length_table: Tensor,
+        product_tuple_length_table: Tensor,
+    ) -> Tensor:
+        """
+        Concatenate cleavage_event tensors and remap atom tuple row indices.
+
+        cleavage_event keeps shape [M, 5].
+
+        columns:
+            0: cleavage_id
+            1: reaction_id
+            2: product_molecule_id
+            3: reactant_atom_row_index
+            4: product_atom_row_index
+        """
+        if len(structures) != len(atom_row_index_remaps):
+            raise ValueError(
+                "structures and atom_row_index_remaps must have the same length. "
+                f"Got {len(structures)} and {len(atom_row_index_remaps)}."
+            )
+
+        has_cleavage_events = any(
+            structure.cleavage_event.numel() > 0
+            for structure in structures
+        )
+
+        if not has_cleavage_events:
+            return torch.empty(
+                (0, 5),
+                dtype=torch.long,
+                device=device,
+            )
+
+        reactant_tuple_length_by_key = (
+            FragmentTreeStructure._tuple_length_table_to_dict(
+                table=reactant_tuple_length_table,
+                width=3,
+                key_width=2,
+                name="reactant_tuple_length_table",
+            )
+        )
+
+        product_tuple_length_by_key = (
+            FragmentTreeStructure._tuple_length_table_to_dict(
+                table=product_tuple_length_table,
+                width=4,
+                key_width=3,
+                name="product_tuple_length_table",
+            )
+        )
+
+        cleavage_event_parts: list[Tensor] = []
+
+        for structure_index, structure in enumerate(structures):
+            event = structure.cleavage_event.to(device).clone()
+
+            if event.numel() == 0:
+                cleavage_event_parts.append(event)
+                continue
+
+            if event.dim() != 2 or event.size(1) != 5:
+                raise ValueError(
+                    "cleavage_event must have shape [M, 5], "
+                    f"got shape {tuple(event.shape)}."
+                )
+
+            atom_row_index_remap = atom_row_index_remaps[structure_index]
+
+            for event_index in range(event.size(0)):
+                cleavage_id = int(event[event_index, 0].item())
+                reaction_id = int(event[event_index, 1].item())
+                product_molecule_id = int(event[event_index, 2].item())
+
+                reactant_key = (
+                    cleavage_id,
+                    reaction_id,
+                )
+
+                product_key = (
+                    cleavage_id,
+                    reaction_id,
+                    product_molecule_id,
+                )
+
+                if reactant_key not in reactant_tuple_length_by_key:
+                    raise KeyError(
+                        "reactant_tuple_length_table does not contain "
+                        f"key={reactant_key}."
+                    )
+
+                if product_key not in product_tuple_length_by_key:
+                    raise KeyError(
+                        "product_tuple_length_table does not contain "
+                        f"key={product_key}."
+                    )
+
+                reactant_tuple_length = int(
+                    reactant_tuple_length_by_key[reactant_key]
+                )
+
+                product_tuple_length = int(
+                    product_tuple_length_by_key[product_key]
+                )
+
+                old_reactant_row_index = int(event[event_index, 3].item())
+                old_product_row_index = int(event[event_index, 4].item())
+
+                new_reactant_row_index = (
+                    FragmentTreeStructure._map_atom_row_index(
+                        atom_row_index_remap=atom_row_index_remap,
+                        tuple_length=reactant_tuple_length,
+                        old_row_index=old_reactant_row_index,
+                        name="reactant_atom_row_index",
+                    )
+                )
+
+                new_product_row_index = (
+                    FragmentTreeStructure._map_atom_row_index(
+                        atom_row_index_remap=atom_row_index_remap,
+                        tuple_length=product_tuple_length,
+                        old_row_index=old_product_row_index,
+                        name="product_atom_row_index",
+                    )
+                )
+
+                event[event_index, 3] = new_reactant_row_index
+                event[event_index, 4] = new_product_row_index
+
+            cleavage_event_parts.append(event)
+
+        return torch.cat(
+            cleavage_event_parts,
+            dim=0,
+        )
+
+    @staticmethod
+    def _tuple_length_table_to_dict(
+        *,
+        table: Tensor,
+        width: int,
+        key_width: int,
+        name: str,
+    ) -> Dict[Tuple[int, ...], int]:
+        """
+        Convert a tuple-length table tensor to a Python lookup dict.
+
+        The last column is treated as tuple_length.
+        """
+        table = table.long()
+
+        if table.numel() == 0:
+            return {}
+
+        if table.dim() != 2 or table.size(1) != width:
+            raise ValueError(
+                f"{name} must have shape [N, {width}], "
+                f"got shape {tuple(table.shape)}."
+            )
+
+        output: Dict[Tuple[int, ...], int] = {}
+
+        for row in table.tolist():
+            row_tuple = tuple(int(value) for value in row)
+
+            key = row_tuple[:key_width]
+            tuple_length = int(row_tuple[-1])
+
+            if key in output:
+                previous = output[key]
+
+                if previous != tuple_length:
+                    raise ValueError(
+                        f"Inconsistent tuple length in {name} for key={key}: "
+                        f"{previous} vs {tuple_length}."
+                    )
+            else:
+                output[key] = tuple_length
+
+        return output
+
+    @staticmethod
+    def _map_atom_row_index(
+        *,
+        atom_row_index_remap: Dict[int, Tensor],
+        tuple_length: int,
+        old_row_index: int,
+        name: str,
+    ) -> int:
+        """Map an old atom tuple row index to a new merged row index."""
+        tuple_length = int(tuple_length)
+        old_row_index = int(old_row_index)
+
+        if tuple_length not in atom_row_index_remap:
+            raise KeyError(
+                f"{name} requires tuple_length={tuple_length}, "
+                "but atom_row_index_remap does not contain that key. "
+                f"Available tuple lengths: "
+                f"{sorted(atom_row_index_remap.keys())}."
+            )
+
+        remap = atom_row_index_remap[tuple_length]
+
+        if old_row_index < 0:
+            raise IndexError(
+                f"{name} contains negative row index: {old_row_index}."
+            )
+
+        if old_row_index >= int(remap.numel()):
+            raise IndexError(
+                f"{name} is out of range for tuple_length={tuple_length}: "
+                f"old_row_index={old_row_index}, remap_size={remap.numel()}."
+            )
+
+        return int(remap[old_row_index].item())
+
+    @staticmethod
+    def _concat_sample_precursor_edge_index_paths(
+        *,
+        structures: Sequence["FragmentTreeStructure"],
+        device: torch.device,
+    ) -> Tensor:
+        """
+        Concatenate sample_precursor_edge_index_path with edge offsets.
+
+        Negative padding values such as -1 are kept unchanged.
+
+        This method also handles the case where some structures have no
+        precursor paths.
+        """
+        max_path_width = 0
+
+        for structure in structures:
+            path = structure.sample_precursor_edge_index_path
+
+            if path.dim() != 2:
+                raise ValueError(
+                    "sample_precursor_edge_index_path must be 2D, "
+                    f"got shape {tuple(path.shape)}."
+                )
+
+            max_path_width = max(
+                max_path_width,
+                int(path.size(1)),
+            )
+
+        path_parts = []
+
+        edge_offset = 0
+
+        for structure in structures:
+            path = structure.sample_precursor_edge_index_path.to(device).clone()
+
+            if path.size(1) < max_path_width:
+                pad_width = max_path_width - int(path.size(1))
+
+                padding = torch.full(
+                    (path.size(0), pad_width),
+                    -1,
+                    dtype=path.dtype,
+                    device=device,
+                )
+
+                path = torch.cat(
+                    [path, padding],
+                    dim=1,
+                )
+
+            shifted_path = torch.where(
+                path >= 0,
+                path + edge_offset,
+                path,
+            )
+
+            path_parts.append(shifted_path)
+            edge_offset += structure.num_edges
+
+        if len(path_parts) == 0:
+            return torch.empty(
+                (0, 0),
+                dtype=torch.long,
+                device=device,
+            )
+
+        return torch.cat(
+            path_parts,
+            dim=0,
+        )

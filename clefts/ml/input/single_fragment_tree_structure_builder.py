@@ -4,18 +4,23 @@ from dataclasses import dataclass, field
 from typing import Dict, Optional, Tuple, List, Set, Sequence
 
 import torch
-from torch import Tensor
 from torch_geometric.data import Batch, Data
 import numpy as np
 
 from ...libs.mmkit.mmkit import Compound, Adduct
 from ...libs.msentity.msentity import SpectrumRecord
 from ...domain.fragment.cleavage import CleavageResult
-from ...domain.fragment.tree import FragmentEdge
 from ...domain.fragment.ion_tree import FragmentIonTree
-from ...domain.fragment.pathway import FragmentPathway, FragmentPathwayGroup, FragmentPathwayNode, FragmentPathwayEdge, CleavageStep
+from ...domain.fragment.pathway import (
+    FragmentPathway,
+    FragmentPathwayGroup,
+    FragmentPathwayNode,
+    FragmentPathwayEdge,
+    CleavageStep,
+)
 from ..specgen import CleftsSpecGen
 from .fragment_tree_structure import FragmentTreeStructure
+
 
 @dataclass
 class FragmentTreeSample:
@@ -52,6 +57,7 @@ class FragmentTreeSample:
     # This field preserves pathway-level grouping.
     # In contrast, edge_indexes stores the flattened set of all edges
     # used by this sample.
+
 
 @dataclass
 class SingleFragmentTreeStructureBuilder:
@@ -124,60 +130,40 @@ class SingleFragmentTreeStructureBuilder:
     #     cleavage_id,
     #     reaction_id,
     #     product_molecule_id,
-    #     reactant_row_index,
-    #     product_row_index,
+    #     reactant_atom_row_index,
+    #     product_atom_row_index,
     # )
     #
     # cleavage_id, reaction_id, and product_molecule_id are identifiers
     # defined by the cleavage/reaction model or rule set.
     #
-    # reactant_row_index is an index into:
-    #     cleavage_reactant_atom_idxs[reactant_tuple_length]
+    # reactant_atom_row_index and product_atom_row_index both refer to:
+    #     cleavage_atom_idxs[tuple_length][row_index]
     #
-    # product_row_index is an index into:
-    #     cleavage_product_atom_idxs[product_tuple_length]
-    #
-    # The tuple lengths are obtained from the corresponding atom-index tuples.
-    # The actual atom-index tuples are not stored directly here.
-    # They are stored in the cleavage atom-index bucket tables below.
+    # The tuple_length is not stored in cleavage_event.
+    # It is inferred outside this builder from:
+    #     reactant: (cleavage_id, reaction_id)
+    #     product:  (cleavage_id, reaction_id, product_molecule_id)
 
     # -------------------------
     # Cleavage atom-index buckets
     # tuple_length -> rows of unique atom-index tuples
     # -------------------------
-    cleavage_reactant_atom_idxs: Dict[int, List[Tuple[int, ...]]] = field(default_factory=dict)
-    # Dict[tuple_length, List[reactant_atom_index_tuple]]
+    cleavage_atom_idxs: Dict[int, List[Tuple[int, ...]]] = field(default_factory=dict)
+    # Dict[tuple_length, List[atom_index_tuple]]
     #
-    # Stores unique reactant-side atom-index tuples grouped by tuple length.
+    # Stores unique global atom-index tuples grouped by tuple length.
     #
     # key:
-    #     tuple_length, i.e. len(reactant_atom_index_tuple)
+    #     tuple_length, i.e. len(atom_index_tuple)
     #
     # value:
     #     list of unique global atom-index tuples with that length.
     #
-    # cleavage_reactant_atom_idxs[tuple_length][reactant_row_index]
-    # gives one reactant-side atom-index tuple.
+    # cleavage_atom_idxs[tuple_length][row_index]
+    # gives one atom-index tuple.
     #
-    # This bucket is shared across different cleavage_id values
-    # as long as the atom-index tuple length is the same.
-
-    cleavage_product_atom_idxs: Dict[int, List[Tuple[int, ...]]] = field(default_factory=dict)
-    # Dict[tuple_length, List[product_atom_index_tuple]]
-    #
-    # Stores unique product-side atom-index tuples grouped by tuple length.
-    #
-    # key:
-    #     tuple_length, i.e. len(product_atom_index_tuple)
-    #
-    # value:
-    #     list of unique global atom-index tuples with that length.
-    #
-    # cleavage_product_atom_idxs[tuple_length][product_row_index]
-    # gives one product-side atom-index tuple.
-    #
-    # This bucket is shared across different cleavage_id values
-    # as long as the atom-index tuple length is the same.
+    # Both reactant-side and product-side atom tuples are stored here.
 
     samples: Dict[int, FragmentTreeSample] = field(default_factory=dict)
     # sample_index -> sample-specific information.
@@ -192,18 +178,29 @@ class SingleFragmentTreeStructureBuilder:
     # -------------------------
     # Private lookup tables
     # -------------------------
-    _node_index_by_smiles: Dict[str, int] = field(default_factory=dict, init=False, repr=False)
+    _node_index_by_smiles: Dict[str, int] = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+    )
     # canonical_smiles -> node_index.
     #
     # Used to avoid adding duplicate nodes for the same canonical SMILES.
 
-    _edge_index_by_node_indexes: Dict[Tuple[int, int], int] = field(default_factory=dict, init=False, repr=False)
+    _edge_index_by_node_indexes: Dict[Tuple[int, int], int] = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+    )
     # (src_node_index, dst_node_index) -> edge_index.
     #
     # Used to avoid adding duplicate directed edges between the same source
     # and destination nodes.
 
-    _cleavage_event_index_by_key: Dict[Tuple[int, int, int, int, int, int], int] = field(
+    _cleavage_event_index_by_key: Dict[
+        Tuple[int, int, int, int, int, int],
+        int,
+    ] = field(
         default_factory=dict,
         init=False,
         repr=False,
@@ -213,8 +210,8 @@ class SingleFragmentTreeStructureBuilder:
     #     cleavage_id,
     #     reaction_id,
     #     product_molecule_id,
-    #     reactant_row_index,
-    #     product_row_index,
+    #     reactant_atom_row_index,
+    #     product_atom_row_index,
     # ) -> cleavage_event_index.
     #
     # Used to avoid adding duplicate cleavage events.
@@ -222,36 +219,21 @@ class SingleFragmentTreeStructureBuilder:
     # edge_index and row indexes are internal indexes in this builder.
     # cleavage_id, reaction_id, and product_molecule_id are external/model-defined IDs.
 
-    _reactant_row_index_by_atom_idxs: Dict[Tuple[int, ...], int] = field(
+    _atom_row_index_by_atom_idxs: Dict[Tuple[int, ...], int] = field(
         default_factory=dict,
         init=False,
         repr=False,
     )
-    # reactant_atom_index_tuple -> reactant_row_index.
+    # atom_index_tuple -> row_index.
     #
     # The tuple length is obtained by:
-    #     tuple_length = len(reactant_atom_index_tuple)
+    #     tuple_length = len(atom_index_tuple)
     #
     # The row index refers to:
-    #     cleavage_reactant_atom_idxs[tuple_length][reactant_row_index]
+    #     cleavage_atom_idxs[tuple_length][row_index]
     #
-    # Used to avoid storing duplicate reactant-side atom-index tuples.
+    # Used to avoid storing duplicate atom-index tuples.
 
-    _product_row_index_by_atom_idxs: Dict[Tuple[int, ...], int] = field(
-        default_factory=dict,
-        init=False,
-        repr=False,
-    )
-    # product_atom_index_tuple -> product_row_index.
-    #
-    # The tuple length is obtained by:
-    #     tuple_length = len(product_atom_index_tuple)
-    #
-    # The row index refers to:
-    #     cleavage_product_atom_idxs[tuple_length][product_row_index]
-    #
-    # Used to avoid storing duplicate product-side atom-index tuples.
-    
     def __post_init__(self) -> None:
         if not isinstance(self._model, CleftsSpecGen):
             raise TypeError(
@@ -313,15 +295,34 @@ class SingleFragmentTreeStructureBuilder:
                 dtype=torch.long,
             )
 
-        cleavage_reactant_atom_idxs = {
-            tuple_length: torch.tensor(rows, dtype=torch.long)
-            for tuple_length, rows in self.cleavage_reactant_atom_idxs.items()
+        cleavage_atom_idxs = {
+            int(tuple_length): torch.tensor(rows, dtype=torch.long)
+            for tuple_length, rows in self.cleavage_atom_idxs.items()
         }
 
-        cleavage_product_atom_idxs = {
-            tuple_length: torch.tensor(rows, dtype=torch.long)
-            for tuple_length, rows in self.cleavage_product_atom_idxs.items()
-        }
+        # -------------------------
+        # Tuple-length tables
+        # -------------------------
+        reactant_tuple_length_table = self._tuple_length_dict_to_tensor(
+            self._model.cleavage_edge_fnet.reactant_tuple_length_by_event_type,
+            key_width=2,
+        )
+        # [R, 3]
+        # columns:
+        #   0: cleavage_id
+        #   1: reaction_id
+        #   2: reactant_tuple_length
+
+        product_tuple_length_table = self._tuple_length_dict_to_tensor(
+            self._model.cleavage_edge_fnet.product_tuple_length_by_event_type,
+            key_width=3,
+        )
+        # [P, 4]
+        # columns:
+        #   0: cleavage_id
+        #   1: reaction_id
+        #   2: product_molecule_id
+        #   3: product_tuple_length
 
         # -------------------------
         # Samples
@@ -424,13 +425,14 @@ class SingleFragmentTreeStructureBuilder:
             edge_index=edge_index,
             cleavage_event_edge_index=cleavage_event_edge_index,
             cleavage_event=cleavage_event,
-            cleavage_reactant_atom_idxs=cleavage_reactant_atom_idxs,
-            cleavage_product_atom_idxs=cleavage_product_atom_idxs,
+            cleavage_atom_idxs=cleavage_atom_idxs,
             sample_adduct_type_index=sample_adduct_type_index,
             sample_ce_value=sample_ce_value,
             sample_edge_index=sample_edge_index,
             sample_precursor_edge_index_path=sample_precursor_edge_index_path,
             sample_precursor_path_index=sample_precursor_path_index,
+            reactant_tuple_length_table=reactant_tuple_length_table,
+            product_tuple_length_table=product_tuple_length_table,
         )
 
     def add_same_smiles_dataset_first_cleavage(
@@ -481,11 +483,20 @@ class SingleFragmentTreeStructureBuilder:
             _include_fragment_compound_cache=True,
         )
 
-        fragment_compound_by_index = fragment_ion_tree._fragment_compound_by_index if hasattr(fragment_ion_tree, "_fragment_compound_by_index") else None
-        fragment_compound_by_smiles = {}
+        fragment_compound_by_index = (
+            fragment_ion_tree._fragment_compound_by_index
+            if hasattr(fragment_ion_tree, "_fragment_compound_by_index")
+            else None
+        )
+
+        fragment_compound_by_smiles: Dict[str, Compound] = {}
         tree_node_index_by_smiles: Dict[str, int] = {}
-        src_smiles_to_outgoing_fragment_edges: Dict[str, List[Tuple[str, FragmentPathwayEdge]]] = {}
+        src_smiles_to_outgoing_fragment_edges: Dict[
+            str,
+            List[Tuple[str, FragmentPathwayEdge]],
+        ] = {}
         cleavage_results_by_smiles: Dict[str, List[CleavageResult]] = {}
+
         if fragment_compound_by_index is not None:
             for node_index, compound in fragment_compound_by_index.items():
                 fragment_compound_by_smiles[compound.smiles] = compound
@@ -497,6 +508,7 @@ class SingleFragmentTreeStructureBuilder:
                 compound = Compound.from_smiles(smiles)
                 fragment_compound_by_smiles[smiles] = compound
             return compound
+
         def get_tree_node_index_by_smiles(smiles: str) -> Optional[int]:
             tree_node_index = tree_node_index_by_smiles.get(smiles)
             if tree_node_index is None:
@@ -507,13 +519,19 @@ class SingleFragmentTreeStructureBuilder:
                 else:
                     tree_node_index = None
             return tree_node_index
+
         def get_cleavage_results_by_smiles(smiles: str) -> List[CleavageResult]:
             cleavage_results = cleavage_results_by_smiles.get(smiles)
             if cleavage_results is None:
                 compound = get_compound_by_smiles(smiles)
-                cleavage_results = self._model.fragmenter.cleavage_pattern_set.fragment_all(compound)
+                cleavage_results = (
+                    self._model.fragmenter.cleavage_pattern_set.fragment_all(
+                        compound
+                    )
+                )
                 cleavage_results_by_smiles[smiles] = cleavage_results
             return cleavage_results
+
         def get_outgoing_fragment_edges_by_src_smiles(
             src_smiles: str,
             fragment_ion_tree: FragmentIonTree,
@@ -524,19 +542,25 @@ class SingleFragmentTreeStructureBuilder:
 
             if dst_smiles_and_edge_list is None:
                 dst_smiles_and_edge_list = []
+
                 src_node = fragment_ion_tree.get_node_by_smiles(src_smiles)
                 if src_node is None:
                     raise ValueError(
-                        f"Source SMILES {src_smiles!r} not found in fragment ion tree."
+                        f"Source SMILES {src_smiles!r} not found in "
+                        "fragment ion tree."
                     )
+
                 src_node_index = int(src_node.index)
                 out_edges = fragment_ion_tree.get_out_edges(src_node_index)
+
                 if len(out_edges) > 0:
                     for out_edge in out_edges:
                         dst_node_index = out_edge.target_index
                         dst_node = fragment_ion_tree.get_node(dst_node_index)
                         dst_smiles = dst_node.smiles
-                        fragment_pathway_edge = FragmentPathwayEdge.from_fragment_edge(out_edge)
+                        fragment_pathway_edge = (
+                            FragmentPathwayEdge.from_fragment_edge(out_edge)
+                        )
                         dst_smiles_and_edge_list.append(
                             (
                                 dst_smiles,
@@ -544,7 +568,10 @@ class SingleFragmentTreeStructureBuilder:
                             )
                         )
                 else:
-                    dst_smiles_to_cleavage_steps: Dict[str, List[CleavageStep]] = {}
+                    dst_smiles_to_cleavage_steps: Dict[
+                        str,
+                        List[CleavageStep],
+                    ] = {}
 
                     cleavage_results = get_cleavage_results_by_smiles(src_smiles)
 
@@ -561,18 +588,22 @@ class SingleFragmentTreeStructureBuilder:
                                     reaction_id=product.id,
                                     product_molecule_id=product_molecule.id,
                                     reactant_indices=tuple(product.reactant_indices),
-                                    product_indices=tuple(product_molecule.product_indices),
+                                    product_indices=tuple(
+                                        product_molecule.product_indices
+                                    ),
                                 )
 
                                 dst_smiles_to_cleavage_steps[dst_smiles].append(
                                     cleavage_step
                                 )
 
-                    for dst_smiles, cleavage_steps in dst_smiles_to_cleavage_steps.items():
+                    for dst_smiles, cleavage_steps in (
+                        dst_smiles_to_cleavage_steps.items()
+                    ):
                         dst_smiles_and_edge_list.append(
                             (
                                 dst_smiles,
-                                FragmentPathwayEdge(cleavage_steps),
+                                FragmentPathwayEdge(tuple(cleavage_steps)),
                             )
                         )
 
@@ -591,6 +622,7 @@ class SingleFragmentTreeStructureBuilder:
 
         for record_index in range(len(dataset)):
             record = dataset[record_index]
+
             try:
                 (
                     smiles,
@@ -607,7 +639,7 @@ class SingleFragmentTreeStructureBuilder:
                     smiles_column=smiles_column,
                     instrument_column=instrument_column,
                 )
-            except Exception as e:
+            except Exception:
                 sample_indexes.append(-1)
                 continue
 
@@ -658,8 +690,15 @@ class SingleFragmentTreeStructureBuilder:
                         "not found in fragment ion tree."
                     )
 
-                for dst_smiles, fp_edge in get_outgoing_fragment_edges_by_src_smiles(precursor_node.smiles, fragment_ion_tree):
-                    edge_index = self._ensure_get_edge_index(precursor_node.smiles, dst_smiles, fp_edge)
+                for dst_smiles, fp_edge in get_outgoing_fragment_edges_by_src_smiles(
+                    precursor_node.smiles,
+                    fragment_ion_tree,
+                ):
+                    edge_index = self._ensure_get_edge_index(
+                        precursor_node.smiles,
+                        dst_smiles,
+                        fp_edge,
+                    )
 
                     if edge_index is None:
                         continue
@@ -673,58 +712,136 @@ class SingleFragmentTreeStructureBuilder:
 
         return np.asarray(sample_indexes, dtype=int)
 
+    def reset(self) -> None:
+        """Reset all accumulated structure and sample information.
+
+        Notes
+        -----
+        This method keeps self._model unchanged.
+        """
+
+        # -------------------------
+        # Nodes
+        # -------------------------
+        self.node_smiles = []
+        self.node_graph = []
+        self._node_graph_offset = [0]
+
+        # -------------------------
+        # Edges
+        # -------------------------
+        self.edge_src = []
+        self.edge_dst = []
+
+        # -------------------------
+        # Cleavage events
+        # -------------------------
+        self.cleavage_event_edge_index = []
+        self.cleavage_event = []
+
+        # -------------------------
+        # Shared cleavage atom-index table
+        # -------------------------
+        self.cleavage_atom_idxs = {}
+
+        # -------------------------
+        # Samples
+        # -------------------------
+        self.samples = {}
+
+        # -------------------------
+        # Private lookup tables
+        # -------------------------
+        self._node_index_by_smiles = {}
+        self._edge_index_by_node_indexes = {}
+        self._cleavage_event_index_by_key = {}
+        self._atom_row_index_by_atom_idxs = {}
+
     # -------------------------
     # internal helpers
     # -------------------------
-    def _get_mol_graph(self, smiles: str, compound: Optional[Compound] = None) -> Data:
-        builder = self._model._mol_encoder.graph_builder if self._model is not None else None
+    def _get_mol_graph(
+        self,
+        smiles: str,
+        compound: Optional[Compound] = None,
+    ) -> Data:
+        builder = (
+            self._model._mol_encoder.graph_builder
+            if self._model is not None
+            else None
+        )
+
         if builder is None:
             raise ValueError(
                 "mol_graph_builder is not set. "
-                "Set model.mol_encoder.graph_builder (dict or callable) to auto-add nodes."
+                "Set model.mol_encoder.graph_builder to auto-add nodes."
             )
+
         if compound is None:
             compound = Compound.from_smiles(smiles)
-        g = builder.build(compound)
-        if not isinstance(g, Data):
-            raise TypeError("mol_graph_builder must return torch_geometric.data.Data")
-        return g
 
-    def _get_node_index(self, smiles: str, compound: Optional[Compound] = None) -> int:
+        graph = builder.build(compound)
+
+        if not isinstance(graph, Data):
+            raise TypeError("mol_graph_builder must return torch_geometric.data.Data")
+
+        return graph
+
+    def _get_node_index(
+        self,
+        smiles: str,
+        compound: Optional[Compound] = None,
+    ) -> int:
         if smiles in self._node_index_by_smiles:
             return self._node_index_by_smiles[smiles]
-        else:
-            raise KeyError(f"Node with SMILES {smiles!r} not found.")
 
-    def _ensure_get_node_index(self, smiles: Optional[str], compound: Optional[Compound] = None) -> Optional[int]:
+        raise KeyError(f"Node with SMILES {smiles!r} not found.")
+
+    def _ensure_get_node_index(
+        self,
+        smiles: Optional[str],
+        compound: Optional[Compound] = None,
+    ) -> Optional[int]:
+        if smiles is None:
+            return None
+
         if smiles in self._node_index_by_smiles:
             return self._node_index_by_smiles[smiles]
 
         node_index = len(self.node_smiles)
-        g = self._get_mol_graph(smiles, compound)
+        graph = self._get_mol_graph(smiles, compound)
 
         self.node_smiles.append(smiles)
-        self.node_graph.append(g)
+        self.node_graph.append(graph)
 
         prev = self._node_graph_offset[-1]
-        n_nodes = g.num_nodes
-        self._node_graph_offset.append(prev + n_nodes)
+        num_atoms = graph.num_nodes
+        self._node_graph_offset.append(prev + num_atoms)
 
         self._node_index_by_smiles[smiles] = node_index
+
         return node_index
 
-    def _get_edge_index(self, src_smiles: str, dst_smiles: str) -> int:
+    def _get_edge_index(
+        self,
+        src_smiles: str,
+        dst_smiles: str,
+    ) -> int:
         src_index = self._get_node_index(src_smiles)
         dst_index = self._get_node_index(dst_smiles)
 
-        key = (src_index, dst_index)
+        key = (
+            src_index,
+            dst_index,
+        )
+
         if key in self._edge_index_by_node_indexes:
             return self._edge_index_by_node_indexes[key]
-        else:
-            raise KeyError(
-                f"Edge from {src_smiles!r} to {dst_smiles!r} not found. "
-                f"Source node index: {src_index}, destination node index: {dst_index}."
-            )
+
+        raise KeyError(
+            f"Edge from {src_smiles!r} to {dst_smiles!r} not found. "
+            f"Source node index: {src_index}, destination node index: {dst_index}."
+        )
 
     def _ensure_get_edge_index(
         self,
@@ -732,14 +849,14 @@ class SingleFragmentTreeStructureBuilder:
         dst_smiles: str,
         fragment_pathway_edge: FragmentPathwayEdge,
     ) -> Optional[int]:
-        """Ensure edge and its cleavage event are registered.
+        """Ensure edge and its cleavage events are registered.
 
         This method registers:
             - source node
             - destination node
             - directed edge
-            - reactant/product atom-index rows
-            - cleavage event
+            - atom-index rows
+            - cleavage events
 
         Returns
         -------
@@ -750,7 +867,13 @@ class SingleFragmentTreeStructureBuilder:
         src_index = self._ensure_get_node_index(src_smiles)
         dst_index = self._ensure_get_node_index(dst_smiles)
 
-        key = (src_index, dst_index)
+        if src_index is None or dst_index is None:
+            return None
+
+        key = (
+            src_index,
+            dst_index,
+        )
 
         if key in self._edge_index_by_node_indexes:
             edge_index = self._edge_index_by_node_indexes[key]
@@ -768,21 +891,23 @@ class SingleFragmentTreeStructureBuilder:
             reaction_id = int(cleavage_step.reaction_id)
             product_molecule_id = int(cleavage_step.product_molecule_id)
 
-            reactant_atom_idxs = self._local_to_global_atom_idxs(
-                node_index=src_index,
-                atom_idxs=cleavage_step.reactant_indices,
+            reactant_atom_idxs = tuple(
+                int(atom_index)
+                for atom_index in cleavage_step.reactant_indices
             )
+            # Local atom indices in the source fragment SMILES.
 
-            product_atom_idxs = self._local_to_global_atom_idxs(
-                node_index=dst_index,
-                atom_idxs=cleavage_step.product_indices,
+            product_atom_idxs = tuple(
+                int(atom_index)
+                for atom_index in cleavage_step.product_indices
             )
+            # Local atom indices in the destination fragment SMILES.
 
-            reactant_row_index = self._ensure_get_reactant_row_index(
+            reactant_row_index = self._ensure_get_atom_row_index(
                 reactant_atom_idxs,
             )
 
-            product_row_index = self._ensure_get_product_row_index(
+            product_row_index = self._ensure_get_atom_row_index(
                 product_atom_idxs,
             )
 
@@ -797,110 +922,82 @@ class SingleFragmentTreeStructureBuilder:
 
         return edge_index
 
-    def _get_node_edge_index(self, src_smiles: str, dst_smiles: str) -> Tuple[int, int, int]:
+    def _get_node_edge_index(
+        self,
+        src_smiles: str,
+        dst_smiles: str,
+    ) -> Tuple[int, int, int]:
         src_index = self._get_node_index(src_smiles)
         dst_index = self._get_node_index(dst_smiles)
         edge_index = self._get_edge_index(src_smiles, dst_smiles)
+
         return src_index, dst_index, edge_index
-    
-    def _ensure_get_node_edge_index(self, src_smiles: str, dst_smiles: str, fragment_pathway_edge: FragmentPathwayEdge) -> Optional[Tuple[int, int, int]]:
+
+    def _ensure_get_node_edge_index(
+        self,
+        src_smiles: str,
+        dst_smiles: str,
+        fragment_pathway_edge: FragmentPathwayEdge,
+    ) -> Optional[Tuple[int, int, int]]:
         src_index = self._ensure_get_node_index(src_smiles)
         dst_index = self._ensure_get_node_index(dst_smiles)
-        edge_index = self._ensure_get_edge_index(src_smiles, dst_smiles, fragment_pathway_edge)
+
+        edge_index = self._ensure_get_edge_index(
+            src_smiles,
+            dst_smiles,
+            fragment_pathway_edge,
+        )
+
+        if src_index is None or dst_index is None or edge_index is None:
+            return None
+
         return src_index, dst_index, edge_index
 
-    def _get_reactant_row_index(
+    def _get_atom_row_index(
         self,
         atom_idxs: Sequence[int],
     ) -> int:
-        atom_idx_tuple = tuple(atom_idxs)
-        tuple_length = len(atom_idx_tuple)
+        atom_idx_tuple = tuple(int(i) for i in atom_idxs)
 
-        if atom_idx_tuple in self._reactant_row_index_by_atom_idxs:
-            return self._reactant_row_index_by_atom_idxs[atom_idx_tuple]
-        else:
-            raise KeyError(
-                f"Reactant atom index tuple {atom_idx_tuple} not found."
-            )
+        if atom_idx_tuple in self._atom_row_index_by_atom_idxs:
+            return self._atom_row_index_by_atom_idxs[atom_idx_tuple]
 
-    def _ensure_get_reactant_row_index(
+        raise KeyError(
+            f"Atom index tuple {atom_idx_tuple} not found."
+        )
+
+    def _ensure_get_atom_row_index(
         self,
         atom_idxs: Sequence[int],
     ) -> int:
-        """Ensure a reactant-side atom-index tuple is registered.
+        """Ensure an atom-index tuple is registered.
 
         Parameters
         ----------
         atom_idxs:
-            Global atom indexes on the reactant/source side.
+            Global atom indexes.
 
         Returns
         -------
         int
-            reactant_row_index.
+            Row index in cleavage_atom_idxs[tuple_length].
         """
 
         atom_idx_tuple = tuple(int(i) for i in atom_idxs)
         tuple_length = len(atom_idx_tuple)
 
-        if atom_idx_tuple in self._reactant_row_index_by_atom_idxs:
-            return self._reactant_row_index_by_atom_idxs[atom_idx_tuple]
+        if atom_idx_tuple in self._atom_row_index_by_atom_idxs:
+            return self._atom_row_index_by_atom_idxs[atom_idx_tuple]
 
-        if tuple_length not in self.cleavage_reactant_atom_idxs:
-            self.cleavage_reactant_atom_idxs[tuple_length] = []
+        if tuple_length not in self.cleavage_atom_idxs:
+            self.cleavage_atom_idxs[tuple_length] = []
 
-        reactant_row_index = len(self.cleavage_reactant_atom_idxs[tuple_length])
-        self.cleavage_reactant_atom_idxs[tuple_length].append(atom_idx_tuple)
+        row_index = len(self.cleavage_atom_idxs[tuple_length])
+        self.cleavage_atom_idxs[tuple_length].append(atom_idx_tuple)
 
-        self._reactant_row_index_by_atom_idxs[atom_idx_tuple] = reactant_row_index
+        self._atom_row_index_by_atom_idxs[atom_idx_tuple] = row_index
 
-        return reactant_row_index
-
-    def _get_product_row_index(
-        self,
-        atom_idxs: Sequence[int],
-    ) -> int:
-        atom_idx_tuple = tuple(atom_idxs)
-
-        if atom_idx_tuple in self._product_row_index_by_atom_idxs:
-            return self._product_row_index_by_atom_idxs[atom_idx_tuple]
-        else:
-            raise KeyError(
-                f"Product atom index tuple {atom_idx_tuple} not found."
-            )
-
-    def _ensure_get_product_row_index(
-        self,
-        atom_idxs: Sequence[int],
-    ) -> int:
-        """Ensure a product-side atom-index tuple is registered.
-
-        Parameters
-        ----------
-        atom_idxs:
-            Global atom indexes on the product/destination side.
-
-        Returns
-        -------
-        int
-            product_row_index.
-        """
-
-        atom_idx_tuple = tuple(int(i) for i in atom_idxs)
-        tuple_length = len(atom_idx_tuple)
-
-        if atom_idx_tuple in self._product_row_index_by_atom_idxs:
-            return self._product_row_index_by_atom_idxs[atom_idx_tuple]
-
-        if tuple_length not in self.cleavage_product_atom_idxs:
-            self.cleavage_product_atom_idxs[tuple_length] = []
-
-        product_row_index = len(self.cleavage_product_atom_idxs[tuple_length])
-        self.cleavage_product_atom_idxs[tuple_length].append(atom_idx_tuple)
-
-        self._product_row_index_by_atom_idxs[atom_idx_tuple] = product_row_index
-
-        return product_row_index
+        return row_index
 
     def _get_cleavage_event_index(
         self,
@@ -923,15 +1020,15 @@ class SingleFragmentTreeStructureBuilder:
 
         if key in self._cleavage_event_index_by_key:
             return self._cleavage_event_index_by_key[key]
-        else:
-            raise KeyError(
-                f"Cleavage event not found for edge_index={edge_index}, "
-                f"cleavage_id={cleavage_id}, reaction_id={reaction_id}, "
-                f"product_molecule_id={product_molecule_id}, "
-                f"reactant_row_index={reactant_row_index}, "
-                f"product_row_index={product_row_index}."
-            )
-    
+
+        raise KeyError(
+            f"Cleavage event not found for edge_index={edge_index}, "
+            f"cleavage_id={cleavage_id}, reaction_id={reaction_id}, "
+            f"product_molecule_id={product_molecule_id}, "
+            f"reactant_row_index={reactant_row_index}, "
+            f"product_row_index={product_row_index}."
+        )
+
     def _ensure_get_cleavage_event_index(
         self,
         *,
@@ -993,6 +1090,7 @@ class SingleFragmentTreeStructureBuilder:
             )
 
         offset = self._node_graph_offset[node_index]
+
         return tuple(int(i) + offset for i in atom_idxs)
 
     def _add_fragment_pathway_edge_to_structure(
@@ -1001,25 +1099,34 @@ class SingleFragmentTreeStructureBuilder:
         fragment_pathway_src_node: Optional[FragmentPathwayNode],
         fragment_pathway_dst_node: FragmentPathwayNode,
         fragment_pathway_edge: Optional[FragmentPathwayEdge],
-        fragment_compound_by_smiles: Dict[str, Compound] = None,
-    ) -> int:
+        fragment_compound_by_smiles: Optional[Dict[str, Compound]] = None,
+    ) -> Optional[int]:
         """Add one FragmentPathwayEdge to the shared tree structure.
 
         This method registers:
             - node
             - edge
-            - reactant/product atom-index rows
-            - cleavage event
+            - atom-index rows
+            - cleavage events
 
         It does not update self.samples.
         """
 
-        src_smiles = fragment_pathway_src_node.smiles if fragment_pathway_src_node is not None else None
+        src_smiles = (
+            fragment_pathway_src_node.smiles
+            if fragment_pathway_src_node is not None
+            else None
+        )
         dst_smiles = fragment_pathway_dst_node.smiles
-        
-        # src_node_index = self._ensure_get_node_index(src_smiles, fragment_compound_by_smiles.get(src_smiles) if fragment_compound_by_smiles is not None else None) if src_smiles is not None else None
-        # dst_node_index = self._ensure_get_node_index(dst_smiles, fragment_compound_by_smiles.get(dst_smiles) if fragment_compound_by_smiles is not None else None)
-        edge_index = self._ensure_get_edge_index(src_smiles, dst_smiles, fragment_pathway_edge) if src_smiles is not None else None
+
+        if src_smiles is None or fragment_pathway_edge is None:
+            return None
+
+        edge_index = self._ensure_get_edge_index(
+            src_smiles,
+            dst_smiles,
+            fragment_pathway_edge,
+        )
 
         return edge_index
 
@@ -1028,28 +1135,32 @@ class SingleFragmentTreeStructureBuilder:
         *,
         fragment_pathway: FragmentPathway,
         padding_length: int,
-        fragment_compound_by_smiles: Dict[str, Compound] = None,
+        fragment_compound_by_smiles: Optional[Dict[str, Compound]] = None,
     ) -> Tuple[int, ...]:
         """Convert one FragmentPathway into one edge_index tuple."""
 
         edge_indexes: List[int] = []
 
-        for p_idx in range(1, len(fragment_pathway)):
-            if p_idx == 0:
-                fp_src_node = None
-                fp_edge = None
-            else:
-                fp_src_node = fragment_pathway.get_node(p_idx - 1)
-                fp_edge = fragment_pathway.get_edge(p_idx - 1)
-            fp_dst_node = fragment_pathway.get_node(p_idx)
+        for path_index in range(1, len(fragment_pathway)):
+            fragment_pathway_src_node = fragment_pathway.get_node(path_index - 1)
+            fragment_pathway_edge = fragment_pathway.get_edge(path_index - 1)
+            fragment_pathway_dst_node = fragment_pathway.get_node(path_index)
+
             edge_index = self._add_fragment_pathway_edge_to_structure(
-                fragment_pathway_src_node=fp_src_node,
-                fragment_pathway_dst_node=fp_dst_node,
-                fragment_pathway_edge=fp_edge,
+                fragment_pathway_src_node=fragment_pathway_src_node,
+                fragment_pathway_dst_node=fragment_pathway_dst_node,
+                fragment_pathway_edge=fragment_pathway_edge,
                 fragment_compound_by_smiles=fragment_compound_by_smiles,
             )
-            edge_indexes.append(edge_index)
-        edge_indexes.extend(-1 for _ in range(padding_length - len(fragment_pathway) + 1))
+
+            if edge_index is not None:
+                edge_indexes.append(int(edge_index))
+
+        edge_indexes.extend(
+            -1
+            for _ in range(padding_length - len(fragment_pathway) + 1)
+        )
+
         return tuple(edge_indexes)
 
     def _fragment_pathway_group_to_edge_index_paths(
@@ -1057,7 +1168,7 @@ class SingleFragmentTreeStructureBuilder:
         *,
         fragment_pathway_group: FragmentPathwayGroup,
         padding_length: int,
-        fragment_compound_by_smiles: Dict[str, Compound] = None,
+        fragment_compound_by_smiles: Optional[Dict[str, Compound]] = None,
     ) -> Set[Tuple[int, ...]]:
         """Convert precursor FragmentPathwayGroup into edge_index paths.
 
@@ -1081,7 +1192,83 @@ class SingleFragmentTreeStructureBuilder:
                 edge_index_paths.add(edge_index_path)
 
         return edge_index_paths
-        
+
+    @staticmethod
+    def _tuple_length_dict_to_tensor(
+        tuple_length_by_key: Dict[Tuple[int, ...], int],
+        *,
+        key_width: int,
+    ) -> torch.Tensor:
+        """Convert tuple-length lookup dict to a sorted tensor table.
+
+        Parameters
+        ----------
+        tuple_length_by_key:
+            Mapping from event-type key to tuple length.
+
+            Reactant:
+                (cleavage_id, reaction_id) -> reactant_tuple_length
+
+            Product:
+                (cleavage_id, reaction_id, product_molecule_id)
+                -> product_tuple_length
+
+        key_width:
+            Number of elements in the event-type key.
+
+            Reactant:
+                key_width = 2
+
+            Product:
+                key_width = 3
+
+        Returns
+        -------
+        Tensor
+            Reactant:
+                [R, 3]
+                columns:
+                    0: cleavage_id
+                    1: reaction_id
+                    2: reactant_tuple_length
+
+            Product:
+                [P, 4]
+                columns:
+                    0: cleavage_id
+                    1: reaction_id
+                    2: product_molecule_id
+                    3: product_tuple_length
+        """
+
+        rows: list[tuple[int, ...]] = []
+
+        for key, tuple_length in tuple_length_by_key.items():
+            key = tuple(int(value) for value in key)
+
+            if len(key) != key_width:
+                raise ValueError(
+                    f"Expected key width {key_width}, "
+                    f"but got key={key}."
+                )
+
+            rows.append(
+                key + (int(tuple_length),)
+            )
+
+        rows.sort()
+
+        if len(rows) == 0:
+            return torch.empty(
+                (0, key_width + 1),
+                dtype=torch.long,
+            )
+
+        return torch.tensor(
+            rows,
+            dtype=torch.long,
+        )
+
     def _parse_record_info(
         self,
         record: SpectrumRecord,
@@ -1133,5 +1320,3 @@ class SingleFragmentTreeStructureBuilder:
         smiles = str(record[smiles_column])
 
         return smiles, precursor_mz, adduct_type, adduct_type_index, ce_value, instrument
-
-        
