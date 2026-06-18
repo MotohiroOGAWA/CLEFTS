@@ -70,6 +70,18 @@ class MolEncoder(nn.Module):
     def graph_dim(self) -> int:
         return self._graph_dim
 
+    @property
+    def atom_dim(self) -> int:
+        return self.graph_builder.atom_dim
+
+    @property
+    def bond_dim(self) -> int:
+        return self.graph_builder.bond_dim
+    
+    @property
+    def symbols(self) -> Tuple[str]:
+        return self.graph_builder.symbols
+
     def encode_components(self, compound: Compound) -> Data:
         """
         Convert one Compound into a PyG Data object (features only).
@@ -151,15 +163,3 @@ class MolEncoder(nn.Module):
         batch = self.forward(batch)
 
         return batch, valid_indices_t
-
-    @property
-    def atom_dim(self) -> int:
-        return self.graph_builder.atom_dim
-
-    @property
-    def bond_dim(self) -> int:
-        return self.graph_builder.bond_dim
-    
-    @property
-    def symbols(self) -> Tuple[str]:
-        return self.graph_builder.symbols

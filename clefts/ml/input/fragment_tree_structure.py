@@ -93,6 +93,30 @@ class FragmentTreeStructure:
     @property
     def num_samples(self) -> int:
         return int(self.sample_adduct_type_index.numel())
+    
+    @property
+    def cleavage_pattern_ids(self) -> Tensor:
+        return self.cleavage_event[:, 0] # [M]
+
+    @property
+    def cleavage_reaction_ids(self) -> Tensor:
+        return self.cleavage_event[:, 1] # [M]
+    
+    @property
+    def cleavage_product_molecule_ids(self) -> Tensor:
+        return self.cleavage_event[:, 2] # [M]
+
+    @property
+    def cleavage_reactant_row_indices(self) -> Tensor:
+        return self.cleavage_event[:, 3] # [M]
+    
+    @property
+    def cleavage_product_row_indices(self) -> Tensor:
+        return self.cleavage_event[:, 4] # [M]
+    
+    @property
+    def device(self) -> torch.device:
+        return self.edge_index.device
 
     def to(self, device: torch.device | str) -> "FragmentTreeStructure":
         """Move tensor fields to device.

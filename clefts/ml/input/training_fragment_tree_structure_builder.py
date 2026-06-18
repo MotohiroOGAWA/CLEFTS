@@ -12,7 +12,7 @@ from ...libs.msentity.msentity import SpectrumRecord
 from ...domain.fragment.ion_tree import FragmentIonTree
 from ...domain.fragment.pathway import FragmentPathway, FragmentPathwayGroup, FragmentPathwayNode, FragmentPathwayEdge
 from ..specgen import CleftsSpecGen
-from .fragment_tree_structure_builder import FragmentTreeSample, FragmentTreeStructureBuilder
+from .single_fragment_tree_structure_builder import FragmentTreeSample, SingleFragmentTreeStructureBuilder
 
 @dataclass
 class TrainingFragmentTreeSample(FragmentTreeSample):
@@ -25,7 +25,7 @@ class TrainingFragmentTreeSample(FragmentTreeSample):
     # [K] Peak intensity values.
 
 @dataclass
-class TrainingFragmentTreeStructureBuilder(FragmentTreeStructureBuilder):
+class TrainingFragmentTreeStructureBuilder(SingleFragmentTreeStructureBuilder):
 
     def add_training_sample(
         self,

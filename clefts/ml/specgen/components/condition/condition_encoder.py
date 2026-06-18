@@ -8,7 +8,7 @@ import torch.nn as nn
 from .adduct_embedding import AdductEmbeddingLayer
 from .collision_energy_feature import CollisionEnergyFeatureLayer
 
-from ....common.nn_utils import build_fc_layers
+from ....common.torch_utils.nn_utils import build_fc_layers
 from .....libs.mmkit.mmkit import Adduct
 
 

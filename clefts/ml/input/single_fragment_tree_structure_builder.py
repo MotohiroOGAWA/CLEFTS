@@ -54,7 +54,7 @@ class FragmentTreeSample:
     # used by this sample.
 
 @dataclass
-class FragmentTreeStructureBuilder:
+class SingleFragmentTreeStructureBuilder:
     _model: CleftsSpecGen = field(repr=False, compare=False)
     # CleftsSpecGen model used to define model-derived IDs and settings.
     #

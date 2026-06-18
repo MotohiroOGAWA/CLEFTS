@@ -13,7 +13,7 @@ class AdductEmbeddingLayer(nn.Module):
         super().__init__()
 
         # --- normalize & register adduct types ---
-        self._adduct_type_strs = tuple(sorted({str(ad) for ad in adduct_type_strs}))
+        self._adduct_type_strs = tuple(adduct_type_strs)
         self._adduct_types: Tuple[Adduct] = tuple(
             Adduct.parse(ad) for ad in self._adduct_type_strs
         )
