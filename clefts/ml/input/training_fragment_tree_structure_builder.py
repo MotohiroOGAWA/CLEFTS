@@ -11,7 +11,7 @@ from ...libs.mmkit.mmkit import Compound, Adduct
 from ...libs.msentity.msentity import SpectrumRecord
 from ...domain.fragment.ion_tree import FragmentIonTree
 from ...domain.fragment.pathway import FragmentPathway, FragmentPathwayGroup, FragmentPathwayNode, FragmentPathwayEdge
-from ..specgen import CleftsSpecGen
+from ..specgen import FragmentTreeProbabilityModel
 from .single_fragment_tree_structure_builder import FragmentTreeSample, SingleFragmentTreeStructureBuilder
 
 @dataclass
@@ -70,7 +70,7 @@ class TrainingFragmentTreeStructureBuilder(SingleFragmentTreeStructureBuilder):
 
         adduct_type_index = self._model.get_index_by_adduct_type(adduct_type)
 
-        ce_value = CleftsSpecGen.parse_ce_to_ev(
+        ce_value = FragmentTreeProbabilityModel.parse_ce_to_ev(
             ce_value_raw,
             precursor_mz=precursor_mz,
             instrument=instrument,

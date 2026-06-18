@@ -55,6 +55,24 @@ class Fragmenter:
             )
         return mapper[main_adduct_type]
 
+    def get_ion_shift_adducts_by_adduct_type(self, adduct_type: Adduct) -> Tuple[Adduct, ...]:
+        main_adduct_type = self._resolve_main_adduct_type(adduct_type)
+        return self.fragment_ion_tree_builder.fragment_ion_adduct_rule_set.get_ion_shift_adducts_by_adduct_type(
+            main_adduct_type
+        )
+    
+    def get_unsaturation_adduct_candidates_by_adduct_type(self, adduct_type: Adduct) -> Tuple[Adduct, ...]:
+        main_adduct_type = self._resolve_main_adduct_type(adduct_type)
+        return self.fragment_ion_tree_builder.fragment_ion_adduct_rule_set.get_unsaturation_adduct_candidates_by_adduct_type(
+            main_adduct_type
+        )
+
+    def get_radical_adduct_candidates_by_adduct_type(self, adduct_type: Adduct) -> Tuple[Adduct, ...]:
+        main_adduct_type = self._resolve_main_adduct_type(adduct_type)
+        return self.fragment_ion_tree_builder.fragment_ion_adduct_rule_set.get_radical_adduct_candidates_by_adduct_type(
+            main_adduct_type
+        )
+
     def build_fragment_tree(
         self,
         compound: Compound,

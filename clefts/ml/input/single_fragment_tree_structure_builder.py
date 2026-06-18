@@ -18,7 +18,7 @@ from ...domain.fragment.pathway import (
     FragmentPathwayEdge,
     CleavageStep,
 )
-from ..specgen import CleftsSpecGen
+from ..specgen import FragmentTreeProbabilityModel
 from .fragment_tree_structure import FragmentTreeStructure
 
 
@@ -61,7 +61,7 @@ class FragmentTreeSample:
 
 @dataclass
 class SingleFragmentTreeStructureBuilder:
-    _model: CleftsSpecGen = field(repr=False, compare=False)
+    _model: FragmentTreeProbabilityModel = field(repr=False, compare=False)
     # CleftsSpecGen model used to define model-derived IDs and settings.
     #
     # This builder depends on the model for:
@@ -235,7 +235,7 @@ class SingleFragmentTreeStructureBuilder:
     # Used to avoid storing duplicate atom-index tuples.
 
     def __post_init__(self) -> None:
-        if not isinstance(self._model, CleftsSpecGen):
+        if not isinstance(self._model, FragmentTreeProbabilityModel):
             raise TypeError(
                 "_model must be an instance of CleftsSpecGen, "
                 f"but got {type(self._model).__name__}."
@@ -1303,7 +1303,7 @@ class SingleFragmentTreeStructureBuilder:
 
         adduct_type_index = self._model.get_index_by_adduct_type(adduct_type)
 
-        ce_value = CleftsSpecGen.parse_ce_to_ev(
+        ce_value = FragmentTreeProbabilityModel.parse_ce_to_ev(
             ce_value_raw,
             precursor_mz=precursor_mz,
             instrument=instrument,

@@ -11,7 +11,7 @@ from torch import Tensor
 from torch_geometric.data import Batch, Data
 
 from clefts.ml.input.fragment_tree_structure import FragmentTreeStructure
-from clefts.ml.specgen.generator import CleftsSpecGen
+from mnt.app.clefts.ml.specgen.fragment_tree_probability_model import FragmentTreeProbabilityModel
 
 
 class DummyConditionEncoder(nn.Module):
@@ -310,8 +310,8 @@ class TestBuildSampleTreePygBatch(unittest.TestCase):
     # ------------------------------------------------------------------
     # Fixtures
     # ------------------------------------------------------------------
-    def _make_model(self) -> CleftsSpecGen:
-        model = CleftsSpecGen.__new__(CleftsSpecGen)
+    def _make_model(self) -> FragmentTreeProbabilityModel:
+        model = FragmentTreeProbabilityModel.__new__(FragmentTreeProbabilityModel)
         nn.Module.__init__(model)
 
         model._condition_encoder = DummyConditionEncoder()

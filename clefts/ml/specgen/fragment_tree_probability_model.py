@@ -1,12 +1,13 @@
 import torch
 import torch.nn as nn
 from torch_geometric.data import Data, Batch
+from dataclasses import dataclass
 from typing import Tuple, Dict, List, Union, Optional
+from bidict import bidict
 
 from ...libs.mmkit.mmkit import Adduct
 from ...domain.fragment import Fragmenter
 from ...domain.mass import parse_ce_to_ev
-from ..common.torch_utils.model_base import ModelBase
 from ..common.layers.graphormer import GraphormerEncoder
 from ..input.fragment_tree_structure import FragmentTreeStructure
 from ..input.fragment_tree_features import FragmentTreeFeatures
@@ -15,7 +16,80 @@ from ..mol import MolEncoder
 from .components.condition.condition_encoder import MS2ConditionEncoder
 from .components.cleavage.cleavage_edge_feature_net import CleavageEdgeFeatureNet
 
-class CleftsSpecGen(ModelBase):
+from dataclasses import dataclass
+from torch import Tensor
+from torch_geometric.data import Batch
+
+
+@dataclass
+class AdductConditionalNodeChoiceProbabilities:
+    """Node choice probabilities whose candidates depend on main adduct type."""
+
+    logit_by_adduct: Dict[Adduct, Tensor]
+    # key: main adduct type
+    # value: [N_adduct, C_adduct]
+
+    prob_by_adduct: Dict[Adduct, Tensor]
+    # key: main adduct type
+    # value: [N_adduct, C_adduct]
+
+    node_index_by_adduct: Dict[Adduct, Tensor]
+    # key: main adduct type
+    # value: [N_adduct]
+
+    candidates_by_adduct: Dict[Adduct, Tuple[Adduct, ...]]
+    # key: main adduct type
+    # value: candidate adducts
+
+
+@dataclass
+class FragmentGenerationProbabilities:
+    """Probabilities used for fragment-tree generation."""
+
+    edge_logit: Tensor
+    # [E_tree]
+
+    p_edge: Tensor
+    # [E_tree]
+
+    expand_logit: Tensor
+    # [N_tree]
+
+    p_expand: Tensor
+    # [N_tree]
+
+    p_stop: Tensor
+    # [N_tree]
+
+    ion: AdductConditionalNodeChoiceProbabilities
+
+    unsaturation: AdductConditionalNodeChoiceProbabilities
+
+    radical: AdductConditionalNodeChoiceProbabilities
+
+
+@dataclass
+class FragmentTreeProbabilityOutput:
+    """Output of FragmentTreeProbabilityModel."""
+
+    ft_features: "FragmentTreeFeatures"
+
+    sample_tree_batch: Batch
+    # sample_tree_batch.x:
+    #   [N_tree, tree_dim]
+    #
+    # sample_tree_batch.tree_graph_repr:
+    #   [G, tree_graph_repr_dim]
+    #
+    # sample_tree_batch.condition_tree_repr:
+    #   [G, tree_graph_repr_dim]
+    #
+    # sample_tree_batch.kept_sample_ids:
+    #   [G]
+
+    probabilities: FragmentGenerationProbabilities
+
+class FragmentTreeProbabilityModel(nn.Module):
     def __init__(self,
                  mol_encoder_params:Dict,
                  condition_encoder_params:Dict,
@@ -24,10 +98,7 @@ class CleftsSpecGen(ModelBase):
                  fragmenter_params:Dict,
                  dropout: float,
                  ):
-        super(CleftsSpecGen, self).__init__(
-            ignore_config_keys=[],
-            **{k: v for k, v in locals().items() if k != 'self'}
-        )
+        super(FragmentTreeProbabilityModel, self).__init__()
 
         mol_encoder_params = mol_encoder_params.copy()
         mol_encoder_params['dropout'] = dropout
@@ -83,8 +154,94 @@ class CleftsSpecGen(ModelBase):
             nn.Dropout(dropout),
         )
 
+        # -------------------------
+        # Probability heads
+        # -------------------------
+        tree_dim = self.tree_encoder.dim
+        edge_dim = self.cleavage_edge_fnet.feature_dim
 
-        pass
+        self.edge_select_head = nn.Sequential(
+            nn.Linear(
+                tree_dim * 2 + edge_dim,
+                tree_dim,
+            ),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(
+                tree_dim,
+                1,
+            ),
+        )
+
+        self.node_expand_head = nn.Sequential(
+            nn.Linear(
+                tree_dim,
+                tree_dim,
+            ),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(
+                tree_dim,
+                1,
+            ),
+        )
+
+
+        self.main_adduct_types = bidict({idx: adduct for idx, adduct in enumerate(self._fragmenter.adduct_types)})
+        self.ion_candidates_by_adduct: Dict[Adduct, Tuple[Adduct, ...]] = {adduct: self._fragmenter.get_ion_shift_adducts_by_adduct_type(adduct) for adduct in self._fragmenter.adduct_types}
+        self.unsaturation_candidates_by_adduct: Dict[Adduct, Tuple[Adduct, ...]] = {adduct: self._fragmenter.get_unsaturation_adduct_candidates_by_adduct_type(adduct) for adduct in self._fragmenter.adduct_types}
+        self.radical_candidates_by_adduct: Dict[Adduct, Tuple[Adduct, ...]] = {adduct: self._fragmenter.get_radical_adduct_candidates_by_adduct_type(adduct) for adduct in self._fragmenter.adduct_types}
+
+        self.node_ion_heads_by_adduct_str = nn.ModuleDict()
+        self.node_unsaturation_heads_by_adduct_str = nn.ModuleDict()
+        self.node_radical_heads_by_adduct_str = nn.ModuleDict()
+        for adduct_type in self._fragmenter.adduct_types:
+            adduct_key = str(adduct_type)
+
+            ion_candidates = self.ion_candidates_by_adduct[adduct_type]
+            unsaturation_candidates = self.unsaturation_candidates_by_adduct[
+                adduct_type
+            ]
+            radical_candidates = self.radical_candidates_by_adduct[adduct_type]
+
+            if len(ion_candidates) == 0:
+                raise ValueError(
+                    f"No ion candidates found for adduct type: {adduct_type}"
+                )
+
+            if len(unsaturation_candidates) == 0:
+                raise ValueError(
+                    f"No unsaturation candidates found for adduct type: {adduct_type}"
+                )
+
+            if len(radical_candidates) == 0:
+                raise ValueError(
+                    f"No radical candidates found for adduct type: {adduct_type}"
+                )
+
+            self.node_ion_heads_by_adduct_str[adduct_key] = (
+                self._make_node_choice_head(
+                    tree_dim=tree_dim,
+                    num_candidates=len(ion_candidates),
+                    dropout=dropout,
+                )
+            )
+
+            self.node_unsaturation_heads_by_adduct_str[adduct_key] = (
+                self._make_node_choice_head(
+                    tree_dim=tree_dim,
+                    num_candidates=len(unsaturation_candidates),
+                    dropout=dropout,
+                )
+            )
+
+            self.node_radical_heads_by_adduct_str[adduct_key] = (
+                self._make_node_choice_head(
+                    tree_dim=tree_dim,
+                    num_candidates=len(radical_candidates),
+                    dropout=dropout,
+                )
+            )
     
 
     @property
@@ -120,24 +277,87 @@ class CleftsSpecGen(ModelBase):
         return ev
     
     def forward(self, data: Union[FragmentTreeStructure, FragmentTreeFeatures]) -> FragmentTreeFeatures:
-        if isinstance(data, FragmentTreeStructure):
-            mol_graph = self._mol_encoder(data.node_graph)
-            self._validate_mol_encoder_output(mol_graph, data)
-            ft_features = FragmentTreeFeatures.from_structure(data, mol_graph)
+        ft_features = self._build_fragment_tree_features(data)
 
-            edge_attr = self.cleavage_edge_fnet(ft_features)
-            if edge_attr.size(0) != data.edge_index.size(1):
-                raise ValueError(f"CleavageEdgeFeatureNet output has {edge_attr.size(0)} edges, but FragmentTreeStructure has {data.edge_index.size(1)} edges. These must match.")
-            ft_features = FragmentTreeFeatures.from_structure(data, node_graphs=mol_graph, edge_attr=edge_attr)
-        elif isinstance(data, FragmentTreeFeatures):
-            ft_features = data
-        else:
-            raise TypeError(f"Unsupported data type: {type(data)}")
+        sample_tree_batch = self._encode_sample_tree(ft_features)
 
-        sample_tree_batch, condition_tree_repr, kept_sample_ids = self._build_sample_tree_pyg_batch(ft_features)
+        probabilities = self._compute_fragment_generation_probabilities(
+            ft_features=ft_features,
+            sample_tree_batch=sample_tree_batch,
+        )
 
-        return ft_features
+        return FragmentTreeProbabilityOutput(
+            ft_features=ft_features,
+            sample_tree_batch=sample_tree_batch,
+            probabilities=probabilities,
+        )
 
+    def _build_fragment_tree_features(
+        self,
+        data: "FragmentTreeStructure | FragmentTreeFeatures",
+    ) -> "FragmentTreeFeatures":
+        """Build FragmentTreeFeatures from structure or return given features."""
+
+        if isinstance(data, FragmentTreeFeatures):
+            return data
+
+        if not isinstance(data, FragmentTreeStructure):
+            raise TypeError(
+                f"Unsupported data type: {type(data)}"
+            )
+
+        mol_graph = self._mol_encoder(data.node_graph)
+        self._validate_mol_encoder_output(mol_graph, data)
+
+        ft_features = FragmentTreeFeatures.from_structure(
+            data,
+            node_graphs=mol_graph,
+        )
+
+        edge_attr = self.cleavage_edge_fnet(ft_features)
+
+        if edge_attr.size(0) != data.edge_index.size(1):
+            raise ValueError(
+                "CleavageEdgeFeatureNet output has invalid edge dimension: "
+                f"got {edge_attr.size(0)}, "
+                f"expected {data.edge_index.size(1)}."
+            )
+
+        return FragmentTreeFeatures.from_structure(
+            data,
+            node_graphs=mol_graph,
+            edge_attr=edge_attr,
+        )
+
+    def _encode_sample_tree(
+        self,
+        ft_features: "FragmentTreeFeatures",
+    ) -> Batch:
+        """
+        Build sample-wise tree graphs and encode them.
+
+        Returns
+        -------
+        Batch
+            PyG Batch with encoded tree node embeddings attached to x.
+        """
+
+        sample_tree_batch, condition_tree_repr, kept_sample_ids = (
+            self._build_sample_tree_pyg_batch(ft_features)
+        )
+
+        tree_node_emb, tree_graph_repr = self.tree_encoder(
+            sample_tree_batch,
+            graph_repr=condition_tree_repr,
+        )
+
+        # Store encoded features in the batch itself.
+        sample_tree_batch.x = tree_node_emb
+        sample_tree_batch.tree_graph_repr = tree_graph_repr
+        sample_tree_batch.condition_tree_repr = condition_tree_repr
+        sample_tree_batch.kept_sample_ids = kept_sample_ids
+
+        return sample_tree_batch
 
     def _validate_mol_encoder_output(self, mol_graph: Batch, structure: FragmentTreeStructure):
         if mol_graph.num_graphs != structure.num_nodes:
@@ -146,6 +366,78 @@ class CleftsSpecGen(ModelBase):
             raise ValueError(f"MolEncoder output has x.size(0)={mol_graph.x.size(0)}, but FragmentTreeStructure's node_graph have num_nodes={structure.node_graph.num_nodes}. These must match.")
         if mol_graph.edge_index.size(1) != structure.node_graph.num_edges:
             raise ValueError(f"MolEncoder output has edge_index.size(1)={mol_graph.edge_index.size(1)}, but FragmentTreeStructure's node_graph have num_edges={structure.node_graph.num_edges}. These must match.")
+
+    def _compute_fragment_generation_probabilities(
+        self,
+        *,
+        sample_tree_batch: Batch,
+    ) -> FragmentGenerationProbabilities:
+        """
+        Compute fragment generation probabilities from encoded sample tree batch.
+        """
+
+        tree_node_emb = sample_tree_batch.x
+        # [N_tree, tree_dim]
+
+        edge_src, edge_dst = sample_tree_batch.edge_index
+        # [E_tree], [E_tree]
+
+        edge_input = torch.cat(
+            [
+                tree_node_emb[edge_src],
+                tree_node_emb[edge_dst],
+                sample_tree_batch.edge_attr,
+            ],
+            dim=-1,
+        )
+        # [E_tree, tree_dim * 2 + edge_dim]
+
+        edge_logit = self.edge_select_head(edge_input).squeeze(-1)
+        # [E_tree]
+
+        p_edge = _softmax_by_group(
+            logits=edge_logit,
+            group=edge_src,
+            num_groups=int(tree_node_emb.size(0)),
+        )
+        # [E_tree]
+
+        expand_logit = self.node_expand_head(tree_node_emb).squeeze(-1)
+        # [N_tree]
+
+        p_expand = torch.sigmoid(expand_logit)
+        # [N_tree]
+
+        p_stop = 1.0 - p_expand
+        # [N_tree]
+
+        ion_logit = self.node_ion_head(tree_node_emb)
+        # [N_tree, num_ion_types]
+
+        neutral_logit = self.node_neutral_head(tree_node_emb)
+        # [N_tree, num_neutral_types]
+
+        p_ion = torch.softmax(
+            ion_logit,
+            dim=-1,
+        )
+
+        p_neutral = torch.softmax(
+            neutral_logit,
+            dim=-1,
+        )
+
+        return FragmentGenerationProbabilities(
+            edge_logit=edge_logit,
+            p_edge=p_edge,
+            expand_logit=expand_logit,
+            p_expand=p_expand,
+            p_stop=p_stop,
+            ion_logit=ion_logit,
+            neutral_logit=neutral_logit,
+            p_ion=p_ion,
+            p_neutral=p_neutral,
+        )
 
     def _build_sample_tree_pyg_batch(
         self,
@@ -1074,6 +1366,209 @@ class CleftsSpecGen(ModelBase):
 
         return seq
 
+    def _compute_fragment_generation_probabilities(
+        self,
+        *,
+        ft_features: "FragmentTreeFeatures",
+        sample_tree_batch: Batch,
+    ) -> FragmentGenerationProbabilities:
+        """
+        Compute fragment generation probabilities from encoded sample tree batch.
+        """
+
+        structure = ft_features.structure
+
+        node_emb = sample_tree_batch.x
+        # [N_tree, tree_dim]
+
+        if node_emb is None:
+            raise ValueError(
+                "sample_tree_batch.x must contain encoded tree node embeddings."
+            )
+
+        if sample_tree_batch.edge_attr is None:
+            raise ValueError(
+                "sample_tree_batch.edge_attr must not be None."
+            )
+
+        edge_src, edge_dst = sample_tree_batch.edge_index
+        # [E_tree], [E_tree]
+
+        edge_input = torch.cat(
+            [
+                node_emb[edge_src],
+                node_emb[edge_dst],
+                sample_tree_batch.edge_attr,
+            ],
+            dim=-1,
+        )
+        # [E_tree, tree_dim * 2 + edge_dim]
+
+        edge_logit = self.edge_select_head(edge_input).squeeze(-1)
+        # [E_tree]
+
+        p_edge = _softmax_by_group(
+            logits=edge_logit,
+            group=edge_src,
+            num_groups=int(node_emb.size(0)),
+        )
+        # [E_tree]
+
+        expand_logit = self.node_expand_head(node_emb).squeeze(-1)
+        # [N_tree]
+
+        p_expand = torch.sigmoid(expand_logit)
+        # [N_tree]
+
+        p_stop = 1.0 - p_expand
+        # [N_tree]
+
+        node_graph_index = sample_tree_batch.batch
+        # [N_tree]
+
+        node_sample_ids = sample_tree_batch.kept_sample_ids[node_graph_index]
+        # [N_tree]
+
+        node_main_adduct_type_index = structure.sample_adduct_type_index.to(
+            node_emb.device
+        )[node_sample_ids]
+        # [N_tree]
+
+        ion = self._compute_adduct_conditional_node_choice_probabilities(
+            node_emb=node_emb,
+            node_main_adduct_type_index=node_main_adduct_type_index,
+            head_by_adduct_str=self.node_ion_heads_by_adduct_str,
+            candidates_by_adduct=self.ion_candidates_by_adduct,
+        )
+
+        unsaturation = self._compute_adduct_conditional_node_choice_probabilities(
+            node_emb=node_emb,
+            node_main_adduct_type_index=node_main_adduct_type_index,
+            head_by_adduct_str=self.node_unsaturation_heads_by_adduct_str,
+            candidates_by_adduct=self.unsaturation_candidates_by_adduct,
+        )
+
+        radical = self._compute_adduct_conditional_node_choice_probabilities(
+            node_emb=node_emb,
+            node_main_adduct_type_index=node_main_adduct_type_index,
+            head_by_adduct_str=self.node_radical_heads_by_adduct_str,
+            candidates_by_adduct=self.radical_candidates_by_adduct,
+        )
+
+        return FragmentGenerationProbabilities(
+            edge_logit=edge_logit,
+            p_edge=p_edge,
+            expand_logit=expand_logit,
+            p_expand=p_expand,
+            p_stop=p_stop,
+            ion=ion,
+            unsaturation=unsaturation,
+            radical=radical,
+        )
+
+    def _compute_adduct_conditional_node_choice_probabilities(
+        self,
+        *,
+        node_emb: Tensor,
+        node_main_adduct_type_index: Tensor,
+        head_by_adduct_str: nn.ModuleDict,
+        candidates_by_adduct: Dict[Adduct, Tuple[Adduct, ...]],
+    ) -> AdductConditionalNodeChoiceProbabilities:
+        """
+        Compute node-wise choice probabilities using adduct-specific heads.
+
+        Parameters
+        ----------
+        node_emb:
+            [N_tree, tree_dim]
+
+        node_main_adduct_type_index:
+            [N_tree]
+            Main adduct type index for each tree node.
+
+        head_by_adduct_str:
+            ModuleDict whose keys are generated by _adduct_to_head_key().
+
+        candidates_by_adduct:
+            Candidate table keyed by main Adduct.
+
+        Returns
+        -------
+        AdductConditionalNodeChoiceProbabilities
+        """
+
+        logit_by_adduct: Dict[Adduct, Tensor] = {}
+        prob_by_adduct: Dict[Adduct, Tensor] = {}
+        node_index_by_adduct: Dict[Adduct, Tensor] = {}
+
+        for adduct_index, adduct_type in self.main_adduct_types.items():
+            adduct_key = str(adduct_type)
+
+            if adduct_key not in head_by_adduct_str:
+                continue
+
+            node_mask = node_main_adduct_type_index == adduct_index
+
+            node_index = node_mask.nonzero(
+                as_tuple=False,
+            ).view(-1)
+            # [N_adduct]
+
+            if node_index.numel() == 0:
+                continue
+
+            node_emb_for_adduct = node_emb[node_index]
+            # [N_adduct, tree_dim]
+
+            logit = head_by_adduct_str[adduct_key](
+                node_emb_for_adduct
+            )
+            # [N_adduct, C_adduct]
+
+            prob = torch.softmax(
+                logit,
+                dim=-1,
+            )
+            # [N_adduct, C_adduct]
+
+            logit_by_adduct[adduct_type] = logit
+            prob_by_adduct[adduct_type] = prob
+            node_index_by_adduct[adduct_type] = node_index
+
+        return AdductConditionalNodeChoiceProbabilities(
+            logit_by_adduct=logit_by_adduct,
+            prob_by_adduct=prob_by_adduct,
+            node_index_by_adduct=node_index_by_adduct,
+            candidates_by_adduct=candidates_by_adduct,
+        )
+
+    @staticmethod
+    def _make_node_choice_head(
+        *,
+        tree_dim: int,
+        num_candidates: int,
+        dropout: float,
+    ) -> nn.Module:
+        """Create a node-wise candidate selection head."""
+
+        if num_candidates <= 0:
+            raise ValueError(
+                "num_candidates must be positive."
+            )
+
+        return nn.Sequential(
+            nn.Linear(
+                tree_dim,
+                tree_dim,
+            ),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(
+                tree_dim,
+                num_candidates,
+            ),
+        )
+
     @staticmethod
     def _convert_local_pathway_sequences_to_batch_indices(
         *,
@@ -1230,3 +1725,90 @@ class CleftsSpecGen(ModelBase):
             seq[edge_valid] = seq[edge_valid] + edge_offsets[edge_valid]
 
         return seq
+
+def _softmax_by_group(
+    logits: Tensor,
+    group: Tensor,
+    num_groups: int,
+    eps: float = 1e-12,
+) -> Tensor:
+    """
+    Compute softmax over values that belong to the same group.
+
+    Parameters
+    ----------
+    logits:
+        [N]
+
+    group:
+        [N]
+        group[i] is the group id of logits[i].
+
+    num_groups:
+        Number of groups.
+
+    Returns
+    -------
+    Tensor
+        [N]
+        Softmax-normalized values within each group.
+    """
+
+    if logits.numel() == 0:
+        return logits
+
+    if logits.dim() != 1:
+        raise ValueError(
+            f"logits must be 1D, got shape {tuple(logits.shape)}."
+        )
+
+    if group.dim() != 1:
+        raise ValueError(
+            f"group must be 1D, got shape {tuple(group.shape)}."
+        )
+
+    if logits.size(0) != group.size(0):
+        raise ValueError(
+            "logits and group must have the same length. "
+            f"Got logits={logits.size(0)}, group={group.size(0)}."
+        )
+
+    if group.min().item() < 0 or group.max().item() >= num_groups:
+        raise IndexError(
+            "group index out of range. "
+            f"min={group.min().item()}, "
+            f"max={group.max().item()}, "
+            f"num_groups={num_groups}."
+        )
+
+    max_per_group = torch.full(
+        (num_groups,),
+        -float("inf"),
+        dtype=logits.dtype,
+        device=logits.device,
+    )
+
+    max_per_group.scatter_reduce_(
+        dim=0,
+        index=group,
+        src=logits,
+        reduce="amax",
+        include_self=True,
+    )
+
+    shifted_logits = logits - max_per_group[group]
+    exp_logits = torch.exp(shifted_logits)
+
+    denom = torch.zeros(
+        (num_groups,),
+        dtype=logits.dtype,
+        device=logits.device,
+    )
+
+    denom.scatter_add_(
+        dim=0,
+        index=group,
+        src=exp_logits,
+    )
+
+    return exp_logits / (denom[group] + eps)

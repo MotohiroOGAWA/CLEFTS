@@ -171,6 +171,46 @@ class FragmentIonAdductRuleSet:
 
         return self.adduct_rules[index]
 
+    def get_unsaturation_adduct_candidates_by_adduct_type(
+        self,
+        adduct_type: Adduct | str,
+    ) -> Tuple[Adduct, ...]:
+        """Return unsaturation adduct candidates for the given adduct type."""
+
+        rule = self.get_rule_by_adduct_type(adduct_type)
+
+        return rule.unsaturation_adduct_candidates
+
+    def get_unsaturation_adduct_candidates_by_index(
+        self,
+        index: int,
+    ) -> Tuple[Adduct, ...]:
+        """Return unsaturation adduct candidates for the class index."""
+
+        rule = self.get_rule_by_index(index)
+
+        return rule.unsaturation_adduct_candidates
+    
+    def get_radical_adduct_candidates_by_adduct_type(
+        self,
+        adduct_type: Adduct | str,
+    ) -> Tuple[Adduct, ...]:
+        """Return radical adduct candidates for the given adduct type."""
+
+        rule = self.get_rule_by_adduct_type(adduct_type)
+
+        return rule.radical_adduct_candidates
+
+    def get_radical_adduct_candidates_by_index(
+        self,
+        index: int,
+    ) -> Tuple[Adduct, ...]:
+        """Return radical adduct candidates for the class index."""
+
+        rule = self.get_rule_by_index(index)
+
+        return rule.radical_adduct_candidates
+
     def get_ion_shift_adducts_by_adduct_type(
         self,
         adduct_type: Adduct | str,
@@ -179,10 +219,7 @@ class FragmentIonAdductRuleSet:
 
         rule = self.get_rule_by_adduct_type(adduct_type)
 
-        return tuple(
-            ion_shift_rule.ion_shift
-            for ion_shift_rule in rule.ion_shifts
-        )
+        return rule.ion_shift_adduct_candidates
 
     def get_ion_shift_adducts_by_index(
         self,
@@ -192,8 +229,18 @@ class FragmentIonAdductRuleSet:
 
         rule = self.get_rule_by_index(index)
 
+        return rule.ion_shift_adduct_candidates
+
+    def get_neutral_delta_h_by_adduct_type(
+        self,
+        adduct_type: Adduct | str,
+    ) -> Tuple[float, ...]:
+        """Return neutral delta H values for the given adduct type."""
+
+        rule = self.get_rule_by_adduct_type(adduct_type)
+
         return tuple(
-            ion_shift_rule.ion_shift
+            ion_shift_rule.neutral_delta_h
             for ion_shift_rule in rule.ion_shifts
         )
 

@@ -60,6 +60,46 @@ class FragmentIonAdductRule:
             raise ValueError(
                 "radical_atoms must be empty when radical is False"
             )
+    
+    @property
+    def unsaturation_delta_h_candidates(self) -> Tuple[int, ...]:
+        """Return unsaturation candidates for this adduct rule.
+
+        For now, only the specified unsaturation value is returned.
+        """
+        return tuple(u for u in range(self.unsaturation + 1))
+    
+    @property
+    def unsaturation_adduct_candidates(self) -> Tuple[Adduct, ...]:
+        """Return adduct candidates for this adduct rule.
+
+        For now, only the specified unsaturation value is returned.
+        """
+        return tuple(Adduct.from_dict({"H": cnt * -2}) for cnt in self.unsaturation_delta_h_candidates)
+    
+    @property
+    def radical_delta_h_candidates(self) -> Tuple[int, ...]:
+        """Return radical delta H candidates for this adduct rule.
+
+        For now, only the specified radical value is returned.
+        """
+        return (0, 1) if self.radical else (0,)
+    
+    @property
+    def radical_adduct_candidates(self) -> Tuple[Adduct, ...]:
+        """Return radical adduct candidates for this adduct rule.
+
+        For now, only the specified radical value is returned.
+        """
+        return tuple(Adduct.from_dict({"H": -cnt}) for cnt in self.radical_delta_h_candidates)
+    
+    @property
+    def ion_shift_adduct_candidates(self) -> Tuple[Adduct, ...]:
+        """Return ion shift adduct candidates for this adduct rule.
+
+        For now, only the specified ion shift values are returned.
+        """
+        return tuple(ion_shift.ion_shift for ion_shift in self.ion_shifts)
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "FragmentIonAdductRule":
