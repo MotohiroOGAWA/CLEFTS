@@ -79,14 +79,22 @@ class CleftsSpecGen(ModelBase):
         ev = parse_ce_to_ev(ce, precursor_mz, instrument)
         return ev
     
-    def forward(self, data: FragmentTreeStructure):
+    def forward(self, data: Union[FragmentTreeStructure, FragmentTreeFeatures]) -> FragmentTreeFeatures:
         if isinstance(data, FragmentTreeStructure):
             mol_graph = self._mol_encoder(data.node_graph)
             self._validate_mol_encoder_output(mol_graph, data)
             ft_features = FragmentTreeFeatures.from_structure(data, mol_graph)
 
             edge_attr = self.cleavage_edge_fnet(ft_features)
-            pass
+            if edge_attr.size(0) != data.edge_index.size(1):
+                raise ValueError(f"CleavageEdgeFeatureNet output has {edge_attr.size(0)} edges, but FragmentTreeStructure has {data.edge_index.size(1)} edges. These must match.")
+            fp_features = FragmentTreeFeatures.from_structure(data, node_graphs=mol_graph, edge_attr=edge_attr)
+        elif isinstance(data, FragmentTreeFeatures):
+            fp_features = data
+        else:
+            raise TypeError(f"Unsupported data type: {type(data)}")
+        return fp_features
+
 
     def _validate_mol_encoder_output(self, mol_graph: Batch, structure: FragmentTreeStructure):
         if mol_graph.num_graphs != structure.num_nodes:
