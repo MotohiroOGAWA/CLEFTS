@@ -7,6 +7,7 @@ from ...libs.mmkit.mmkit import Adduct
 from ...domain.fragment import Fragmenter
 from ...domain.mass import parse_ce_to_ev
 from ..common.torch_utils.model_base import ModelBase
+from ..common.layers.graphormer import GraphormerEncoder
 from ..input.fragment_tree_structure import FragmentTreeStructure
 from ..input.fragment_tree_features import FragmentTreeFeatures
 
@@ -19,6 +20,7 @@ class CleftsSpecGen(ModelBase):
                  mol_encoder_params:Dict,
                  condition_encoder_params:Dict,
                  cleavage_edge_fnet_params:Dict,
+                 tree_encoder_params: Dict,
                  fragmenter_params:Dict,
                  dropout: float,
                  ):
@@ -42,6 +44,44 @@ class CleftsSpecGen(ModelBase):
         cleavage_edge_fnet_params['atom_dim'] = self.mol_encoder.node_dim
         cleavage_edge_fnet_params['dropout'] = dropout
         self.cleavage_edge_fnet = CleavageEdgeFeatureNet(**cleavage_edge_fnet_params)
+
+
+        # -------------------------
+        # Tree encoder
+        # -------------------------
+        tree_encoder_params = tree_encoder_params.copy()
+
+        tree_encoder_in_dim = (
+            self.mol_encoder.graph_dim
+            + 3
+        )
+        # Current _build_tree_pyg_data concatenates:
+        #   ft_features.mol_x     [N, mol_graph_dim]
+        #   node_type             [N, 3]
+        #
+        # Therefore:
+        #   tree node feature dim = mol_graph_dim + 3
+
+        tree_encoder_params["in_dim"] = tree_encoder_in_dim
+        tree_encoder_params["edge_dim"] = self.cleavage_edge_fnet.feature_dim
+        tree_encoder_params["max_spatial_dist"] = self.fragmenter.tree_max_depth + 1
+        tree_encoder_params["max_edge_dist"] = self.fragmenter.tree_max_depth + 1
+        tree_encoder_params["dropout"] = dropout
+        tree_encoder_params["add_virtual_node"] = True
+        tree_encoder_params["undirected_for_spd"] = False
+        tree_encoder_params["undirected_for_path"] = False
+        tree_encoder_params["freeze_vnode"] = True
+
+        self.tree_encoder = GraphormerEncoder(**tree_encoder_params)
+
+        # -------------------------
+        # MS2 condition -> tree graph representation
+        # -------------------------
+        self.ms2_condition_to_tree_proj = nn.Sequential(
+            nn.Linear(self._condition_encoder.feature_dim, self.tree_encoder.dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+        )
 
 
         pass
@@ -94,7 +134,7 @@ class CleftsSpecGen(ModelBase):
         else:
             raise TypeError(f"Unsupported data type: {type(data)}")
 
-        tree_pyg_features, exp_feat, kept_sample_ids = self._build_tree_pyg_data(ft_batch)
+        sample_tree_batch, condition_tree_repr, kept_sample_ids = self._build_sample_tree_pyg_batch(ft_features)
 
         return ft_features
 
@@ -107,243 +147,265 @@ class CleftsSpecGen(ModelBase):
         if mol_graph.edge_index.size(1) != structure.node_graph.num_edges:
             raise ValueError(f"MolEncoder output has edge_index.size(1)={mol_graph.edge_index.size(1)}, but FragmentTreeStructure's node_graph have num_edges={structure.node_graph.num_edges}. These must match.")
 
-
-    def _build_tree_pyg_data(
+    def _build_sample_tree_pyg_batch(
         self,
         ft_features: "FragmentTreeFeatures",
     ) -> Tuple[Batch, torch.Tensor, torch.Tensor]:
         """
-        Build per-sample FragmentTree PyG graphs from FragmentTreeFeatures.
+        Build per-sample PyG fragment-tree graphs.
+
+        This function converts a global FragmentTreeStructure into a PyG Batch
+        where each graph corresponds to one MS/MS sample.
 
         Current FragmentTreeStructure specification
         -------------------------------------------
-        This implementation assumes:
+        st.edge_index:
+            [2, E]
+            Global fragment-tree edges.
 
-            st.edge_index:
-                [2, E]
+        st.sample_edge_index:
+            [2, L]
+            row 0: sample index
+            row 1: edge index
 
-            st.sample_edge_index:
-                [2, L]
-                row 0: sample index
-                row 1: edge index
+        st.sample_adduct_type_index:
+            [S]
+            Adduct type index for each sample.
 
-            st.sample_adduct_type_index:
-                [S]
+        st.sample_ce_value:
+            [S]
+            Collision energy value for each sample.
 
-            st.sample_ce_value:
-                [S]
+        st.sample_precursor_edge_index_path:
+            [P, D]
+            Padded precursor edge paths.
+            Padding value is -1.
 
-            st.sample_precursor_edge_index_path:
-                [P, D]
-                Each row is a padded sequence of edge ids.
-                Padding value is -1.
-
-            st.sample_precursor_path_index:
-                [P]
-                sample index for each precursor edge path.
+        st.sample_precursor_path_index:
+            [P]
+            sample index for each precursor path.
 
         Returns
         -------
-        pyg_batch:
+        sample_tree_batch:
             PyG Batch of per-sample fragment-tree graphs.
 
-        graph_repr:
-            [G, tree_dim]
-            Per-graph experimental representation aligned with pyg_batch graph order.
+        condition_tree_repr:
+            [G, tree_graph_repr_dim]
+            MS2 condition representation aligned with sample_tree_batch graph order.
 
         kept_sample_ids:
             [G]
-            Original sample ids used in pyg_batch.
+            Original sample ids used in sample_tree_batch.
         """
 
-        st = ft_features.structure
+        structure = ft_features.structure
 
-        tree_node_x = ft_features.mol_x
-        # [N, node_dim]
+        global_node_features = ft_features.mol_x
+        # [N, mol_graph_dim]
 
-        all_edge_attr = ft_features.edge_attr
+        global_edge_features = ft_features.edge_attr
         # [E, edge_dim]
 
-        device = tree_node_x.device
+        device = global_node_features.device
 
-        if st.edge_index.dim() != 2 or st.edge_index.size(0) != 2:
+        if structure.edge_index.dim() != 2 or structure.edge_index.size(0) != 2:
             raise ValueError(
-                "st.edge_index must have shape [2, E], "
-                f"got shape {tuple(st.edge_index.shape)}."
+                "structure.edge_index must have shape [2, E], "
+                f"got shape {tuple(structure.edge_index.shape)}."
             )
 
-        E = int(st.edge_index.size(1))
-        N = int(tree_node_x.size(0))
-        S = int(st.num_samples)
+        num_global_edges = int(structure.edge_index.size(1))
+        num_global_nodes = int(global_node_features.size(0))
+        num_samples = int(structure.num_samples)
 
-        if S <= 0:
-            raise ValueError("FragmentTreeStructure must contain at least one sample.")
+        if num_samples <= 0:
+            raise ValueError(
+                "FragmentTreeStructure must contain at least one sample."
+            )
 
-        if all_edge_attr.dim() != 2 or all_edge_attr.size(0) != E:
+        if (
+            global_edge_features.dim() != 2
+            or global_edge_features.size(0) != num_global_edges
+        ):
             raise ValueError(
                 "ft_features.edge_attr must have shape [E, edge_dim]. "
-                f"Got shape {tuple(all_edge_attr.shape)}, E={E}."
+                f"Got shape {tuple(global_edge_features.shape)}, "
+                f"E={num_global_edges}."
             )
 
-        sample_edge_index = st.sample_edge_index.to(device).long()
+        sample_edge_index = structure.sample_edge_index.to(device).long()
         # [2, L]
 
         if sample_edge_index.dim() != 2 or sample_edge_index.size(0) != 2:
             raise ValueError(
-                "st.sample_edge_index must have shape [2, L], "
+                "structure.sample_edge_index must have shape [2, L], "
                 f"got shape {tuple(sample_edge_index.shape)}."
             )
 
-        sample_precursor_edge_index_path = (
-            st.sample_precursor_edge_index_path.to(device).long()
+        sample_precursor_edge_paths = (
+            structure.sample_precursor_edge_index_path.to(device).long()
         )
         # [P, D]
 
-        sample_precursor_path_index = (
-            st.sample_precursor_path_index.to(device).long()
+        sample_precursor_path_sample_index = (
+            structure.sample_precursor_path_index.to(device).long()
         )
         # [P]
 
-        if sample_precursor_edge_index_path.dim() != 2:
+        if sample_precursor_edge_paths.dim() != 2:
             raise ValueError(
-                "st.sample_precursor_edge_index_path must be 2D, "
-                f"got shape {tuple(sample_precursor_edge_index_path.shape)}."
+                "structure.sample_precursor_edge_index_path must be 2D, "
+                f"got shape {tuple(sample_precursor_edge_paths.shape)}."
             )
 
-        if sample_precursor_path_index.dim() != 1:
+        if sample_precursor_path_sample_index.dim() != 1:
             raise ValueError(
-                "st.sample_precursor_path_index must be 1D, "
-                f"got shape {tuple(sample_precursor_path_index.shape)}."
+                "structure.sample_precursor_path_index must be 1D, "
+                f"got shape {tuple(sample_precursor_path_sample_index.shape)}."
             )
 
-        if sample_precursor_edge_index_path.size(0) != sample_precursor_path_index.size(0):
+        if (
+            sample_precursor_edge_paths.size(0)
+            != sample_precursor_path_sample_index.size(0)
+        ):
             raise ValueError(
                 "sample_precursor_edge_index_path and sample_precursor_path_index "
                 "must have the same number of rows. "
-                f"Got {sample_precursor_edge_index_path.size(0)} and "
-                f"{sample_precursor_path_index.size(0)}."
+                f"Got {sample_precursor_edge_paths.size(0)} and "
+                f"{sample_precursor_path_sample_index.size(0)}."
             )
 
-        global_edge_u = st.edge_index[0].to(device).long()
+        global_edge_src = structure.edge_index[0].to(device).long()
         # [E]
 
-        global_edge_v = st.edge_index[1].to(device).long()
+        global_edge_dst = structure.edge_index[1].to(device).long()
         # [E]
 
         # -------------------------
-        # Per-sample experimental features
+        # Sample condition -> tree graph representation
         # -------------------------
-        exp_feat_all = self.experimental_fnet(
-            st.sample_adduct_type_index.to(device).long(),
-            st.sample_ce_value.to(device),
+        sample_condition_features = self._condition_encoder(
+            structure.sample_adduct_type_index.to(device).long(),
+            structure.sample_ce_value.to(device),
         )
-        # [S, exp_dim]
+        # [S, condition_dim]
 
-        exp_feat_all = self.tree_graphrepr_proj(exp_feat_all)
-        # [S, tree_dim]
+        sample_condition_tree_repr = self.ms2_condition_to_tree_proj(
+            sample_condition_features
+        )
+        # [S, tree_graph_repr_dim]
 
-        if exp_feat_all.size(0) != S:
+        if sample_condition_tree_repr.size(0) != num_samples:
             raise ValueError(
-                "experimental_fnet output has invalid sample dimension: "
-                f"got {exp_feat_all.size(0)}, expected {S}."
+                "MS2ConditionEncoder output has invalid sample dimension: "
+                f"got {sample_condition_tree_repr.size(0)}, "
+                f"expected {num_samples}."
             )
 
-        if exp_feat_all.size(1) != self.tree_encoder.dim:
+        if sample_condition_tree_repr.size(1) != self.tree_encoder.graph_repr_dim:
             raise ValueError(
-                "tree_graphrepr_proj output has invalid feature dimension: "
-                f"got {exp_feat_all.size(1)}, expected {self.tree_encoder.dim}."
+                "ms2_condition_to_tree_proj output has invalid feature dimension: "
+                f"got {sample_condition_tree_repr.size(1)}, "
+                f"expected {self.tree_encoder.graph_repr_dim}."
             )
 
-        data_list: List[Data] = []
+        sample_data_list: List[Data] = []
         kept_sample_ids: List[int] = []
 
-        seq_list: List[Tensor] = []
-        seq_ptr_list: List[int] = [0]
-        edge_ptr_list: List[int] = [0]
+        local_precursor_sequence_parts: List[torch.Tensor] = []
+        precursor_sequence_ptr: List[int] = [0]
+        edge_ptr: List[int] = [0]
 
-        path_width = int(sample_precursor_edge_index_path.size(1))
+        max_precursor_path_width = int(sample_precursor_edge_paths.size(1))
 
-        for sample_id in range(S):
+        for sample_id in range(num_samples):
             # -------------------------
-            # 1) Edges assigned to this sample
+            # 1) Collect edges assigned to this sample
             # -------------------------
             sample_edge_mask = sample_edge_index[0] == sample_id
-            edge_ids_from_sample = sample_edge_index[1][sample_edge_mask].long()
-            edge_ids_from_sample = edge_ids_from_sample[
-                edge_ids_from_sample >= 0
-            ]
 
-            if edge_ids_from_sample.numel() > 0:
-                edge_ids_from_sample = torch.unique(
-                    edge_ids_from_sample,
+            sample_edge_ids = sample_edge_index[1][sample_edge_mask].long()
+            sample_edge_ids = sample_edge_ids[sample_edge_ids >= 0]
+
+            if sample_edge_ids.numel() > 0:
+                sample_edge_ids = torch.unique(
+                    sample_edge_ids,
                     sorted=True,
                 )
 
             # -------------------------
-            # 2) Precursor edge paths assigned to this sample
+            # 2) Collect precursor paths assigned to this sample
             # -------------------------
-            path_mask = sample_precursor_path_index == sample_id
-            precursor_edge_paths = sample_precursor_edge_index_path[path_mask]
+            precursor_path_mask = sample_precursor_path_sample_index == sample_id
+
+            sample_precursor_paths = sample_precursor_edge_paths[
+                precursor_path_mask
+            ]
             # [P_s, D]
 
-            if precursor_edge_paths.numel() > 0:
-                precursor_path_edge_ids = precursor_edge_paths.reshape(-1)
-                precursor_path_edge_ids = precursor_path_edge_ids[
-                    precursor_path_edge_ids >= 0
-                ]
+            if sample_precursor_paths.numel() > 0:
+                precursor_edge_ids = sample_precursor_paths.reshape(-1)
+                precursor_edge_ids = precursor_edge_ids[precursor_edge_ids >= 0]
 
-                if precursor_path_edge_ids.numel() > 0:
-                    precursor_path_edge_ids = torch.unique(
-                        precursor_path_edge_ids,
+                if precursor_edge_ids.numel() > 0:
+                    precursor_edge_ids = torch.unique(
+                        precursor_edge_ids,
                         sorted=True,
                     )
             else:
-                precursor_path_edge_ids = torch.empty(
+                precursor_edge_ids = torch.empty(
                     (0,),
                     dtype=torch.long,
                     device=device,
                 )
 
-            # Use both sample edges and precursor-path edges.
-            # This prevents precursor path edges from being missing in the local graph.
-            edge_ids = torch.cat(
+            # The local sample graph must contain both:
+            #   - edges assigned to the sample
+            #   - edges appearing in precursor paths
+            global_edge_ids = torch.cat(
                 [
-                    edge_ids_from_sample,
-                    precursor_path_edge_ids,
+                    sample_edge_ids,
+                    precursor_edge_ids,
                 ],
                 dim=0,
             )
 
-            if edge_ids.numel() > 0:
-                edge_ids = torch.unique(
-                    edge_ids,
+            if global_edge_ids.numel() > 0:
+                global_edge_ids = torch.unique(
+                    global_edge_ids,
                     sorted=True,
                 )
 
-            if edge_ids.numel() == 0:
+            if global_edge_ids.numel() == 0:
                 raise ValueError(
                     f"No edges found for sample {sample_id}. "
                     "Each sample must have at least one edge in sample_edge_index "
                     "or sample_precursor_edge_index_path."
                 )
 
-            if edge_ids.min().item() < 0 or edge_ids.max().item() >= E:
+            if (
+                global_edge_ids.min().item() < 0
+                or global_edge_ids.max().item() >= num_global_edges
+            ):
                 raise IndexError(
-                    f"edge_ids out of range for sample {sample_id}: "
-                    f"min={edge_ids.min().item()}, max={edge_ids.max().item()}, E={E}."
+                    f"global_edge_ids out of range for sample {sample_id}: "
+                    f"min={global_edge_ids.min().item()}, "
+                    f"max={global_edge_ids.max().item()}, "
+                    f"E={num_global_edges}."
                 )
 
             # -------------------------
-            # 3) Nodes for this sample
+            # 3) Collect nodes used by this sample
             # -------------------------
-            u = global_edge_u[edge_ids]
-            v = global_edge_v[edge_ids]
+            global_src_nodes = global_edge_src[global_edge_ids]
+            global_dst_nodes = global_edge_dst[global_edge_ids]
 
-            node_ids = torch.unique(
+            global_node_ids = torch.unique(
                 torch.cat(
                     [
-                        u,
-                        v,
+                        global_src_nodes,
+                        global_dst_nodes,
                     ],
                     dim=0,
                 ),
@@ -351,31 +413,36 @@ class CleftsSpecGen(ModelBase):
             )
             # [N_s]
 
-            if node_ids.numel() == 0:
+            if global_node_ids.numel() == 0:
                 raise ValueError(
                     f"No nodes found for sample {sample_id}."
                 )
 
-            if node_ids.min().item() < 0 or node_ids.max().item() >= N:
+            if (
+                global_node_ids.min().item() < 0
+                or global_node_ids.max().item() >= num_global_nodes
+            ):
                 raise IndexError(
-                    f"node_ids out of range for sample {sample_id}: "
-                    f"min={node_ids.min().item()}, max={node_ids.max().item()}, N={N}."
+                    f"global_node_ids out of range for sample {sample_id}: "
+                    f"min={global_node_ids.min().item()}, "
+                    f"max={global_node_ids.max().item()}, "
+                    f"N={num_global_nodes}."
                 )
 
-            num_nodes_in_sample = int(node_ids.numel())
+            num_sample_nodes = int(global_node_ids.numel())
 
             # -------------------------
             # 4) Global node id -> local node id
             # -------------------------
-            node_old_to_new = torch.full(
-                (N,),
+            local_node_id_by_global_node_id = torch.full(
+                (num_global_nodes,),
                 -1,
                 dtype=torch.long,
                 device=device,
             )
 
-            node_old_to_new[node_ids] = torch.arange(
-                num_nodes_in_sample,
+            local_node_id_by_global_node_id[global_node_ids] = torch.arange(
+                num_sample_nodes,
                 dtype=torch.long,
                 device=device,
             )
@@ -383,334 +450,276 @@ class CleftsSpecGen(ModelBase):
             # -------------------------
             # 5) Slice node features
             # -------------------------
-            x = tree_node_x[node_ids]
-            # [N_s, node_dim]
+            sample_node_features = global_node_features[global_node_ids]
+            # [N_s, mol_graph_dim]
 
             # -------------------------
-            # 6) Node type features
+            # 6) Add node role features
             # -------------------------
-            node_type = torch.zeros(
-                (num_nodes_in_sample, 3),
+            node_role_one_hot = torch.zeros(
+                (num_sample_nodes, 3),
                 dtype=torch.float32,
                 device=device,
             )
-            node_type[:, 2] = 1.0
+            node_role_one_hot[:, 2] = 1.0
             # columns:
             #   0: precursor_path_node
-            #   1: precursor_root
-            #   2: normal
+            #   1: precursor_root_node
+            #   2: normal_node
 
-            precursor_root_global_nodes = self._infer_precursor_root_nodes_from_edge_paths(
-                edge_paths=precursor_edge_paths,
-                global_edge_u=global_edge_u,
+            precursor_root_global_node_ids = (
+                self._get_precursor_root_node_ids_from_edge_paths(
+                    edge_paths=sample_precursor_paths,
+                    global_edge_src=global_edge_src,
+                )
             )
             # [R_s]
 
-            if precursor_root_global_nodes.numel() > 0:
-                precursor_root_local_nodes = node_old_to_new[
-                    precursor_root_global_nodes
-                ]
-                precursor_root_local_nodes = precursor_root_local_nodes[
-                    precursor_root_local_nodes >= 0
+            if precursor_root_global_node_ids.numel() > 0:
+                precursor_root_local_node_ids = local_node_id_by_global_node_id[
+                    precursor_root_global_node_ids
                 ]
 
-                if precursor_root_local_nodes.numel() > 0:
-                    precursor_root_local_nodes = torch.unique(
-                        precursor_root_local_nodes,
+                precursor_root_local_node_ids = precursor_root_local_node_ids[
+                    precursor_root_local_node_ids >= 0
+                ]
+
+                if precursor_root_local_node_ids.numel() > 0:
+                    precursor_root_local_node_ids = torch.unique(
+                        precursor_root_local_node_ids,
                         sorted=True,
                     )
 
-                    node_type[precursor_root_local_nodes] = 0.0
-                    node_type[precursor_root_local_nodes, 1] = 1.0
+                    node_role_one_hot[precursor_root_local_node_ids] = 0.0
+                    node_role_one_hot[precursor_root_local_node_ids, 1] = 1.0
 
-            precursor_path_global_nodes = self._infer_nodes_from_edge_paths(
-                edge_paths=precursor_edge_paths,
-                global_edge_u=global_edge_u,
-                global_edge_v=global_edge_v,
+            precursor_path_global_node_ids = (
+                self._get_node_ids_from_edge_paths(
+                    edge_paths=sample_precursor_paths,
+                    global_edge_src=global_edge_src,
+                    global_edge_dst=global_edge_dst,
+                )
             )
             # [Q_s]
 
-            if precursor_path_global_nodes.numel() > 0:
-                precursor_path_local_nodes = node_old_to_new[
-                    precursor_path_global_nodes
-                ]
-                precursor_path_local_nodes = precursor_path_local_nodes[
-                    precursor_path_local_nodes >= 0
+            if precursor_path_global_node_ids.numel() > 0:
+                precursor_path_local_node_ids = local_node_id_by_global_node_id[
+                    precursor_path_global_node_ids
                 ]
 
-                if precursor_path_local_nodes.numel() > 0:
-                    precursor_path_local_nodes = torch.unique(
-                        precursor_path_local_nodes,
+                precursor_path_local_node_ids = precursor_path_local_node_ids[
+                    precursor_path_local_node_ids >= 0
+                ]
+
+                if precursor_path_local_node_ids.numel() > 0:
+                    precursor_path_local_node_ids = torch.unique(
+                        precursor_path_local_node_ids,
                         sorted=True,
                     )
 
-                    # Do not overwrite precursor roots.
-                    if precursor_root_global_nodes.numel() > 0:
-                        root_local = node_old_to_new[precursor_root_global_nodes]
-                        root_local = root_local[root_local >= 0]
-                        if root_local.numel() > 0:
-                            precursor_path_local_nodes = precursor_path_local_nodes[
-                                ~torch.isin(
-                                    precursor_path_local_nodes,
-                                    torch.unique(root_local),
-                                )
-                            ]
-
-                    if precursor_path_local_nodes.numel() > 0:
-                        node_type[precursor_path_local_nodes] = 0.0
-                        node_type[precursor_path_local_nodes, 0] = 1.0
-
-            # -------------------------
-            # 7) Optional adduct / neutral-HS node features
-            # -------------------------
-            extra_node_features: List[Tensor] = [
-                node_type,
-            ]
-
-            if hasattr(self, "_adduct_type_idx_to_one_hot_vec"):
-                adduct_one_hot_table = self._adduct_type_idx_to_one_hot_vec.to(device)
-                adduct_dim = int(adduct_one_hot_table.size(1))
-
-                ion_hot_node = torch.zeros(
-                    (num_nodes_in_sample, adduct_dim),
-                    dtype=torch.float32,
-                    device=device,
-                )
-
-                sample_adduct_idx = int(
-                    st.sample_adduct_type_index[sample_id].item()
-                )
-
-                if 0 <= sample_adduct_idx < adduct_one_hot_table.size(0):
-                    if precursor_root_global_nodes.numel() > 0:
-                        precursor_root_local_nodes = node_old_to_new[
-                            precursor_root_global_nodes
+                    # Do not overwrite precursor root nodes.
+                    if precursor_root_global_node_ids.numel() > 0:
+                        root_local_node_ids = local_node_id_by_global_node_id[
+                            precursor_root_global_node_ids
                         ]
-                        precursor_root_local_nodes = precursor_root_local_nodes[
-                            precursor_root_local_nodes >= 0
+                        root_local_node_ids = root_local_node_ids[
+                            root_local_node_ids >= 0
                         ]
 
-                        if precursor_root_local_nodes.numel() > 0:
-                            ion_hot_node[precursor_root_local_nodes] = (
-                                adduct_one_hot_table[sample_adduct_idx]
+                        if root_local_node_ids.numel() > 0:
+                            precursor_path_local_node_ids = (
+                                precursor_path_local_node_ids[
+                                    ~torch.isin(
+                                        precursor_path_local_node_ids,
+                                        torch.unique(root_local_node_ids),
+                                    )
+                                ]
                             )
 
-                extra_node_features.append(ion_hot_node)
+                    if precursor_path_local_node_ids.numel() > 0:
+                        node_role_one_hot[precursor_path_local_node_ids] = 0.0
+                        node_role_one_hot[precursor_path_local_node_ids, 0] = 1.0
 
-            if hasattr(self, "_neutral_hs_adduct_idx_to_one_hot_vec"):
-                neutral_one_hot_table = self._neutral_hs_adduct_idx_to_one_hot_vec.to(
-                    device
-                )
-                neutral_dim = int(neutral_one_hot_table.size(1))
-
-                neutral_hot_node = torch.zeros(
-                    (num_nodes_in_sample, neutral_dim),
-                    dtype=torch.float32,
-                    device=device,
-                )
-
-                extra_node_features.append(neutral_hot_node)
-
-            x = torch.cat(
+            sample_node_features = torch.cat(
                 [
-                    x,
-                    *extra_node_features,
+                    sample_node_features,
+                    node_role_one_hot,
                 ],
                 dim=1,
             )
+            # [N_s, mol_graph_dim + 3]
 
             # -------------------------
-            # 8) Slice/remap edges
+            # 7) Slice and remap edges
             # -------------------------
-            edge_old_to_new = torch.full(
-                (E,),
+            local_edge_id_by_global_edge_id = torch.full(
+                (num_global_edges,),
                 -1,
                 dtype=torch.long,
                 device=device,
             )
 
-            edge_old_to_new[edge_ids] = torch.arange(
-                edge_ids.numel(),
+            local_edge_id_by_global_edge_id[global_edge_ids] = torch.arange(
+                global_edge_ids.numel(),
                 dtype=torch.long,
                 device=device,
             )
 
-            u_new = node_old_to_new[global_edge_u[edge_ids]]
-            v_new = node_old_to_new[global_edge_v[edge_ids]]
+            local_src_nodes = local_node_id_by_global_node_id[
+                global_edge_src[global_edge_ids]
+            ]
 
-            if (u_new < 0).any() or (v_new < 0).any():
+            local_dst_nodes = local_node_id_by_global_node_id[
+                global_edge_dst[global_edge_ids]
+            ]
+
+            if (local_src_nodes < 0).any() or (local_dst_nodes < 0).any():
                 raise ValueError(
                     f"Some edges for sample {sample_id} have endpoints "
                     "that do not map to local node ids."
                 )
 
-            edge_index = torch.stack(
+            sample_edge_index_local = torch.stack(
                 [
-                    u_new,
-                    v_new,
+                    local_src_nodes,
+                    local_dst_nodes,
                 ],
                 dim=0,
             )
             # [2, E_s]
 
-            edge_attr = all_edge_attr[edge_ids]
+            sample_edge_features = global_edge_features[global_edge_ids]
             # [E_s, edge_dim]
 
-            edge_id_global = edge_ids
-            # [E_s]
-
             # -------------------------
-            # 9) Build local precursor pathway sequence
+            # 8) Build local precursor pathway sequence
             # -------------------------
-            precursor_pathway_seq_local = self._edge_paths_to_local_node_edge_seq(
-                edge_paths=precursor_edge_paths,
-                global_edge_u=global_edge_u,
-                global_edge_v=global_edge_v,
-                node_old_to_new=node_old_to_new,
-                edge_old_to_new=edge_old_to_new,
-                max_path_width=path_width,
-                device=device,
+            local_precursor_sequence = (
+                self._convert_edge_paths_to_local_node_edge_sequences(
+                    edge_paths=sample_precursor_paths,
+                    global_edge_src=global_edge_src,
+                    global_edge_dst=global_edge_dst,
+                    local_node_id_by_global_node_id=(
+                        local_node_id_by_global_node_id
+                    ),
+                    local_edge_id_by_global_edge_id=(
+                        local_edge_id_by_global_edge_id
+                    ),
+                    max_path_width=max_precursor_path_width,
+                    device=device,
+                )
             )
             # [P_s, 2 * D + 1]
 
-            if precursor_pathway_seq_local.numel() > 0:
-                node_values = precursor_pathway_seq_local[:, 0::2].reshape(-1)
-                node_values = node_values[node_values != -1]
-
-                if node_values.numel() > 0:
-                    if node_values.min().item() < 0:
-                        raise IndexError(
-                            f"Local node ids in precursor path are negative "
-                            f"for sample {sample_id}."
-                        )
-
-                    if node_values.max().item() >= num_nodes_in_sample:
-                        raise IndexError(
-                            f"Local node ids in precursor path are out of range "
-                            f"for sample {sample_id}."
-                        )
-
-                edge_values = precursor_pathway_seq_local[:, 1::2].reshape(-1)
-                edge_values = edge_values[edge_values != -1]
-
-                if edge_values.numel() > 0:
-                    if edge_values.min().item() < 0:
-                        raise IndexError(
-                            f"Local edge ids in precursor path are negative "
-                            f"for sample {sample_id}."
-                        )
-
-                    if edge_values.max().item() >= edge_ids.numel():
-                        raise IndexError(
-                            f"Local edge ids in precursor path are out of range "
-                            f"for sample {sample_id}."
-                        )
-
-            seq_list.append(precursor_pathway_seq_local)
-            seq_ptr_list.append(
-                seq_ptr_list[-1] + int(precursor_pathway_seq_local.size(0))
+            self._validate_local_precursor_sequences(
+                local_precursor_sequence=local_precursor_sequence,
+                num_sample_nodes=num_sample_nodes,
+                num_sample_edges=int(global_edge_ids.numel()),
+                sample_id=sample_id,
             )
-            edge_ptr_list.append(
-                edge_ptr_list[-1] + int(edge_index.size(1))
+
+            local_precursor_sequence_parts.append(local_precursor_sequence)
+
+            precursor_sequence_ptr.append(
+                precursor_sequence_ptr[-1] + int(local_precursor_sequence.size(0))
+            )
+
+            edge_ptr.append(
+                edge_ptr[-1] + int(sample_edge_index_local.size(1))
             )
 
             # -------------------------
-            # 10) Build Data
+            # 9) Build sample Data
             # -------------------------
-            data = Data(
-                x=x,
-                edge_index=edge_index,
-                edge_attr=edge_attr,
+            sample_data = Data(
+                x=sample_node_features,
+                edge_index=sample_edge_index_local,
+                edge_attr=sample_edge_features,
             )
 
-            data.node_id_global = node_ids
-            data.edge_id_global = edge_id_global
-            data.sample_id = torch.tensor(
+            sample_data.node_id_global = global_node_ids
+            sample_data.edge_id_global = global_edge_ids
+            sample_data.sample_id = torch.tensor(
                 sample_id,
                 dtype=torch.long,
                 device=device,
             )
 
-            # Backward-compatible alias if other code still expects member_id.
-            data.member_id = data.sample_id
-
-            data_list.append(data)
+            sample_data_list.append(sample_data)
             kept_sample_ids.append(sample_id)
 
-        if len(data_list) == 0:
+        if len(sample_data_list) == 0:
             raise ValueError("No sample graphs were created.")
 
-        pyg_batch = Batch.from_data_list(data_list)
+        sample_tree_batch = Batch.from_data_list(sample_data_list)
 
-        kept_sample_ids_t = torch.tensor(
+        kept_sample_ids_tensor = torch.tensor(
             kept_sample_ids,
             dtype=torch.long,
             device=device,
         )
 
-        graph_repr = exp_feat_all[kept_sample_ids_t]
-        # [G, tree_dim]
+        condition_tree_repr = sample_condition_tree_repr[
+            kept_sample_ids_tensor
+        ]
+        # [G, tree_graph_repr_dim]
 
         # -------------------------
         # Concatenate precursor pathway sequences
         # -------------------------
-        if len(seq_list) == 0:
-            precursor_pathway_seq_batch = torch.empty(
-                (0, 2 * path_width + 1),
+        if len(local_precursor_sequence_parts) == 0:
+            precursor_pathway_seq = torch.empty(
+                (0, 2 * max_precursor_path_width + 1),
                 dtype=torch.long,
                 device=device,
             )
 
-            precursor_pathway_ptr_batch = torch.zeros(
-                (len(data_list) + 1,),
+            precursor_pathway_ptr = torch.zeros(
+                (len(sample_data_list) + 1,),
                 dtype=torch.long,
                 device=device,
             )
         else:
-            precursor_pathway_seq_batch = torch.cat(
-                seq_list,
+            precursor_pathway_seq = torch.cat(
+                local_precursor_sequence_parts,
                 dim=0,
             )
 
-            precursor_pathway_ptr_batch = torch.tensor(
-                seq_ptr_list,
+            precursor_pathway_ptr = torch.tensor(
+                precursor_sequence_ptr,
                 dtype=torch.long,
                 device=device,
             )
 
-        edge_ptr = torch.tensor(
-            edge_ptr_list,
+        edge_ptr_tensor = torch.tensor(
+            edge_ptr,
             dtype=torch.long,
             device=device,
         )
 
-        precursor_pathway_seq_batch = pathway_seq_local_to_batch_global(
-            seq_local=precursor_pathway_seq_batch,
-            pathway_ptr=precursor_pathway_ptr_batch,
-            node_ptr=pyg_batch.ptr,
-            edge_ptr=edge_ptr,
+        precursor_pathway_seq = self._convert_local_pathway_sequences_to_batch_indices(
+            seq_local=precursor_pathway_seq,
+            pathway_ptr=precursor_pathway_ptr,
+            node_ptr=sample_tree_batch.ptr,
+            edge_ptr=edge_ptr_tensor,
         )
 
-        pyg_batch.precursor_pathway_seq = precursor_pathway_seq_batch
-        pyg_batch.precursor_pathway_ptr = precursor_pathway_ptr_batch
-        pyg_batch.edge_ptr = edge_ptr
+        sample_tree_batch.precursor_pathway_seq = precursor_pathway_seq
+        sample_tree_batch.precursor_pathway_ptr = precursor_pathway_ptr
+        sample_tree_batch.edge_ptr = edge_ptr_tensor
+        sample_tree_batch.kept_sample_ids = kept_sample_ids_tensor
 
-        # Backward-compatible aliases.
-        pyg_batch.kept_sample_ids = kept_sample_ids_t
-        pyg_batch.kept_member_ids = kept_sample_ids_t
-
-        return pyg_batch, graph_repr, kept_sample_ids_t
-
+        return sample_tree_batch, condition_tree_repr, kept_sample_ids_tensor
 
     @staticmethod
-    def _infer_precursor_root_nodes_from_edge_paths(
+    def _get_precursor_root_node_ids_from_edge_paths(
         *,
         edge_paths: torch.Tensor,
-        global_edge_u: torch.Tensor,
+        global_edge_src: torch.Tensor,
     ) -> torch.Tensor:
-        """Infer precursor root nodes from the first valid edge in each path."""
+        """Get precursor root node ids from the first valid edge in each path."""
 
-        device = global_edge_u.device
+        device = global_edge_src.device
 
         if edge_paths.numel() == 0:
             return torch.empty(
@@ -719,20 +728,20 @@ class CleftsSpecGen(ModelBase):
                 device=device,
             )
 
-        roots: List[int] = []
+        root_node_ids: List[int] = []
 
-        for row in edge_paths:
-            valid_edges = row[row >= 0]
+        for edge_path in edge_paths:
+            valid_edge_ids = edge_path[edge_path >= 0]
 
-            if valid_edges.numel() == 0:
+            if valid_edge_ids.numel() == 0:
                 continue
 
-            first_edge_id = int(valid_edges[0].item())
-            roots.append(
-                int(global_edge_u[first_edge_id].item())
+            first_edge_id = int(valid_edge_ids[0].item())
+            root_node_ids.append(
+                int(global_edge_src[first_edge_id].item())
             )
 
-        if len(roots) == 0:
+        if len(root_node_ids) == 0:
             return torch.empty(
                 (0,),
                 dtype=torch.long,
@@ -741,7 +750,7 @@ class CleftsSpecGen(ModelBase):
 
         return torch.unique(
             torch.tensor(
-                roots,
+                root_node_ids,
                 dtype=torch.long,
                 device=device,
             ),
@@ -750,15 +759,15 @@ class CleftsSpecGen(ModelBase):
 
 
     @staticmethod
-    def _infer_nodes_from_edge_paths(
+    def _get_node_ids_from_edge_paths(
         *,
         edge_paths: torch.Tensor,
-        global_edge_u: torch.Tensor,
-        global_edge_v: torch.Tensor,
+        global_edge_src: torch.Tensor,
+        global_edge_dst: torch.Tensor,
     ) -> torch.Tensor:
-        """Infer all node ids appearing in edge paths."""
+        """Get all node ids appearing in edge paths."""
 
-        device = global_edge_u.device
+        device = global_edge_src.device
 
         if edge_paths.numel() == 0:
             return torch.empty(
@@ -767,43 +776,43 @@ class CleftsSpecGen(ModelBase):
                 device=device,
             )
 
-        valid_edges = edge_paths.reshape(-1)
-        valid_edges = valid_edges[valid_edges >= 0]
+        valid_edge_ids = edge_paths.reshape(-1)
+        valid_edge_ids = valid_edge_ids[valid_edge_ids >= 0]
 
-        if valid_edges.numel() == 0:
+        if valid_edge_ids.numel() == 0:
             return torch.empty(
                 (0,),
                 dtype=torch.long,
                 device=device,
             )
 
-        nodes = torch.cat(
+        node_ids = torch.cat(
             [
-                global_edge_u[valid_edges],
-                global_edge_v[valid_edges],
+                global_edge_src[valid_edge_ids],
+                global_edge_dst[valid_edge_ids],
             ],
             dim=0,
         )
 
         return torch.unique(
-            nodes,
+            node_ids,
             sorted=True,
         )
 
 
     @staticmethod
-    def _edge_paths_to_local_node_edge_seq(
+    def _convert_edge_paths_to_local_node_edge_sequences(
         *,
         edge_paths: torch.Tensor,
-        global_edge_u: torch.Tensor,
-        global_edge_v: torch.Tensor,
-        node_old_to_new: torch.Tensor,
-        edge_old_to_new: torch.Tensor,
+        global_edge_src: torch.Tensor,
+        global_edge_dst: torch.Tensor,
+        local_node_id_by_global_node_id: torch.Tensor,
+        local_edge_id_by_global_edge_id: torch.Tensor,
         max_path_width: int,
         device: torch.device,
     ) -> torch.Tensor:
         """
-        Convert edge-only precursor paths to local node-edge-node sequences.
+        Convert global edge paths to local node-edge-node sequences.
 
         Parameters
         ----------
@@ -813,80 +822,411 @@ class CleftsSpecGen(ModelBase):
 
         Returns
         -------
-        seq:
+        local_sequences:
             [P_s, 2 * D + 1]
 
             columns:
-                0: node id
-                1: edge id
-                2: node id
-                3: edge id
+                0: local node id
+                1: local edge id
+                2: local node id
+                3: local edge id
                 ...
         """
 
         path_count = int(edge_paths.size(0))
-        seq_width = 2 * int(max_path_width) + 1
+        sequence_width = 2 * int(max_path_width) + 1
 
         if path_count == 0:
             return torch.empty(
-                (0, seq_width),
+                (0, sequence_width),
                 dtype=torch.long,
                 device=device,
             )
 
-        seq = torch.full(
-            (path_count, seq_width),
+        local_sequences = torch.full(
+            (path_count, sequence_width),
             -1,
             dtype=torch.long,
             device=device,
         )
 
         for path_index in range(path_count):
-            row = edge_paths[path_index]
-            valid_edges = row[row >= 0]
+            edge_path = edge_paths[path_index]
+            valid_edge_ids = edge_path[edge_path >= 0]
 
-            if valid_edges.numel() == 0:
+            if valid_edge_ids.numel() == 0:
                 continue
 
-            first_edge_id = int(valid_edges[0].item())
-            first_src_node = int(global_edge_u[first_edge_id].item())
+            first_edge_id = int(valid_edge_ids[0].item())
+            first_global_src_node = int(global_edge_src[first_edge_id].item())
 
-            first_src_node_local = int(node_old_to_new[first_src_node].item())
+            first_local_src_node = int(
+                local_node_id_by_global_node_id[first_global_src_node].item()
+            )
 
-            if first_src_node_local < 0:
+            if first_local_src_node < 0:
                 raise ValueError(
-                    f"First source node {first_src_node} does not map to "
-                    "a local node id."
+                    f"First source node {first_global_src_node} does not map "
+                    "to a local node id."
                 )
 
-            seq[path_index, 0] = first_src_node_local
+            local_sequences[path_index, 0] = first_local_src_node
 
-            for step_index, edge_id_tensor in enumerate(valid_edges):
-                edge_id = int(edge_id_tensor.item())
+            for step_index, edge_id_tensor in enumerate(valid_edge_ids):
+                global_edge_id = int(edge_id_tensor.item())
 
-                local_edge_id = int(edge_old_to_new[edge_id].item())
+                local_edge_id = int(
+                    local_edge_id_by_global_edge_id[global_edge_id].item()
+                )
+
                 if local_edge_id < 0:
                     raise ValueError(
-                        f"Edge {edge_id} does not map to a local edge id."
+                        f"Edge {global_edge_id} does not map to a local edge id."
                     )
 
-                dst_node = int(global_edge_v[edge_id].item())
-                local_dst_node = int(node_old_to_new[dst_node].item())
+                global_dst_node = int(global_edge_dst[global_edge_id].item())
+
+                local_dst_node = int(
+                    local_node_id_by_global_node_id[global_dst_node].item()
+                )
+
                 if local_dst_node < 0:
                     raise ValueError(
-                        f"Destination node {dst_node} does not map to "
-                        "a local node id."
+                        f"Destination node {global_dst_node} does not map "
+                        "to a local node id."
                     )
 
-                edge_col = 2 * step_index + 1
-                node_col = 2 * step_index + 2
+                edge_column = 2 * step_index + 1
+                node_column = 2 * step_index + 2
 
-                if edge_col >= seq_width or node_col >= seq_width:
+                if edge_column >= sequence_width or node_column >= sequence_width:
                     raise IndexError(
                         "Precursor path is longer than max_path_width."
                     )
 
-                seq[path_index, edge_col] = local_edge_id
-                seq[path_index, node_col] = local_dst_node
+                local_sequences[path_index, edge_column] = local_edge_id
+                local_sequences[path_index, node_column] = local_dst_node
+
+        return local_sequences
+
+
+    @staticmethod
+    def _validate_local_precursor_sequences(
+        *,
+        local_precursor_sequence: torch.Tensor,
+        num_sample_nodes: int,
+        num_sample_edges: int,
+        sample_id: int,
+    ) -> None:
+        """Validate local node and edge ids in precursor pathway sequences."""
+
+        if local_precursor_sequence.numel() == 0:
+            return
+
+        node_values = local_precursor_sequence[:, 0::2].reshape(-1)
+        node_values = node_values[node_values != -1]
+
+        if node_values.numel() > 0:
+            if node_values.min().item() < 0:
+                raise IndexError(
+                    f"Local node ids in precursor path are negative "
+                    f"for sample {sample_id}."
+                )
+
+            if node_values.max().item() >= num_sample_nodes:
+                raise IndexError(
+                    f"Local node ids in precursor path are out of range "
+                    f"for sample {sample_id}."
+                )
+
+        edge_values = local_precursor_sequence[:, 1::2].reshape(-1)
+        edge_values = edge_values[edge_values != -1]
+
+        if edge_values.numel() > 0:
+            if edge_values.min().item() < 0:
+                raise IndexError(
+                    f"Local edge ids in precursor path are negative "
+                    f"for sample {sample_id}."
+                )
+
+            if edge_values.max().item() >= num_sample_edges:
+                raise IndexError(
+                    f"Local edge ids in precursor path are out of range "
+                    f"for sample {sample_id}."
+                )
+
+    def convert_local_pathway_sequences_to_batch_indices(
+        seq_local: torch.Tensor,
+        pathway_ptr: torch.Tensor,
+        node_ptr: torch.Tensor,
+        edge_ptr: torch.Tensor,
+        *,
+        edge_positions: str = "odd0",
+    ) -> torch.Tensor:
+        """
+        Convert local node/edge ids in pathway sequences to PyG-batch-global ids.
+
+        seq_local:
+            [P, L]
+            Local node-edge-node sequences.
+
+        pathway_ptr:
+            [G + 1]
+            CSR pointer that groups pathway rows by sample graph.
+
+        node_ptr:
+            [G + 1]
+            PyG Batch node pointer.
+
+        edge_ptr:
+            [G + 1]
+            PyG Batch edge pointer.
+        """
+
+        device = seq_local.device
+
+        seq = seq_local.long().clone()
+        pathway_ptr = pathway_ptr.long().to(device)
+        node_ptr = node_ptr.long().to(device)
+        edge_ptr = edge_ptr.long().to(device)
+
+        num_sequences, sequence_width = seq.shape
+        num_graphs = int(pathway_ptr.numel() - 1)
+
+        if node_ptr.numel() != num_graphs + 1:
+            raise ValueError(
+                "node_ptr must have shape [G + 1] aligned with pathway_ptr."
+            )
+
+        if edge_ptr.numel() != num_graphs + 1:
+            raise ValueError(
+                "edge_ptr must have shape [G + 1] aligned with pathway_ptr."
+            )
+
+        sequence_counts = (
+            pathway_ptr[1:] - pathway_ptr[:-1]
+        ).clamp_min(0)
+
+        graph_id_by_sequence = torch.repeat_interleave(
+            torch.arange(
+                num_graphs,
+                device=device,
+                dtype=torch.long,
+            ),
+            sequence_counts,
+        )
+        # [P]
+
+        if graph_id_by_sequence.numel() != num_sequences:
+            raise ValueError(
+                "pathway_ptr does not match seq_local rows."
+            )
+
+        node_offset_by_sequence = node_ptr[graph_id_by_sequence]
+        edge_offset_by_sequence = edge_ptr[graph_id_by_sequence]
+
+        positions = torch.arange(
+            sequence_width,
+            device=device,
+        )
+
+        if edge_positions == "odd0":
+            is_edge_position = positions % 2 == 1
+        elif edge_positions == "even0":
+            is_edge_position = positions % 2 == 0
+        else:
+            raise ValueError(
+                'edge_positions must be "odd0" or "even0".'
+            )
+
+        is_edge = is_edge_position.view(1, sequence_width).expand(
+            num_sequences,
+            sequence_width,
+        )
+
+        is_node = ~is_edge
+        is_valid = seq >= 0
+
+        node_valid = is_valid & is_node
+        edge_valid = is_valid & is_edge
+
+        if node_valid.any():
+            node_offsets = node_offset_by_sequence.view(
+                num_sequences,
+                1,
+            ).expand(
+                num_sequences,
+                sequence_width,
+            )
+
+            seq[node_valid] = seq[node_valid] + node_offsets[node_valid]
+
+        if edge_valid.any():
+            edge_offsets = edge_offset_by_sequence.view(
+                num_sequences,
+                1,
+            ).expand(
+                num_sequences,
+                sequence_width,
+            )
+
+            seq[edge_valid] = seq[edge_valid] + edge_offsets[edge_valid]
+
+        return seq
+
+    @staticmethod
+    def _convert_local_pathway_sequences_to_batch_indices(
+        *,
+        seq_local: torch.Tensor,
+        pathway_ptr: torch.Tensor,
+        node_ptr: torch.Tensor,
+        edge_ptr: torch.Tensor,
+        edge_positions: str = "odd0",
+    ) -> torch.Tensor:
+        """
+        Convert local node/edge ids in pathway sequences to PyG-batch-global ids.
+
+        Parameters
+        ----------
+        seq_local:
+            [P, L]
+            Local node-edge-node sequences.
+
+            Example:
+                [local_node, local_edge, local_node, local_edge, local_node]
+
+        pathway_ptr:
+            [G + 1]
+            CSR pointer that groups pathway rows by sample graph.
+
+        node_ptr:
+            [G + 1]
+            PyG Batch node pointer.
+
+        edge_ptr:
+            [G + 1]
+            PyG Batch edge pointer.
+
+        edge_positions:
+            "odd0":
+                Edge ids are at positions 1, 3, 5, ...
+                This matches node-edge-node-edge-node sequences.
+
+            "even0":
+                Edge ids are at positions 0, 2, 4, ...
+
+        Returns
+        -------
+        torch.Tensor
+            [P, L]
+            Pathway sequences whose local node/edge ids are converted to
+            PyG-batch-global node/edge ids.
+        """
+
+        device = seq_local.device
+
+        seq = seq_local.long().clone()
+        pathway_ptr = pathway_ptr.long().to(device)
+        node_ptr = node_ptr.long().to(device)
+        edge_ptr = edge_ptr.long().to(device)
+
+        if seq.dim() != 2:
+            raise ValueError(
+                "seq_local must be 2D, "
+                f"got shape {tuple(seq.shape)}."
+            )
+
+        num_sequences, sequence_width = seq.shape
+        num_graphs = int(pathway_ptr.numel() - 1)
+
+        if node_ptr.numel() != num_graphs + 1:
+            raise ValueError(
+                "node_ptr must have shape [G + 1] aligned with pathway_ptr. "
+                f"Got node_ptr={tuple(node_ptr.shape)}, "
+                f"pathway_ptr={tuple(pathway_ptr.shape)}."
+            )
+
+        if edge_ptr.numel() != num_graphs + 1:
+            raise ValueError(
+                "edge_ptr must have shape [G + 1] aligned with pathway_ptr. "
+                f"Got edge_ptr={tuple(edge_ptr.shape)}, "
+                f"pathway_ptr={tuple(pathway_ptr.shape)}."
+            )
+
+        sequence_counts = (
+            pathway_ptr[1:] - pathway_ptr[:-1]
+        ).clamp_min(0)
+        # [G]
+
+        graph_id_by_sequence = torch.repeat_interleave(
+            torch.arange(
+                num_graphs,
+                dtype=torch.long,
+                device=device,
+            ),
+            sequence_counts,
+        )
+        # [P]
+
+        if graph_id_by_sequence.numel() != num_sequences:
+            raise ValueError(
+                "pathway_ptr does not match seq_local rows. "
+                f"Expected {num_sequences} rows, "
+                f"but pathway_ptr represents {graph_id_by_sequence.numel()} rows."
+            )
+
+        node_offset_by_sequence = node_ptr[graph_id_by_sequence]
+        edge_offset_by_sequence = edge_ptr[graph_id_by_sequence]
+
+        positions = torch.arange(
+            sequence_width,
+            dtype=torch.long,
+            device=device,
+        )
+
+        if edge_positions == "odd0":
+            is_edge_position = positions % 2 == 1
+        elif edge_positions == "even0":
+            is_edge_position = positions % 2 == 0
+        else:
+            raise ValueError(
+                'edge_positions must be "odd0" or "even0".'
+            )
+
+        is_edge = is_edge_position.view(
+            1,
+            sequence_width,
+        ).expand(
+            num_sequences,
+            sequence_width,
+        )
+
+        is_node = ~is_edge
+        is_valid = seq >= 0
+
+        node_valid = is_valid & is_node
+        edge_valid = is_valid & is_edge
+
+        if node_valid.any():
+            node_offsets = node_offset_by_sequence.view(
+                num_sequences,
+                1,
+            ).expand(
+                num_sequences,
+                sequence_width,
+            )
+
+            seq[node_valid] = seq[node_valid] + node_offsets[node_valid]
+
+        if edge_valid.any():
+            edge_offsets = edge_offset_by_sequence.view(
+                num_sequences,
+                1,
+            ).expand(
+                num_sequences,
+                sequence_width,
+            )
+
+            seq[edge_valid] = seq[edge_valid] + edge_offsets[edge_valid]
 
         return seq

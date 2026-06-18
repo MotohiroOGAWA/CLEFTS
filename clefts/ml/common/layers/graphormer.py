@@ -921,7 +921,7 @@ class GraphormerBlock(nn.Module):
       - Block runs one big attention; cross-graph positions are masked out.
     """
 
-    def __init__(self, dim: int, num_heads: int, dropout: float = 0.0, ffn_mult: int = 4):
+    def __init__(self, dim: int, num_heads: int, dropout: float = 0.0, ffn_mult: int = 4, freeze_token_count: int = 0):
         super().__init__()
         self.norm1 = nn.LayerNorm(dim)
         self.mha = GraphormerMHA(dim, num_heads, dropout=dropout)
@@ -936,13 +936,32 @@ class GraphormerBlock(nn.Module):
         )
         self.drop2 = nn.Dropout(dropout)
 
+        self.freeze_token_count = freeze_token_count
+
     def forward(
         self,
-        x: torch.Tensor,                            # [B, cap, D] or [N, D]
-        dist_bias: Optional[torch.Tensor] = None,   # [B, H, cap, cap] or [H, N, N]
-        edge_bias: Optional[torch.Tensor] = None,   # [B, H, cap, cap] or [H, N, N]
-        node_mask: Optional[torch.Tensor] = None,   # [B, cap] bool
+        x: torch.Tensor,                            # [B, num_tokens, D]
+        dist_bias: Optional[torch.Tensor] = None,   # [B, H, num_tokens, num_tokens]
+        edge_bias: Optional[torch.Tensor] = None,   # [B, H, num_tokens, num_tokens]
+        node_mask: Optional[torch.Tensor] = None,   # [B, num_tokens] bool
     ) -> torch.Tensor:
+
+        if self.freeze_token_count < 0:
+            raise ValueError("freeze_token_count must be non-negative.")
+
+        if self.freeze_token_count > x.size(1):
+            raise ValueError(
+                "freeze_token_count must be <= number of tokens. "
+                f"Got freeze_token_count={self.freeze_token_count}, "
+                f"num_tokens={x.size(1)}."
+            )
+
+        if self.freeze_token_count > 0:
+            frozen_tokens = x[:, :self.freeze_token_count, :].clone()
+            # [B, freeze_token_count, D]
+        else:
+            frozen_tokens = None
+
         h = self.norm1(x)
         h = self.mha(h, node_mask=node_mask, dist_bias=dist_bias, edge_bias=edge_bias)
         x = x + self.drop1(h)
@@ -950,6 +969,10 @@ class GraphormerBlock(nn.Module):
         h = self.norm2(x)
         h = self.ffn(h)
         x = x + self.drop2(h)
+
+        if frozen_tokens is not None:
+            x[:, :self.freeze_token_count, :] = frozen_tokens
+
         return x
 
 
@@ -969,6 +992,7 @@ class GraphormerEncoder(nn.Module):
         add_virtual_node: bool = False,
         undirected_for_spd: bool = True,
         undirected_for_path: bool = True,
+        freeze_vnode: bool = False,
         start_cap: int = 64,
         cap_growth: float = 2.0,
     ):
@@ -977,6 +1001,11 @@ class GraphormerEncoder(nn.Module):
 
         if num_graph_tokens <= 0:
             raise ValueError("num_graph_tokens must be positive")
+
+        if freeze_vnode and not add_virtual_node:
+            raise ValueError(
+                "freeze_vnode=True requires add_virtual_node=True."
+            )
 
         self.dim = dim
         self.num_graph_tokens = int(num_graph_tokens)
@@ -991,6 +1020,12 @@ class GraphormerEncoder(nn.Module):
         self.add_virtual_node = add_virtual_node
         self.undirected_for_spd = undirected_for_spd
         self.undirected_for_path = undirected_for_path
+        self.freeze_vnode = freeze_vnode
+        self.freeze_token_count = (
+            self.num_graph_tokens
+            if self.add_virtual_node and self.freeze_vnode
+            else 0
+        )
 
         self.start_cap = start_cap
         self.cap_growth = cap_growth
@@ -1012,7 +1047,7 @@ class GraphormerEncoder(nn.Module):
         )
 
         self.blocks = nn.ModuleList([
-            GraphormerBlock(dim=dim, num_heads=num_heads, dropout=dropout)
+            GraphormerBlock(dim=dim, num_heads=num_heads, dropout=dropout, freeze_token_count=self.freeze_token_count)
             for _ in range(num_layers)
         ])
 

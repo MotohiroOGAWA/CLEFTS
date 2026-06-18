@@ -12,87 +12,173 @@ from clefts.ml.input.fragment_tree_structure import FragmentTreeStructure
 
 
 class TestFragmentTreeStructure(unittest.TestCase):
-    """Tests for FragmentTreeStructure."""
+    """Tests for FragmentTreeStructure.from_structures."""
 
-    REACTANT_TUPLE_LENGTH_BY_EVENT_TYPE: Dict[Tuple[int, int], int] = {
-        (100, 200): 2,
-        (101, 201): 1,
-    }
-
-    PRODUCT_TUPLE_LENGTH_BY_EVENT_TYPE: Dict[Tuple[int, int, int], int] = {
-        (100, 200, 0): 1,
-        (101, 201, 0): 2,
-    }
-
-    def test_from_structures_combines_basic_counts(self) -> None:
+    def test_from_structures_combines_all_fields_as_expected(self) -> None:
         structure_a = self._make_structure_a()
         structure_b = self._make_structure_b()
 
-        batched = self._batch([structure_a, structure_b])
-
-        self.assertEqual(batched.num_nodes, 4)
-        self.assertEqual(batched.num_edges, 4)
-        self.assertEqual(batched.num_cleavage_events, 4)
-        self.assertEqual(batched.num_samples, 2)
-
-    def test_from_structures_offsets_node_graph_offset(self) -> None:
-        structure_a = self._make_structure_a()
-        structure_b = self._make_structure_b()
-
-        batched = self._batch([structure_a, structure_b])
-
-        expected = torch.tensor(
-            [0, 3, 5, 7, 9],
-            dtype=torch.long,
+        batched = FragmentTreeStructure.from_structures(
+            [structure_a, structure_b]
         )
 
-        self.assertTrue(torch.equal(batched.node_graph_offset, expected))
+        # -------------------------
+        # Basic counts
+        # -------------------------
+        self.assertEqual(batched.num_nodes, 5)
+        self.assertEqual(batched.num_edges, 5)
+        self.assertEqual(batched.num_cleavage_events, 5)
+        self.assertEqual(batched.num_samples, 3)
 
-    def test_from_structures_offsets_edge_index(self) -> None:
-        structure_a = self._make_structure_a()
-        structure_b = self._make_structure_b()
-
-        batched = self._batch([structure_a, structure_b])
-
-        expected = torch.tensor(
-            [
-                [0, 1, 2, 3],
-                [1, 0, 3, 2],
-            ],
-            dtype=torch.long,
+        # -------------------------
+        # node_smiles
+        # -------------------------
+        np.testing.assert_array_equal(
+            batched.node_smiles,
+            np.asarray(
+                [
+                    "A_node_0",
+                    "A_node_1",
+                    "B_node_0",
+                    "B_node_1",
+                    "B_node_2",
+                ],
+                dtype=object,
+            ),
         )
 
-        self.assertTrue(torch.equal(batched.edge_index, expected))
-
-    def test_from_structures_offsets_cleavage_event_edge_index(self) -> None:
-        structure_a = self._make_structure_a()
-        structure_b = self._make_structure_b()
-
-        batched = self._batch([structure_a, structure_b])
-
-        expected = torch.tensor(
-            [0, 1, 2, 3],
-            dtype=torch.long,
+        # -------------------------
+        # node_graph
+        # -------------------------
+        self.assertTensorEqual(
+            batched.node_graph.x,
+            torch.tensor(
+                [
+                    [0.0],
+                    [1.0],
+                    [2.0],
+                    [3.0],
+                    [4.0],
+                    [5.0],
+                    [6.0],
+                    [100.0],
+                    [101.0],
+                    [102.0],
+                    [103.0],
+                    [104.0],
+                    [105.0],
+                    [106.0],
+                    [107.0],
+                ],
+                dtype=torch.float32,
+            ),
         )
 
-        self.assertTrue(
-            torch.equal(
-                batched.cleavage_event_edge_index,
-                expected,
-            )
+        self.assertTensorEqual(
+            batched.node_graph.batch,
+            torch.tensor(
+                [
+                    0,
+                    0,
+                    0,
+                    0,
+                    1,
+                    1,
+                    1,
+                    2,
+                    2,
+                    3,
+                    3,
+                    3,
+                    3,
+                    3,
+                    4,
+                ],
+                dtype=torch.long,
+            ),
         )
 
-    def test_from_structures_merges_cleavage_atom_idxs_uniquely(self) -> None:
-        structure_a = self._make_structure_a()
-        structure_b = self._make_structure_b()
+        self.assertTensorEqual(
+            batched.node_graph.ptr,
+            torch.tensor(
+                [0, 4, 7, 9, 14, 15],
+                dtype=torch.long,
+            ),
+        )
 
-        batched = self._batch([structure_a, structure_b])
+        # -------------------------
+        # node_graph_offset
+        # -------------------------
+        self.assertTensorEqual(
+            batched.node_graph_offset,
+            torch.tensor(
+                [0, 4, 7, 9, 14, 15],
+                dtype=torch.long,
+            ),
+        )
 
+        # -------------------------
+        # edge_index
+        # -------------------------
+        self.assertTensorEqual(
+            batched.edge_index,
+            torch.tensor(
+                [
+                    [0, 1, 0, 2, 3],
+                    [1, 0, 0, 3, 4],
+                ],
+                dtype=torch.long,
+            ),
+        )
+
+        # -------------------------
+        # cleavage_event_edge_index
+        # -------------------------
+        self.assertTensorEqual(
+            batched.cleavage_event_edge_index,
+            torch.tensor(
+                [0, 1, 2, 3, 4],
+                dtype=torch.long,
+            ),
+        )
+
+        # -------------------------
+        # tuple-length tables
+        # -------------------------
+        self.assertTensorEqual(
+            batched.reactant_tuple_length_table,
+            torch.tensor(
+                [
+                    [10, 20, 2],
+                    [11, 21, 1],
+                ],
+                dtype=torch.long,
+            ),
+        )
+
+        self.assertTensorEqual(
+            batched.product_tuple_length_table,
+            torch.tensor(
+                [
+                    [10, 20, 0, 1],
+                    [11, 21, 0, 2],
+                ],
+                dtype=torch.long,
+            ),
+        )
+
+        # -------------------------
+        # cleavage_atom_idxs
+        # -------------------------
+        # Important:
+        # Values are local atom indices.
+        # Therefore, they are NOT shifted by node_graph_offset.
         self.assertEqual(
             self._tensor_rows_to_tuples(batched.cleavage_atom_idxs[1]),
             [
-                (3,),
                 (2,),
+                (0,),
+                (3,),
             ],
         )
 
@@ -100,133 +186,221 @@ class TestFragmentTreeStructure(unittest.TestCase):
             self._tensor_rows_to_tuples(batched.cleavage_atom_idxs[2]),
             [
                 (0, 1),
+                (1, 2),
             ],
         )
 
-    def test_from_structures_restores_cleavage_event_atom_tuples(self) -> None:
-        """cleavage_event row indices should restore correct atom tuples."""
+        # -------------------------
+        # cleavage_event
+        # -------------------------
+        # cleavage_event[:, 3] and cleavage_event[:, 4] should point to
+        # the merged unique cleavage_atom_idxs rows.
+        self.assertTensorEqual(
+            batched.cleavage_event,
+            torch.tensor(
+                [
+                    # structure_a event 0
+                    # reactant: len2 old row 0 -> (0, 1) -> new row 0
+                    # product:  len1 old row 0 -> (2,)   -> new row 0
+                    [10, 20, 0, 0, 0],
 
-        structure_a = self._make_structure_a()
-        structure_b = self._make_structure_b()
+                    # structure_a event 1
+                    # reactant: len1 old row 1 -> (2,)   -> new row 0
+                    # product:  len2 old row 1 -> (1, 2) -> new row 1
+                    [11, 21, 0, 0, 1],
 
-        batched = self._batch([structure_a, structure_b])
+                    # structure_a event 2
+                    # reactant: len2 old row 2 -> (0, 1) -> new row 0
+                    # product:  len1 old row 2 -> (0,)   -> new row 1
+                    [10, 20, 0, 0, 1],
 
+                    # structure_b event 0
+                    # reactant: len2 old row 0 -> (0, 1) -> new row 0
+                    # product:  len1 old row 0 -> (2,)   -> new row 0
+                    [10, 20, 0, 0, 0],
+
+                    # structure_b event 1
+                    # reactant: len1 old row 1 -> (3,)   -> new row 2
+                    # product:  len2 old row 1 -> (1, 2) -> new row 1
+                    [11, 21, 0, 2, 1],
+                ],
+                dtype=torch.long,
+            ),
+        )
+
+        # -------------------------
+        # Restored cleavage event information
+        # -------------------------
         restored = self._restore_cleavage_event_info(batched)
 
-        expected = [
+        expected_restored = [
             (
                 0,
-                (100, 200, 0),
+                (10, 20, 0),
                 (0, 1),
-                (3,),
+                (2,),
             ),
             (
                 1,
-                (101, 201, 0),
-                (3,),
-                (0, 1),
+                (11, 21, 0),
+                (2,),
+                (1, 2),
             ),
             (
                 2,
-                (100, 200, 0),
+                (10, 20, 0),
+                (0, 1),
+                (0,),
+            ),
+            (
+                3,
+                (10, 20, 0),
                 (0, 1),
                 (2,),
             ),
             (
-                3,
-                (101, 201, 0),
-                (2,),
-                (0, 1),
+                4,
+                (11, 21, 0),
+                (3,),
+                (1, 2),
             ),
         ]
 
-        self.assertEqual(restored, expected)
+        self.assertEqual(restored, expected_restored)
 
-    def test_from_structures_concatenates_sample_values(self) -> None:
-        structure_a = self._make_structure_a()
-        structure_b = self._make_structure_b()
-
-        batched = self._batch([structure_a, structure_b])
-
-        self.assertTrue(
-            torch.equal(
-                batched.sample_adduct_type_index,
-                torch.tensor([0, 1], dtype=torch.long),
-            )
+        # -------------------------
+        # sample_adduct_type_index
+        # -------------------------
+        self.assertTensorEqual(
+            batched.sample_adduct_type_index,
+            torch.tensor(
+                [0, 2, 1],
+                dtype=torch.long,
+            ),
         )
 
-        self.assertTrue(
-            torch.equal(
-                batched.sample_ce_value,
-                torch.tensor([10.0, 20.0], dtype=torch.float32),
-            )
+        # -------------------------
+        # sample_ce_value
+        # -------------------------
+        self.assertTensorEqual(
+            batched.sample_ce_value,
+            torch.tensor(
+                [10.0, 20.0, 30.0],
+                dtype=torch.float32,
+            ),
         )
 
-    def test_from_structures_offsets_sample_edge_index(self) -> None:
+        # -------------------------
+        # sample_edge_index
+        # -------------------------
+        self.assertTensorEqual(
+            batched.sample_edge_index,
+            torch.tensor(
+                [
+                    [0, 0, 1, 1, 2, 2],
+                    [0, 2, 1, 2, 3, 4],
+                ],
+                dtype=torch.long,
+            ),
+        )
+
+        # -------------------------
+        # sample_precursor_edge_index_path
+        # -------------------------
+        # structure_a has width 2.
+        # structure_b has width 3.
+        # Therefore, structure_a rows are padded to width 3.
+        self.assertTensorEqual(
+            batched.sample_precursor_edge_index_path,
+            torch.tensor(
+                [
+                    [0, -1, -1],
+                    [2, 1, -1],
+                    [4, 3, -1],
+                ],
+                dtype=torch.long,
+            ),
+        )
+
+        # -------------------------
+        # sample_precursor_path_index
+        # -------------------------
+        self.assertTensorEqual(
+            batched.sample_precursor_path_index,
+            torch.tensor(
+                [0, 1, 2],
+                dtype=torch.long,
+            ),
+        )
+
+        # -------------------------
+        # device
+        # -------------------------
+        self.assertEqual(batched.device, batched.edge_index.device)
+
+    def test_from_structures_single_structure_still_uniques_atom_rows(
+        self) -> None:
+        """Even one structure should have cleavage_atom_idxs uniqued and remapped."""
+
         structure_a = self._make_structure_a()
-        structure_b = self._make_structure_b()
 
-        batched = self._batch([structure_a, structure_b])
+        batched = FragmentTreeStructure.from_structures([structure_a])
 
-        expected = torch.tensor(
+        self.assertEqual(
+            self._tensor_rows_to_tuples(batched.cleavage_atom_idxs[1]),
             [
-                [0, 0, 1, 1],
-                [0, 1, 2, 3],
+                (2,),
+                (0,),
             ],
-            dtype=torch.long,
         )
 
-        self.assertTrue(torch.equal(batched.sample_edge_index, expected))
-
-    def test_from_structures_offsets_sample_precursor_edge_index_path(self) -> None:
-        structure_a = self._make_structure_a()
-        structure_b = self._make_structure_b()
-
-        batched = self._batch([structure_a, structure_b])
-
-        expected = torch.tensor(
+        self.assertEqual(
+            self._tensor_rows_to_tuples(batched.cleavage_atom_idxs[2]),
             [
-                [0, -1],
-                [3, -1],
+                (0, 1),
+                (1, 2),
             ],
-            dtype=torch.long,
         )
 
-        self.assertTrue(
-            torch.equal(
-                batched.sample_precursor_edge_index_path,
-                expected,
-            )
+        self.assertTensorEqual(
+            batched.cleavage_event,
+            torch.tensor(
+                [
+                    [10, 20, 0, 0, 0],
+                    [11, 21, 0, 0, 1],
+                    [10, 20, 0, 0, 1],
+                ],
+                dtype=torch.long,
+            ),
         )
 
-    def test_from_structures_offsets_sample_precursor_path_index(self) -> None:
-        structure_a = self._make_structure_a()
-        structure_b = self._make_structure_b()
+        restored = self._restore_cleavage_event_info(batched)
 
-        batched = self._batch([structure_a, structure_b])
-
-        expected = torch.tensor(
-            [0, 1],
-            dtype=torch.long,
+        self.assertEqual(
+            restored,
+            [
+                (
+                    0,
+                    (10, 20, 0),
+                    (0, 1),
+                    (2,),
+                ),
+                (
+                    1,
+                    (11, 21, 0),
+                    (2,),
+                    (1, 2),
+                ),
+                (
+                    2,
+                    (10, 20, 0),
+                    (0, 1),
+                    (0,),
+                ),
+            ],
         )
 
-        self.assertTrue(
-            torch.equal(
-                batched.sample_precursor_path_index,
-                expected,
-            )
-        )
-
-    def test_from_structures_requires_tuple_length_lookup(self) -> None:
-        structure_a = self._make_structure_a()
-        structure_b = self._make_structure_b()
-
-        with self.assertRaises(ValueError):
-            FragmentTreeStructure.from_structures(
-                [structure_a, structure_b],
-            )
-
-    def test_from_structures_moves_to_device(self) -> None:
+    def test_from_structures_moves_all_tensor_fields_to_device(self) -> None:
         structure_a = self._make_structure_a()
         structure_b = self._make_structure_b()
 
@@ -235,18 +409,20 @@ class TestFragmentTreeStructure(unittest.TestCase):
         batched = FragmentTreeStructure.from_structures(
             [structure_a, structure_b],
             device=device,
-            reactant_tuple_length_by_event_type=(
-                self.REACTANT_TUPLE_LENGTH_BY_EVENT_TYPE
-            ),
-            product_tuple_length_by_event_type=(
-                self.PRODUCT_TUPLE_LENGTH_BY_EVENT_TYPE
-            ),
         )
 
-        self.assertEqual(batched.edge_index.device, device)
-        self.assertEqual(batched.cleavage_event.device, device)
-        self.assertEqual(batched.cleavage_event_edge_index.device, device)
         self.assertEqual(batched.node_graph_offset.device, device)
+        self.assertEqual(batched.edge_index.device, device)
+        self.assertEqual(batched.cleavage_event_edge_index.device, device)
+        self.assertEqual(batched.cleavage_event.device, device)
+        self.assertEqual(batched.reactant_tuple_length_table.device, device)
+        self.assertEqual(batched.product_tuple_length_table.device, device)
+        self.assertEqual(batched.sample_adduct_type_index.device, device)
+        self.assertEqual(batched.sample_ce_value.device, device)
+        self.assertEqual(batched.sample_edge_index.device, device)
+        self.assertEqual(batched.sample_precursor_edge_index_path.device, device)
+        self.assertEqual(batched.sample_precursor_path_index.device, device)
+        self.assertEqual(batched.node_graph.x.device, device)
 
         for atom_idxs in batched.cleavage_atom_idxs.values():
             self.assertEqual(atom_idxs.device, device)
@@ -257,118 +433,125 @@ class TestFragmentTreeStructure(unittest.TestCase):
     def _make_structure_a(self) -> FragmentTreeStructure:
         return self._make_structure(
             node_smiles=[
-                "a_node_0",
-                "a_node_1",
+                "A_node_0",
+                "A_node_1",
             ],
             atom_counts=[
+                4,
                 3,
-                2,
             ],
+            x_start=0,
             edge_index=[
-                [0, 1],
-                [1, 0],
+                [0, 1, 0],
+                [1, 0, 0],
             ],
             cleavage_event_edge_index=[
                 0,
                 1,
+                2,
             ],
             cleavage_event=[
-                # Event type: (100, 200, 0)
-                # reactant tuple length = 2
-                # product tuple length = 1
-                #
-                # reactant row 0 -> cleavage_atom_idxs[2][0] = (0, 1)
-                # product row 0  -> cleavage_atom_idxs[1][0] = (3,)
-                [100, 200, 0, 0, 0],
-
-                # Event type: (101, 201, 0)
-                # reactant tuple length = 1
-                # product tuple length = 2
-                #
-                # reactant row 1 -> cleavage_atom_idxs[1][1] = (3,)
-                # product row 1  -> cleavage_atom_idxs[2][1] = (0, 1)
-                #
-                # These rows intentionally duplicate row 0.
-                # from_structures should unique them and remap row indices.
-                [101, 201, 0, 1, 1],
+                [10, 20, 0, 0, 0],
+                [11, 21, 0, 1, 1],
+                [10, 20, 0, 2, 2],
             ],
             cleavage_atom_idxs={
                 1: [
-                    [3],
-                    [3],
+                    [2],
+                    [2],
+                    [0],
                 ],
                 2: [
                     [0, 1],
+                    [1, 2],
                     [0, 1],
                 ],
             },
+            reactant_tuple_length_table=[
+                [11, 21, 1],
+                [10, 20, 2],
+            ],
+            product_tuple_length_table=[
+                [11, 21, 0, 2],
+                [10, 20, 0, 1],
+            ],
             sample_adduct_type_index=[
                 0,
+                2,
             ],
             sample_ce_value=[
                 10.0,
+                20.0,
             ],
             sample_edge_index=[
-                [0, 0],
-                [0, 1],
+                [0, 0, 1, 1],
+                [0, 2, 1, 2],
             ],
             sample_precursor_edge_index_path=[
                 [0, -1],
+                [2, 1],
             ],
             sample_precursor_path_index=[
                 0,
+                1,
             ],
         )
 
     def _make_structure_b(self) -> FragmentTreeStructure:
         return self._make_structure(
             node_smiles=[
-                "b_node_0",
-                "b_node_1",
+                "B_node_0",
+                "B_node_1",
+                "B_node_2",
             ],
             atom_counts=[
                 2,
-                2,
+                5,
+                1,
             ],
+            x_start=100,
             edge_index=[
                 [0, 1],
-                [1, 0],
+                [1, 2],
             ],
             cleavage_event_edge_index=[
                 0,
                 1,
             ],
             cleavage_event=[
-                # After batching, atom offset is 5.
-                #
-                # reactant row 0 -> (0, 1) + 5 = (5, 6)
-                # product row 0  -> (2,) + 5 = (7,)
-                [100, 200, 0, 0, 0],
-
-                # reactant row 0 -> (2,) + 5 = (7,)
-                # product row 0  -> (0, 1) + 5 = (5, 6)
-                [101, 201, 0, 0, 0],
+                [10, 20, 0, 0, 0],
+                [11, 21, 0, 1, 1],
             ],
             cleavage_atom_idxs={
                 1: [
                     [2],
+                    [3],
                 ],
                 2: [
                     [0, 1],
+                    [1, 2],
                 ],
             },
+            reactant_tuple_length_table=[
+                [10, 20, 2],
+                [11, 21, 1],
+            ],
+            product_tuple_length_table=[
+                [10, 20, 0, 1],
+                [11, 21, 0, 2],
+            ],
             sample_adduct_type_index=[
                 1,
             ],
             sample_ce_value=[
-                20.0,
+                30.0,
             ],
             sample_edge_index=[
                 [0, 0],
                 [0, 1],
             ],
             sample_precursor_edge_index_path=[
-                [1, -1],
+                [1, 0, -1],
             ],
             sample_precursor_path_index=[
                 0,
@@ -380,10 +563,13 @@ class TestFragmentTreeStructure(unittest.TestCase):
         *,
         node_smiles: List[str],
         atom_counts: List[int],
+        x_start: int,
         edge_index: List[List[int]],
         cleavage_event_edge_index: List[int],
         cleavage_event: List[List[int]],
         cleavage_atom_idxs: Dict[int, List[List[int]]],
+        reactant_tuple_length_table: List[List[int]],
+        product_tuple_length_table: List[List[int]],
         sample_adduct_type_index: List[int],
         sample_ce_value: List[float],
         sample_edge_index: List[List[int]],
@@ -395,7 +581,10 @@ class TestFragmentTreeStructure(unittest.TestCase):
                 node_smiles,
                 dtype=object,
             ),
-            node_graph=self._make_node_graph_batch(atom_counts),
+            node_graph=self._make_node_graph_batch(
+                atom_counts=atom_counts,
+                x_start=x_start,
+            ),
             node_graph_offset=self._make_node_graph_offset(atom_counts),
             edge_index=torch.tensor(
                 edge_index,
@@ -421,6 +610,24 @@ class TestFragmentTreeStructure(unittest.TestCase):
                 )
                 for tuple_length, rows in cleavage_atom_idxs.items()
             },
+            reactant_tuple_length_table=torch.tensor(
+                reactant_tuple_length_table,
+                dtype=torch.long,
+            )
+            if len(reactant_tuple_length_table) > 0
+            else torch.empty(
+                (0, 3),
+                dtype=torch.long,
+            ),
+            product_tuple_length_table=torch.tensor(
+                product_tuple_length_table,
+                dtype=torch.long,
+            )
+            if len(product_tuple_length_table) > 0
+            else torch.empty(
+                (0, 4),
+                dtype=torch.long,
+            ),
             sample_adduct_type_index=torch.tensor(
                 sample_adduct_type_index,
                 dtype=torch.long,
@@ -461,65 +668,35 @@ class TestFragmentTreeStructure(unittest.TestCase):
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
-    def _batch(
-        self,
-        structures: List[FragmentTreeStructure],
-    ) -> FragmentTreeStructure:
-        return FragmentTreeStructure.from_structures(
-            structures,
-            reactant_tuple_length_by_event_type=(
-                self.REACTANT_TUPLE_LENGTH_BY_EVENT_TYPE
-            ),
-            product_tuple_length_by_event_type=(
-                self.PRODUCT_TUPLE_LENGTH_BY_EVENT_TYPE
-            ),
-        )
-
-    @staticmethod
-    def _make_node_graph_batch(atom_counts: List[int]) -> Batch:
-        data_list: List[Data] = []
-
-        value_offset = 0
-
-        for num_atoms in atom_counts:
-            x = torch.arange(
-                value_offset,
-                value_offset + num_atoms,
-                dtype=torch.float32,
-            ).view(num_atoms, 1)
-
-            data_list.append(Data(x=x))
-            value_offset += num_atoms
-
-        return Batch.from_data_list(data_list)
-
-    @staticmethod
-    def _make_node_graph_offset(atom_counts: List[int]) -> Tensor:
-        offsets = [0]
-        total = 0
-
-        for num_atoms in atom_counts:
-            total += int(num_atoms)
-            offsets.append(total)
-
-        return torch.tensor(
-            offsets,
-            dtype=torch.long,
-        )
-
     def _restore_cleavage_event_info(
         self,
         structure: FragmentTreeStructure,
     ) -> List[Tuple[int, Tuple[int, int, int], Tuple[int, ...], Tuple[int, ...]]]:
-        restored = []
+        restored: List[
+            Tuple[int, Tuple[int, int, int], Tuple[int, ...], Tuple[int, ...]]
+        ] = []
+
+        reactant_tuple_length_by_key = self._table_to_lookup(
+            structure.reactant_tuple_length_table,
+            key_width=2,
+        )
+
+        product_tuple_length_by_key = self._table_to_lookup(
+            structure.product_tuple_length_table,
+            key_width=3,
+        )
 
         for event_index in range(structure.num_cleavage_events):
             event_edge_index = int(
                 structure.cleavage_event_edge_index[event_index].item()
             )
 
-            cleavage_id = int(structure.cleavage_event[event_index, 0].item())
-            reaction_id = int(structure.cleavage_event[event_index, 1].item())
+            cleavage_id = int(
+                structure.cleavage_event[event_index, 0].item()
+            )
+            reaction_id = int(
+                structure.cleavage_event[event_index, 1].item()
+            )
             product_molecule_id = int(
                 structure.cleavage_event[event_index, 2].item()
             )
@@ -531,14 +708,14 @@ class TestFragmentTreeStructure(unittest.TestCase):
                 structure.cleavage_event[event_index, 4].item()
             )
 
-            reactant_tuple_length = self.REACTANT_TUPLE_LENGTH_BY_EVENT_TYPE[
+            reactant_tuple_length = reactant_tuple_length_by_key[
                 (
                     cleavage_id,
                     reaction_id,
                 )
             ]
 
-            product_tuple_length = self.PRODUCT_TUPLE_LENGTH_BY_EVENT_TYPE[
+            product_tuple_length = product_tuple_length_by_key[
                 (
                     cleavage_id,
                     reaction_id,
@@ -576,11 +753,81 @@ class TestFragmentTreeStructure(unittest.TestCase):
         return restored
 
     @staticmethod
+    def _table_to_lookup(
+        table: Tensor,
+        *,
+        key_width: int,
+    ) -> Dict[Tuple[int, ...], int]:
+        lookup: Dict[Tuple[int, ...], int] = {}
+
+        for row in table.tolist():
+            row_tuple = tuple(int(value) for value in row)
+            key = row_tuple[:key_width]
+            tuple_length = row_tuple[-1]
+            lookup[key] = int(tuple_length)
+
+        return lookup
+
+    @staticmethod
+    def _make_node_graph_batch(
+        *,
+        atom_counts: List[int],
+        x_start: int,
+    ) -> Batch:
+        data_list: List[Data] = []
+
+        value = int(x_start)
+
+        for atom_count in atom_counts:
+            x = torch.arange(
+                value,
+                value + int(atom_count),
+                dtype=torch.float32,
+            ).view(int(atom_count), 1)
+
+            data_list.append(Data(x=x))
+            value += int(atom_count)
+
+        return Batch.from_data_list(data_list)
+
+    @staticmethod
+    def _make_node_graph_offset(atom_counts: List[int]) -> Tensor:
+        offsets = [0]
+        total = 0
+
+        for atom_count in atom_counts:
+            total += int(atom_count)
+            offsets.append(total)
+
+        return torch.tensor(
+            offsets,
+            dtype=torch.long,
+        )
+
+    @staticmethod
     def _tensor_rows_to_tuples(tensor: Tensor) -> List[Tuple[int, ...]]:
         return [
             tuple(int(value) for value in row.tolist())
             for row in tensor
         ]
+
+    def assertTensorEqual(
+        self,
+        actual: Tensor,
+        expected: Tensor,
+    ) -> None:
+        self.assertTrue(
+            torch.equal(
+                actual.cpu(),
+                expected.cpu(),
+            ),
+            msg=(
+                "\nActual:\n"
+                f"{actual}\n"
+                "Expected:\n"
+                f"{expected}"
+            ),
+        )
 
 
 if __name__ == "__main__":
