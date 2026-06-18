@@ -4,6 +4,7 @@ from torch_geometric.data import Data, Batch
 from dataclasses import dataclass
 from typing import Tuple, Dict, List, Union, Optional
 from bidict import bidict
+import numpy as np
 
 from ...libs.mmkit.mmkit import Adduct
 from ...domain.fragment import Fragmenter
@@ -22,24 +23,20 @@ from torch_geometric.data import Batch
 
 
 @dataclass
-class AdductConditionalNodeChoiceProbabilities:
-    """Node choice probabilities whose candidates depend on main adduct type."""
+class FlatAdductNodeChoiceProbabilities:
+    """Flat node choice probabilities with adduct-dependent valid candidates."""
 
-    logit_by_adduct: Dict[Adduct, Tensor]
-    # key: main adduct type
-    # value: [N_adduct, C_adduct]
+    logit: Tensor
+    # [N_tree, C_flat]
+    # Invalid columns are filled with -inf.
 
-    prob_by_adduct: Dict[Adduct, Tensor]
-    # key: main adduct type
-    # value: [N_adduct, C_adduct]
+    prob: Tensor
+    # [N_tree, C_flat]
+    # Invalid columns are 0.
 
-    node_index_by_adduct: Dict[Adduct, Tensor]
-    # key: main adduct type
-    # value: [N_adduct]
-
-    candidates_by_adduct: Dict[Adduct, Tuple[Adduct, ...]]
-    # key: main adduct type
-    # value: candidate adducts
+    valid_mask: Tensor
+    # [N_tree, C_flat]
+    # True if the column is valid for the node's main adduct type.
 
 
 @dataclass
@@ -61,11 +58,14 @@ class FragmentGenerationProbabilities:
     p_stop: Tensor
     # [N_tree]
 
-    ion: AdductConditionalNodeChoiceProbabilities
+    ion: FlatAdductNodeChoiceProbabilities
+    # ion.prob: [N_tree, C_ion_flat]
 
-    unsaturation: AdductConditionalNodeChoiceProbabilities
+    unsaturation: FlatAdductNodeChoiceProbabilities
+    # unsaturation.prob: [N_tree, C_unsaturation_flat]
 
-    radical: AdductConditionalNodeChoiceProbabilities
+    radical: FlatAdductNodeChoiceProbabilities
+    # radical.prob: [N_tree, C_radical_flat]
 
 
 @dataclass
@@ -186,15 +186,49 @@ class FragmentTreeProbabilityModel(nn.Module):
             ),
         )
 
+        self.main_adduct_types = bidict(
+            {
+                idx: adduct
+                for idx, adduct in enumerate(self._fragmenter.adduct_types)
+            }
+        )
 
-        self.main_adduct_types = bidict({idx: adduct for idx, adduct in enumerate(self._fragmenter.adduct_types)})
-        self.ion_candidates_by_adduct: Dict[Adduct, Tuple[Adduct, ...]] = {adduct: self._fragmenter.get_ion_shift_adducts_by_adduct_type(adduct) for adduct in self._fragmenter.adduct_types}
-        self.unsaturation_candidates_by_adduct: Dict[Adduct, Tuple[Adduct, ...]] = {adduct: self._fragmenter.get_unsaturation_adduct_candidates_by_adduct_type(adduct) for adduct in self._fragmenter.adduct_types}
-        self.radical_candidates_by_adduct: Dict[Adduct, Tuple[Adduct, ...]] = {adduct: self._fragmenter.get_radical_adduct_candidates_by_adduct_type(adduct) for adduct in self._fragmenter.adduct_types}
+        self.ion_candidates_by_adduct: Dict[Adduct, np.ndarray] = {
+            adduct: np.asarray(
+                self._fragmenter.get_ion_shift_adducts_by_adduct_type(adduct),
+                dtype=object,
+            )
+            for adduct in self._fragmenter.adduct_types
+        }
+
+        self.unsaturation_candidates_by_adduct: Dict[Adduct, np.ndarray] = {
+            adduct: np.asarray(
+                self._fragmenter.get_unsaturation_adduct_candidates_by_adduct_type(
+                    adduct
+                ),
+                dtype=object,
+            )
+            for adduct in self._fragmenter.adduct_types
+        }
+
+        self.radical_candidates_by_adduct: Dict[Adduct, np.ndarray] = {
+            adduct: np.asarray(
+                self._fragmenter.get_radical_adduct_candidates_by_adduct_type(
+                    adduct
+                ),
+                dtype=object,
+            )
+            for adduct in self._fragmenter.adduct_types
+        }
+
+        self.ion_flat_candidates, self.ion_candidate_slice_by_adduct = self._build_flat_adduct_candidate_table(self.ion_candidates_by_adduct)
+        self.unsaturation_flat_candidates, self.unsaturation_candidate_slice_by_adduct = self._build_flat_adduct_candidate_table(self.unsaturation_candidates_by_adduct)
+        self.radical_flat_candidates, self.radical_candidate_slice_by_adduct = self._build_flat_adduct_candidate_table(self.radical_candidates_by_adduct)
 
         self.node_ion_heads_by_adduct_str = nn.ModuleDict()
         self.node_unsaturation_heads_by_adduct_str = nn.ModuleDict()
         self.node_radical_heads_by_adduct_str = nn.ModuleDict()
+
         for adduct_type in self._fragmenter.adduct_types:
             adduct_key = str(adduct_type)
 
@@ -291,6 +325,77 @@ class FragmentTreeProbabilityModel(nn.Module):
             sample_tree_batch=sample_tree_batch,
             probabilities=probabilities,
         )
+
+    def _build_flat_adduct_candidate_table(
+        self,
+        candidates_by_adduct: Dict[Adduct, np.ndarray],
+    ) -> Tuple[np.ndarray, Dict[Adduct, slice]]:
+        """
+        Build a flat candidate table.
+
+        Returns
+        -------
+        flat_candidates:
+            np.ndarray with shape [C_flat, 2]
+
+            flat_candidates[:, 0]:
+                main adduct types
+
+            flat_candidates[:, 1]:
+                candidate adducts
+
+        candidate_slice_by_adduct:
+            Dict[Adduct, slice]
+            Column slice in flat_candidates for each main adduct type.
+        """
+
+        rows: List[Tuple[Adduct, Adduct]] = []
+        candidate_slice_by_adduct: Dict[Adduct, slice] = {}
+
+        cursor = 0
+
+        for _, main_adduct_type in self.main_adduct_types.items():
+            candidates = candidates_by_adduct[main_adduct_type]
+
+            if candidates.ndim != 1:
+                raise ValueError(
+                    "Each candidates_by_adduct value must be 1D np.ndarray. "
+                    f"Got shape {candidates.shape} for {main_adduct_type}."
+                )
+
+            if len(candidates) == 0:
+                raise ValueError(
+                    f"No candidates found for adduct type: {main_adduct_type}"
+                )
+
+            start = cursor
+
+            for candidate_adduct in candidates:
+                rows.append(
+                    (
+                        main_adduct_type,
+                        candidate_adduct,
+                    )
+                )
+                cursor += 1
+
+            end = cursor
+            candidate_slice_by_adduct[main_adduct_type] = slice(start, end)
+
+        flat_candidates = np.asarray(
+            rows,
+            dtype=object,
+        )
+
+        if flat_candidates.size == 0:
+            flat_candidates = np.empty(
+                (0, 2),
+                dtype=object,
+            )
+        else:
+            flat_candidates = flat_candidates.reshape(-1, 2)
+
+        return flat_candidates, candidate_slice_by_adduct
 
     def _build_fragment_tree_features(
         self,
@@ -1434,25 +1539,28 @@ class FragmentTreeProbabilityModel(nn.Module):
         )[node_sample_ids]
         # [N_tree]
 
-        ion = self._compute_adduct_conditional_node_choice_probabilities(
+        ion = self._compute_flat_adduct_node_choice_probabilities(
             node_emb=node_emb,
             node_main_adduct_type_index=node_main_adduct_type_index,
             head_by_adduct_str=self.node_ion_heads_by_adduct_str,
-            candidates_by_adduct=self.ion_candidates_by_adduct,
+            flat_candidates=self.ion_flat_candidates,
+            candidate_slice_by_adduct=self.ion_candidate_slice_by_adduct,
         )
 
-        unsaturation = self._compute_adduct_conditional_node_choice_probabilities(
+        unsaturation = self._compute_flat_adduct_node_choice_probabilities(
             node_emb=node_emb,
             node_main_adduct_type_index=node_main_adduct_type_index,
             head_by_adduct_str=self.node_unsaturation_heads_by_adduct_str,
-            candidates_by_adduct=self.unsaturation_candidates_by_adduct,
+            flat_candidates=self.unsaturation_flat_candidates,
+            candidate_slice_by_adduct=self.unsaturation_candidate_slice_by_adduct,
         )
 
-        radical = self._compute_adduct_conditional_node_choice_probabilities(
+        radical = self._compute_flat_adduct_node_choice_probabilities(
             node_emb=node_emb,
             node_main_adduct_type_index=node_main_adduct_type_index,
             head_by_adduct_str=self.node_radical_heads_by_adduct_str,
-            candidates_by_adduct=self.radical_candidates_by_adduct,
+            flat_candidates=self.radical_flat_candidates,
+            candidate_slice_by_adduct=self.radical_candidate_slice_by_adduct,
         )
 
         return FragmentGenerationProbabilities(
@@ -1466,16 +1574,21 @@ class FragmentTreeProbabilityModel(nn.Module):
             radical=radical,
         )
 
-    def _compute_adduct_conditional_node_choice_probabilities(
+    def _compute_flat_adduct_node_choice_probabilities(
         self,
         *,
         node_emb: Tensor,
         node_main_adduct_type_index: Tensor,
         head_by_adduct_str: nn.ModuleDict,
-        candidates_by_adduct: Dict[Adduct, Tuple[Adduct, ...]],
-    ) -> AdductConditionalNodeChoiceProbabilities:
+        flat_candidates: np.ndarray,
+        candidate_slice_by_adduct: Dict[Adduct, slice],
+    ) -> FlatAdductNodeChoiceProbabilities:
         """
-        Compute node-wise choice probabilities using adduct-specific heads.
+        Compute flat node-wise choice probabilities.
+
+        Invalid columns are assigned:
+            logit = -inf
+            prob = 0
 
         Parameters
         ----------
@@ -1484,32 +1597,61 @@ class FragmentTreeProbabilityModel(nn.Module):
 
         node_main_adduct_type_index:
             [N_tree]
-            Main adduct type index for each tree node.
 
         head_by_adduct_str:
-            ModuleDict whose keys are generated by _adduct_to_head_key().
+            ModuleDict for adduct-specific heads.
 
-        candidates_by_adduct:
-            Candidate table keyed by main Adduct.
+        flat_candidates:
+            np.ndarray with shape [C_flat, 2]
+
+            flat_candidates[:, 0]:
+                main adduct type
+
+            flat_candidates[:, 1]:
+                candidate adduct
+
+        candidate_slice_by_adduct:
+            Dict from main adduct type to flat column slice.
 
         Returns
         -------
-        AdductConditionalNodeChoiceProbabilities
+        FlatAdductNodeChoiceProbabilities
         """
 
-        logit_by_adduct: Dict[Adduct, Tensor] = {}
-        prob_by_adduct: Dict[Adduct, Tensor] = {}
-        node_index_by_adduct: Dict[Adduct, Tensor] = {}
+        device = node_emb.device
+        dtype = node_emb.dtype
 
-        for adduct_index, adduct_type in self.main_adduct_types.items():
-            adduct_key = str(adduct_type)
+        num_nodes = int(node_emb.size(0))
+        num_choices = int(flat_candidates.shape[0])
+
+        flat_logit = torch.full(
+            (num_nodes, num_choices),
+            -float("inf"),
+            dtype=dtype,
+            device=device,
+        )
+
+        flat_prob = torch.zeros(
+            (num_nodes, num_choices),
+            dtype=dtype,
+            device=device,
+        )
+
+        valid_mask = torch.zeros(
+            (num_nodes, num_choices),
+            dtype=torch.bool,
+            device=device,
+        )
+
+        for adduct_index, main_adduct_type in self.main_adduct_types.items():
+            adduct_key = str(main_adduct_type)
 
             if adduct_key not in head_by_adduct_str:
                 continue
 
-            node_mask = node_main_adduct_type_index == adduct_index
-
-            node_index = node_mask.nonzero(
+            node_index = (
+                node_main_adduct_type_index == adduct_index
+            ).nonzero(
                 as_tuple=False,
             ).view(-1)
             # [N_adduct]
@@ -1517,29 +1659,62 @@ class FragmentTreeProbabilityModel(nn.Module):
             if node_index.numel() == 0:
                 continue
 
+            if main_adduct_type not in candidate_slice_by_adduct:
+                raise KeyError(
+                    f"No candidate slice found for adduct type: {main_adduct_type}"
+                )
+
+            candidate_slice = candidate_slice_by_adduct[main_adduct_type]
+
+            candidate_index = torch.arange(
+                candidate_slice.start,
+                candidate_slice.stop,
+                dtype=torch.long,
+                device=device,
+            )
+            # [C_adduct]
+
             node_emb_for_adduct = node_emb[node_index]
             # [N_adduct, tree_dim]
 
-            logit = head_by_adduct_str[adduct_key](
+            local_logit = head_by_adduct_str[adduct_key](
                 node_emb_for_adduct
             )
             # [N_adduct, C_adduct]
 
-            prob = torch.softmax(
-                logit,
+            if local_logit.size(1) != candidate_index.numel():
+                raise ValueError(
+                    "Head output size and candidate slice size mismatch. "
+                    f"adduct_type={main_adduct_type}, "
+                    f"local_logit.size(1)={local_logit.size(1)}, "
+                    f"candidate_count={candidate_index.numel()}."
+                )
+
+            local_prob = torch.softmax(
+                local_logit,
                 dim=-1,
             )
             # [N_adduct, C_adduct]
 
-            logit_by_adduct[adduct_type] = logit
-            prob_by_adduct[adduct_type] = prob
-            node_index_by_adduct[adduct_type] = node_index
+            flat_logit[
+                node_index[:, None],
+                candidate_index[None, :],
+            ] = local_logit
 
-        return AdductConditionalNodeChoiceProbabilities(
-            logit_by_adduct=logit_by_adduct,
-            prob_by_adduct=prob_by_adduct,
-            node_index_by_adduct=node_index_by_adduct,
-            candidates_by_adduct=candidates_by_adduct,
+            flat_prob[
+                node_index[:, None],
+                candidate_index[None, :],
+            ] = local_prob
+
+            valid_mask[
+                node_index[:, None],
+                candidate_index[None, :],
+            ] = True
+
+        return FlatAdductNodeChoiceProbabilities(
+            logit=flat_logit,
+            prob=flat_prob,
+            valid_mask=valid_mask,
         )
 
     @staticmethod
