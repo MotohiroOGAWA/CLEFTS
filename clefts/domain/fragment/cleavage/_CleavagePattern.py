@@ -106,6 +106,30 @@ class _CleavagePattern:
             raise TypeError(
                 f"{cls.__name__} must override copy()."
             )
+    
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "reactant_smarts": self.reactant_smarts,
+            "products": [
+                reaction.source_rule.to_dict()
+                for reaction in self.cleavage_reactions
+            ],
+        }
+
+    @classmethod
+    def from_dict(
+        cls,
+        data: dict[str, Any],
+    ) -> _CleavagePattern:
+        return cls.from_rules(
+            name=data["name"],
+            reactant_smarts=data["reactant_smarts"],
+            products=tuple(
+                ProductRule.from_dict(product_data)
+                for product_data in data["products"]
+            )
+        )
         
     @classmethod
     def from_rules(

@@ -43,6 +43,22 @@ class FlatAdductNodeChoiceProbabilities:
 class FragmentGenerationProbabilities:
     """Probabilities used for fragment-tree generation."""
 
+    precursor_logit: Tensor
+    # [P]
+
+    p_precursor: Tensor
+    # [P]
+    # Sum is 1 within each sample graph.
+
+    precursor_expand_logit: Tensor
+    # [P]
+
+    p_precursor_expand: Tensor
+    # [P]
+
+    p_precursor_stop: Tensor
+    # [P]
+
     edge_logit: Tensor
     # [E_tree]
 
@@ -88,6 +104,55 @@ class FragmentTreeProbabilityOutput:
     #   [G]
 
     probabilities: FragmentGenerationProbabilities
+
+@dataclass
+class BestFlatAdductCombination:
+    """Best ion / unsaturation / radical combination for each node."""
+
+    ion_index: Tensor
+    # [N_tree]
+
+    unsaturation_index: Tensor
+    # [N_tree]
+
+    radical_index: Tensor
+    # [N_tree]
+
+    probability: Tensor
+    # [N_tree]
+    # max over ion * unsaturation * radical
+
+
+@dataclass
+class NodeGenerationFlowProbabilities:
+    """Graph-wise node generation flow probabilities."""
+
+    p_precursor_init: Tensor
+    # [N_tree]
+    # Initial probability mass at precursor candidate nodes.
+    # Sum is 1 within each sample graph.
+
+    p_reach: Tensor
+    # [N_tree]
+    # Total probability of reaching each node.
+
+    p_emit: Tensor
+    # [N_tree]
+    # p_reach * p_stop
+
+    p_emit_best_adduct: Tensor
+    # [N_tree]
+    # p_reach * p_stop * best_adduct_probability
+
+    p_expand_node: Tensor
+    # [N_tree]
+    # p_reach * p_expand
+
+    p_expand_edge: Tensor
+    # [E_tree]
+    # p_reach[src] * p_expand[src] * p_edge
+
+    best_adduct: BestFlatAdductCombination
 
 class FragmentTreeProbabilityModel(nn.Module):
     def __init__(self,
@@ -159,6 +224,20 @@ class FragmentTreeProbabilityModel(nn.Module):
         # -------------------------
         tree_dim = self.tree_encoder.dim
         edge_dim = self.cleavage_edge_fnet.feature_dim
+
+        self.precursor_select_head = nn.Sequential(
+            nn.Linear(tree_dim, tree_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(tree_dim, 1),
+        )
+
+        self.precursor_expand_head = nn.Sequential(
+            nn.Linear(tree_dim, tree_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(tree_dim, 1),
+        )
 
         self.edge_select_head = nn.Sequential(
             nn.Linear(
@@ -471,78 +550,6 @@ class FragmentTreeProbabilityModel(nn.Module):
             raise ValueError(f"MolEncoder output has x.size(0)={mol_graph.x.size(0)}, but FragmentTreeStructure's node_graph have num_nodes={structure.node_graph.num_nodes}. These must match.")
         if mol_graph.edge_index.size(1) != structure.node_graph.num_edges:
             raise ValueError(f"MolEncoder output has edge_index.size(1)={mol_graph.edge_index.size(1)}, but FragmentTreeStructure's node_graph have num_edges={structure.node_graph.num_edges}. These must match.")
-
-    def _compute_fragment_generation_probabilities(
-        self,
-        *,
-        sample_tree_batch: Batch,
-    ) -> FragmentGenerationProbabilities:
-        """
-        Compute fragment generation probabilities from encoded sample tree batch.
-        """
-
-        tree_node_emb = sample_tree_batch.x
-        # [N_tree, tree_dim]
-
-        edge_src, edge_dst = sample_tree_batch.edge_index
-        # [E_tree], [E_tree]
-
-        edge_input = torch.cat(
-            [
-                tree_node_emb[edge_src],
-                tree_node_emb[edge_dst],
-                sample_tree_batch.edge_attr,
-            ],
-            dim=-1,
-        )
-        # [E_tree, tree_dim * 2 + edge_dim]
-
-        edge_logit = self.edge_select_head(edge_input).squeeze(-1)
-        # [E_tree]
-
-        p_edge = _softmax_by_group(
-            logits=edge_logit,
-            group=edge_src,
-            num_groups=int(tree_node_emb.size(0)),
-        )
-        # [E_tree]
-
-        expand_logit = self.node_expand_head(tree_node_emb).squeeze(-1)
-        # [N_tree]
-
-        p_expand = torch.sigmoid(expand_logit)
-        # [N_tree]
-
-        p_stop = 1.0 - p_expand
-        # [N_tree]
-
-        ion_logit = self.node_ion_head(tree_node_emb)
-        # [N_tree, num_ion_types]
-
-        neutral_logit = self.node_neutral_head(tree_node_emb)
-        # [N_tree, num_neutral_types]
-
-        p_ion = torch.softmax(
-            ion_logit,
-            dim=-1,
-        )
-
-        p_neutral = torch.softmax(
-            neutral_logit,
-            dim=-1,
-        )
-
-        return FragmentGenerationProbabilities(
-            edge_logit=edge_logit,
-            p_edge=p_edge,
-            expand_logit=expand_logit,
-            p_expand=p_expand,
-            p_stop=p_stop,
-            ion_logit=ion_logit,
-            neutral_logit=neutral_logit,
-            p_ion=p_ion,
-            p_neutral=p_neutral,
-        )
 
     def _build_sample_tree_pyg_batch(
         self,
@@ -1028,6 +1035,9 @@ class FragmentTreeProbabilityModel(nn.Module):
             # -------------------------
             # 9) Build sample Data
             # -------------------------
+            sample_main_adduct_type_index = structure.sample_adduct_type_index.to(device).long()[sample_id]
+            sample_node_main_adduct_type_index = torch.full((num_sample_nodes,), int(sample_main_adduct_type_index.item()), dtype=torch.long, device=device)
+
             sample_data = Data(
                 x=sample_node_features,
                 edge_index=sample_edge_index_local,
@@ -1036,11 +1046,8 @@ class FragmentTreeProbabilityModel(nn.Module):
 
             sample_data.node_id_global = global_node_ids
             sample_data.edge_id_global = global_edge_ids
-            sample_data.sample_id = torch.tensor(
-                sample_id,
-                dtype=torch.long,
-                device=device,
-            )
+            sample_data.node_main_adduct_type_index = sample_node_main_adduct_type_index
+            sample_data.sample_id = torch.tensor(sample_id, dtype=torch.long, device=device)
 
             sample_data_list.append(sample_data)
             kept_sample_ids.append(sample_id)
@@ -1081,6 +1088,12 @@ class FragmentTreeProbabilityModel(nn.Module):
                 local_precursor_sequence_parts,
                 dim=0,
             )
+            precursor_pathway_seq[precursor_pathway_seq < 0] = 0
+            if torch.any(precursor_pathway_seq[:, 0] != 0):
+                raise ValueError(
+                    "All precursor pathway sequences have invalid node ids. "
+                    "This indicates a bug in the local sequence conversion."
+                )
 
             precursor_pathway_ptr = torch.tensor(
                 precursor_sequence_ptr,
@@ -1107,6 +1120,45 @@ class FragmentTreeProbabilityModel(nn.Module):
         sample_tree_batch.kept_sample_ids = kept_sample_ids_tensor
 
         return sample_tree_batch, condition_tree_repr, kept_sample_ids_tensor
+
+    @staticmethod
+    def _get_last_valid_nodes_from_node_edge_sequences(
+        node_edge_sequences: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Get the last valid node id from each node-edge-node sequence.
+
+        Parameters
+        ----------
+        node_edge_sequences:
+            [P, L]
+            Node-edge-node sequences.
+            Node ids are placed at columns 0, 2, 4, ...
+
+        Returns
+        -------
+        Tensor
+            [P]
+            Last valid node id for each sequence.
+        """
+
+        if node_edge_sequences.numel() == 0:
+            return torch.empty((0,), dtype=torch.long, device=node_edge_sequences.device)
+
+        node_columns = node_edge_sequences[:, 0::2]
+        # [P, num_node_positions]
+
+        last_nodes: List[int] = []
+
+        for row in node_columns:
+            valid_nodes = row[row >= 0]
+
+            if valid_nodes.numel() == 0:
+                raise ValueError("Each precursor pathway must contain at least one valid node.")
+
+            last_nodes.append(int(valid_nodes[-1].item()))
+
+        return torch.tensor(last_nodes, dtype=torch.long, device=node_edge_sequences.device)
 
     @staticmethod
     def _get_precursor_root_node_ids_from_edge_paths(
@@ -1474,35 +1526,34 @@ class FragmentTreeProbabilityModel(nn.Module):
     def _compute_fragment_generation_probabilities(
         self,
         *,
-        ft_features: "FragmentTreeFeatures",
+        ft_features: FragmentTreeFeatures,
         sample_tree_batch: Batch,
     ) -> FragmentGenerationProbabilities:
         """
         Compute fragment generation probabilities from encoded sample tree batch.
         """
 
-        structure = ft_features.structure
-
-        node_emb = sample_tree_batch.x
+        tree_node_emb = sample_tree_batch.x
         # [N_tree, tree_dim]
 
-        if node_emb is None:
-            raise ValueError(
-                "sample_tree_batch.x must contain encoded tree node embeddings."
-            )
-
-        if sample_tree_batch.edge_attr is None:
-            raise ValueError(
-                "sample_tree_batch.edge_attr must not be None."
-            )
+        (
+            precursor_logit,
+            p_precursor,
+            precursor_expand_logit,
+            p_precursor_expand,
+            p_precursor_stop,
+        ) = self._compute_precursor_probabilities(
+            sample_tree_batch=sample_tree_batch,
+            tree_node_emb=tree_node_emb,
+        )
 
         edge_src, edge_dst = sample_tree_batch.edge_index
         # [E_tree], [E_tree]
 
         edge_input = torch.cat(
             [
-                node_emb[edge_src],
-                node_emb[edge_dst],
+                tree_node_emb[edge_src],
+                tree_node_emb[edge_dst],
                 sample_tree_batch.edge_attr,
             ],
             dim=-1,
@@ -1515,11 +1566,11 @@ class FragmentTreeProbabilityModel(nn.Module):
         p_edge = _softmax_by_group(
             logits=edge_logit,
             group=edge_src,
-            num_groups=int(node_emb.size(0)),
+            num_groups=int(tree_node_emb.size(0)),
         )
         # [E_tree]
 
-        expand_logit = self.node_expand_head(node_emb).squeeze(-1)
+        expand_logit = self.node_expand_head(tree_node_emb).squeeze(-1)
         # [N_tree]
 
         p_expand = torch.sigmoid(expand_logit)
@@ -1528,6 +1579,32 @@ class FragmentTreeProbabilityModel(nn.Module):
         p_stop = 1.0 - p_expand
         # [N_tree]
 
+        ion = self._compute_flat_adduct_node_choice_probabilities(
+            node_emb=tree_node_emb,
+            node_main_adduct_type_index=sample_tree_batch.node_main_adduct_type_index,
+            head_by_adduct_str=self.node_ion_heads_by_adduct_str,
+            flat_candidates=self.ion_flat_candidates,
+            candidate_slice_by_adduct=self.ion_candidate_slice_by_adduct,
+        )
+
+        unsaturation = self._compute_flat_adduct_node_choice_probabilities(
+            node_emb=tree_node_emb,
+            node_main_adduct_type_index=sample_tree_batch.node_main_adduct_type_index,
+            head_by_adduct_str=self.node_unsaturation_heads_by_adduct_str,
+            flat_candidates=self.unsaturation_flat_candidates,
+            candidate_slice_by_adduct=self.unsaturation_candidate_slice_by_adduct,
+        )
+
+        radical = self._compute_flat_adduct_node_choice_probabilities(
+            node_emb=tree_node_emb,
+            node_main_adduct_type_index=sample_tree_batch.node_main_adduct_type_index,
+            head_by_adduct_str=self.node_radical_heads_by_adduct_str,
+            flat_candidates=self.radical_flat_candidates,
+            candidate_slice_by_adduct=self.radical_candidate_slice_by_adduct,
+        )
+
+        structure = ft_features.structure
+
         node_graph_index = sample_tree_batch.batch
         # [N_tree]
 
@@ -1535,35 +1612,16 @@ class FragmentTreeProbabilityModel(nn.Module):
         # [N_tree]
 
         node_main_adduct_type_index = structure.sample_adduct_type_index.to(
-            node_emb.device
+            tree_node_emb.device
         )[node_sample_ids]
         # [N_tree]
 
-        ion = self._compute_flat_adduct_node_choice_probabilities(
-            node_emb=node_emb,
-            node_main_adduct_type_index=node_main_adduct_type_index,
-            head_by_adduct_str=self.node_ion_heads_by_adduct_str,
-            flat_candidates=self.ion_flat_candidates,
-            candidate_slice_by_adduct=self.ion_candidate_slice_by_adduct,
-        )
-
-        unsaturation = self._compute_flat_adduct_node_choice_probabilities(
-            node_emb=node_emb,
-            node_main_adduct_type_index=node_main_adduct_type_index,
-            head_by_adduct_str=self.node_unsaturation_heads_by_adduct_str,
-            flat_candidates=self.unsaturation_flat_candidates,
-            candidate_slice_by_adduct=self.unsaturation_candidate_slice_by_adduct,
-        )
-
-        radical = self._compute_flat_adduct_node_choice_probabilities(
-            node_emb=node_emb,
-            node_main_adduct_type_index=node_main_adduct_type_index,
-            head_by_adduct_str=self.node_radical_heads_by_adduct_str,
-            flat_candidates=self.radical_flat_candidates,
-            candidate_slice_by_adduct=self.radical_candidate_slice_by_adduct,
-        )
-
         return FragmentGenerationProbabilities(
+            precursor_logit=precursor_logit,
+            p_precursor=p_precursor,
+            precursor_expand_logit=precursor_expand_logit,
+            p_precursor_expand=p_precursor_expand,
+            p_precursor_stop=p_precursor_stop,
             edge_logit=edge_logit,
             p_edge=p_edge,
             expand_logit=expand_logit,
@@ -1572,6 +1630,111 @@ class FragmentTreeProbabilityModel(nn.Module):
             ion=ion,
             unsaturation=unsaturation,
             radical=radical,
+        )
+
+    def _compute_precursor_probabilities(
+        self,
+        *,
+        sample_tree_batch: Batch,
+        tree_node_emb: Tensor,
+    ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+        """
+        Compute precursor selection and precursor expand / stop probabilities.
+
+        Returns
+        -------
+        precursor_logit:
+            [P]
+
+        p_precursor:
+            [P]
+            Sum is 1 within each sample graph.
+
+        precursor_expand_logit:
+            [P]
+
+        p_precursor_expand:
+            [P]
+
+        p_precursor_stop:
+            [P]
+        """
+
+        if not hasattr(sample_tree_batch, "precursor_pathway_seq"):
+            raise ValueError("sample_tree_batch must have precursor_pathway_seq.")
+
+        if not hasattr(sample_tree_batch, "precursor_pathway_ptr"):
+            raise ValueError("sample_tree_batch must have precursor_pathway_ptr.")
+
+        device = tree_node_emb.device
+
+        precursor_pathway_seq = sample_tree_batch.precursor_pathway_seq.to(device).long()
+        # [P, L]
+
+        precursor_pathway_ptr = sample_tree_batch.precursor_pathway_ptr.to(device).long()
+        # [G + 1]
+
+        if precursor_pathway_seq.numel() == 0:
+            raise ValueError("precursor_pathway_seq must not be empty.")
+
+        row_counts = precursor_pathway_ptr[1:] - precursor_pathway_ptr[:-1]
+        # [G]
+
+        if (row_counts <= 0).any():
+            raise ValueError(
+                "Each sample graph must have at least one precursor pathway. "
+                f"row_counts={row_counts.detach().cpu().tolist()}"
+            )
+
+        precursor_node_index = self._get_last_valid_nodes_from_node_edge_sequences(
+            precursor_pathway_seq
+        )
+        # [P]
+
+        if precursor_node_index.numel() != precursor_pathway_seq.size(0):
+            raise ValueError(
+                "Failed to get one precursor node for each precursor pathway."
+            )
+
+        precursor_node_emb = tree_node_emb[precursor_node_index]
+        # [P, tree_dim]
+
+        precursor_logit = self.precursor_select_head(precursor_node_emb).squeeze(-1)
+        # [P]
+
+        precursor_expand_logit = self.precursor_expand_head(precursor_node_emb).squeeze(-1)
+        # [P]
+
+        graph_index_by_precursor = torch.repeat_interleave(
+            torch.arange(row_counts.numel(), dtype=torch.long, device=device),
+            row_counts,
+        )
+        # [P]
+
+        if graph_index_by_precursor.numel() != precursor_logit.numel():
+            raise ValueError(
+                "precursor_pathway_ptr does not match precursor_pathway_seq rows."
+            )
+
+        p_precursor = _softmax_by_group(
+            logits=precursor_logit,
+            group=graph_index_by_precursor,
+            num_groups=int(row_counts.numel()),
+        )
+        # [P]
+
+        p_precursor_expand = torch.sigmoid(precursor_expand_logit)
+        # [P]
+
+        p_precursor_stop = 1.0 - p_precursor_expand
+        # [P]
+
+        return (
+            precursor_logit,
+            p_precursor,
+            precursor_expand_logit,
+            p_precursor_expand,
+            p_precursor_stop,
         )
 
     def _compute_flat_adduct_node_choice_probabilities(
@@ -1752,6 +1915,7 @@ class FragmentTreeProbabilityModel(nn.Module):
         node_ptr: torch.Tensor,
         edge_ptr: torch.Tensor,
         edge_positions: str = "odd0",
+        require_root: bool = True,
     ) -> torch.Tensor:
         """
         Convert local node/edge ids in pathway sequences to PyG-batch-global ids.
@@ -1763,11 +1927,11 @@ class FragmentTreeProbabilityModel(nn.Module):
             Local node-edge-node sequences.
 
             Example:
-                [local_node, local_edge, local_node, local_edge, local_node]
+                [local_node, local_edge, local_node]
 
         pathway_ptr:
             [G + 1]
-            CSR pointer that groups pathway rows by sample graph.
+            Pointer that groups pathway rows by graph.
 
         node_ptr:
             [G + 1]
@@ -1775,22 +1939,24 @@ class FragmentTreeProbabilityModel(nn.Module):
 
         edge_ptr:
             [G + 1]
-            PyG Batch edge pointer.
+            Edge pointer for concatenated edge_attr / edge ids.
 
         edge_positions:
             "odd0":
                 Edge ids are at positions 1, 3, 5, ...
-                This matches node-edge-node-edge-node sequences.
+                This matches [node, edge, node, edge, node].
 
             "even0":
                 Edge ids are at positions 0, 2, 4, ...
+
+        require_root:
+            If True, seq_local[:, 0] must be a valid local root node id.
 
         Returns
         -------
         torch.Tensor
             [P, L]
-            Pathway sequences whose local node/edge ids are converted to
-            PyG-batch-global node/edge ids.
+            Pathway sequences converted to batch-global node/edge ids.
         """
 
         device = seq_local.device
@@ -1801,39 +1967,59 @@ class FragmentTreeProbabilityModel(nn.Module):
         edge_ptr = edge_ptr.long().to(device)
 
         if seq.dim() != 2:
-            raise ValueError(
-                "seq_local must be 2D, "
-                f"got shape {tuple(seq.shape)}."
-            )
+            raise ValueError(f"seq_local must be 2D, got shape {tuple(seq.shape)}.")
+
+        if pathway_ptr.dim() != 1:
+            raise ValueError(f"pathway_ptr must be 1D, got shape {tuple(pathway_ptr.shape)}.")
+
+        if node_ptr.dim() != 1:
+            raise ValueError(f"node_ptr must be 1D, got shape {tuple(node_ptr.shape)}.")
+
+        if edge_ptr.dim() != 1:
+            raise ValueError(f"edge_ptr must be 1D, got shape {tuple(edge_ptr.shape)}.")
 
         num_sequences, sequence_width = seq.shape
         num_graphs = int(pathway_ptr.numel() - 1)
 
+        if num_graphs < 0:
+            raise ValueError("pathway_ptr must have at least one element.")
+
+        if pathway_ptr.numel() != num_graphs + 1:
+            raise ValueError(
+                "pathway_ptr must have shape [G + 1]. "
+                f"Got pathway_ptr={tuple(pathway_ptr.shape)}."
+            )
+
         if node_ptr.numel() != num_graphs + 1:
             raise ValueError(
                 "node_ptr must have shape [G + 1] aligned with pathway_ptr. "
-                f"Got node_ptr={tuple(node_ptr.shape)}, "
-                f"pathway_ptr={tuple(pathway_ptr.shape)}."
+                f"Got node_ptr={tuple(node_ptr.shape)}, pathway_ptr={tuple(pathway_ptr.shape)}."
             )
 
         if edge_ptr.numel() != num_graphs + 1:
             raise ValueError(
                 "edge_ptr must have shape [G + 1] aligned with pathway_ptr. "
-                f"Got edge_ptr={tuple(edge_ptr.shape)}, "
-                f"pathway_ptr={tuple(pathway_ptr.shape)}."
+                f"Got edge_ptr={tuple(edge_ptr.shape)}, pathway_ptr={tuple(pathway_ptr.shape)}."
             )
 
-        sequence_counts = (
-            pathway_ptr[1:] - pathway_ptr[:-1]
-        ).clamp_min(0)
+        if num_sequences == 0:
+            return seq
+
+        if require_root and (seq[:, 0] < 0).any():
+            bad_rows = (seq[:, 0] < 0).nonzero(as_tuple=False).view(-1)
+            raise ValueError(
+                "Each pathway sequence must start with a valid local root node. "
+                f"bad_rows={bad_rows.detach().cpu().tolist()}."
+            )
+
+        sequence_counts = pathway_ptr[1:] - pathway_ptr[:-1]
         # [G]
 
+        if (sequence_counts < 0).any():
+            raise ValueError("pathway_ptr must be non-decreasing.")
+
         graph_id_by_sequence = torch.repeat_interleave(
-            torch.arange(
-                num_graphs,
-                dtype=torch.long,
-                device=device,
-            ),
+            torch.arange(num_graphs, dtype=torch.long, device=device),
             sequence_counts,
         )
         # [P]
@@ -1841,62 +2027,34 @@ class FragmentTreeProbabilityModel(nn.Module):
         if graph_id_by_sequence.numel() != num_sequences:
             raise ValueError(
                 "pathway_ptr does not match seq_local rows. "
-                f"Expected {num_sequences} rows, "
-                f"but pathway_ptr represents {graph_id_by_sequence.numel()} rows."
+                f"Expected {num_sequences} rows, but pathway_ptr represents {graph_id_by_sequence.numel()} rows."
             )
 
-        node_offset_by_sequence = node_ptr[graph_id_by_sequence]
-        edge_offset_by_sequence = edge_ptr[graph_id_by_sequence]
-
-        positions = torch.arange(
-            sequence_width,
-            dtype=torch.long,
-            device=device,
-        )
+        positions = torch.arange(sequence_width, dtype=torch.long, device=device)
 
         if edge_positions == "odd0":
             is_edge_position = positions % 2 == 1
         elif edge_positions == "even0":
             is_edge_position = positions % 2 == 0
         else:
-            raise ValueError(
-                'edge_positions must be "odd0" or "even0".'
-            )
+            raise ValueError('edge_positions must be "odd0" or "even0".')
 
-        is_edge = is_edge_position.view(
-            1,
-            sequence_width,
-        ).expand(
-            num_sequences,
-            sequence_width,
-        )
-
+        is_edge = is_edge_position.view(1, sequence_width).expand(num_sequences, sequence_width)
         is_node = ~is_edge
         is_valid = seq >= 0
+
+        node_offset_by_sequence = node_ptr[graph_id_by_sequence]
+        edge_offset_by_sequence = edge_ptr[graph_id_by_sequence]
 
         node_valid = is_valid & is_node
         edge_valid = is_valid & is_edge
 
         if node_valid.any():
-            node_offsets = node_offset_by_sequence.view(
-                num_sequences,
-                1,
-            ).expand(
-                num_sequences,
-                sequence_width,
-            )
-
+            node_offsets = node_offset_by_sequence.view(num_sequences, 1).expand(num_sequences, sequence_width)
             seq[node_valid] = seq[node_valid] + node_offsets[node_valid]
 
         if edge_valid.any():
-            edge_offsets = edge_offset_by_sequence.view(
-                num_sequences,
-                1,
-            ).expand(
-                num_sequences,
-                sequence_width,
-            )
-
+            edge_offsets = edge_offset_by_sequence.view(num_sequences, 1).expand(num_sequences, sequence_width)
             seq[edge_valid] = seq[edge_valid] + edge_offsets[edge_valid]
 
         return seq

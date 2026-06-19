@@ -306,14 +306,20 @@ class CleavagePatternSet:
     ) -> CleavagePatternSet:
         """Deserialize a pattern set from a dictionary."""
         patterns = tuple(
-            CleavagePattern.from_dict(pattern_data)
+            CleavagePattern.from_dict(pattern_data) if ("pattern_id" in pattern_data) else _CleavagePattern.from_dict(pattern_data)
             for pattern_data in data["patterns"]
         )
 
-        return cls(
-            name=data["name"],
-            patterns=patterns,
-        )
+        if any(not isinstance(pattern, CleavagePattern) for pattern in patterns):
+            return cls.from_patterns(
+                patterns=patterns,
+                name=data.get("name", ""),
+            )
+        else:
+            return cls(
+                name=data.get("name", ""),
+                patterns=patterns,
+            )
     
     def copy(self) -> CleavagePatternSet:
         """Return a copy of this pattern set."""
