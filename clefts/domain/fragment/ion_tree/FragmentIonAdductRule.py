@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Dict, Tuple, Any, Set
+from dataclasses import dataclass, field
+from typing import Dict, Tuple, Any, Set, Optional
 
 from ....libs.mmkit.mmkit import Adduct, Compound
 
@@ -16,6 +16,13 @@ class FragmentIonAdductRule:
     unsaturation: int
     ion_shifts: Tuple[IonShiftRule, ...]
     radical_atoms: Tuple[str, ...] = ()
+
+    _precursor_delta_h_state_by_adduct: Dict[Adduct, Tuple[int, int]] = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+        compare=False,
+    )
 
     def __post_init__(self) -> None:
         if not isinstance(self.name, str):
@@ -60,9 +67,15 @@ class FragmentIonAdductRule:
             raise ValueError(
                 "radical_atoms must be empty when radical is False"
             )
+
+        object.__setattr__(
+            self,
+            "_precursor_delta_h_state_by_adduct",
+            self._build_precursor_delta_h_state_by_adduct(),
+        )
     
     @property
-    def unsaturation_delta_h_candidates(self) -> Tuple[int, ...]:
+    def unsaturation_candidates(self) -> Tuple[int, ...]:
         """Return unsaturation candidates for this adduct rule.
 
         For now, only the specified unsaturation value is returned.
@@ -75,10 +88,10 @@ class FragmentIonAdductRule:
 
         For now, only the specified unsaturation value is returned.
         """
-        return tuple(Adduct.from_dict({"H": cnt * -2}) for cnt in self.unsaturation_delta_h_candidates)
+        return tuple(Adduct.from_dict({"H": cnt * -2}) for cnt in self.unsaturation_candidates)
     
     @property
-    def radical_delta_h_candidates(self) -> Tuple[int, ...]:
+    def radical_candidates(self) -> Tuple[int, ...]:
         """Return radical delta H candidates for this adduct rule.
 
         For now, only the specified radical value is returned.
@@ -91,7 +104,7 @@ class FragmentIonAdductRule:
 
         For now, only the specified radical value is returned.
         """
-        return tuple(Adduct.from_dict({"H": -cnt}) for cnt in self.radical_delta_h_candidates)
+        return tuple(Adduct.from_dict({"H": -cnt}) for cnt in self.radical_candidates)
     
     @property
     def ion_shift_adduct_candidates(self) -> Tuple[Adduct, ...]:
@@ -100,6 +113,49 @@ class FragmentIonAdductRule:
         For now, only the specified ion shift values are returned.
         """
         return tuple(ion_shift.ion_shift for ion_shift in self.ion_shifts)
+
+    def get_precursor_delta_h_state_by_adduct(
+        self,
+        precursor_adduct: Adduct,
+    ) -> Optional[Tuple[int, int]]:
+        """Return precursor ion state from a precursor adduct.
+
+        This method returns the ion state corresponding to the given
+        precursor adduct.
+
+        The returned ion state is:
+
+            (unsaturation, radical)
+
+        This method uses the lookup table built from self.adduct_type and
+        possible H-loss states. It does not use ion_shifts.
+
+        Example
+        -------
+        If self.adduct_type is [M+H]+, the lookup table contains:
+
+            [M+H]+  -> (0, 0)
+            [M]+    -> (0, 1)
+            [M-H]+  -> (1, 0)
+            [M-2H]+ -> (1, 1)
+
+        Parameters
+        ----------
+        precursor_adduct:
+            Observed or specified precursor adduct.
+
+        Returns
+        -------
+        Optional[Tuple[int, int]]
+            The corresponding (unsaturation, radical) state.
+            Returns None if precursor_adduct is not registered in the lookup
+            table.
+        """
+
+        if not isinstance(precursor_adduct, Adduct):
+            raise TypeError("precursor_adduct must be an Adduct.")
+
+        return self._precursor_delta_h_state_by_adduct.get(precursor_adduct, None)
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "FragmentIonAdductRule":
@@ -248,3 +304,40 @@ class FragmentIonAdductRule:
             atom.GetSymbol()
             for atom in mol.GetAtoms()
         }
+    
+    def _build_precursor_delta_h_state_by_adduct(
+        self,
+    ) -> Dict[Adduct, Tuple[int, int]]:
+        """Build lookup table from precursor adduct type to delta H state.
+
+        This table is based only on H loss from self.adduct_type.
+
+        For each state:
+
+            delta_H = -2 * unsaturation - radical
+
+        Therefore, if self.adduct_type is [M+H]+:
+
+            unsaturation=0, radical=0 -> delta_H= 0 -> [M+H]+
+            unsaturation=0, radical=1 -> delta_H=-1 -> [M]+
+            unsaturation=1, radical=0 -> delta_H=-2 -> [M-H]+
+            unsaturation=1, radical=1 -> delta_H=-3 -> [M-2H]+
+        """
+
+        table: Dict[Adduct, Tuple[int, int]] = {}
+
+        for radical_delta_h in self.radical_candidates:
+            for unsaturation in self.unsaturation_candidates:
+                state = (
+                    int(unsaturation),
+                    int(radical_delta_h != 0),
+                )
+
+                delta_h = -2 * int(unsaturation) - int(radical_delta_h)
+                delta_h_adduct = Adduct.from_dict({"H": delta_h})
+                adduct = self.adduct_type.add_prefer_self(delta_h_adduct)
+
+                if adduct not in table:
+                    table[adduct] = state
+
+        return table

@@ -43,8 +43,8 @@ class FragmentTreeSample:
     #     edge_dst[edge_index]
     # in the shared FragmentTreeStructureBuilder.
 
-    precursor_edge_indexes: Set[Tuple[int, ...]] = field(default_factory=set)
-    # Set of precursor pathway edge-index tuples.
+    precursor_edge_indexes: List[Tuple[int, ...]] = field(default_factory=list)
+    # List of precursor pathway edge-index tuples.
     #
     # Each tuple represents one complete precursor fragment pathway:
     #     (edge_index_0, edge_index_1, ..., edge_index_k)
@@ -57,6 +57,8 @@ class FragmentTreeSample:
     # This field preserves pathway-level grouping.
     # In contrast, edge_indexes stores the flattened set of all edges
     # used by this sample.
+    precursor_unsaturation_indexes: List[int] = field(default_factory=list)
+    precursor_radical_indexes: List[int] = field(default_factory=list)
 
 
 @dataclass
@@ -379,17 +381,55 @@ class SingleFragmentTreeStructureBuilder:
             )
 
         precursor_paths: list[tuple[int, ...]] = []
-        precursor_path_sample_indexes: list[int] = []
+        precursor_path_unsaturation_indexes: list[int] = []
+        precursor_path_radical_indexes: list[int] = []
+        precursor_sample_indexes: list[int] = []
 
         for old_sample_index in sample_indexes:
             new_sample_index = sample_index_remap[old_sample_index]
             sample = self.samples[old_sample_index]
 
-            for edge_index_path in sorted(sample.precursor_edge_indexes):
+            if not (
+                len(sample.precursor_edge_indexes)
+                == len(sample.precursor_unsaturation_indexes)
+                == len(sample.precursor_radical_indexes)
+            ):
+                raise ValueError(
+                    "Mismatch in lengths of precursor_edge_indexes, "
+                    "precursor_unsaturation_indexes, and precursor_radical_indexes "
+                    f"for sample {old_sample_index}: "
+                    f"{len(sample.precursor_edge_indexes)}, "
+                    f"{len(sample.precursor_unsaturation_indexes)}, "
+                    f"{len(sample.precursor_radical_indexes)}."
+                )
+
+            precursor_path_records = list(
+                zip(
+                    sample.precursor_edge_indexes,
+                    sample.precursor_unsaturation_indexes,
+                    sample.precursor_radical_indexes,
+                )
+            )
+
+            # Keep deterministic order without breaking correspondence between
+            # path, unsaturation index, and radical index.
+            precursor_path_records.sort(key=lambda item: item[0])
+
+            for (
+                edge_index_path,
+                unsaturation_index,
+                radical_index,
+            ) in precursor_path_records:
                 precursor_paths.append(
                     tuple(int(edge_index) for edge_index in edge_index_path)
                 )
-                precursor_path_sample_indexes.append(int(new_sample_index))
+                precursor_path_unsaturation_indexes.append(
+                    int(unsaturation_index)
+                )
+                precursor_path_radical_indexes.append(
+                    int(radical_index)
+                )
+                precursor_sample_indexes.append(int(new_sample_index))
 
         if len(precursor_paths) > 0:
             path_lengths = {len(path) for path in precursor_paths}
@@ -404,8 +444,18 @@ class SingleFragmentTreeStructureBuilder:
                 dtype=torch.long,
             )
 
-            sample_precursor_path_index = torch.tensor(
-                precursor_path_sample_indexes,
+            sample_precursor_unsaturation_index = torch.tensor(
+                precursor_path_unsaturation_indexes,
+                dtype=torch.long,
+            )
+
+            sample_precursor_radical_index = torch.tensor(
+                precursor_path_radical_indexes,
+                dtype=torch.long,
+            )
+
+            sample_precursor_index = torch.tensor(
+                precursor_sample_indexes,
                 dtype=torch.long,
             )
         else:
@@ -413,7 +463,15 @@ class SingleFragmentTreeStructureBuilder:
                 (0, 0),
                 dtype=torch.long,
             )
-            sample_precursor_path_index = torch.empty(
+            sample_precursor_unsaturation_index = torch.empty(
+                (0,),
+                dtype=torch.long,
+            )
+            sample_precursor_radical_index = torch.empty(
+                (0,),
+                dtype=torch.long,
+            )
+            sample_precursor_index = torch.empty(
                 (0,),
                 dtype=torch.long,
             )
@@ -429,8 +487,10 @@ class SingleFragmentTreeStructureBuilder:
             sample_adduct_type_index=sample_adduct_type_index,
             sample_ce_value=sample_ce_value,
             sample_edge_index=sample_edge_index,
-            sample_precursor_edge_index_path=sample_precursor_edge_index_path,
-            sample_precursor_path_index=sample_precursor_path_index,
+            precursor_edge_index_path=sample_precursor_edge_index_path,
+            precursor_unsaturation_index=sample_precursor_unsaturation_index,
+            precursor_radical_index=sample_precursor_radical_index,
+            precursor_sample_index=sample_precursor_index,
             reactant_tuple_length_table=reactant_tuple_length_table,
             product_tuple_length_table=product_tuple_length_table,
         )
@@ -616,7 +676,7 @@ class SingleFragmentTreeStructureBuilder:
         # -------------------------
         # Cache precursor pathways by adduct type
         # -------------------------
-        precursor_fragment_pathways_by_adduct: Dict[str, FragmentPathwayGroup] = {}
+        precursor_fragment_pathways_by_adduct: Dict[Adduct, FragmentPathwayGroup] = {}
 
         sample_indexes: List[int] = []
 
@@ -627,7 +687,7 @@ class SingleFragmentTreeStructureBuilder:
                 (
                     smiles,
                     precursor_mz,
-                    adduct_type,
+                    precursor_type,
                     adduct_type_index,
                     ce_value,
                     instrument,
@@ -645,50 +705,47 @@ class SingleFragmentTreeStructureBuilder:
 
             sample_index = len(self.samples)
 
-            adduct_type_key = str(adduct_type)
-
-            if adduct_type_key not in precursor_fragment_pathways_by_adduct:
+            if precursor_type not in precursor_fragment_pathways_by_adduct:
                 precursor_fragment_pathways, _ = (
                     self._model.fragmenter.assign_fragment_pathways_to_peaks(
                         fragment_ion_tree=fragment_ion_tree,
-                        precursor_type=adduct_type,
+                        precursor_type=precursor_type,
                         peaks_mz=[],
                     )
                 )
 
-                precursor_fragment_pathways_by_adduct[adduct_type_key] = (
-                    precursor_fragment_pathways
-                )
+                precursor_fragment_pathways_by_adduct[precursor_type] = precursor_fragment_pathways
 
-            precursor_fragment_pathways = (
-                precursor_fragment_pathways_by_adduct[adduct_type_key]
-            )
+            precursor_fragment_pathways = precursor_fragment_pathways_by_adduct[precursor_type]
+
+            
+            main_adduct_type = self._model.fragmenter.adduct_types[adduct_type_index]
 
             sample = FragmentTreeSample(
                 adduct_type_index=int(adduct_type_index),
                 ce_value=float(ce_value),
             )
 
-            precursor_edge_index_paths = self._fragment_pathway_group_to_edge_index_paths(
-                fragment_pathway_group=precursor_fragment_pathways,
-                padding_length=self._model.fragmenter.precursor_candidate_max_depth,
-                fragment_compound_by_smiles=fragment_compound_by_smiles,
-            )
-            sample.precursor_edge_indexes.update(precursor_edge_index_paths)
-
-            # -------------------------
-            # Add first-cleavage edges for this sample
-            # -------------------------
-            for precursor_node in precursor_fragment_pathways.precursor_nodes:
-                tree_precursor_node = fragment_ion_tree.get_node_by_smiles(
-                    precursor_node.smiles
+            for precursor_pathway in precursor_fragment_pathways:
+                precursor_edge_index_path = self._fragment_pathway_to_edge_index_path(
+                    fragment_pathway=precursor_pathway,
+                    padding_length=self._model.fragmenter.precursor_candidate_max_depth,
+                    fragment_compound_by_smiles=fragment_compound_by_smiles,
+                )
+                if len(precursor_edge_index_path) == 0:
+                    continue
+                precursor_node = precursor_pathway.precursor_node
+                if precursor_node is None:
+                    continue
+                precursor_adduct = precursor_node.precursor_adduct_type
+                precursor_delta_h_state = self._model.fragmenter.get_precursor_delta_h_state_by_adduct_type(
+                    main_adduct_type=main_adduct_type,
+                    adduct_type=precursor_adduct,
                 )
 
-                if tree_precursor_node is None:
-                    raise ValueError(
-                        f"Precursor node SMILES {precursor_node.smiles!r} "
-                        "not found in fragment ion tree."
-                    )
+                sample.precursor_edge_indexes.append(tuple(precursor_edge_index_path))
+                sample.precursor_unsaturation_indexes.append(int(precursor_delta_h_state[0]))
+                sample.precursor_radical_indexes.append(int(precursor_delta_h_state[1]))
 
                 for dst_smiles, fp_edge in get_outgoing_fragment_edges_by_src_smiles(
                     precursor_node.smiles,
@@ -706,9 +763,12 @@ class SingleFragmentTreeStructureBuilder:
                     edge_index = int(edge_index)
 
                     sample.edge_indexes.add(edge_index)
-
-                self.samples[int(sample_index)] = sample
-                sample_indexes.append(int(sample_index))
+                if len(sample.precursor_edge_indexes) == len(sample.precursor_unsaturation_indexes) == len(sample.precursor_radical_indexes):
+                    if len(sample.precursor_edge_indexes) > 0:
+                        self.samples[int(sample_index)] = sample
+                        sample_indexes.append(int(sample_index))
+                else:
+                    raise ValueError("Mismatch in lengths of precursor_edge_indexes, precursor_unsaturation_indexes, and precursor_radical_indexes")
 
         return np.asarray(sample_indexes, dtype=int)
 
@@ -1169,17 +1229,17 @@ class SingleFragmentTreeStructureBuilder:
         fragment_pathway_group: FragmentPathwayGroup,
         padding_length: int,
         fragment_compound_by_smiles: Optional[Dict[str, Compound]] = None,
-    ) -> Set[Tuple[int, ...]]:
+    ) -> List[Tuple[int, ...]]:
         """Convert precursor FragmentPathwayGroup into edge_index paths.
 
         Returns
         -------
-        Set[Tuple[int, ...]]
-            Set of edge_index tuples.
+        List[Tuple[int, ...]]
+            List of edge_index tuples.
             Each tuple represents one complete precursor fragment pathway.
         """
 
-        edge_index_paths: Set[Tuple[int, ...]] = set()
+        edge_index_paths: List[Tuple[int, ...]] = []
 
         for fragment_pathway in fragment_pathway_group:
             edge_index_path = self._fragment_pathway_to_edge_index_path(
@@ -1189,7 +1249,7 @@ class SingleFragmentTreeStructureBuilder:
             )
 
             if len(edge_index_path) > 0:
-                edge_index_paths.add(edge_index_path)
+                edge_index_paths.append(edge_index_path)
 
         return edge_index_paths
 
@@ -1284,8 +1344,8 @@ class SingleFragmentTreeStructureBuilder:
 
         This method extracts:
             - precursor m/z
-            - adduct type
-            - adduct type index
+            - precursor type
+            - precursor adduct type index
             - collision energy in eV
             - SMILES
             - optional instrument
@@ -1293,7 +1353,7 @@ class SingleFragmentTreeStructureBuilder:
         precursor_mz = float(record[precursor_mz_column])
 
         adduct_type_str = str(record[adduct_type_column])
-        adduct_type = Adduct.parse(adduct_type_str)
+        precursor_type = Adduct.parse(adduct_type_str)
 
         ce_value_raw = record[collision_energy_column]
 
@@ -1301,7 +1361,7 @@ class SingleFragmentTreeStructureBuilder:
         if instrument_column is not None:
             instrument = record[instrument_column]
 
-        adduct_type_index = self._model.get_index_by_adduct_type(adduct_type)
+        adduct_type_index = self._model.get_index_by_adduct_type(precursor_type)
 
         ce_value = FragmentTreeProbabilityModel.parse_ce_to_ev(
             ce_value_raw,
@@ -1314,9 +1374,9 @@ class SingleFragmentTreeStructureBuilder:
                 f"Failed to parse collision energy: {ce_value_raw!r} "
                 f"for SMILES={record[smiles_column]!r}, "
                 f"precursor_mz={precursor_mz}, "
-                f"adduct_type={adduct_type}."
+                f"adduct_type={precursor_type}."
             )
 
         smiles = str(record[smiles_column])
 
-        return smiles, precursor_mz, adduct_type, adduct_type_index, ce_value, instrument
+        return smiles, precursor_mz, precursor_type, adduct_type_index, ce_value, instrument

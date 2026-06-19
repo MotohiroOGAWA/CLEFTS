@@ -231,18 +231,18 @@ class FragmentIonAdductRuleSet:
 
         return rule.ion_shift_adduct_candidates
 
-    def get_neutral_delta_h_by_adduct_type(
+    def get_precursor_delta_h_state_by_adduct_type(
         self,
-        adduct_type: Adduct | str,
-    ) -> Tuple[float, ...]:
-        """Return neutral delta H values for the given adduct type."""
+        main_adduct_type: Adduct | str,
+        precursor_adduct_type: Adduct | str,
+    ) -> Tuple[Adduct, ...]:
+        """Return precursor delta H states for the given adduct type."""
 
-        rule = self.get_rule_by_adduct_type(adduct_type)
+        rule = self.get_rule_by_adduct_type(main_adduct_type)
 
-        return tuple(
-            ion_shift_rule.neutral_delta_h
-            for ion_shift_rule in rule.ion_shifts
-        )
+        return rule.get_precursor_delta_h_state_by_adduct(precursor_adduct_type)
+
+    
 
     def encode_adduct_type(
         self,

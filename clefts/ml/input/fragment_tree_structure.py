@@ -117,22 +117,106 @@ class FragmentTreeStructure:
     # sample_edge_index[0, l] = sample index
     # sample_edge_index[1, l] = edge index
 
-    sample_precursor_edge_index_path: Tensor
+    precursor_edge_index_path: Tensor
     # [P, D]
     #
     # P:
     #     Number of precursor paths.
     #
     # D:
-    #     Padded path length.
+    #     Padded precursor path length.
+    #
+    # precursor_edge_index_path[p, d] is the edge index at position d
+    # in precursor path p.
+    #
+    # Each edge index refers to:
+    #     edge_index[:, edge_index_value]
     #
     # Negative values such as -1 are treated as padding.
 
-    sample_precursor_path_index: Tensor
+    precursor_unsaturation_index: Tensor
     # [P]
     #
-    # sample_precursor_path_index[p] = sample index associated with
-    # sample_precursor_edge_index_path[p].
+    # precursor_unsaturation_index[p] is the unsaturation state index
+    # associated with precursor path p.
+    #
+    # This tensor is aligned with:
+    #     precursor_edge_index_path[p]
+    #     precursor_radical_index[p]
+    #     precursor_sample_index[p]
+
+    precursor_radical_index: Tensor
+    # [P]
+    #
+    # precursor_radical_index[p] is the radical state index
+    # associated with precursor path p.
+    #
+    # This tensor is aligned with:
+    #     precursor_edge_index_path[p]
+    #     precursor_unsaturation_index[p]
+    #     precursor_sample_index[p]
+
+    precursor_sample_index: Tensor
+    # [P]
+    #
+    # precursor_sample_index[p] is the sample index associated with
+    # precursor path p.
+    #
+    # This tensor is aligned with:
+    #     precursor_edge_index_path[p]
+    #     precursor_unsaturation_index[p]
+    #     precursor_radical_index[p]
+
+    def __post_init__(self) -> None:
+        num_precursor_paths = int(self.precursor_edge_index_path.size(0))
+
+        if self.precursor_edge_index_path.dim() != 2:
+            raise ValueError(
+                "precursor_edge_index_path must be 2D, "
+                f"got shape {tuple(self.precursor_edge_index_path.shape)}."
+            )
+
+        if self.precursor_unsaturation_index.dim() != 1:
+            raise ValueError(
+                "precursor_unsaturation_index must be 1D, "
+                f"got shape {tuple(self.precursor_unsaturation_index.shape)}."
+            )
+
+        if self.precursor_radical_index.dim() != 1:
+            raise ValueError(
+                "precursor_radical_index must be 1D, "
+                f"got shape {tuple(self.precursor_radical_index.shape)}."
+            )
+
+        if self.precursor_sample_index.dim() != 1:
+            raise ValueError(
+                "precursor_sample_index must be 1D, "
+                f"got shape {tuple(self.precursor_sample_index.shape)}."
+            )
+
+        if self.precursor_unsaturation_index.numel() != num_precursor_paths:
+            raise ValueError(
+                "precursor_unsaturation_index must have the same length as "
+                "precursor_edge_index_path rows. "
+                f"Got {self.precursor_unsaturation_index.numel()} and "
+                f"{num_precursor_paths}."
+            )
+
+        if self.precursor_radical_index.numel() != num_precursor_paths:
+            raise ValueError(
+                "precursor_radical_index must have the same length as "
+                "precursor_edge_index_path rows. "
+                f"Got {self.precursor_radical_index.numel()} and "
+                f"{num_precursor_paths}."
+            )
+
+        if self.precursor_sample_index.numel() != num_precursor_paths:
+            raise ValueError(
+                "precursor_sample_index must have the same length as "
+                "precursor_edge_index_path rows. "
+                f"Got {self.precursor_sample_index.numel()} and "
+                f"{num_precursor_paths}."
+            )
 
     @property
     def num_nodes(self) -> int:
@@ -196,11 +280,17 @@ class FragmentTreeStructure:
             sample_adduct_type_index=self.sample_adduct_type_index.to(device),
             sample_ce_value=self.sample_ce_value.to(device),
             sample_edge_index=self.sample_edge_index.to(device),
-            sample_precursor_edge_index_path=(
-                self.sample_precursor_edge_index_path.to(device)
+            precursor_edge_index_path=(
+                self.precursor_edge_index_path.to(device)
             ),
-            sample_precursor_path_index=(
-                self.sample_precursor_path_index.to(device)
+            precursor_unsaturation_index=(
+                self.precursor_unsaturation_index.to(device)
+            ),
+            precursor_radical_index=(
+                self.precursor_radical_index.to(device)
+            ),
+            precursor_sample_index=(
+                self.precursor_sample_index.to(device)
             ),
             reactant_tuple_length_table=(
                 self.reactant_tuple_length_table.to(device)
@@ -446,44 +536,70 @@ class FragmentTreeStructure:
         )
 
         # -------------------------
-        # sample_precursor_edge_index_path
+        # precursor_edge_index_path
         # -------------------------
-        sample_precursor_edge_index_path = (
-            cls._concat_sample_precursor_edge_index_paths(
+        precursor_edge_index_path = (
+            cls._concat_precursor_edge_index_paths(
                 structures=structures,
                 device=tensor_device,
             )
         )
 
         # -------------------------
-        # sample_precursor_path_index
+        # precursor_unsaturation_index
         # -------------------------
-        sample_precursor_path_index_parts = []
+        precursor_unsaturation_index = torch.cat(
+            [
+                structure.precursor_unsaturation_index.to(
+                    tensor_device
+                ).long()
+                for structure in structures
+            ],
+            dim=0,
+        )
+
+        # -------------------------
+        # precursor_radical_index
+        # -------------------------
+        precursor_radical_index = torch.cat(
+            [
+                structure.precursor_radical_index.to(
+                    tensor_device
+                ).long()
+                for structure in structures
+            ],
+            dim=0,
+        )
+
+        # -------------------------
+        # precursor_sample_index
+        # -------------------------
+        precursor_sample_index_parts = []
 
         sample_offset = 0
 
         for structure in structures:
-            path_index = structure.sample_precursor_path_index.to(
+            precursor_sample_index_part = structure.precursor_sample_index.to(
                 tensor_device
             ).clone()
 
-            if path_index.dim() != 1:
+            if precursor_sample_index_part.dim() != 1:
                 raise ValueError(
-                    "sample_precursor_path_index must be 1D, "
-                    f"got shape {tuple(path_index.shape)}."
+                    "precursor_sample_index must be 1D, "
+                    f"got shape {tuple(precursor_sample_index_part.shape)}."
                 )
 
-            shifted_path_index = torch.where(
-                path_index >= 0,
-                path_index + sample_offset,
-                path_index,
+            shifted_precursor_sample_index = torch.where(
+                precursor_sample_index_part >= 0,
+                precursor_sample_index_part + sample_offset,
+                precursor_sample_index_part,
             )
 
-            sample_precursor_path_index_parts.append(shifted_path_index)
+            precursor_sample_index_parts.append(shifted_precursor_sample_index)
             sample_offset += structure.num_samples
 
-        sample_precursor_path_index = torch.cat(
-            sample_precursor_path_index_parts,
+        precursor_sample_index = torch.cat(
+            precursor_sample_index_parts,
             dim=0,
         )
 
@@ -498,8 +614,10 @@ class FragmentTreeStructure:
             sample_adduct_type_index=sample_adduct_type_index,
             sample_ce_value=sample_ce_value,
             sample_edge_index=sample_edge_index,
-            sample_precursor_edge_index_path=sample_precursor_edge_index_path,
-            sample_precursor_path_index=sample_precursor_path_index,
+            precursor_edge_index_path=precursor_edge_index_path,
+            precursor_unsaturation_index=precursor_unsaturation_index,
+            precursor_radical_index=precursor_radical_index,
+            precursor_sample_index=precursor_sample_index,
             reactant_tuple_length_table=reactant_tuple_length_table,
             product_tuple_length_table=product_tuple_length_table,
         )
@@ -966,13 +1084,13 @@ class FragmentTreeStructure:
         return int(remap[old_row_index].item())
 
     @staticmethod
-    def _concat_sample_precursor_edge_index_paths(
+    def _concat_precursor_edge_index_paths(
         *,
         structures: Sequence["FragmentTreeStructure"],
         device: torch.device,
     ) -> Tensor:
         """
-        Concatenate sample_precursor_edge_index_path with edge offsets.
+        Concatenate precursor_edge_index_path with edge offsets.
 
         Negative padding values such as -1 are kept unchanged.
 
@@ -982,11 +1100,11 @@ class FragmentTreeStructure:
         max_path_width = 0
 
         for structure in structures:
-            path = structure.sample_precursor_edge_index_path
+            path = structure.precursor_edge_index_path
 
             if path.dim() != 2:
                 raise ValueError(
-                    "sample_precursor_edge_index_path must be 2D, "
+                    "precursor_edge_index_path must be 2D, "
                     f"got shape {tuple(path.shape)}."
                 )
 
@@ -1000,7 +1118,7 @@ class FragmentTreeStructure:
         edge_offset = 0
 
         for structure in structures:
-            path = structure.sample_precursor_edge_index_path.to(device).clone()
+            path = structure.precursor_edge_index_path.to(device).clone()
 
             if path.size(1) < max_path_width:
                 pad_width = max_path_width - int(path.size(1))

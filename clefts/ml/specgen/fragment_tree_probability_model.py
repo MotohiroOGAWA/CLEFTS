@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from torch_geometric.data import Data, Batch
 from dataclasses import dataclass
-from typing import Tuple, Dict, List, Union, Optional
+from typing import Dict, List, Tuple, Union, Optional
 from bidict import bidict
 import numpy as np
 
@@ -17,9 +17,7 @@ from ..mol import MolEncoder
 from .components.condition.condition_encoder import MS2ConditionEncoder
 from .components.cleavage.cleavage_edge_feature_net import CleavageEdgeFeatureNet
 
-from dataclasses import dataclass
 from torch import Tensor
-from torch_geometric.data import Batch
 
 
 @dataclass
@@ -41,23 +39,15 @@ class FlatAdductNodeChoiceProbabilities:
 
 @dataclass
 class FragmentGenerationProbabilities:
-    """Probabilities used for fragment-tree generation."""
+    """Probabilities used for fragment-tree generation.
 
-    precursor_logit: Tensor
-    # [P]
-
-    p_precursor: Tensor
-    # [P]
-    # Sum is 1 within each sample graph.
-
-    precursor_expand_logit: Tensor
-    # [P]
-
-    p_precursor_expand: Tensor
-    # [P]
-
-    p_precursor_stop: Tensor
-    # [P]
+    Notes
+    -----
+    Precursor-specific probabilities are intentionally not stored here.
+    Precursor roots are treated as ordinary tree nodes whose initial
+    reach probability is assigned inside
+    ``compute_node_generation_flow_probabilities``.
+    """
 
     edge_logit: Tensor
     # [E_tree]
@@ -125,32 +115,33 @@ class BestFlatAdductCombination:
 
 @dataclass
 class NodeGenerationFlowProbabilities:
-    """Graph-wise node generation flow probabilities."""
+    """Graph-wise generation flow probabilities.
 
-    p_precursor_init: Tensor
-    # [N_tree]
-    # Initial probability mass at precursor candidate nodes.
-    # Sum is 1 within each sample graph.
+    Precursor roots are included in p_reach / p_emit / p_expand_node.
+    There is no separate precursor probability output.
+    """
 
     p_reach: Tensor
     # [N_tree]
     # Total probability of reaching each node.
+    # Includes precursor root reach.
 
     p_emit: Tensor
     # [N_tree]
-    # p_reach * p_stop
+    # Probability that each reached node stops and appears as a peak.
+    # Includes precursor peak emission.
 
     p_emit_best_adduct: Tensor
     # [N_tree]
-    # p_reach * p_stop * best_adduct_probability
+    # p_emit * max(ion * unsaturation * radical)
 
     p_expand_node: Tensor
     # [N_tree]
-    # p_reach * p_expand
+    # Probability that each reached node expands.
 
     p_expand_edge: Tensor
     # [E_tree]
-    # p_reach[src] * p_expand[src] * p_edge
+    # Global probability of passing through each edge.
 
     best_adduct: BestFlatAdductCombination
 
@@ -224,21 +215,6 @@ class FragmentTreeProbabilityModel(nn.Module):
         # -------------------------
         tree_dim = self.tree_encoder.dim
         edge_dim = self.cleavage_edge_fnet.feature_dim
-
-        self.precursor_select_head = nn.Sequential(
-            nn.Linear(tree_dim, tree_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(tree_dim, 1),
-        )
-
-        self.precursor_expand_head = nn.Sequential(
-            nn.Linear(tree_dim, tree_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(tree_dim, 1),
-        )
-
         self.edge_select_head = nn.Sequential(
             nn.Linear(
                 tree_dim * 2 + edge_dim,
@@ -389,7 +365,7 @@ class FragmentTreeProbabilityModel(nn.Module):
         ev = parse_ce_to_ev(ce, precursor_mz, instrument)
         return ev
     
-    def forward(self, data: Union[FragmentTreeStructure, FragmentTreeFeatures]) -> FragmentTreeFeatures:
+    def forward(self, data: Union[FragmentTreeStructure, FragmentTreeFeatures]) -> FragmentTreeProbabilityOutput:
         ft_features = self._build_fragment_tree_features(data)
 
         sample_tree_batch = self._encode_sample_tree(ft_features)
@@ -403,6 +379,236 @@ class FragmentTreeProbabilityModel(nn.Module):
             ft_features=ft_features,
             sample_tree_batch=sample_tree_batch,
             probabilities=probabilities,
+        )
+    
+    @staticmethod
+    def compute_node_generation_flow_probabilities(
+        *,
+        sample_tree_batch: Batch,
+        probabilities: FragmentGenerationProbabilities,
+        max_generation_steps: int,
+    ) -> NodeGenerationFlowProbabilities:
+        """
+        Convert local probabilities into graph-wise joint probabilities.
+
+        Flow
+        ----
+        Precursor roots are not represented by dedicated probabilities.
+        Instead, each graph starts from its precursor root node(s):
+
+            precursor root nodes
+                -> emit as precursor peaks
+                -> expand through outgoing edges
+                    -> reach fragment nodes
+                        -> emit as fragment peaks
+                        -> expand further
+
+        If a graph has multiple unique precursor root nodes, the initial
+        reach mass is distributed uniformly among those roots. Therefore,
+        the sum of the initial reach mass is 1 within each sample graph,
+        but that initial tensor is not returned separately.
+        """
+
+        if max_generation_steps < 0:
+            raise ValueError("max_generation_steps must be non-negative.")
+
+        if not hasattr(sample_tree_batch, "precursor_pathway_seq"):
+            raise ValueError("sample_tree_batch must have precursor_pathway_seq.")
+
+        if not hasattr(sample_tree_batch, "precursor_pathway_ptr"):
+            raise ValueError("sample_tree_batch must have precursor_pathway_ptr.")
+
+        p_edge = probabilities.p_edge
+        p_expand = probabilities.p_expand
+        p_stop = probabilities.p_stop
+
+        device = p_edge.device
+        dtype = p_edge.dtype
+
+        precursor_pathway_seq = sample_tree_batch.precursor_pathway_seq.to(device).long()
+        # [P, L]
+        # columns:
+        #   0: precursor root node
+        #   1: first edge
+        #   2: first fragment node
+        #   3: next edge
+        #   4: next fragment node
+        #   ...
+
+        precursor_pathway_ptr = sample_tree_batch.precursor_pathway_ptr.to(device).long()
+        # [G + 1]
+
+        edge_src, edge_dst = sample_tree_batch.edge_index
+        edge_src = edge_src.to(device).long()
+        edge_dst = edge_dst.to(device).long()
+
+        num_nodes = int(p_expand.size(0))
+        num_edges = int(p_edge.size(0))
+        num_graphs = int(precursor_pathway_ptr.numel() - 1)
+
+        if precursor_pathway_seq.dim() != 2:
+            raise ValueError(
+                "precursor_pathway_seq must be 2D, "
+                f"got shape {tuple(precursor_pathway_seq.shape)}."
+            )
+
+        if precursor_pathway_ptr.dim() != 1:
+            raise ValueError(
+                "precursor_pathway_ptr must be 1D, "
+                f"got shape {tuple(precursor_pathway_ptr.shape)}."
+            )
+
+        if num_graphs < 0:
+            raise ValueError("precursor_pathway_ptr must have at least one element.")
+
+        if edge_src.numel() != num_edges:
+            raise ValueError(
+                "edge_index size mismatch: "
+                f"edge_index has {edge_src.numel()} edges, p_edge has {num_edges}."
+            )
+
+        if p_expand.size(0) != p_stop.size(0):
+            raise ValueError(
+                "p_expand and p_stop must have the same node dimension. "
+                f"Got p_expand={p_expand.size(0)}, p_stop={p_stop.size(0)}."
+            )
+
+        if precursor_pathway_seq.numel() == 0:
+            raise ValueError("precursor_pathway_seq must contain at least one precursor root.")
+
+        row_counts = precursor_pathway_ptr[1:] - precursor_pathway_ptr[:-1]
+        # [G]
+
+        if (row_counts <= 0).any():
+            raise ValueError(
+                "Each sample graph must have at least one precursor pathway. "
+                f"row_counts={row_counts.detach().cpu().tolist()}"
+            )
+
+        precursor_root_node = precursor_pathway_seq[:, 0]
+        # [P]
+
+        if (precursor_root_node < 0).any():
+            bad_rows = (precursor_root_node < 0).nonzero(as_tuple=False).view(-1)
+            raise ValueError(
+                "Each precursor pathway must start with a valid root node. "
+                f"bad_rows={bad_rows.detach().cpu().tolist()}."
+            )
+
+        if precursor_root_node.max().item() >= num_nodes:
+            raise IndexError(
+                "precursor root node index is out of range: "
+                f"max={precursor_root_node.max().item()}, num_nodes={num_nodes}."
+            )
+
+        graph_index_by_path = torch.repeat_interleave(
+            torch.arange(num_graphs, dtype=torch.long, device=device),
+            row_counts,
+        )
+        # [P]
+
+        if graph_index_by_path.numel() != precursor_root_node.numel():
+            raise ValueError(
+                "precursor_pathway_ptr does not match precursor_pathway_seq rows."
+            )
+
+        # ------------------------------------------------------------
+        # Initial frontier.
+        # ------------------------------------------------------------
+        # Each graph starts with total probability mass = 1.
+        # If there are multiple unique precursor roots in the graph,
+        # distribute it uniformly among those roots.
+        graph_node_key = graph_index_by_path * num_nodes + precursor_root_node
+        unique_graph_node_key = torch.unique(graph_node_key, sorted=True)
+
+        unique_graph_index = unique_graph_node_key // num_nodes
+        unique_root_node = unique_graph_node_key % num_nodes
+
+        root_count_by_graph = torch.zeros(
+            (num_graphs,),
+            dtype=dtype,
+            device=device,
+        )
+
+        root_count_by_graph.scatter_add_(
+            0,
+            unique_graph_index,
+            torch.ones_like(unique_graph_index, dtype=dtype),
+        )
+
+        root_probability = 1.0 / root_count_by_graph[unique_graph_index]
+        # [R_unique]
+
+        frontier = torch.zeros(
+            (num_nodes,),
+            dtype=dtype,
+            device=device,
+        )
+
+        frontier.scatter_add_(
+            0,
+            unique_root_node,
+            root_probability,
+        )
+        # [N_tree]
+        # This is the initial reach state. It is not returned separately.
+
+        p_reach = frontier.clone()
+        p_emit = torch.zeros((num_nodes,), dtype=dtype, device=device)
+        p_expand_node = torch.zeros((num_nodes,), dtype=dtype, device=device)
+        p_expand_edge = torch.zeros((num_edges,), dtype=dtype, device=device)
+
+        # ------------------------------------------------------------
+        # Generation flow.
+        # ------------------------------------------------------------
+        # step = 0:
+        #   precursor roots can emit or expand.
+        #
+        # step >= 1:
+        #   reached fragment nodes can emit or expand.
+        for step in range(max_generation_steps + 1):
+            step_emit = frontier * p_stop
+            p_emit = p_emit + step_emit
+
+            if step == max_generation_steps:
+                break
+
+            step_expand_node = frontier * p_expand
+            step_expand_edge = step_expand_node[edge_src] * p_edge
+
+            p_expand_node = p_expand_node + step_expand_node
+            p_expand_edge = p_expand_edge + step_expand_edge
+
+            next_frontier = torch.zeros(
+                (num_nodes,),
+                dtype=dtype,
+                device=device,
+            )
+
+            next_frontier.scatter_add_(
+                0,
+                edge_dst,
+                step_expand_edge,
+            )
+
+            p_reach = p_reach + next_frontier
+            frontier = next_frontier
+
+        best_adduct = FragmentTreeProbabilityModel.compute_best_flat_adduct_combination(
+            ion=probabilities.ion,
+            unsaturation=probabilities.unsaturation,
+            radical=probabilities.radical,
+        )
+
+        p_emit_best_adduct = p_emit * best_adduct.probability
+
+        return NodeGenerationFlowProbabilities(
+            p_reach=p_reach,
+            p_emit=p_emit,
+            p_emit_best_adduct=p_emit_best_adduct,
+            p_expand_node=p_expand_node,
+            p_expand_edge=p_expand_edge,
+            best_adduct=best_adduct,
         )
 
     def _build_flat_adduct_candidate_table(
@@ -475,6 +681,35 @@ class FragmentTreeProbabilityModel(nn.Module):
             flat_candidates = flat_candidates.reshape(-1, 2)
 
         return flat_candidates, candidate_slice_by_adduct
+
+
+    def _get_flat_candidate_index(
+        self,
+        *,
+        flat_candidates: np.ndarray,
+        candidate_slice_by_adduct: Dict[Adduct, slice],
+        main_adduct_type: Adduct,
+        candidate_adduct: Adduct,
+    ) -> int:
+        """Return the flat candidate index for a known adduct candidate."""
+
+        if main_adduct_type not in candidate_slice_by_adduct:
+            raise KeyError(
+                f"No candidate slice found for adduct type: {main_adduct_type}"
+            )
+
+        candidate_slice = candidate_slice_by_adduct[main_adduct_type]
+
+        for flat_index in range(candidate_slice.start, candidate_slice.stop):
+            if flat_candidates[flat_index, 1] == candidate_adduct:
+                return flat_index
+
+        raise ValueError(
+            "Known precursor candidate adduct was not found in the flat "
+            "candidate table. "
+            f"main_adduct_type={main_adduct_type}, "
+            f"candidate_adduct={candidate_adduct}"
+        )
 
     def _build_fragment_tree_features(
         self,
@@ -871,6 +1106,12 @@ class FragmentTreeProbabilityModel(nn.Module):
             #   1: precursor_root_node
             #   2: normal_node
 
+            node_is_precursor_root = torch.zeros(
+                (num_sample_nodes,),
+                dtype=torch.bool,
+                device=device,
+            )
+
             precursor_root_global_node_ids = (
                 self._get_precursor_root_node_ids_from_edge_paths(
                     edge_paths=sample_precursor_paths,
@@ -896,6 +1137,7 @@ class FragmentTreeProbabilityModel(nn.Module):
 
                     node_role_one_hot[precursor_root_local_node_ids] = 0.0
                     node_role_one_hot[precursor_root_local_node_ids, 1] = 1.0
+                    node_is_precursor_root[precursor_root_local_node_ids] = True
 
             precursor_path_global_node_ids = (
                 self._get_node_ids_from_edge_paths(
@@ -1036,7 +1278,61 @@ class FragmentTreeProbabilityModel(nn.Module):
             # 9) Build sample Data
             # -------------------------
             sample_main_adduct_type_index = structure.sample_adduct_type_index.to(device).long()[sample_id]
-            sample_node_main_adduct_type_index = torch.full((num_sample_nodes,), int(sample_main_adduct_type_index.item()), dtype=torch.long, device=device)
+            sample_node_main_adduct_type_index = torch.full(
+                (num_sample_nodes,),
+                int(sample_main_adduct_type_index.item()),
+                dtype=torch.long,
+                device=device,
+            )
+
+            sample_main_adduct_type = self.main_adduct_types[
+                int(sample_main_adduct_type_index.item())
+            ]
+
+            known_ion_flat_index = self._get_flat_candidate_index(
+                flat_candidates=self.ion_flat_candidates,
+                candidate_slice_by_adduct=self.ion_candidate_slice_by_adduct,
+                main_adduct_type=sample_main_adduct_type,
+                candidate_adduct=sample_main_adduct_type,
+            )
+
+            known_unsaturation_flat_index = self._get_flat_candidate_index(
+                flat_candidates=self.unsaturation_flat_candidates,
+                candidate_slice_by_adduct=self.unsaturation_candidate_slice_by_adduct,
+                main_adduct_type=sample_main_adduct_type,
+                candidate_adduct=sample_main_adduct_type,
+            )
+
+            known_radical_flat_index = self._get_flat_candidate_index(
+                flat_candidates=self.radical_flat_candidates,
+                candidate_slice_by_adduct=self.radical_candidate_slice_by_adduct,
+                main_adduct_type=sample_main_adduct_type,
+                candidate_adduct=sample_main_adduct_type,
+            )
+
+            node_precursor_ion_flat_index = torch.full(
+                (num_sample_nodes,),
+                -1,
+                dtype=torch.long,
+                device=device,
+            )
+            node_precursor_unsaturation_flat_index = torch.full(
+                (num_sample_nodes,),
+                -1,
+                dtype=torch.long,
+                device=device,
+            )
+            node_precursor_radical_flat_index = torch.full(
+                (num_sample_nodes,),
+                -1,
+                dtype=torch.long,
+                device=device,
+            )
+
+            if node_is_precursor_root.any():
+                node_precursor_ion_flat_index[node_is_precursor_root] = known_ion_flat_index
+                node_precursor_unsaturation_flat_index[node_is_precursor_root] = known_unsaturation_flat_index
+                node_precursor_radical_flat_index[node_is_precursor_root] = known_radical_flat_index
 
             sample_data = Data(
                 x=sample_node_features,
@@ -1047,6 +1343,10 @@ class FragmentTreeProbabilityModel(nn.Module):
             sample_data.node_id_global = global_node_ids
             sample_data.edge_id_global = global_edge_ids
             sample_data.node_main_adduct_type_index = sample_node_main_adduct_type_index
+            sample_data.node_is_precursor_root = node_is_precursor_root
+            sample_data.node_precursor_ion_flat_index = node_precursor_ion_flat_index
+            sample_data.node_precursor_unsaturation_flat_index = node_precursor_unsaturation_flat_index
+            sample_data.node_precursor_radical_flat_index = node_precursor_radical_flat_index
             sample_data.sample_id = torch.tensor(sample_id, dtype=torch.long, device=device)
 
             sample_data_list.append(sample_data)
@@ -1531,21 +1831,14 @@ class FragmentTreeProbabilityModel(nn.Module):
     ) -> FragmentGenerationProbabilities:
         """
         Compute fragment generation probabilities from encoded sample tree batch.
+
+        Precursor-specific probabilities are not computed. Precursor roots use
+        the same p_expand / p_stop as other nodes, and their known precursor
+        adduct states are forced to one-hot probabilities.
         """
 
         tree_node_emb = sample_tree_batch.x
         # [N_tree, tree_dim]
-
-        (
-            precursor_logit,
-            p_precursor,
-            precursor_expand_logit,
-            p_precursor_expand,
-            p_precursor_stop,
-        ) = self._compute_precursor_probabilities(
-            sample_tree_batch=sample_tree_batch,
-            tree_node_emb=tree_node_emb,
-        )
 
         edge_src, edge_dst = sample_tree_batch.edge_index
         # [E_tree], [E_tree]
@@ -1603,25 +1896,25 @@ class FragmentTreeProbabilityModel(nn.Module):
             candidate_slice_by_adduct=self.radical_candidate_slice_by_adduct,
         )
 
-        structure = ft_features.structure
+        ion = self._force_known_flat_adduct_node_choice_probabilities(
+            probabilities=ion,
+            node_is_known=sample_tree_batch.node_is_precursor_root,
+            known_flat_candidate_index=sample_tree_batch.node_precursor_ion_flat_index,
+        )
 
-        node_graph_index = sample_tree_batch.batch
-        # [N_tree]
+        unsaturation = self._force_known_flat_adduct_node_choice_probabilities(
+            probabilities=unsaturation,
+            node_is_known=sample_tree_batch.node_is_precursor_root,
+            known_flat_candidate_index=sample_tree_batch.node_precursor_unsaturation_flat_index,
+        )
 
-        node_sample_ids = sample_tree_batch.kept_sample_ids[node_graph_index]
-        # [N_tree]
-
-        node_main_adduct_type_index = structure.sample_adduct_type_index.to(
-            tree_node_emb.device
-        )[node_sample_ids]
-        # [N_tree]
+        radical = self._force_known_flat_adduct_node_choice_probabilities(
+            probabilities=radical,
+            node_is_known=sample_tree_batch.node_is_precursor_root,
+            known_flat_candidate_index=sample_tree_batch.node_precursor_radical_flat_index,
+        )
 
         return FragmentGenerationProbabilities(
-            precursor_logit=precursor_logit,
-            p_precursor=p_precursor,
-            precursor_expand_logit=precursor_expand_logit,
-            p_precursor_expand=p_precursor_expand,
-            p_precursor_stop=p_precursor_stop,
             edge_logit=edge_logit,
             p_edge=p_edge,
             expand_logit=expand_logit,
@@ -1630,111 +1923,6 @@ class FragmentTreeProbabilityModel(nn.Module):
             ion=ion,
             unsaturation=unsaturation,
             radical=radical,
-        )
-
-    def _compute_precursor_probabilities(
-        self,
-        *,
-        sample_tree_batch: Batch,
-        tree_node_emb: Tensor,
-    ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
-        """
-        Compute precursor selection and precursor expand / stop probabilities.
-
-        Returns
-        -------
-        precursor_logit:
-            [P]
-
-        p_precursor:
-            [P]
-            Sum is 1 within each sample graph.
-
-        precursor_expand_logit:
-            [P]
-
-        p_precursor_expand:
-            [P]
-
-        p_precursor_stop:
-            [P]
-        """
-
-        if not hasattr(sample_tree_batch, "precursor_pathway_seq"):
-            raise ValueError("sample_tree_batch must have precursor_pathway_seq.")
-
-        if not hasattr(sample_tree_batch, "precursor_pathway_ptr"):
-            raise ValueError("sample_tree_batch must have precursor_pathway_ptr.")
-
-        device = tree_node_emb.device
-
-        precursor_pathway_seq = sample_tree_batch.precursor_pathway_seq.to(device).long()
-        # [P, L]
-
-        precursor_pathway_ptr = sample_tree_batch.precursor_pathway_ptr.to(device).long()
-        # [G + 1]
-
-        if precursor_pathway_seq.numel() == 0:
-            raise ValueError("precursor_pathway_seq must not be empty.")
-
-        row_counts = precursor_pathway_ptr[1:] - precursor_pathway_ptr[:-1]
-        # [G]
-
-        if (row_counts <= 0).any():
-            raise ValueError(
-                "Each sample graph must have at least one precursor pathway. "
-                f"row_counts={row_counts.detach().cpu().tolist()}"
-            )
-
-        precursor_node_index = self._get_last_valid_nodes_from_node_edge_sequences(
-            precursor_pathway_seq
-        )
-        # [P]
-
-        if precursor_node_index.numel() != precursor_pathway_seq.size(0):
-            raise ValueError(
-                "Failed to get one precursor node for each precursor pathway."
-            )
-
-        precursor_node_emb = tree_node_emb[precursor_node_index]
-        # [P, tree_dim]
-
-        precursor_logit = self.precursor_select_head(precursor_node_emb).squeeze(-1)
-        # [P]
-
-        precursor_expand_logit = self.precursor_expand_head(precursor_node_emb).squeeze(-1)
-        # [P]
-
-        graph_index_by_precursor = torch.repeat_interleave(
-            torch.arange(row_counts.numel(), dtype=torch.long, device=device),
-            row_counts,
-        )
-        # [P]
-
-        if graph_index_by_precursor.numel() != precursor_logit.numel():
-            raise ValueError(
-                "precursor_pathway_ptr does not match precursor_pathway_seq rows."
-            )
-
-        p_precursor = _softmax_by_group(
-            logits=precursor_logit,
-            group=graph_index_by_precursor,
-            num_groups=int(row_counts.numel()),
-        )
-        # [P]
-
-        p_precursor_expand = torch.sigmoid(precursor_expand_logit)
-        # [P]
-
-        p_precursor_stop = 1.0 - p_precursor_expand
-        # [P]
-
-        return (
-            precursor_logit,
-            p_precursor,
-            precursor_expand_logit,
-            p_precursor_expand,
-            p_precursor_stop,
         )
 
     def _compute_flat_adduct_node_choice_probabilities(
@@ -2058,6 +2246,121 @@ class FragmentTreeProbabilityModel(nn.Module):
             seq[edge_valid] = seq[edge_valid] + edge_offsets[edge_valid]
 
         return seq
+
+
+    @staticmethod
+    def _force_known_flat_adduct_node_choice_probabilities(
+        *,
+        probabilities: FlatAdductNodeChoiceProbabilities,
+        node_is_known: Tensor,
+        known_flat_candidate_index: Tensor,
+    ) -> FlatAdductNodeChoiceProbabilities:
+        """
+        Force known node choices to one-hot probabilities.
+
+        This is mainly used for precursor root nodes. The precursor adduct is
+        already known from the sample condition, so it should not be predicted
+        from a candidate set.
+        """
+
+        if node_is_known.dim() != 1:
+            raise ValueError(
+                "node_is_known must be 1D, "
+                f"got shape {tuple(node_is_known.shape)}."
+            )
+
+        if known_flat_candidate_index.dim() != 1:
+            raise ValueError(
+                "known_flat_candidate_index must be 1D, "
+                f"got shape {tuple(known_flat_candidate_index.shape)}."
+            )
+
+        if node_is_known.size(0) != probabilities.prob.size(0):
+            raise ValueError(
+                "node_is_known and probability rows must have the same length. "
+                f"Got node_is_known={node_is_known.size(0)}, "
+                f"prob_rows={probabilities.prob.size(0)}."
+            )
+
+        if known_flat_candidate_index.size(0) != probabilities.prob.size(0):
+            raise ValueError(
+                "known_flat_candidate_index and probability rows must have "
+                "the same length. "
+                f"Got known_flat_candidate_index={known_flat_candidate_index.size(0)}, "
+                f"prob_rows={probabilities.prob.size(0)}."
+            )
+
+        logit = probabilities.logit.clone()
+        prob = probabilities.prob.clone()
+        valid_mask = probabilities.valid_mask.clone()
+
+        node_index = node_is_known.to(prob.device).bool().nonzero(
+            as_tuple=False,
+        ).view(-1)
+
+        if node_index.numel() == 0:
+            return probabilities
+
+        candidate_index = known_flat_candidate_index.to(prob.device).long()[node_index]
+
+        if (candidate_index < 0).any():
+            bad_nodes = node_index[candidate_index < 0]
+            raise ValueError(
+                "Known flat candidate index is missing for some known nodes. "
+                f"bad_nodes={bad_nodes.detach().cpu().tolist()}"
+            )
+
+        if candidate_index.max().item() >= prob.size(1):
+            raise IndexError(
+                "Known flat candidate index is out of range. "
+                f"max={candidate_index.max().item()}, num_choices={prob.size(1)}."
+            )
+
+        prob[node_index] = 0.0
+        prob[node_index, candidate_index] = 1.0
+
+        valid_mask[node_index] = False
+        valid_mask[node_index, candidate_index] = True
+
+        logit[node_index] = -float("inf")
+        logit[node_index, candidate_index] = 0.0
+
+        return FlatAdductNodeChoiceProbabilities(
+            logit=logit,
+            prob=prob,
+            valid_mask=valid_mask,
+        )
+
+    @staticmethod
+    def compute_best_flat_adduct_combination(
+        *,
+        ion: FlatAdductNodeChoiceProbabilities,
+        unsaturation: FlatAdductNodeChoiceProbabilities,
+        radical: FlatAdductNodeChoiceProbabilities,
+    ) -> BestFlatAdductCombination:
+        """Compute best ion * unsaturation * radical probability for each node."""
+
+        ion_prob = ion.prob.masked_fill(~ion.valid_mask, -1.0)
+        unsaturation_prob = unsaturation.prob.masked_fill(~unsaturation.valid_mask, -1.0)
+        radical_prob = radical.prob.masked_fill(~radical.valid_mask, -1.0)
+
+        best_ion_prob, ion_index = ion_prob.max(dim=1)
+        best_unsaturation_prob, unsaturation_index = unsaturation_prob.max(dim=1)
+        best_radical_prob, radical_index = radical_prob.max(dim=1)
+
+        best_ion_prob = best_ion_prob.clamp_min(0.0)
+        best_unsaturation_prob = best_unsaturation_prob.clamp_min(0.0)
+        best_radical_prob = best_radical_prob.clamp_min(0.0)
+
+        probability = best_ion_prob * best_unsaturation_prob * best_radical_prob
+
+        return BestFlatAdductCombination(
+            ion_index=ion_index,
+            unsaturation_index=unsaturation_index,
+            radical_index=radical_index,
+            probability=probability,
+        )
+
 
 def _softmax_by_group(
     logits: Tensor,
