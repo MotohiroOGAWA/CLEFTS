@@ -45,6 +45,12 @@ class FragmentTreeCandidateSelectionOutput:
     sample_tree_batch: object
     keep_logit: Tensor
     cleave_logit: Tensor
+    ion_logit: Tensor
+    unsaturation_logit: Tensor
+    radical_logit: Tensor
+    ion_valid_mask_by_role_adduct: Tensor
+    unsaturation_valid_mask_by_role_adduct: Tensor
+    radical_valid_mask_by_role_adduct: Tensor
     kept_candidates: List[FragmentIonCandidate]
     next_cleavage_candidates: List[NextCleavageCandidate]
 
@@ -77,11 +83,12 @@ class FragmentTreeCandidateSelector(nn.Module):
         self.max_next_cleavage_candidates = int(max_next_cleavage_candidates)
         self.max_nodes_for_ion_candidates = max_nodes_for_ion_candidates
         tree_dim = int(feature_model.tree_encoder.dim)
-        formula_dim = int(feature_model.formula_tensorizer.dim)
         hidden_dim = int(hidden_dim or tree_dim)
         self.node_keep_head = nn.Sequential(nn.Linear(tree_dim, hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, 1))
         self.node_cleave_head = nn.Sequential(nn.Linear(tree_dim, hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, 1))
-        self.fragment_ion_candidate_head = nn.Sequential(nn.Linear(tree_dim + formula_dim * 2, hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, 1))
+        self.ion_head = nn.Sequential(nn.Linear(tree_dim, hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, len(feature_model.ion_flat_candidates)))
+        self.unsaturation_head = nn.Sequential(nn.Linear(tree_dim, hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, len(feature_model.unsaturation_flat_candidates)))
+        self.radical_head = nn.Sequential(nn.Linear(tree_dim, hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, len(feature_model.radical_flat_candidates)))
 
     def forward(self, data: Union[FragmentTreeStructure, FragmentTreeFeatures]) -> FragmentTreeCandidateSelectionOutput:
         feature_output = self.feature_model(data)
@@ -89,12 +96,21 @@ class FragmentTreeCandidateSelector(nn.Module):
         sample_tree_batch = feature_output.sample_tree_batch
         keep_logit = self.node_keep_head(sample_tree_batch.x).squeeze(-1)
         cleave_logit = self.node_cleave_head(sample_tree_batch.x).squeeze(-1)
+        ion_logit = self.ion_head(sample_tree_batch.x)
+        unsaturation_logit = self.unsaturation_head(sample_tree_batch.x)
+        radical_logit = self.radical_head(sample_tree_batch.x)
         return FragmentTreeCandidateSelectionOutput(
             features=features,
             sample_tree_batch=sample_tree_batch,
             keep_logit=keep_logit,
             cleave_logit=cleave_logit,
-            kept_candidates=self._select_fragment_ion_candidates(features=features, sample_tree_batch=sample_tree_batch, keep_logit=keep_logit),
+            ion_logit=ion_logit,
+            unsaturation_logit=unsaturation_logit,
+            radical_logit=radical_logit,
+            ion_valid_mask_by_role_adduct=self.feature_model.ion_candidate_valid_mask_by_role_adduct,
+            unsaturation_valid_mask_by_role_adduct=self.feature_model.unsaturation_candidate_valid_mask_by_role_adduct,
+            radical_valid_mask_by_role_adduct=self.feature_model.radical_candidate_valid_mask_by_role_adduct,
+            kept_candidates=self._select_fragment_ion_candidates(features=features, sample_tree_batch=sample_tree_batch, keep_logit=keep_logit, ion_logit=ion_logit, unsaturation_logit=unsaturation_logit, radical_logit=radical_logit),
             next_cleavage_candidates=self._select_next_cleavage_candidates(sample_tree_batch=sample_tree_batch, cleave_logit=cleave_logit),
         )
 
@@ -106,7 +122,7 @@ class FragmentTreeCandidateSelector(nn.Module):
             output = self.forward(output.features)
         return output
 
-    def _select_fragment_ion_candidates(self, *, features, sample_tree_batch, keep_logit: Tensor) -> List[FragmentIonCandidate]:
+    def _select_fragment_ion_candidates(self, *, features, sample_tree_batch, keep_logit: Tensor, ion_logit: Tensor, unsaturation_logit: Tensor, radical_logit: Tensor) -> List[FragmentIonCandidate]:
         structure = features.structure
         device = keep_logit.device
         node_is_precursor_root = sample_tree_batch.node_is_precursor_root.to(device).bool()
@@ -130,14 +146,16 @@ class FragmentTreeCandidateSelector(nn.Module):
                     global_node_id=int(sample_tree_batch.node_id_global[batch_node_index].detach().cpu().item()),
                     sample_id=int(kept_sample_ids[graph_index].detach().cpu().item()),
                     keep_logit=keep_logit,
+                    ion_logit=ion_logit,
+                    unsaturation_logit=unsaturation_logit,
+                    radical_logit=radical_logit,
                 )
             )
         candidates.sort(key=lambda item: item.score, reverse=True)
         return candidates[: self.max_fragment_ion_candidates]
 
-    def _score_joint_ion_candidates_for_node(self, *, structure: FragmentTreeStructure, sample_tree_batch, batch_node_index: int, global_node_id: int, sample_id: int, keep_logit: Tensor) -> List[FragmentIonCandidate]:
+    def _score_joint_ion_candidates_for_node(self, *, structure: FragmentTreeStructure, sample_tree_batch, batch_node_index: int, global_node_id: int, sample_id: int, keep_logit: Tensor, ion_logit: Tensor, unsaturation_logit: Tensor, radical_logit: Tensor) -> List[FragmentIonCandidate]:
         device = keep_logit.device
-        node_emb = sample_tree_batch.x[batch_node_index]
         base_formula = structure.node_formula[global_node_id].to(device).float()
         main_adduct_index = int(sample_tree_batch.node_main_adduct_type_index[batch_node_index].detach().cpu().item())
         role_index = int(bool(sample_tree_batch.node_is_precursor_root[batch_node_index].detach().cpu().item()))
@@ -159,9 +177,15 @@ class FragmentTreeCandidateSelector(nn.Module):
         if len(rows) == 0:
             return []
         formula_tensor = torch.stack([row[3] for row in rows], dim=0)
-        delta_tensor = torch.stack([row[4] for row in rows], dim=0)
-        candidate_input = torch.cat([node_emb[None, :].expand(formula_tensor.size(0), -1), formula_tensor, delta_tensor], dim=-1)
-        candidate_logit = self.fragment_ion_candidate_head(candidate_input).squeeze(-1)
+        candidate_logit = torch.stack(
+            [
+                ion_logit[batch_node_index, row[0]]
+                + unsaturation_logit[batch_node_index, row[1]]
+                + radical_logit[batch_node_index, row[2]]
+                for row in rows
+            ],
+            dim=0,
+        )
         combined_score = keep_logit[batch_node_index] + candidate_logit
         top = torch.topk(combined_score, k=min(self.max_fragment_ion_candidates, int(combined_score.numel())))
         tensorizer = self.feature_model.formula_tensorizer

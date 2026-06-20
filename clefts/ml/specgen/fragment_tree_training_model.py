@@ -149,11 +149,7 @@ class FormulaGroupCoverageLoss(nn.Module):
 
 
 class FragmentTreeSelectionTrainingLoss(nn.Module):
-    """Loss for keep/cleave and grouped formula target training."""
-
-    def __init__(self, missing_formula_penalty: float = 32.0) -> None:
-        super().__init__()
-        self.formula_group_loss = FormulaGroupCoverageLoss(missing_formula_penalty)
+    """Loss for peak-wise fragment coverage, state prediction, and cleavage."""
 
     def forward(
         self,
@@ -161,16 +157,12 @@ class FragmentTreeSelectionTrainingLoss(nn.Module):
         target: TrainingFragmentTreeStructure,
     ) -> Tensor:
         device = output.keep_logit.device
+        self._validate_state_targets(target)
         losses: List[Tensor] = []
 
-        keep_target, keep_mask = self._build_keep_targets(output, target, device=device)
-        if keep_mask.any():
-            losses.append(
-                F.binary_cross_entropy_with_logits(
-                    output.keep_logit[keep_mask],
-                    keep_target[keep_mask],
-                )
-            )
+        if target.target_node_index.numel() > 0:
+            losses.append(self._peak_fragment_loss(output, target, device=device))
+            losses.append(self._state_loss(output, target, device=device))
 
         cleave_target, cleave_mask = self._build_cleave_targets(output, target, device=device)
         if cleave_mask.any():
@@ -181,84 +173,222 @@ class FragmentTreeSelectionTrainingLoss(nn.Module):
                 )
             )
 
-        if target.target_formula.numel() > 0:
-            losses.append(self._formula_group_loss(output, target, device=device))
-
         if len(losses) == 0:
             return output.keep_logit.sum() * 0.0
         return torch.stack(losses).mean()
 
-    def _formula_group_loss(
+    @staticmethod
+    def _validate_state_targets(target: TrainingFragmentTreeStructure) -> None:
+        target_count = int(target.target_node_index.numel())
+        state_tensors = (
+            target.target_ion_index,
+            target.target_unsaturation_index,
+            target.target_radical_index,
+            target.target_sample_index,
+            target.target_peak_index,
+            target.target_intensity,
+        )
+        if any(int(tensor.numel()) != target_count for tensor in state_tensors):
+            raise ValueError("Target state tensors must align with target_node_index.")
+        if target_count > 0:
+            if (
+                (target.target_ion_index < 0).any()
+                or (target.target_unsaturation_index < 0).any()
+                or (target.target_radical_index < 0).any()
+            ):
+                raise ValueError(
+                    "Training structures must contain resolved ion, "
+                    "unsaturation, and radical target indexes. Regenerate "
+                    "the training structures with the current builder."
+                )
+
+    def _peak_fragment_loss(
         self,
         output: FragmentTreeCandidateSelectionOutput,
         target: TrainingFragmentTreeStructure,
         *,
         device: torch.device,
     ) -> Tensor:
-        if len(output.kept_candidates) == 0:
-            return output.keep_logit.new_tensor(
-                self.formula_group_loss.missing_formula_penalty
+        batch_node_by_sample_node = self._batch_node_by_sample_node(output, device=device)
+        losses: List[Tensor] = []
+        weights: List[Tensor] = []
+
+        for peak_key in self._target_peak_keys(target, device=device):
+            row_index = self._target_peak_mask(target, peak_key=peak_key, device=device)
+            batch_node_indexes = self._unique_batch_node_indexes(
+                target_sample_index=target.target_sample_index[row_index].to(device),
+                target_node_index=target.target_node_index[row_index].to(device),
+                batch_node_by_sample_node=batch_node_by_sample_node,
             )
+            if batch_node_indexes.numel() == 0:
+                continue
+            peak_logit = output.keep_logit[batch_node_indexes]
+            losses.append(F.softplus(-torch.logsumexp(peak_logit, dim=0)))
+            weights.append(target.target_intensity[row_index].to(device).float().max())
 
-        candidate_logit = torch.stack(
-            [
-                candidate.score_tensor.to(device)
-                if candidate.score_tensor is not None
-                else output.keep_logit.new_tensor(float(candidate.score))
-                for candidate in output.kept_candidates
-            ],
-            dim=0,
-        )
-        candidate_formula = torch.stack(
-            [candidate.formula_tensor for candidate in output.kept_candidates], dim=0
-        ).to(device)
-        candidate_sample_index = torch.tensor(
-            [candidate.sample_id for candidate in output.kept_candidates],
-            dtype=torch.long,
-            device=device,
-        )
+        return self._weighted_mean(losses, weights, output.keep_logit)
 
-        target_group_index = getattr(target, "target_formula_group_index", None)
-        if target_group_index is None:
-            target_group_index = torch.arange(
-                target.target_formula.size(0), dtype=torch.long, device=device
-            )
-
-        return self.formula_group_loss(
-            candidate_logit,
-            candidate_formula,
-            target.target_formula.to(device),
-            candidate_sample_index=candidate_sample_index,
-            target_sample_index=target.target_sample_index.to(device),
-            target_group_index=target_group_index.to(device),
-            target_weight=target.target_intensity.to(device),
-        )
-
-    def _build_keep_targets(
+    def _state_loss(
         self,
         output: FragmentTreeCandidateSelectionOutput,
         target: TrainingFragmentTreeStructure,
         *,
         device: torch.device,
-    ) -> Tuple[Tensor, Tensor]:
+    ) -> Tensor:
         batch = output.sample_tree_batch
-        keep_target = torch.zeros_like(output.keep_logit, dtype=torch.float32, device=device)
-        keep_mask = ~batch.node_is_precursor_root.to(device).bool()
+        batch_node_by_sample_node = self._batch_node_by_sample_node(output, device=device)
+        losses: List[Tensor] = []
+        weights: List[Tensor] = []
 
-        if target.target_node_index.numel() == 0:
-            return keep_target, keep_mask
+        for peak_key in self._target_peak_keys(target, device=device):
+            row_index = self._target_peak_mask(target, peak_key=peak_key, device=device)
+            batch_node_indexes = self._unique_batch_node_indexes(
+                target_sample_index=target.target_sample_index[row_index].to(device),
+                target_node_index=target.target_node_index[row_index].to(device),
+                batch_node_by_sample_node=batch_node_by_sample_node,
+            )
+            if batch_node_indexes.numel() == 0:
+                continue
 
-        positive_pairs = self._target_sample_node_pairs(
-            target_sample_index=target.target_sample_index.to(device),
-            target_node_index=target.target_node_index.to(device),
-        )
-        self._apply_positive_node_pairs(
-            target_tensor=keep_target,
-            positive_pairs=positive_pairs,
-            batch=batch,
-            device=device,
-        )
-        return keep_target, keep_mask
+            fragment_prob = torch.softmax(output.keep_logit[batch_node_indexes], dim=0).detach()
+            prob_by_batch_node = {
+                int(batch_node): fragment_prob[index]
+                for index, batch_node in enumerate(batch_node_indexes.detach().cpu().tolist())
+            }
+            peak_weight = target.target_intensity[row_index].to(device).float().max()
+            seen_nodes: set[int] = set()
+
+            for row in row_index.detach().cpu().tolist():
+                row = int(row)
+                key = (
+                    int(target.target_sample_index[row].detach().cpu().item()),
+                    int(target.target_node_index[row].detach().cpu().item()),
+                )
+                batch_node_index = batch_node_by_sample_node.get(key)
+                if batch_node_index is None or batch_node_index in seen_nodes:
+                    continue
+                seen_nodes.add(batch_node_index)
+
+                role_index = int(bool(batch.node_is_precursor_root[batch_node_index].detach().cpu().item()))
+                main_adduct_index = int(batch.node_main_adduct_type_index[batch_node_index].detach().cpu().item())
+                node_weight = peak_weight * prob_by_batch_node[int(batch_node_index)]
+
+                losses.append(
+                    self._masked_cross_entropy(
+                        output.ion_logit[batch_node_index],
+                        int(target.target_ion_index[row].detach().cpu().item()),
+                        output.ion_valid_mask_by_role_adduct[role_index, main_adduct_index],
+                    )
+                )
+                weights.append(node_weight)
+
+                losses.append(
+                    self._masked_cross_entropy(
+                        output.unsaturation_logit[batch_node_index],
+                        int(target.target_unsaturation_index[row].detach().cpu().item()),
+                        output.unsaturation_valid_mask_by_role_adduct[role_index, main_adduct_index],
+                    )
+                )
+                weights.append(node_weight)
+
+                losses.append(
+                    self._masked_cross_entropy(
+                        output.radical_logit[batch_node_index],
+                        int(target.target_radical_index[row].detach().cpu().item()),
+                        output.radical_valid_mask_by_role_adduct[role_index, main_adduct_index],
+                    )
+                )
+                weights.append(node_weight)
+
+        return self._weighted_mean(losses, weights, output.keep_logit)
+
+    @staticmethod
+    def _masked_cross_entropy(logit: Tensor, target_index: int, mask: Tensor) -> Tensor:
+        if mask.numel() == 0:
+            return F.cross_entropy(logit[None, :], logit.new_tensor([target_index], dtype=torch.long))
+        mask = mask.to(logit.device).bool()
+        if target_index < 0 or target_index >= int(logit.numel()):
+            raise IndexError(f"target_index={target_index} is out of range for logits.")
+        if not bool(mask[target_index].detach().cpu().item()):
+            raise ValueError(f"target_index={target_index} is not valid for this node role/adduct.")
+        masked_logit = logit.masked_fill(~mask, -torch.finfo(logit.dtype).max)
+        return F.cross_entropy(masked_logit[None, :], logit.new_tensor([target_index], dtype=torch.long))
+
+    @staticmethod
+    def _target_peak_keys(
+        target: TrainingFragmentTreeStructure,
+        *,
+        device: torch.device,
+    ) -> List[Tuple[int, int]]:
+        keys: List[Tuple[int, int]] = []
+        seen: set[Tuple[int, int]] = set()
+        sample_index = target.target_sample_index.to(device).long()
+        peak_index = target.target_peak_index.to(device).long()
+        for row in range(int(sample_index.numel())):
+            key = (int(sample_index[row].item()), int(peak_index[row].item()))
+            if key not in seen:
+                seen.add(key)
+                keys.append(key)
+        return keys
+
+    @staticmethod
+    def _target_peak_mask(
+        target: TrainingFragmentTreeStructure,
+        *,
+        peak_key: Tuple[int, int],
+        device: torch.device,
+    ) -> Tensor:
+        sample_index = target.target_sample_index.to(device).long()
+        peak_index = target.target_peak_index.to(device).long()
+        return ((sample_index == int(peak_key[0])) & (peak_index == int(peak_key[1]))).nonzero(as_tuple=False).view(-1)
+
+    @staticmethod
+    def _batch_node_by_sample_node(
+        output: FragmentTreeCandidateSelectionOutput,
+        *,
+        device: torch.device,
+    ) -> Dict[Tuple[int, int], int]:
+        batch = output.sample_tree_batch
+        kept_sample_ids = batch.kept_sample_ids.to(device).long()
+        graph_index_by_node = batch.batch.to(device).long()
+        node_global_ids = batch.node_id_global.to(device).long()
+        mapping: Dict[Tuple[int, int], int] = {}
+        for batch_node_index in range(int(node_global_ids.numel())):
+            graph_index = int(graph_index_by_node[batch_node_index].item())
+            sample_id = int(kept_sample_ids[graph_index].item())
+            node_id = int(node_global_ids[batch_node_index].item())
+            mapping[(sample_id, node_id)] = int(batch_node_index)
+        return mapping
+
+    @staticmethod
+    def _unique_batch_node_indexes(
+        *,
+        target_sample_index: Tensor,
+        target_node_index: Tensor,
+        batch_node_by_sample_node: Dict[Tuple[int, int], int],
+    ) -> Tensor:
+        device = target_sample_index.device
+        indexes: List[int] = []
+        seen: set[int] = set()
+        for sample_id, node_id in zip(
+            target_sample_index.detach().cpu().tolist(),
+            target_node_index.detach().cpu().tolist(),
+        ):
+            batch_node_index = batch_node_by_sample_node.get((int(sample_id), int(node_id)))
+            if batch_node_index is not None and batch_node_index not in seen:
+                seen.add(batch_node_index)
+                indexes.append(batch_node_index)
+        return torch.tensor(indexes, dtype=torch.long, device=device)
+
+    @staticmethod
+    def _weighted_mean(losses: List[Tensor], weights: List[Tensor], like: Tensor) -> Tensor:
+        if len(losses) == 0:
+            return like.sum() * 0.0
+        loss_tensor = torch.stack(losses)
+        weight_tensor = torch.stack(weights).to(loss_tensor.device).float().clamp_min(0.0)
+        if float(weight_tensor.sum().detach().cpu().item()) <= 0.0:
+            return loss_tensor.mean()
+        return (loss_tensor * weight_tensor).sum() / weight_tensor.sum()
 
     def _build_cleave_targets(
         self,

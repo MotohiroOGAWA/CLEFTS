@@ -24,6 +24,9 @@ class TrainingFormulaTarget:
     node_index: int
     peak_index: int
     group_index: int
+    ion_index: int
+    unsaturation_index: int
+    radical_index: int
     formula_tensor: Tensor
     intensity: float
 
@@ -236,6 +239,9 @@ class TrainingFragmentTreeStructureBuilder(SingleFragmentTreeStructureBuilder):
         target_node_indexes: List[int] = []
         target_formula_rows: List[Tensor] = []
         target_intensities: List[float] = []
+        target_ion_indexes: List[int] = []
+        target_unsaturation_indexes: List[int] = []
+        target_radical_indexes: List[int] = []
         target_sample_indexes: List[int] = []
         target_peak_indexes: List[int] = []
         target_formula_group_indexes: List[int] = []
@@ -262,6 +268,9 @@ class TrainingFragmentTreeStructureBuilder(SingleFragmentTreeStructureBuilder):
                 target_node_indexes.append(int(target.node_index))
                 target_formula_rows.append(target.formula_tensor.to(structure.device))
                 target_intensities.append(float(target.intensity))
+                target_ion_indexes.append(int(target.ion_index))
+                target_unsaturation_indexes.append(int(target.unsaturation_index))
+                target_radical_indexes.append(int(target.radical_index))
                 target_formula_group_indexes.append(int(target.group_index))
                 target_sample_indexes.append(int(new_sample_index))
                 target_peak_indexes.append(int(target.peak_index))
@@ -316,21 +325,18 @@ class TrainingFragmentTreeStructureBuilder(SingleFragmentTreeStructureBuilder):
             precursor_sample_index=structure.precursor_sample_index,
             target_node_keep=target_node_keep,
             target_node_expand=target_node_expand,
-            target_ion_index=torch.full(
-                (len(target_node_indexes),),
-                -1,
+            target_ion_index=torch.tensor(
+                target_ion_indexes,
                 dtype=torch.long,
                 device=structure.device,
             ),
-            target_unsaturation_index=torch.full(
-                (len(target_node_indexes),),
-                -1,
+            target_unsaturation_index=torch.tensor(
+                target_unsaturation_indexes,
                 dtype=torch.long,
                 device=structure.device,
             ),
-            target_radical_index=torch.full(
-                (len(target_node_indexes),),
-                -1,
+            target_radical_index=torch.tensor(
+                target_radical_indexes,
                 dtype=torch.long,
                 device=structure.device,
             ),
@@ -510,19 +516,153 @@ class TrainingFragmentTreeStructureBuilder(SingleFragmentTreeStructureBuilder):
 
                 terminal_node = fragment_pathway.terminal_node
                 terminal_node_index = self._get_node_index(terminal_node.smiles)
+                ion_index, unsaturation_index, radical_index = (
+                    self._resolve_fragment_state_target(
+                        fragment_pathway=fragment_pathway,
+                        main_adduct_type=self._model.fragmenter.adduct_types[
+                            int(sample.adduct_type_index)
+                        ],
+                    )
+                )
                 sample.target_node_keep_indexes.add(int(terminal_node_index))
-                sample.target_formula_rows.append(
-                    TrainingFormulaTarget(
+                self._add_or_replace_formula_target(
+                    sample=sample,
+                    target=TrainingFormulaTarget(
                         node_index=int(terminal_node_index),
                         peak_index=int(peak_index),
                         group_index=int(group_index),
+                        ion_index=int(ion_index),
+                        unsaturation_index=int(unsaturation_index),
+                        radical_index=int(radical_index),
                         formula_tensor=formula_tensorizer.formula_to_tensor(
                             formula,
                             dtype=torch.float32,
                         ),
                         intensity=peak_intensity,
-                    )
+                    ),
+                    main_adduct_type=self._model.fragmenter.adduct_types[
+                        int(sample.adduct_type_index)
+                    ],
                 )
+
+    def _add_or_replace_formula_target(
+        self,
+        *,
+        sample: TrainingFragmentTreeSample,
+        target: TrainingFormulaTarget,
+        main_adduct_type: Adduct,
+    ) -> None:
+        target_priority = self._state_target_priority(
+            main_adduct_type=main_adduct_type,
+            ion_index=target.ion_index,
+            unsaturation_index=target.unsaturation_index,
+            radical_index=target.radical_index,
+        )
+        for index, current in enumerate(sample.target_formula_rows):
+            if (
+                int(current.peak_index) != int(target.peak_index)
+                or int(current.node_index) != int(target.node_index)
+            ):
+                continue
+            current_priority = self._state_target_priority(
+                main_adduct_type=main_adduct_type,
+                ion_index=current.ion_index,
+                unsaturation_index=current.unsaturation_index,
+                radical_index=current.radical_index,
+            )
+            if target_priority < current_priority:
+                sample.target_formula_rows[index] = target
+            return
+
+        sample.target_formula_rows.append(target)
+
+    def _resolve_fragment_state_target(
+        self,
+        *,
+        fragment_pathway,
+        main_adduct_type: Adduct,
+    ) -> Tuple[int, int, int]:
+        target_formula = fragment_pathway.formula.normalized
+        terminal_formula = fragment_pathway.terminal_node.to_compound().formula
+
+        adduct_index = self._model.main_adduct_types.inverse[main_adduct_type]
+        role_index = 0
+        ion_mask = self._model.ion_candidate_valid_mask_by_role_adduct[
+            role_index, int(adduct_index)
+        ]
+        unsaturation_mask = self._model.unsaturation_candidate_valid_mask_by_role_adduct[
+            role_index, int(adduct_index)
+        ]
+        radical_mask = self._model.radical_candidate_valid_mask_by_role_adduct[
+            role_index, int(adduct_index)
+        ]
+
+        matches: List[Tuple[Tuple[int, int, int, int, int], Tuple[int, int, int]]] = []
+        for ion_index in ion_mask.nonzero(as_tuple=False).view(-1).tolist():
+            ion_adduct = self._model.ion_flat_candidates[int(ion_index), 1]
+            for unsaturation_index in unsaturation_mask.nonzero(as_tuple=False).view(-1).tolist():
+                unsaturation_adduct = self._model.unsaturation_flat_candidates[
+                    int(unsaturation_index), 1
+                ]
+                for radical_index in radical_mask.nonzero(as_tuple=False).view(-1).tolist():
+                    radical_adduct = self._model.radical_flat_candidates[
+                        int(radical_index), 1
+                    ]
+                    adduct = ion_adduct.add_prefer_self(unsaturation_adduct)
+                    adduct = adduct.add_prefer_self(radical_adduct)
+                    formula = adduct.apply_to_formula(terminal_formula).normalized
+                    if formula != target_formula:
+                        continue
+
+                    priority = (
+                        self._adduct_distance_from_zero(unsaturation_adduct),
+                        self._adduct_distance_from_zero(radical_adduct),
+                        abs(int(unsaturation_index)),
+                        abs(int(radical_index)),
+                        abs(int(ion_index)),
+                    )
+                    matches.append(
+                        (
+                            priority,
+                            (int(ion_index), int(unsaturation_index), int(radical_index)),
+                        )
+                    )
+
+        if not matches:
+            raise ValueError(
+                "Could not resolve state target for fragment pathway: "
+                f"formula={target_formula}, main_adduct_type={main_adduct_type}, "
+                f"terminal_smiles={fragment_pathway.terminal_node.smiles}."
+            )
+
+        matches.sort(key=lambda item: item[0])
+        return matches[0][1]
+
+    def _state_target_priority(
+        self,
+        *,
+        main_adduct_type: Adduct,
+        ion_index: int,
+        unsaturation_index: int,
+        radical_index: int,
+    ) -> Tuple[int, int, int, int, int]:
+        unsaturation_adduct = self._model.unsaturation_flat_candidates[
+            int(unsaturation_index), 1
+        ]
+        radical_adduct = self._model.radical_flat_candidates[int(radical_index), 1]
+        return (
+            self._adduct_distance_from_zero(unsaturation_adduct),
+            self._adduct_distance_from_zero(radical_adduct),
+            abs(int(unsaturation_index)),
+            abs(int(radical_index)),
+            abs(int(ion_index)),
+        )
+
+    @staticmethod
+    def _adduct_distance_from_zero(adduct: Adduct) -> int:
+        return int(abs(adduct.charge)) + sum(
+            abs(int(count)) for count in adduct.element_diff.values()
+        )
 
     def _get_outgoing_edge_indexes_from_fragment_ion_tree(
         self,
