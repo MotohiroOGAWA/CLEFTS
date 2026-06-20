@@ -13,7 +13,7 @@ from ..common.layers.graphormer import GraphormerEncoder
 from ..input.fragment_tree_structure import FragmentTreeStructure
 from ..input.fragment_tree_features import FragmentTreeFeatures
 
-from ..mol import MolEncoder
+from ..mol import MolEncoder, FormulaTensorizer
 from .components.condition.condition_encoder import MS2ConditionEncoder
 from .components.cleavage.cleavage_edge_feature_net import CleavageEdgeFeatureNet
 
@@ -320,6 +320,20 @@ class FragmentTreeProbabilityModel(nn.Module):
             for adduct in self._fragmenter.adduct_types
         }
 
+        formula_adducts = []
+        for candidates_by_adduct in (
+            self.ion_candidates_by_adduct,
+            self.unsaturation_candidates_by_adduct,
+            self.radical_candidates_by_adduct,
+        ):
+            for candidates in candidates_by_adduct.values():
+                formula_adducts.extend(list(candidates))
+
+        self._formula_tensorizer = FormulaTensorizer.from_symbols_and_adducts(
+            symbols=self.mol_encoder.symbols,
+            adducts=formula_adducts,
+        )
+
         (
             self.ion_flat_candidates,
             self.ion_candidate_slice_by_adduct,
@@ -446,6 +460,10 @@ class FragmentTreeProbabilityModel(nn.Module):
                 )
             )
     
+
+    @property
+    def formula_tensorizer(self) -> FormulaTensorizer:
+        return self._formula_tensorizer
 
     @property
     def mol_atom_dim(self) -> int:

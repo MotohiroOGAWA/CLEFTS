@@ -118,6 +118,42 @@ class TestFragmentTreeStructure(unittest.TestCase):
         )
 
         # -------------------------
+        # formula tensors
+        # -------------------------
+        self.assertEqual(batched.formula_element_order, ("C", "H", "O", "Na"))
+        self.assertTensorEqual(
+            batched.node_formula,
+            torch.tensor(
+                [
+                    [1.0, 2.0, 0.0, 0.0, 0.0],
+                    [2.0, 4.0, 1.0, 0.0, 0.0],
+                    [101.0, 202.0, 0.0, 0.0, 0.0],
+                    [102.0, 204.0, 1.0, 0.0, 0.0],
+                    [103.0, 206.0, 0.0, 1.0, 0.0],
+                ],
+                dtype=torch.float32,
+            ),
+        )
+        self.assertTensorEqual(
+            batched.ion_formula_delta,
+            torch.tensor(
+                [
+                    [0.0, 1.0, 0.0, 0.0, 1.0],
+                    [0.0, 0.0, 0.0, 1.0, 1.0],
+                ],
+                dtype=torch.float32,
+            ),
+        )
+        self.assertTensorEqual(
+            batched.unsaturation_formula_delta,
+            torch.tensor([[0.0, -2.0, 0.0, 0.0, 0.0]], dtype=torch.float32),
+        )
+        self.assertTensorEqual(
+            batched.radical_formula_delta,
+            torch.tensor([[0.0, -1.0, 0.0, 0.0, 0.0]], dtype=torch.float32),
+        )
+
+        # -------------------------
         # edge_index
         # -------------------------
         self.assertTensorEqual(
@@ -305,13 +341,13 @@ class TestFragmentTreeStructure(unittest.TestCase):
         )
 
         # -------------------------
-        # sample_precursor_edge_index_path
+        # precursor_edge_index_path
         # -------------------------
         # structure_a has width 2.
         # structure_b has width 3.
         # Therefore, structure_a rows are padded to width 3.
         self.assertTensorEqual(
-            batched.sample_precursor_edge_index_path,
+            batched.precursor_edge_index_path,
             torch.tensor(
                 [
                     [0, -1, -1],
@@ -323,10 +359,10 @@ class TestFragmentTreeStructure(unittest.TestCase):
         )
 
         # -------------------------
-        # sample_precursor_path_index
+        # precursor_sample_index
         # -------------------------
         self.assertTensorEqual(
-            batched.sample_precursor_path_index,
+            batched.precursor_sample_index,
             torch.tensor(
                 [0, 1, 2],
                 dtype=torch.long,
@@ -417,11 +453,17 @@ class TestFragmentTreeStructure(unittest.TestCase):
         self.assertEqual(batched.cleavage_event.device, device)
         self.assertEqual(batched.reactant_tuple_length_table.device, device)
         self.assertEqual(batched.product_tuple_length_table.device, device)
+        self.assertEqual(batched.node_formula.device, device)
+        self.assertEqual(batched.ion_formula_delta.device, device)
+        self.assertEqual(batched.unsaturation_formula_delta.device, device)
+        self.assertEqual(batched.radical_formula_delta.device, device)
         self.assertEqual(batched.sample_adduct_type_index.device, device)
         self.assertEqual(batched.sample_ce_value.device, device)
         self.assertEqual(batched.sample_edge_index.device, device)
-        self.assertEqual(batched.sample_precursor_edge_index_path.device, device)
-        self.assertEqual(batched.sample_precursor_path_index.device, device)
+        self.assertEqual(batched.precursor_edge_index_path.device, device)
+        self.assertEqual(batched.precursor_unsaturation_index.device, device)
+        self.assertEqual(batched.precursor_radical_index.device, device)
+        self.assertEqual(batched.precursor_sample_index.device, device)
         self.assertEqual(batched.node_graph.x.device, device)
 
         for atom_idxs in batched.cleavage_atom_idxs.values():
@@ -487,11 +529,19 @@ class TestFragmentTreeStructure(unittest.TestCase):
                 [0, 0, 1, 1],
                 [0, 2, 1, 2],
             ],
-            sample_precursor_edge_index_path=[
+            precursor_edge_index_path=[
                 [0, -1],
                 [2, 1],
             ],
-            sample_precursor_path_index=[
+            precursor_unsaturation_index=[
+                0,
+                1,
+            ],
+            precursor_radical_index=[
+                0,
+                1,
+            ],
+            precursor_sample_index=[
                 0,
                 1,
             ],
@@ -550,10 +600,16 @@ class TestFragmentTreeStructure(unittest.TestCase):
                 [0, 0],
                 [0, 1],
             ],
-            sample_precursor_edge_index_path=[
+            precursor_edge_index_path=[
                 [1, 0, -1],
             ],
-            sample_precursor_path_index=[
+            precursor_unsaturation_index=[
+                2,
+            ],
+            precursor_radical_index=[
+                2,
+            ],
+            precursor_sample_index=[
                 0,
             ],
         )
@@ -573,9 +629,13 @@ class TestFragmentTreeStructure(unittest.TestCase):
         sample_adduct_type_index: List[int],
         sample_ce_value: List[float],
         sample_edge_index: List[List[int]],
-        sample_precursor_edge_index_path: List[List[int]],
-        sample_precursor_path_index: List[int],
+        precursor_edge_index_path: List[List[int]],
+        precursor_unsaturation_index: List[int],
+        precursor_radical_index: List[int],
+        precursor_sample_index: List[int],
     ) -> FragmentTreeStructure:
+        node_index_offset = int(x_start)
+
         return FragmentTreeStructure(
             node_smiles=np.asarray(
                 node_smiles,
@@ -586,6 +646,35 @@ class TestFragmentTreeStructure(unittest.TestCase):
                 x_start=x_start,
             ),
             node_graph_offset=self._make_node_graph_offset(atom_counts),
+            node_formula=torch.tensor(
+                [
+                    [
+                        float(node_index_offset + index + 1),
+                        float((node_index_offset + index + 1) * 2),
+                        float(index % 2),
+                        float(index == len(node_smiles) - 1 and x_start > 0),
+                        0.0,
+                    ]
+                    for index in range(len(node_smiles))
+                ],
+                dtype=torch.float32,
+            ),
+            formula_element_order=("C", "H", "O", "Na"),
+            ion_formula_delta=torch.tensor(
+                [
+                    [0.0, 1.0, 0.0, 0.0, 1.0],
+                    [0.0, 0.0, 0.0, 1.0, 1.0],
+                ],
+                dtype=torch.float32,
+            ),
+            unsaturation_formula_delta=torch.tensor(
+                [[0.0, -2.0, 0.0, 0.0, 0.0]],
+                dtype=torch.float32,
+            ),
+            radical_formula_delta=torch.tensor(
+                [[0.0, -1.0, 0.0, 0.0, 0.0]],
+                dtype=torch.float32,
+            ),
             edge_index=torch.tensor(
                 edge_index,
                 dtype=torch.long,
@@ -645,20 +734,38 @@ class TestFragmentTreeStructure(unittest.TestCase):
                 (2, 0),
                 dtype=torch.long,
             ),
-            sample_precursor_edge_index_path=torch.tensor(
-                sample_precursor_edge_index_path,
+            precursor_edge_index_path=torch.tensor(
+                precursor_edge_index_path,
                 dtype=torch.long,
             )
-            if len(sample_precursor_edge_index_path) > 0
+            if len(precursor_edge_index_path) > 0
             else torch.empty(
                 (0, 0),
                 dtype=torch.long,
             ),
-            sample_precursor_path_index=torch.tensor(
-                sample_precursor_path_index,
+            precursor_unsaturation_index=torch.tensor(
+                precursor_unsaturation_index,
                 dtype=torch.long,
             )
-            if len(sample_precursor_path_index) > 0
+            if len(precursor_unsaturation_index) > 0
+            else torch.empty(
+                (0,),
+                dtype=torch.long,
+            ),
+            precursor_radical_index=torch.tensor(
+                precursor_radical_index,
+                dtype=torch.long,
+            )
+            if len(precursor_radical_index) > 0
+            else torch.empty(
+                (0,),
+                dtype=torch.long,
+            ),
+            precursor_sample_index=torch.tensor(
+                precursor_sample_index,
+                dtype=torch.long,
+            )
+            if len(precursor_sample_index) > 0
             else torch.empty(
                 (0,),
                 dtype=torch.long,

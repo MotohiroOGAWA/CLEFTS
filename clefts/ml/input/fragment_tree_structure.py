@@ -32,6 +32,12 @@ class FragmentTreeStructure:
     # The atom index range of node_index is:
     #     [node_graph_offset[node_index], node_graph_offset[node_index + 1])
 
+    node_formula: Tensor
+    # [N, F] Neutral fragment formula tensor.
+
+    formula_element_order: Tuple[str, ...]
+    # Element order used by node_formula and adduct delta tensors.
+
     # -------------------------
     # Fragment tree edges
     # -------------------------
@@ -102,6 +108,16 @@ class FragmentTreeStructure:
     #   2: product_molecule_id
     #   3: product_tuple_length
 
+    ion_formula_delta: Tensor
+    # [C_ion, F] Delta tensor aligned with model.ion_flat_candidates.
+
+    unsaturation_formula_delta: Tensor
+    # [C_unsaturation, F] Delta tensor aligned with
+    # model.unsaturation_flat_candidates.
+
+    radical_formula_delta: Tensor
+    # [C_radical, F] Delta tensor aligned with model.radical_flat_candidates.
+
     # -------------------------
     # Sample-level information
     # -------------------------
@@ -169,6 +185,44 @@ class FragmentTreeStructure:
 
     def __post_init__(self) -> None:
         num_precursor_paths = int(self.precursor_edge_index_path.size(0))
+
+        if self.node_formula.dim() != 2:
+            raise ValueError(
+                "node_formula must be 2D, "
+                f"got shape {tuple(self.node_formula.shape)}."
+            )
+
+        if self.node_formula.size(0) != self.num_nodes:
+            raise ValueError(
+                "node_formula must have one row per node. "
+                f"Got {self.node_formula.size(0)} rows and "
+                f"{self.num_nodes} nodes."
+            )
+
+        if self.node_formula.size(1) != len(self.formula_element_order) + 1:
+            raise ValueError(
+                "node_formula width must equal len(formula_element_order) + 1 "
+                "for the charge column. "
+                f"Got width={self.node_formula.size(1)} and "
+                f"element_order={self.formula_element_order}."
+            )
+
+        for field_name in (
+            "ion_formula_delta",
+            "unsaturation_formula_delta",
+            "radical_formula_delta",
+        ):
+            value = getattr(self, field_name)
+            if value.dim() != 2:
+                raise ValueError(
+                    f"{field_name} must be 2D, "
+                    f"got shape {tuple(value.shape)}."
+                )
+            if value.size(1) != self.node_formula.size(1):
+                raise ValueError(
+                    f"{field_name} must have formula width "
+                    f"{self.node_formula.size(1)}, got {value.size(1)}."
+                )
 
         if self.precursor_edge_index_path.dim() != 2:
             raise ValueError(
@@ -270,6 +324,8 @@ class FragmentTreeStructure:
             node_smiles=self.node_smiles,
             node_graph=self.node_graph.to(device),
             node_graph_offset=self.node_graph_offset.to(device),
+            node_formula=self.node_formula.to(device),
+            formula_element_order=self.formula_element_order,
             edge_index=self.edge_index.to(device),
             cleavage_event_edge_index=self.cleavage_event_edge_index.to(device),
             cleavage_event=self.cleavage_event.to(device),
@@ -298,6 +354,9 @@ class FragmentTreeStructure:
             product_tuple_length_table=(
                 self.product_tuple_length_table.to(device)
             ),
+            ion_formula_delta=self.ion_formula_delta.to(device),
+            unsaturation_formula_delta=self.unsaturation_formula_delta.to(device),
+            radical_formula_delta=self.radical_formula_delta.to(device),
         )
         
     @classmethod
@@ -387,6 +446,49 @@ class FragmentTreeStructure:
             ],
             dim=0,
         )
+
+        # -------------------------
+        # Formula tensors
+        # -------------------------
+        formula_element_order = tuple(first.formula_element_order)
+
+        for structure in structures:
+            if tuple(structure.formula_element_order) != formula_element_order:
+                raise ValueError(
+                    "All FragmentTreeStructure objects must use the same "
+                    "formula_element_order. "
+                    f"Got {formula_element_order} and "
+                    f"{tuple(structure.formula_element_order)}."
+                )
+
+        node_formula = torch.cat(
+            [
+                structure.node_formula.to(tensor_device)
+                for structure in structures
+            ],
+            dim=0,
+        )
+
+        ion_formula_delta = first.ion_formula_delta.to(tensor_device)
+        unsaturation_formula_delta = first.unsaturation_formula_delta.to(
+            tensor_device
+        )
+        radical_formula_delta = first.radical_formula_delta.to(tensor_device)
+
+        for structure in structures[1:]:
+            for field_name, first_value in (
+                ("ion_formula_delta", ion_formula_delta),
+                ("unsaturation_formula_delta", unsaturation_formula_delta),
+                ("radical_formula_delta", radical_formula_delta),
+            ):
+                value = getattr(structure, field_name).to(tensor_device)
+                if tuple(value.shape) != tuple(first_value.shape) or not torch.equal(
+                    value,
+                    first_value,
+                ):
+                    raise ValueError(
+                        f"All structures must share identical {field_name}."
+                    )
 
         # -------------------------
         # Fragment tree edge_index
@@ -607,6 +709,8 @@ class FragmentTreeStructure:
             node_smiles=node_smiles,
             node_graph=node_graph,
             node_graph_offset=node_graph_offset,
+            node_formula=node_formula,
+            formula_element_order=formula_element_order,
             edge_index=edge_index,
             cleavage_event_edge_index=cleavage_event_edge_index,
             cleavage_event=cleavage_event,
@@ -620,6 +724,9 @@ class FragmentTreeStructure:
             precursor_sample_index=precursor_sample_index,
             reactant_tuple_length_table=reactant_tuple_length_table,
             product_tuple_length_table=product_tuple_length_table,
+            ion_formula_delta=ion_formula_delta,
+            unsaturation_formula_delta=unsaturation_formula_delta,
+            radical_formula_delta=radical_formula_delta,
         )
 
     @staticmethod

@@ -18,7 +18,8 @@ from ...domain.fragment.pathway import (
     FragmentPathwayEdge,
     CleavageStep,
 )
-from ..specgen import FragmentTreeProbabilityModel
+from ..specgen.fragment_tree_probability_model import FragmentTreeProbabilityModel
+from ..mol.formula_encoder import FormulaTensorizer
 from .fragment_tree_structure import FragmentTreeStructure
 
 
@@ -94,6 +95,9 @@ class SingleFragmentTreeStructureBuilder:
     #
     # The atom index range of node_index is:
     #     [_node_graph_offset[node_index], _node_graph_offset[node_index + 1])
+
+    node_formula: List[torch.Tensor] = field(default_factory=list)
+    # [N] Neutral fragment formula tensors aligned with node_smiles.
 
     # -------------------------
     # Edges
@@ -258,6 +262,21 @@ class SingleFragmentTreeStructureBuilder:
         )
 
         node_graph = Batch.from_data_list(self.node_graph)
+
+        node_formula = torch.stack(self.node_formula, dim=0)
+        formula_tensorizer = self._get_formula_tensorizer()
+        ion_formula_delta = formula_tensorizer.adducts_to_delta_tensor(
+            [candidate for _, candidate in self._model.ion_flat_candidates],
+            dtype=node_formula.dtype,
+        )
+        unsaturation_formula_delta = formula_tensorizer.adducts_to_delta_tensor(
+            [candidate for _, candidate in self._model.unsaturation_flat_candidates],
+            dtype=node_formula.dtype,
+        )
+        radical_formula_delta = formula_tensorizer.adducts_to_delta_tensor(
+            [candidate for _, candidate in self._model.radical_flat_candidates],
+            dtype=node_formula.dtype,
+        )
 
         node_graph_offset = torch.tensor(
             self._node_graph_offset,
@@ -480,6 +499,8 @@ class SingleFragmentTreeStructureBuilder:
             node_smiles=node_smiles,
             node_graph=node_graph,
             node_graph_offset=node_graph_offset,
+            node_formula=node_formula,
+            formula_element_order=formula_tensorizer.element_order,
             edge_index=edge_index,
             cleavage_event_edge_index=cleavage_event_edge_index,
             cleavage_event=cleavage_event,
@@ -493,6 +514,9 @@ class SingleFragmentTreeStructureBuilder:
             precursor_sample_index=sample_precursor_index,
             reactant_tuple_length_table=reactant_tuple_length_table,
             product_tuple_length_table=product_tuple_length_table,
+            ion_formula_delta=ion_formula_delta,
+            unsaturation_formula_delta=unsaturation_formula_delta,
+            radical_formula_delta=radical_formula_delta,
         )
 
     def add_same_smiles_dataset_first_cleavage(
@@ -785,6 +809,7 @@ class SingleFragmentTreeStructureBuilder:
         # -------------------------
         self.node_smiles = []
         self.node_graph = []
+        self.node_formula = []
         self._node_graph_offset = [0]
 
         # -------------------------
@@ -820,6 +845,11 @@ class SingleFragmentTreeStructureBuilder:
     # -------------------------
     # internal helpers
     # -------------------------
+    def _get_formula_tensorizer(self) -> FormulaTensorizer:
+        if not hasattr(self._model, "formula_tensorizer"):
+            raise ValueError("model must expose formula_tensorizer.")
+        return self._model.formula_tensorizer
+
     def _get_mol_graph(
         self,
         smiles: str,
@@ -871,8 +901,17 @@ class SingleFragmentTreeStructureBuilder:
         node_index = len(self.node_smiles)
         graph = self._get_mol_graph(smiles, compound)
 
+        if compound is None:
+            compound = Compound.from_smiles(smiles)
+
         self.node_smiles.append(smiles)
         self.node_graph.append(graph)
+        self.node_formula.append(
+            self._get_formula_tensorizer().formula_to_tensor(
+                compound.formula.normalized,
+                dtype=torch.float32,
+            )
+        )
 
         prev = self._node_graph_offset[-1]
         num_atoms = graph.num_nodes

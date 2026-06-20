@@ -638,11 +638,37 @@ class FragmentSpectrumGenerator(ModelBase):
         if self.formula_mz_resolver is not None:
             return self.formula_mz_resolver(probability_output, annotation)
 
+        structure = probability_output.ft_features.structure
+        if (
+            hasattr(structure, "node_formula")
+            and hasattr(structure, "ion_formula_delta")
+            and annotation.ion_choice_index is not None
+            and annotation.unsaturation_choice_index is not None
+            and annotation.radical_choice_index is not None
+        ):
+            tensorizer = self.probability_model.formula_tensorizer
+            formula_tensor = (
+                structure.node_formula[annotation.global_node_id]
+                + structure.ion_formula_delta[annotation.ion_choice_index]
+                + structure.unsaturation_formula_delta[annotation.unsaturation_choice_index]
+                + structure.radical_formula_delta[annotation.radical_choice_index]
+            )
+            formula = tensorizer.tensor_to_formula(formula_tensor).normalized
+            mz = self._formula_to_mz(formula)
+            return str(formula), mz
+
         compound = Compound.from_smiles(annotation.smiles)
         formula = annotation.adduct.apply_to_formula(compound.formula).normalized
-        mz = float(formula.exact_mass)
+        mz = self._formula_to_mz(formula)
 
         return str(formula), mz
+
+    @staticmethod
+    def _formula_to_mz(formula) -> float:
+        charge = int(getattr(formula, "charge", 0))
+        if charge == 0:
+            return float(formula.exact_mass)
+        return float(formula.exact_mass) / abs(charge)
 
     @staticmethod
     def _combine_adducts(

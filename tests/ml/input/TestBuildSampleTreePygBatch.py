@@ -10,8 +10,9 @@ import torch.nn as nn
 from torch import Tensor
 from torch_geometric.data import Batch, Data
 
+from clefts.libs.mmkit.mmkit import Adduct
 from clefts.ml.input.fragment_tree_structure import FragmentTreeStructure
-from mnt.app.clefts.ml.specgen.fragment_tree_probability_model import FragmentTreeProbabilityModel
+from clefts.ml.specgen.fragment_tree_probability_model import FragmentTreeProbabilityModel
 
 
 class DummyConditionEncoder(nn.Module):
@@ -322,6 +323,21 @@ class TestBuildSampleTreePygBatch(unittest.TestCase):
             dim=4,
             graph_repr_dim=4,
         )
+        model.main_adduct_types = {
+            2: Adduct.parse("[M+H]+"),
+            5: Adduct.parse("[M+Na]+"),
+        }
+        model._build_precursor_ion_flat_index = (
+            lambda *, main_adduct_type, count, device: torch.zeros(
+                (count,), dtype=torch.long, device=device
+            )
+        )
+        model._build_precursor_unsaturation_flat_index = (
+            lambda *, main_adduct_type, unsaturation_index, device: unsaturation_index.to(device).long()
+        )
+        model._build_precursor_radical_flat_index = (
+            lambda *, main_adduct_type, radical_index, device: radical_index.to(device).long()
+        )
 
         return model
 
@@ -394,6 +410,20 @@ class TestBuildSampleTreePygBatch(unittest.TestCase):
                 [0, 1, 2, 3, 4, 5],
                 dtype=torch.long,
             ),
+            node_formula=torch.tensor(
+                [
+                    [1.0, 2.0, 0.0],
+                    [2.0, 4.0, 0.0],
+                    [3.0, 6.0, 0.0],
+                    [4.0, 8.0, 0.0],
+                    [5.0, 10.0, 0.0],
+                ],
+                dtype=torch.float32,
+            ),
+            formula_element_order=("C", "H"),
+            ion_formula_delta=torch.tensor([[0.0, 1.0, 1.0]], dtype=torch.float32),
+            unsaturation_formula_delta=torch.tensor([[0.0, -2.0, 0.0]], dtype=torch.float32),
+            radical_formula_delta=torch.tensor([[0.0, -1.0, 0.0]], dtype=torch.float32),
             edge_index=edge_index,
 
             # These fields are not used by _build_sample_tree_pyg_batch,
@@ -440,14 +470,22 @@ class TestBuildSampleTreePygBatch(unittest.TestCase):
                 ],
                 dtype=torch.long,
             ),
-            sample_precursor_edge_index_path=torch.tensor(
+            precursor_edge_index_path=torch.tensor(
                 [
                     [0, 1],
                     [3, 4],
                 ],
                 dtype=torch.long,
             ),
-            sample_precursor_path_index=torch.tensor(
+            precursor_unsaturation_index=torch.tensor(
+                [0, 1],
+                dtype=torch.long,
+            ),
+            precursor_radical_index=torch.tensor(
+                [0, 1],
+                dtype=torch.long,
+            ),
+            precursor_sample_index=torch.tensor(
                 [0, 1],
                 dtype=torch.long,
             ),
