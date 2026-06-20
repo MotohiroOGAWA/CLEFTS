@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import json
+from pathlib import Path
+
 import torch
 
 from clefts.libs.msentity.msentity import MSDataset
@@ -26,14 +28,23 @@ def parse_args() -> argparse.Namespace:
         )
     )
     parser.add_argument(
-        "--input",
+        "--train-input",
         default="data/raw/NIST/NIST23/MSMS-Pos-NIST23_v20_mini.msds",
-        help="Input MSDataset path.",
+        help="Training input MSDataset path.",
+    )
+    parser.add_argument(
+        "--validation-input",
+        default=None,
+        help="Optional validation input MSDataset path.",
     )
     parser.add_argument(
         "--output-dir",
         default="data/test/fragment_tree_training_structures",
-        help="Output directory for per-SMILES .pt structure files.",
+        help=(
+            "Output root directory. Training files are written under "
+            "train_structures, and validation files under validation_structures "
+            "when --validation-input is provided."
+        ),
     )
     parser.add_argument(
         "--params",
@@ -71,31 +82,64 @@ def load_generator(params_path: str, device: torch.device) -> FragmentSpectrumGe
     return generator
 
 
-def main() -> None:
-    args = parse_args()
-    dataset = MSDataset.load(args.input)
-
-    print(f"input: {args.input}")
-    print(f"output_dir: {args.output_dir}")
-    device = torch.device(args.device)
-    generator = load_generator(args.params, device=device)
+def build_structure_files_for_input(
+    *,
+    input_path: str,
+    output_dir: str | Path,
+    args: argparse.Namespace,
+    generator: FragmentSpectrumGenerator,
+    manifest_file: str | Path | None = None,
+) -> list[Path]:
+    dataset = MSDataset.load(input_path)
+    print(f"input: {input_path}")
+    print(f"output_dir: {output_dir}")
 
     saved_files = build_fragment_tree_structure_files(
         dataset=dataset,
         feature_model=generator.feature_model,
-        output_dir=args.output_dir,
+        output_dir=output_dir,
         smiles_column=args.smiles_column,
         precursor_mz_column=args.precursor_mz_column,
         adduct_type_column=args.adduct_type_column,
         collision_energy_column=args.collision_energy_column,
         instrument_column=args.instrument_column,
         overwrite=args.overwrite,
-        manifest_file=args.manifest_file,
+        manifest_file=manifest_file,
     )
 
     print(f"saved structure files: {len(saved_files)}")
     for path in saved_files[:5]:
         print(f"  {path}")
+
+    return saved_files
+
+
+def main() -> None:
+    args = parse_args()
+
+    device = torch.device(args.device)
+    generator = load_generator(args.params, device=device)
+    output_root = Path(args.output_dir)
+
+    train_manifest_file = (
+        None if args.manifest_file is None else Path(args.manifest_file)
+    )
+    build_structure_files_for_input(
+        input_path=args.train_input,
+        output_dir=output_root / "train_structures",
+        args=args,
+        generator=generator,
+        manifest_file=train_manifest_file,
+    )
+
+    if args.validation_input is not None:
+        build_structure_files_for_input(
+            input_path=args.validation_input,
+            output_dir=output_root / "validation_structures",
+            args=args,
+            generator=generator,
+            manifest_file=None,
+        )
 
 
 if __name__ == "__main__":

@@ -9,6 +9,7 @@ from .fragment_tree_formula_intensity_model import (
     FormulaIntensityOutput,
     FormulaIntensityPrediction,
     FormulaIntensityPredictor,
+    FormulaIntensityTrainingOutput,
     FragmentTreeFormulaIntensityPredictor,
 )
 from .fragment_tree_spectrum_predictor import (
@@ -21,6 +22,7 @@ from .fragment_tree_spectrum_predictor import (
 )
 from .fragment_tree_training_model import (
     FormulaGroupCoverageLoss,
+    FragmentTreeIntensityTrainingLoss,
     FragmentTreeSelectionTrainingLoss,
     FragmentTreeTrainingModel,
 )
@@ -33,6 +35,7 @@ __all__ = [
     "FragmentTreeCandidateSelector",
     "FormulaIntensityPrediction",
     "FormulaIntensityOutput",
+    "FormulaIntensityTrainingOutput",
     "FragmentTreeFormulaIntensityPredictor",
     "FormulaIntensityPredictor",
     "FragmentTreeSpectrumPredictor",
@@ -41,6 +44,7 @@ __all__ = [
     "GeneratedMassSpectrum",
     "GeneratedSpectrumPeak",
     "FormulaGroupCoverageLoss",
+    "FragmentTreeIntensityTrainingLoss",
     "FragmentTreeSelectionTrainingLoss",
     "FragmentTreeTrainingModel",
     "fragment_spectrum_output_to_msdataset",

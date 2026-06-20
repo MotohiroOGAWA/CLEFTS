@@ -3,11 +3,14 @@ from __future__ import annotations
 import argparse
 import json
 import shutil
+import math
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
+import numpy as np
+import pandas as pd
 import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -19,18 +22,27 @@ except ImportError:  # pragma: no cover
 
 from ...common.torch_utils.check_point_manager import CheckPointManager, CkptNode
 from ...common.torch_utils.training_setup import get_optimizer
+from ...input.training_fragment_tree_structure import TrainingFragmentTreeStructure
 from ...input.fragment_tree_training_data import (
     FragmentTreeStructureFileDataset,
     collate_fragment_tree_structure_items,
 )
-from ...specgen.fragment_tree_spectrum_predictor import FragmentSpectrumGenerator
+from ...specgen.fragment_tree_spectrum_predictor import (
+    FragmentSpectrumGenerator,
+    FragmentTreeSpectrumPredictor,
+    fragment_spectrum_output_to_msdataset,
+)
 from ...specgen.fragment_tree_training_model import FragmentTreeTrainingModel
+from ....libs.msentity.msentity import MSDataset
+from ....libs.msentity.msentity.core.PeakSeries import PeakSeries
+from ....libs.msentity.msentity.processing.spectrum_similarity import cosine_similarity_pair
 
 METRIC_COLUMNS = (
     "epoch",
     "global_step",
     "train_loss",
     "val_loss",
+    "val_cosine",
     "lr",
 )
 
@@ -76,7 +88,10 @@ def build_training_model(
     device: torch.device,
 ) -> FragmentTreeTrainingModel:
     generator = load_generator(model_config, device=device)
-    model = FragmentTreeTrainingModel(generator.candidate_selector).to(device)
+    model = FragmentTreeTrainingModel(
+        generator.candidate_selector,
+        intensity_predictor=generator.formula_intensity_predictor,
+    ).to(device)
     model.set_checkpoint_model_config(model_config)
     return model
 
@@ -192,11 +207,10 @@ def setup_dataset(
         Path(dataset_info["training_structure_dir"]),
         pattern=pattern,
     )
-    # val_dataset = FragmentTreeStructureFileDataset(
-    #     Path(dataset_info["validation_structure_dir"]),
-    #     pattern=pattern,
-    # )
-    val_dataset = None
+    val_dataset = FragmentTreeStructureFileDataset(
+        Path(dataset_info["validation_structure_dir"]),
+        pattern=pattern,
+    )
     if len(train_dataset) == 0:
         raise ValueError("training_structure_dir contains no training structure files.")
 
@@ -210,20 +224,18 @@ def setup_dataset(
         shuffle=bool(dataset_info.get("shuffle", True)),
         **loader_kwargs,
     )
-    # val_loader = DataLoader(
-    #     val_dataset,
-    #     shuffle=False,
-    #     **loader_kwargs,
-    # )
-    val_loader = None
+    val_loader = DataLoader(
+        val_dataset,
+        shuffle=False,
+        **loader_kwargs,
+    )
 
     extra_data = {
         "training_structure_dir": str(dataset_info["training_structure_dir"]),
         "validation_structure_dir": str(dataset_info["validation_structure_dir"]),
         "pattern": pattern,
         "train_size": len(train_dataset),
-        # "val_size": len(val_dataset),
-        "val_size": 0,
+        "val_size": len(val_dataset),
     }
     return train_dataset, val_dataset, train_loader, val_loader, extra_data
 
@@ -324,6 +336,97 @@ def run_epoch(
     return total_loss / total_samples, total_samples
 
 
+def evaluate_validation_cosine(
+    *,
+    model: FragmentTreeTrainingModel,
+    loader: DataLoader,
+    device: torch.device,
+) -> float:
+    if model.intensity_predictor is None:
+        return float("nan")
+
+    predictor = FragmentTreeSpectrumPredictor(
+        model.candidate_selector,
+        model.intensity_predictor,
+        max_generation_steps=0,
+        normalize_intensity=True,
+    ).to(device)
+    predictor.eval()
+
+    scores: List[float] = []
+    iterator = tqdm(loader, desc="ValCosine")
+    with torch.no_grad():
+        for batch in iterator:
+            structure = batch["structure"].to(device)
+            if not isinstance(structure, TrainingFragmentTreeStructure):
+                continue
+            generated = predictor(structure)
+            predicted_ds = fragment_spectrum_output_to_msdataset(generated)
+            target_ds = target_structure_to_msdataset(
+                structure,
+                model.candidate_selector.feature_model.formula_tensorizer,
+            )
+            count = min(len(predicted_ds), len(target_ds))
+            if count <= 0:
+                continue
+            batch_scores = cosine_similarity_pair(
+                target_ds,
+                np.arange(count, dtype=np.int64),
+                predicted_ds,
+                np.arange(count, dtype=np.int64),
+                show_progress=False,
+            )
+            scores.extend(float(value) for value in batch_scores.tolist())
+            if scores:
+                iterator.set_postfix(cosine=sum(scores) / len(scores))
+
+    if not scores:
+        return float("nan")
+    return sum(scores) / len(scores)
+
+
+def target_structure_to_msdataset(
+    structure: TrainingFragmentTreeStructure,
+    formula_tensorizer,
+) -> MSDataset:
+    peak_rows: List[Tuple[float, float]] = []
+    peak_metadata_rows: List[Dict[str, object]] = []
+    offsets = [0]
+
+    target_sample_index = structure.target_sample_index.detach().cpu().long()
+    target_formula = structure.target_formula.detach().cpu()
+    target_intensity = structure.target_intensity.detach().cpu().float()
+
+    for sample_id in range(int(structure.num_samples)):
+        mask = target_sample_index == int(sample_id)
+        rows = mask.nonzero(as_tuple=False).view(-1).tolist()
+        for row in rows:
+            formula = formula_tensorizer.tensor_to_formula(target_formula[int(row)])
+            charge = int(getattr(formula, "charge", 0))
+            mz = float(formula.exact_mass) if charge == 0 else float(formula.exact_mass) / abs(charge)
+            peak_rows.append((mz, float(target_intensity[int(row)].item())))
+            peak_metadata_rows.append({"sample_id": int(sample_id), "formula": str(formula)})
+        offsets.append(len(peak_rows))
+
+    data = np.asarray(peak_rows, dtype=np.float64)
+    if data.size == 0:
+        data = np.empty((0, 2), dtype=np.float64)
+    metadata = pd.DataFrame({"sample_id": list(range(int(structure.num_samples)))})
+    peak_series = PeakSeries(
+        data=data,
+        offsets=np.asarray(offsets, dtype=np.int64),
+        metadata=pd.DataFrame(peak_metadata_rows),
+        metadata_columns=["sample_id", "formula"],
+        sort_by_mz=True,
+    )
+    return MSDataset(
+        spectrum_metadata=metadata,
+        peak_series=peak_series,
+        columns=metadata.columns.tolist(),
+        description="Validation target spectra from FragmentTreeStructure targets",
+    )
+
+
 def save_managed_checkpoint(
     *,
     ckpt_manager: CheckPointManager,
@@ -418,18 +521,23 @@ def main(
         )
         global_step += len(train_loader)
 
-        # if len(val_loader) > 0:
-        #     with torch.no_grad():
-        #         val_loss, _ = run_epoch(
-        #             model=model,
-        #             loader=val_loader,
-        #             device=device,
-        #             optimizer=None,
-        #             desc=f"Val({epoch_index}/{max_epoch})",
-        #         )
-        # else:
-        #     val_loss = train_loss
-        val_loss = train_loss
+        if val_loader is not None and len(val_loader) > 0:
+            with torch.no_grad():
+                val_loss, _ = run_epoch(
+                    model=model,
+                    loader=val_loader,
+                    device=device,
+                    optimizer=None,
+                    desc=f"Val({epoch_index}/{max_epoch})",
+                )
+                val_cosine = evaluate_validation_cosine(
+                    model=model,
+                    loader=val_loader,
+                    device=device,
+                )
+        else:
+            val_loss = train_loss
+            val_cosine = float("nan")
 
         step_scheduler(scheduler, val_loss)
 
@@ -439,12 +547,15 @@ def main(
             "global_step": global_step,
             "train_loss": train_loss,
             "val_loss": val_loss,
+            "val_cosine": val_cosine,
             "lr": lr,
         }
         ckpt_manager.log_metrics(**metric_row)
         ckpt_manager.flush_metrics(flush_dir=str(run_dir))
         writer.add_scalar("loss/train", train_loss, global_step)
         writer.add_scalar("loss/val", val_loss, global_step)
+        if not math.isnan(val_cosine):
+            writer.add_scalar("similarity/val_cosine", val_cosine, global_step)
         writer.add_scalar("optimizer/lr", lr, global_step)
 
         improved = val_loss < best_val_loss - min_delta
@@ -487,7 +598,8 @@ def main(
 
         print(
             f"epoch={epoch_index} train_loss={train_loss:.6f} "
-            f"val_loss={val_loss:.6f} lr={lr:.6g} samples={train_samples} "
+            f"val_loss={val_loss:.6f} val_cosine={val_cosine:.6f} "
+            f"lr={lr:.6g} samples={train_samples} "
             f"branch_id={ckpt_manager.current_branch_id}"
         )
 

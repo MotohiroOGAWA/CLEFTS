@@ -9,6 +9,7 @@ from torch import Tensor
 
 from ..input.training_fragment_tree_structure import TrainingFragmentTreeStructure
 from .fragment_tree_candidate_selector import FragmentTreeCandidateSelectionOutput
+from .fragment_tree_formula_intensity_model import FragmentTreeFormulaIntensityPredictor
 
 
 class FormulaGroupCoverageLoss(nn.Module):
@@ -454,13 +455,84 @@ class FragmentTreeSelectionTrainingLoss(nn.Module):
                 target_tensor[batch_node_index] = 1.0
 
 
+class FragmentTreeIntensityTrainingLoss(nn.Module):
+    """Loss for normalized intensities over predicted formula nodes."""
+
+    def forward(
+        self,
+        intensity_output,
+        target: TrainingFragmentTreeStructure,
+    ) -> Tensor:
+        if intensity_output.logit.numel() == 0:
+            return target.target_intensity.sum() * 0.0
+
+        device = intensity_output.logit.device
+        losses: List[Tensor] = []
+        for sample_id in intensity_output.sample_index.detach().cpu().unique(sorted=True).tolist():
+            sample_id = int(sample_id)
+            pred_mask = intensity_output.sample_index == sample_id
+            pred_index = pred_mask.nonzero(as_tuple=False).view(-1)
+            target_weight = self._target_weight_for_predictions(
+                predicted_formula=intensity_output.formula_tensor[pred_index],
+                target=target,
+                sample_id=sample_id,
+                device=device,
+            )
+            if float(target_weight.sum().detach().cpu().item()) <= 0.0:
+                # No required formula is present among this sample's predicted formulas.
+                # Selection loss handles missing formulas; intensity has no positive
+                # class to normalize against here.
+                continue
+            target_prob = target_weight / target_weight.sum()
+            log_prob = F.log_softmax(intensity_output.logit[pred_index], dim=0)
+            losses.append(-(target_prob * log_prob).sum())
+
+        if len(losses) == 0:
+            return intensity_output.logit.sum() * 0.0
+        return torch.stack(losses).mean()
+
+    @staticmethod
+    def _target_weight_for_predictions(
+        *,
+        predicted_formula: Tensor,
+        target: TrainingFragmentTreeStructure,
+        sample_id: int,
+        device: torch.device,
+    ) -> Tensor:
+        target_weight = predicted_formula.new_zeros((predicted_formula.size(0),))
+        target_mask = target.target_sample_index.to(device).long() == int(sample_id)
+        if not target_mask.any():
+            return target_weight
+
+        target_formula = target.target_formula.to(device).float()[target_mask]
+        target_intensity = target.target_intensity.to(device).float()[target_mask]
+        for pred_index, formula in enumerate(predicted_formula):
+            formula_mask = torch.all(target_formula == formula, dim=1)
+            if formula_mask.any():
+                target_weight[pred_index] = target_intensity[formula_mask].sum()
+        return target_weight
+
+
 class FragmentTreeTrainingModel(nn.Module):
     """Training wrapper that combines candidate selection and supervised losses."""
 
-    def __init__(self, candidate_selector: nn.Module, loss_fn: nn.Module | None = None) -> None:
+    def __init__(
+        self,
+        candidate_selector: nn.Module,
+        loss_fn: nn.Module | None = None,
+        *,
+        intensity_predictor: FragmentTreeFormulaIntensityPredictor | None = None,
+        intensity_loss_fn: nn.Module | None = None,
+    ) -> None:
         super().__init__()
         self.candidate_selector = candidate_selector
+        self.intensity_predictor = intensity_predictor
         self.loss_fn = loss_fn if loss_fn is not None else FragmentTreeSelectionTrainingLoss()
+        self.intensity_loss_fn = (
+            intensity_loss_fn
+            if intensity_loss_fn is not None
+            else FragmentTreeIntensityTrainingLoss()
+        )
         self._checkpoint_model_config: Dict[str, Any] = {}
 
     def set_checkpoint_model_config(self, model_config: Dict[str, Any]) -> None:
@@ -471,5 +543,18 @@ class FragmentTreeTrainingModel(nn.Module):
 
     def forward(self, batch: TrainingFragmentTreeStructure):
         output = self.candidate_selector(batch)
-        loss = self.loss_fn(output, batch)
-        return {"loss": loss, "candidate_output": output}
+        selection_loss = self.loss_fn(output, batch)
+        if self.intensity_predictor is None:
+            intensity_output = None
+            intensity_loss = selection_loss.detach() * 0.0
+        else:
+            intensity_output = self.intensity_predictor.forward_candidate_output(output)
+            intensity_loss = self.intensity_loss_fn(intensity_output, batch)
+        loss = selection_loss + intensity_loss
+        return {
+            "loss": loss,
+            "selection_loss": selection_loss,
+            "intensity_loss": intensity_loss,
+            "candidate_output": output,
+            "intensity_output": intensity_output,
+        }

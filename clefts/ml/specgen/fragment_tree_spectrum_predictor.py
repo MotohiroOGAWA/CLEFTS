@@ -247,7 +247,7 @@ class FragmentSpectrumGenerator(ModelBase):
             max_next_cleavage_candidates=30,
         )
         self.formula_intensity_predictor = FragmentTreeFormulaIntensityPredictor(
-            formula_dim=self.feature_model.formula_tensorizer.dim,
+            self.feature_model,
         )
         self.spectrum_predictor = FragmentTreeSpectrumPredictor(
             self.candidate_selector,
