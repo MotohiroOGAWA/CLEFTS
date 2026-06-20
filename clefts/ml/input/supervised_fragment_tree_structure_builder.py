@@ -54,6 +54,11 @@ class SupervisedFragmentTreeStructureBuilder(SingleFragmentTreeStructureBuilder)
             target_formula = torch.empty((0, formula_dim), dtype=torch.float32, device=device)
         if target_intensity is None:
             target_intensity = torch.empty((0,), dtype=torch.float32, device=device)
+        target_formula_group_index = torch.empty((0,), dtype=torch.long, device=device)
+        target_sample_index = torch.empty((0,), dtype=torch.long, device=device)
+        target_peak_index = torch.empty((0,), dtype=torch.long, device=device)
+        target_edge_index = torch.empty((2, 0), dtype=torch.long, device=device)
+        target_edge_group_index = torch.empty((0,), dtype=torch.long, device=device)
 
         return TrainingFragmentTreeStructure(
             node_smiles=structure.node_smiles,
@@ -85,4 +90,9 @@ class SupervisedFragmentTreeStructureBuilder(SingleFragmentTreeStructureBuilder)
             target_node_index=target_node_index.to(device),
             target_formula=target_formula.to(device),
             target_intensity=target_intensity.to(device),
+            target_formula_group_index=target_formula_group_index,
+            target_sample_index=target_sample_index,
+            target_peak_index=target_peak_index,
+            target_edge_index=target_edge_index,
+            target_edge_group_index=target_edge_group_index,
         )

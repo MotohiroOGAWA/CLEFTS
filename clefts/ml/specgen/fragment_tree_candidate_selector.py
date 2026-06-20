@@ -27,6 +27,7 @@ class FragmentIonCandidate:
     keep_logit: float
     candidate_logit: float
     probability: float
+    score_tensor: Optional[Tensor] = None
 
 
 @dataclass(frozen=True)
@@ -170,7 +171,7 @@ class FragmentTreeCandidateSelector(nn.Module):
             ion_index, unsaturation_index, radical_index, final_formula, _ = rows[selected]
             formula_cpu = final_formula.detach().cpu()
             score_value = float(combined_score[selected].detach().cpu().item())
-            candidates.append(FragmentIonCandidate(sample_id=sample_id, batch_node_index=batch_node_index, global_node_id=global_node_id, ion_index=ion_index, unsaturation_index=unsaturation_index, radical_index=radical_index, formula=tensorizer.tensor_to_formula(formula_cpu), formula_tensor=formula_cpu, score=score_value, keep_logit=float(keep_logit[batch_node_index].detach().cpu().item()), candidate_logit=float(candidate_logit[selected].detach().cpu().item()), probability=float(torch.sigmoid(combined_score[selected]).detach().cpu().item())))
+            candidates.append(FragmentIonCandidate(sample_id=sample_id, batch_node_index=batch_node_index, global_node_id=global_node_id, ion_index=ion_index, unsaturation_index=unsaturation_index, radical_index=radical_index, formula=tensorizer.tensor_to_formula(formula_cpu), formula_tensor=formula_cpu, score=score_value, keep_logit=float(keep_logit[batch_node_index].detach().cpu().item()), candidate_logit=float(candidate_logit[selected].detach().cpu().item()), probability=float(torch.sigmoid(combined_score[selected]).detach().cpu().item()), score_tensor=combined_score[selected]))
         return candidates
 
     def _select_next_cleavage_candidates(self, *, sample_tree_batch, cleave_logit: Tensor) -> List[NextCleavageCandidate]:
