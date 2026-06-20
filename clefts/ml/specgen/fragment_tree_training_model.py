@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -331,6 +331,13 @@ class FragmentTreeTrainingModel(nn.Module):
         super().__init__()
         self.candidate_selector = candidate_selector
         self.loss_fn = loss_fn if loss_fn is not None else FragmentTreeSelectionTrainingLoss()
+        self._checkpoint_model_config: Dict[str, Any] = {}
+
+    def set_checkpoint_model_config(self, model_config: Dict[str, Any]) -> None:
+        self._checkpoint_model_config = dict(model_config)
+
+    def get_params(self) -> Dict[str, Any]:
+        return dict(self._checkpoint_model_config)
 
     def forward(self, batch: TrainingFragmentTreeStructure):
         output = self.candidate_selector(batch)
