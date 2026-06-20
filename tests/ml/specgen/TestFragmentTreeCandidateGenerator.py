@@ -6,12 +6,12 @@ from types import SimpleNamespace
 import pandas as pd
 import torch
 
-from clefts.ml.specgen.fragment_tree_candidate_generator import (
-    FormulaGroupCoverageLoss,
-    FormulaIntensityPredictor,
-    fragment_spectrum_output_to_msdataset,
-)
-from clefts.ml.specgen.fragment_spectrum_generator import (
+from clefts.libs.mmkit.mmkit import Formula
+from clefts.ml.specgen.fragment_tree_candidate_selector import FragmentIonCandidate
+from clefts.ml.specgen.fragment_tree_formula_intensity_model import FormulaIntensityPredictor
+from clefts.ml.specgen.fragment_tree_spectrum_predictor import fragment_spectrum_output_to_msdataset
+from clefts.ml.specgen.fragment_tree_training_model import FormulaGroupCoverageLoss
+from clefts.ml.specgen.fragment_tree_spectrum_predictor import (
     GeneratedMassSpectrum,
     GeneratedSpectrumPeak,
 )
@@ -58,11 +58,54 @@ class TestFormulaIntensityPredictor(unittest.TestCase):
                 ]
             ),
             torch.tensor([0.8, 0.2]),
+            torch.tensor([2.0, 1.0]),
         )
 
         self.assertEqual(out.shape, (2,))
         self.assertTrue(torch.isfinite(out).all())
         self.assertTrue((out >= 0).all())
+
+    def test_predict_from_candidates_groups_by_sample_and_formula(self) -> None:
+        predictor = FormulaIntensityPredictor(formula_dim=3, hidden_dim=8)
+        formula = Formula.parse("C6H6+")
+        candidates = [
+            FragmentIonCandidate(
+                sample_id=0,
+                batch_node_index=0,
+                global_node_id=0,
+                ion_index=0,
+                unsaturation_index=0,
+                radical_index=0,
+                formula=formula,
+                formula_tensor=torch.tensor([6.0, 6.0, 1.0]),
+                score=1.0,
+                keep_logit=0.5,
+                candidate_logit=0.5,
+                probability=0.7,
+            ),
+            FragmentIonCandidate(
+                sample_id=0,
+                batch_node_index=1,
+                global_node_id=1,
+                ion_index=0,
+                unsaturation_index=0,
+                radical_index=0,
+                formula=formula,
+                formula_tensor=torch.tensor([6.0, 6.0, 1.0]),
+                score=2.0,
+                keep_logit=1.0,
+                candidate_logit=1.0,
+                probability=0.8,
+            ),
+        ]
+
+        output = predictor.predict_from_candidates(candidates)
+
+        self.assertEqual(len(output.formula_predictions), 1)
+        prediction = output.formula_predictions[0]
+        self.assertEqual(prediction.sample_id, 0)
+        self.assertEqual(len(prediction.candidates), 2)
+        self.assertGreaterEqual(prediction.intensity, 0.0)
 
 
 class TestFragmentSpectrumOutputToMSDataset(unittest.TestCase):

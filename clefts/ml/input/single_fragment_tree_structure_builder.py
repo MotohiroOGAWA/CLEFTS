@@ -18,7 +18,7 @@ from ...domain.fragment.pathway import (
     FragmentPathwayEdge,
     CleavageStep,
 )
-from ..specgen.fragment_tree_probability_model import FragmentTreeProbabilityModel
+from ..specgen.fragment_tree_feature_model import FragmentTreeFeatureModel
 from ..mol.formula_encoder import FormulaTensorizer
 from .fragment_tree_structure import FragmentTreeStructure
 
@@ -64,7 +64,7 @@ class FragmentTreeSample:
 
 @dataclass
 class SingleFragmentTreeStructureBuilder:
-    _model: FragmentTreeProbabilityModel = field(repr=False, compare=False)
+    _model: FragmentTreeFeatureModel = field(repr=False, compare=False)
     # CleftsSpecGen model used to define model-derived IDs and settings.
     #
     # This builder depends on the model for:
@@ -241,10 +241,21 @@ class SingleFragmentTreeStructureBuilder:
     # Used to avoid storing duplicate atom-index tuples.
 
     def __post_init__(self) -> None:
-        if not isinstance(self._model, FragmentTreeProbabilityModel):
+        required_model_attrs = (
+            "fragmenter",
+            "mol_encoder",
+            "cleavage_edge_fnet",
+            "formula_tensorizer",
+            "get_index_by_adduct_type",
+        )
+        missing_attrs = [
+            attr for attr in required_model_attrs if not hasattr(self._model, attr)
+        ]
+        if missing_attrs:
             raise TypeError(
-                "_model must be an instance of CleftsSpecGen, "
-                f"but got {type(self._model).__name__}."
+                "_model must provide the FragmentTree feature model interface. "
+                f"Missing attrs: {missing_attrs}. "
+                f"Got {type(self._model).__name__}."
             )
 
     def to_structure(self) -> FragmentTreeStructure:
@@ -1402,7 +1413,7 @@ class SingleFragmentTreeStructureBuilder:
 
         adduct_type_index = self._model.get_index_by_adduct_type(precursor_type)
 
-        ce_value = FragmentTreeProbabilityModel.parse_ce_to_ev(
+        ce_value = FragmentTreeFeatureModel.parse_ce_to_ev(
             ce_value_raw,
             precursor_mz=precursor_mz,
             instrument=instrument,

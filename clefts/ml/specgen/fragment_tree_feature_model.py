@@ -1,102 +1,31 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple, Union
+
+import numpy as np
 import torch
 import torch.nn as nn
-from torch_geometric.data import Data, Batch
-from dataclasses import dataclass
-from typing import Any, Dict, List, Tuple, Union, Optional
 from bidict import bidict
-import numpy as np
+from torch import Tensor
+from torch_geometric.data import Batch, Data
 
-from ...libs.mmkit.mmkit import Adduct
 from ...domain.fragment import Fragmenter
 from ...domain.mass import parse_ce_to_ev
+from ...libs.mmkit.mmkit import Adduct
 from ..common.layers.graphormer import GraphormerEncoder
-from ..input.fragment_tree_structure import FragmentTreeStructure
 from ..input.fragment_tree_features import FragmentTreeFeatures
-
-from ..mol import MolEncoder, FormulaTensorizer
-from .components.condition.condition_encoder import MS2ConditionEncoder
+from ..input.fragment_tree_structure import FragmentTreeStructure
+from ..mol import FormulaTensorizer, MolEncoder
 from .components.cleavage.cleavage_edge_feature_net import CleavageEdgeFeatureNet
-
-from torch import Tensor
-
-
-@dataclass
-class FlatAdductNodeChoiceProbabilities:
-    """Flat node choice probabilities with adduct-dependent valid candidates."""
-
-    logit: Tensor
-    # [N_tree, C_flat]
-    # Invalid columns are filled with -inf.
-
-    prob: Tensor
-    # [N_tree, C_flat]
-    # Invalid columns are 0.
-
-    valid_mask: Tensor
-    # [N_tree, C_flat]
-    # True if the column is valid for the node's main adduct type and role.
-    # Role-dependent validity is controlled by a mask with shape
-    # [2, num_adduct_types, C_flat], where role 0 is non-precursor and
-    # role 1 is precursor root.
+from .components.condition.condition_encoder import MS2ConditionEncoder
 
 
-@dataclass
-class FragmentGenerationProbabilities:
-    """Probabilities used for fragment-tree generation.
-
-    Notes
-    -----
-    Precursor-specific probabilities are intentionally not stored here.
-    Precursor roots are treated as ordinary tree nodes whose initial
-    reach probability is assigned inside
-    ``compute_node_generation_flow_probabilities``.
-    """
-
-    edge_logit: Tensor
-    # [E_tree]
-
-    p_edge: Tensor
-    # [E_tree]
-
-    expand_logit: Tensor
-    # [N_tree]
-
-    p_expand: Tensor
-    # [N_tree]
-
-    p_stop: Tensor
-    # [N_tree]
-
-    ion: FlatAdductNodeChoiceProbabilities
-    # ion.prob: [N_tree, C_ion_flat]
-
-    unsaturation: FlatAdductNodeChoiceProbabilities
-    # unsaturation.prob: [N_tree, C_unsaturation_flat]
-
-    radical: FlatAdductNodeChoiceProbabilities
-    # radical.prob: [N_tree, C_radical_flat]
-
-
-@dataclass
-class FragmentTreeProbabilityOutput:
-    """Output of FragmentTreeProbabilityModel."""
-
-    ft_features: "FragmentTreeFeatures"
-
+@dataclass(frozen=True)
+class FragmentTreeFeatureOutput:
+    ft_features: FragmentTreeFeatures
     sample_tree_batch: Batch
-    # sample_tree_batch.x:
-    #   [N_tree, tree_dim]
-    #
-    # sample_tree_batch.tree_graph_repr:
-    #   [G, tree_graph_repr_dim]
-    #
-    # sample_tree_batch.condition_tree_repr:
-    #   [G, tree_graph_repr_dim]
-    #
-    # sample_tree_batch.kept_sample_ids:
-    #   [G]
 
-    probabilities: FragmentGenerationProbabilities
 
 class FragmentTreeSampleData(Data):
     """PyG Data class for per-sample fragment-tree graphs.
@@ -120,101 +49,47 @@ class FragmentTreeSampleData(Data):
         return super().__inc__(key, value, *args, **kwargs)
 
 
-@dataclass
-class BestFlatAdductCombination:
-    """Best ion / unsaturation / radical combination for each node."""
+class FragmentTreeFeatureModel(nn.Module):
+    """Shared FragmentTree feature backbone.
 
-    ion_index: Tensor
-    # [N_tree]
-
-    unsaturation_index: Tensor
-    # [N_tree]
-
-    radical_index: Tensor
-    # [N_tree]
-
-    probability: Tensor
-    # [N_tree]
-    # max over ion * unsaturation * radical
-
-
-@dataclass
-class NodeGenerationFlowProbabilities:
-    """Graph-wise generation flow probabilities.
-
-    Precursor roots are included in p_reach / p_emit / p_expand_node.
-    There is no separate precursor probability output.
+    This class owns only the common encoders and feature-building utilities used
+    by candidate selection and formula-intensity prediction. It intentionally
+    does not define the old probability heads.
     """
 
-    p_reach: Tensor
-    # [N_tree]
-    # Total probability of reaching each node.
-    # Includes precursor root reach.
-
-    p_emit: Tensor
-    # [N_tree]
-    # Probability that each reached node stops and appears as a peak.
-    # Includes precursor peak emission.
-
-    p_emit_best_adduct: Tensor
-    # [N_tree]
-    # p_emit * max(ion * unsaturation * radical)
-
-    p_expand_node: Tensor
-    # [N_tree]
-    # Probability that each reached node expands.
-
-    p_expand_edge: Tensor
-    # [E_tree]
-    # Global probability of passing through each edge.
-
-    best_adduct: BestFlatAdductCombination
-
-class FragmentTreeProbabilityModel(nn.Module):
-    def __init__(self,
-                 mol_encoder_params:Dict,
-                 condition_encoder_params:Dict,
-                 cleavage_edge_fnet_params:Dict,
-                 tree_encoder_params: Dict,
-                 fragmenter_params:Dict,
-                 dropout: float,
-                 ):
-        super(FragmentTreeProbabilityModel, self).__init__()
+    def __init__(
+        self,
+        mol_encoder_params: Dict,
+        condition_encoder_params: Dict,
+        cleavage_edge_fnet_params: Dict,
+        tree_encoder_params: Dict,
+        fragmenter_params: Dict,
+        dropout: float,
+    ) -> None:
+        super(FragmentTreeFeatureModel, self).__init__()
 
         mol_encoder_params = mol_encoder_params.copy()
-        mol_encoder_params['dropout'] = dropout
+        mol_encoder_params["dropout"] = dropout
         self._mol_encoder = MolEncoder(**mol_encoder_params)
         self._fragmenter = Fragmenter.from_dict(fragmenter_params)
 
         condition_encoder_params = condition_encoder_params.copy()
-        condition_encoder_params['adduct_type_strs'] = tuple(str(ad) for ad in self._fragmenter.adduct_types)
+        condition_encoder_params["adduct_type_strs"] = tuple(
+            str(adduct) for adduct in self._fragmenter.adduct_types
+        )
         self._condition_encoder = MS2ConditionEncoder(**condition_encoder_params)
-        
-        
-        cleavage_edge_fnet_params['cleavage_pattern_set_params'] = self._fragmenter.cleavage_pattern_set.to_dict()
-        cleavage_edge_fnet_params['mol_dim'] = self.mol_encoder.graph_dim
-        cleavage_edge_fnet_params['atom_dim'] = self.mol_encoder.node_dim
-        cleavage_edge_fnet_params['dropout'] = dropout
+
+        cleavage_edge_fnet_params = cleavage_edge_fnet_params.copy()
+        cleavage_edge_fnet_params["cleavage_pattern_set_params"] = (
+            self._fragmenter.cleavage_pattern_set.to_dict()
+        )
+        cleavage_edge_fnet_params["mol_dim"] = self.mol_encoder.graph_dim
+        cleavage_edge_fnet_params["atom_dim"] = self.mol_encoder.node_dim
+        cleavage_edge_fnet_params["dropout"] = dropout
         self.cleavage_edge_fnet = CleavageEdgeFeatureNet(**cleavage_edge_fnet_params)
 
-
-        # -------------------------
-        # Tree encoder
-        # -------------------------
         tree_encoder_params = tree_encoder_params.copy()
-
-        tree_encoder_in_dim = (
-            self.mol_encoder.graph_dim
-            + 3
-        )
-        # Current _build_tree_pyg_data concatenates:
-        #   ft_features.mol_x     [N, mol_graph_dim]
-        #   node_type             [N, 3]
-        #
-        # Therefore:
-        #   tree node feature dim = mol_graph_dim + 3
-
-        tree_encoder_params["in_dim"] = tree_encoder_in_dim
+        tree_encoder_params["in_dim"] = self.mol_encoder.graph_dim + 3
         tree_encoder_params["edge_dim"] = self.cleavage_edge_fnet.feature_dim
         tree_encoder_params["max_spatial_dist"] = self.fragmenter.tree_max_depth + 1
         tree_encoder_params["max_edge_dist"] = self.fragmenter.tree_max_depth + 1
@@ -223,104 +98,41 @@ class FragmentTreeProbabilityModel(nn.Module):
         tree_encoder_params["undirected_for_spd"] = False
         tree_encoder_params["undirected_for_path"] = False
         tree_encoder_params["freeze_vnode"] = True
-
         self.tree_encoder = GraphormerEncoder(**tree_encoder_params)
 
-        # -------------------------
-        # MS2 condition -> tree graph representation
-        # -------------------------
         self.ms2_condition_to_tree_proj = nn.Sequential(
             nn.Linear(self._condition_encoder.feature_dim, self.tree_encoder.dim),
             nn.ReLU(),
             nn.Dropout(dropout),
         )
 
-        # -------------------------
-        # Probability heads
-        # -------------------------
-        tree_dim = self.tree_encoder.dim
-        edge_dim = self.cleavage_edge_fnet.feature_dim
-        self.edge_select_head = nn.Sequential(
-            nn.Linear(
-                tree_dim * 2 + edge_dim,
-                tree_dim,
-            ),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(
-                tree_dim,
-                1,
-            ),
-        )
-
-        self.node_expand_head = nn.Sequential(
-            nn.Linear(
-                tree_dim,
-                tree_dim,
-            ),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(
-                tree_dim,
-                1,
-            ),
-        )
-
         self.main_adduct_types = bidict(
-            {
-                idx: adduct
-                for idx, adduct in enumerate(self._fragmenter.adduct_types)
-            }
+            {idx: adduct for idx, adduct in enumerate(self._fragmenter.adduct_types)}
         )
 
-        # -------------------------
-        # Adduct candidate tables and role masks
-        # -------------------------
-        # Candidate order must be defined only by Fragmenter.
-        # The model must not append, remove, or reorder candidates because
-        # flat candidate indexes are used as training targets.
-        #
-        # Static role/adduct masks have shape:
-        #
-        #     [2, num_adduct_types, C_flat]
-        #
-        # where:
-        #     role 0: non-precursor fragment node
-        #     role 1: precursor root node
-        #
-        # Sample/node-specific precursor masks are built later from
-        # computed precursor flat indexes.
         self.ion_candidates_by_adduct: Dict[Adduct, np.ndarray] = {
             adduct: np.asarray(
-                self._fragmenter.get_ion_shift_adducts_by_adduct_type(
-                    adduct
-                ),
+                self._fragmenter.get_ion_shift_adducts_by_adduct_type(adduct),
                 dtype=object,
             )
             for adduct in self._fragmenter.adduct_types
         }
-
         self.unsaturation_candidates_by_adduct: Dict[Adduct, np.ndarray] = {
             adduct: np.asarray(
-                self._fragmenter.get_unsaturation_adduct_candidates_by_adduct_type(
-                    adduct
-                ),
+                self._fragmenter.get_unsaturation_adduct_candidates_by_adduct_type(adduct),
                 dtype=object,
             )
             for adduct in self._fragmenter.adduct_types
         }
-
         self.radical_candidates_by_adduct: Dict[Adduct, np.ndarray] = {
             adduct: np.asarray(
-                self._fragmenter.get_radical_adduct_candidates_by_adduct_type(
-                    adduct
-                ),
+                self._fragmenter.get_radical_adduct_candidates_by_adduct_type(adduct),
                 dtype=object,
             )
             for adduct in self._fragmenter.adduct_types
         }
 
-        formula_adducts = []
+        formula_adducts: List[Adduct] = []
         for candidates_by_adduct in (
             self.ion_candidates_by_adduct,
             self.unsaturation_candidates_by_adduct,
@@ -334,25 +146,20 @@ class FragmentTreeProbabilityModel(nn.Module):
             adducts=formula_adducts,
         )
 
-        (
-            self.ion_flat_candidates,
-            self.ion_candidate_slice_by_adduct,
-        ) = self._build_flat_adduct_candidate_table(
-            candidates_by_adduct=self.ion_candidates_by_adduct,
+        self.ion_flat_candidates, self.ion_candidate_slice_by_adduct = (
+            self._build_flat_adduct_candidate_table(
+                candidates_by_adduct=self.ion_candidates_by_adduct,
+            )
         )
-
-        (
-            self.unsaturation_flat_candidates,
-            self.unsaturation_candidate_slice_by_adduct,
-        ) = self._build_flat_adduct_candidate_table(
-            candidates_by_adduct=self.unsaturation_candidates_by_adduct,
+        self.unsaturation_flat_candidates, self.unsaturation_candidate_slice_by_adduct = (
+            self._build_flat_adduct_candidate_table(
+                candidates_by_adduct=self.unsaturation_candidates_by_adduct,
+            )
         )
-
-        (
-            self.radical_flat_candidates,
-            self.radical_candidate_slice_by_adduct,
-        ) = self._build_flat_adduct_candidate_table(
-            candidates_by_adduct=self.radical_candidates_by_adduct,
+        self.radical_flat_candidates, self.radical_candidate_slice_by_adduct = (
+            self._build_flat_adduct_candidate_table(
+                candidates_by_adduct=self.radical_candidates_by_adduct,
+            )
         )
 
         self.register_buffer(
@@ -361,27 +168,22 @@ class FragmentTreeProbabilityModel(nn.Module):
                 flat_candidates=self.ion_flat_candidates,
                 candidate_slice_by_adduct=self.ion_candidate_slice_by_adduct,
                 precursor_candidate_by_adduct={
-                    adduct: adduct
-                    for adduct in self._fragmenter.adduct_types
+                    adduct: adduct for adduct in self._fragmenter.adduct_types
                 },
                 precursor_uses_all_candidates=False,
             ),
             persistent=False,
         )
-
         self.register_buffer(
             "unsaturation_candidate_valid_mask_by_role_adduct",
             self._build_candidate_valid_mask_by_role_adduct(
                 flat_candidates=self.unsaturation_flat_candidates,
-                candidate_slice_by_adduct=(
-                    self.unsaturation_candidate_slice_by_adduct
-                ),
+                candidate_slice_by_adduct=self.unsaturation_candidate_slice_by_adduct,
                 precursor_candidate_by_adduct=None,
                 precursor_uses_all_candidates=True,
             ),
             persistent=False,
         )
-
         self.register_buffer(
             "radical_candidate_valid_mask_by_role_adduct",
             self._build_candidate_valid_mask_by_role_adduct(
@@ -392,74 +194,6 @@ class FragmentTreeProbabilityModel(nn.Module):
             ),
             persistent=False,
         )
-
-        self.node_ion_heads_by_adduct_str = nn.ModuleDict()
-        self.node_unsaturation_heads_by_adduct_str = nn.ModuleDict()
-        self.node_radical_heads_by_adduct_str = nn.ModuleDict()
-
-        for adduct_type in self._fragmenter.adduct_types:
-            adduct_key = str(adduct_type)
-
-            ion_candidates = self.ion_candidates_by_adduct[adduct_type]
-            unsaturation_candidates = self.unsaturation_candidates_by_adduct[
-                adduct_type
-            ]
-            radical_candidates = self.radical_candidates_by_adduct[adduct_type]
-
-            if len(ion_candidates) == 0:
-                raise ValueError(
-                    f"No ion candidates found for adduct type: {adduct_type}"
-                )
-
-            if len(unsaturation_candidates) == 0:
-                raise ValueError(
-                    f"No unsaturation candidates found for adduct type: {adduct_type}"
-                )
-
-            if len(radical_candidates) == 0:
-                raise ValueError(
-                    f"No radical candidates found for adduct type: {adduct_type}"
-                )
-
-            ion_candidate_slice = self.ion_candidate_slice_by_adduct[adduct_type]
-            unsaturation_candidate_slice = (
-                self.unsaturation_candidate_slice_by_adduct[adduct_type]
-            )
-            radical_candidate_slice = self.radical_candidate_slice_by_adduct[
-                adduct_type
-            ]
-
-            self.node_ion_heads_by_adduct_str[adduct_key] = (
-                self._make_node_choice_head(
-                    tree_dim=tree_dim,
-                    num_candidates=(
-                        ion_candidate_slice.stop - ion_candidate_slice.start
-                    ),
-                    dropout=dropout,
-                )
-            )
-
-            self.node_unsaturation_heads_by_adduct_str[adduct_key] = (
-                self._make_node_choice_head(
-                    tree_dim=tree_dim,
-                    num_candidates=(
-                        unsaturation_candidate_slice.stop
-                        - unsaturation_candidate_slice.start
-                    ),
-                    dropout=dropout,
-                )
-            )
-
-            self.node_radical_heads_by_adduct_str[adduct_key] = (
-                self._make_node_choice_head(
-                    tree_dim=tree_dim,
-                    num_candidates=(
-                        radical_candidate_slice.stop - radical_candidate_slice.start
-                    ),
-                    dropout=dropout,
-                )
-            )
-    
 
     @property
     def formula_tensorizer(self) -> FormulaTensorizer:
@@ -560,250 +294,16 @@ class FragmentTreeProbabilityModel(nn.Module):
         ev = parse_ce_to_ev(ce, precursor_mz, instrument)
         return ev
     
-    def forward(self, data: Union[FragmentTreeStructure, FragmentTreeFeatures]) -> FragmentTreeProbabilityOutput:
+
+    def forward(
+        self,
+        data: Union[FragmentTreeStructure, FragmentTreeFeatures],
+    ) -> FragmentTreeFeatureOutput:
         ft_features = self._build_fragment_tree_features(data)
-
         sample_tree_batch = self._encode_sample_tree(ft_features)
-
-        probabilities = self._compute_fragment_generation_probabilities(
+        return FragmentTreeFeatureOutput(
             ft_features=ft_features,
             sample_tree_batch=sample_tree_batch,
-        )
-
-        return FragmentTreeProbabilityOutput(
-            ft_features=ft_features,
-            sample_tree_batch=sample_tree_batch,
-            probabilities=probabilities,
-        )
-    
-    @staticmethod
-    def compute_node_generation_flow_probabilities(
-        *,
-        sample_tree_batch: Batch,
-        probabilities: FragmentGenerationProbabilities,
-        max_generation_steps: int,
-    ) -> NodeGenerationFlowProbabilities:
-        """
-        Convert local probabilities into graph-wise joint probabilities.
-
-        Flow
-        ----
-        Precursor roots are not represented by dedicated probabilities.
-        Instead, each graph starts from its precursor root node(s):
-
-            precursor root nodes
-                -> emit as precursor peaks
-                -> expand through outgoing edges
-                    -> reach fragment nodes
-                        -> emit as fragment peaks
-                        -> expand further
-
-        If a graph has multiple unique precursor root nodes, the initial
-        reach mass is distributed uniformly among those roots. Therefore,
-        the sum of the initial reach mass is 1 within each sample graph,
-        but that initial tensor is not returned separately.
-        """
-
-        if max_generation_steps < 0:
-            raise ValueError("max_generation_steps must be non-negative.")
-
-        if not hasattr(sample_tree_batch, "precursor_pathway_seq"):
-            raise ValueError("sample_tree_batch must have precursor_pathway_seq.")
-
-        if not hasattr(sample_tree_batch, "precursor_pathway_ptr"):
-            raise ValueError("sample_tree_batch must have precursor_pathway_ptr.")
-
-        p_edge = probabilities.p_edge
-        p_expand = probabilities.p_expand
-        p_stop = probabilities.p_stop
-
-        device = p_edge.device
-        dtype = p_edge.dtype
-
-        precursor_pathway_seq = sample_tree_batch.precursor_pathway_seq.to(device).long()
-        # [P, L]
-        # columns:
-        #   0: precursor root node
-        #   1: first edge
-        #   2: first fragment node
-        #   3: next edge
-        #   4: next fragment node
-        #   ...
-
-        precursor_pathway_ptr = sample_tree_batch.precursor_pathway_ptr.to(device).long()
-        # [G + 1]
-
-        edge_src, edge_dst = sample_tree_batch.edge_index
-        edge_src = edge_src.to(device).long()
-        edge_dst = edge_dst.to(device).long()
-
-        num_nodes = int(p_expand.size(0))
-        num_edges = int(p_edge.size(0))
-        num_graphs = int(precursor_pathway_ptr.numel() - 1)
-
-        if precursor_pathway_seq.dim() != 2:
-            raise ValueError(
-                "precursor_pathway_seq must be 2D, "
-                f"got shape {tuple(precursor_pathway_seq.shape)}."
-            )
-
-        if precursor_pathway_ptr.dim() != 1:
-            raise ValueError(
-                "precursor_pathway_ptr must be 1D, "
-                f"got shape {tuple(precursor_pathway_ptr.shape)}."
-            )
-
-        if num_graphs < 0:
-            raise ValueError("precursor_pathway_ptr must have at least one element.")
-
-        if edge_src.numel() != num_edges:
-            raise ValueError(
-                "edge_index size mismatch: "
-                f"edge_index has {edge_src.numel()} edges, p_edge has {num_edges}."
-            )
-
-        if p_expand.size(0) != p_stop.size(0):
-            raise ValueError(
-                "p_expand and p_stop must have the same node dimension. "
-                f"Got p_expand={p_expand.size(0)}, p_stop={p_stop.size(0)}."
-            )
-
-        if precursor_pathway_seq.numel() == 0:
-            raise ValueError("precursor_pathway_seq must contain at least one precursor root.")
-
-        row_counts = precursor_pathway_ptr[1:] - precursor_pathway_ptr[:-1]
-        # [G]
-
-        if (row_counts <= 0).any():
-            raise ValueError(
-                "Each sample graph must have at least one precursor pathway. "
-                f"row_counts={row_counts.detach().cpu().tolist()}"
-            )
-
-        precursor_root_node = precursor_pathway_seq[:, 0]
-        # [P]
-
-        if (precursor_root_node < 0).any():
-            bad_rows = (precursor_root_node < 0).nonzero(as_tuple=False).view(-1)
-            raise ValueError(
-                "Each precursor pathway must start with a valid root node. "
-                f"bad_rows={bad_rows.detach().cpu().tolist()}."
-            )
-
-        if precursor_root_node.max().item() >= num_nodes:
-            raise IndexError(
-                "precursor root node index is out of range: "
-                f"max={precursor_root_node.max().item()}, num_nodes={num_nodes}."
-            )
-
-        graph_index_by_path = torch.repeat_interleave(
-            torch.arange(num_graphs, dtype=torch.long, device=device),
-            row_counts,
-        )
-        # [P]
-
-        if graph_index_by_path.numel() != precursor_root_node.numel():
-            raise ValueError(
-                "precursor_pathway_ptr does not match precursor_pathway_seq rows."
-            )
-
-        # ------------------------------------------------------------
-        # Initial frontier.
-        # ------------------------------------------------------------
-        # Each graph starts with total probability mass = 1.
-        # If there are multiple unique precursor roots in the graph,
-        # distribute it uniformly among those roots.
-        graph_node_key = graph_index_by_path * num_nodes + precursor_root_node
-        unique_graph_node_key = torch.unique(graph_node_key, sorted=True)
-
-        unique_graph_index = unique_graph_node_key // num_nodes
-        unique_root_node = unique_graph_node_key % num_nodes
-
-        root_count_by_graph = torch.zeros(
-            (num_graphs,),
-            dtype=dtype,
-            device=device,
-        )
-
-        root_count_by_graph.scatter_add_(
-            0,
-            unique_graph_index,
-            torch.ones_like(unique_graph_index, dtype=dtype),
-        )
-
-        root_probability = 1.0 / root_count_by_graph[unique_graph_index]
-        # [R_unique]
-
-        frontier = torch.zeros(
-            (num_nodes,),
-            dtype=dtype,
-            device=device,
-        )
-
-        frontier.scatter_add_(
-            0,
-            unique_root_node,
-            root_probability,
-        )
-        # [N_tree]
-        # This is the initial reach state. It is not returned separately.
-
-        p_reach = frontier.clone()
-        p_emit = torch.zeros((num_nodes,), dtype=dtype, device=device)
-        p_expand_node = torch.zeros((num_nodes,), dtype=dtype, device=device)
-        p_expand_edge = torch.zeros((num_edges,), dtype=dtype, device=device)
-
-        # ------------------------------------------------------------
-        # Generation flow.
-        # ------------------------------------------------------------
-        # step = 0:
-        #   precursor roots can emit or expand.
-        #
-        # step >= 1:
-        #   reached fragment nodes can emit or expand.
-        for step in range(max_generation_steps + 1):
-            step_emit = frontier * p_stop
-            p_emit = p_emit + step_emit
-
-            if step == max_generation_steps:
-                break
-
-            step_expand_node = frontier * p_expand
-            step_expand_edge = step_expand_node[edge_src] * p_edge
-
-            p_expand_node = p_expand_node + step_expand_node
-            p_expand_edge = p_expand_edge + step_expand_edge
-
-            next_frontier = torch.zeros(
-                (num_nodes,),
-                dtype=dtype,
-                device=device,
-            )
-
-            next_frontier.scatter_add_(
-                0,
-                edge_dst,
-                step_expand_edge,
-            )
-
-            p_reach = p_reach + next_frontier
-            frontier = next_frontier
-
-        best_adduct = FragmentTreeProbabilityModel.compute_best_flat_adduct_combination(
-            ion=probabilities.ion,
-            unsaturation=probabilities.unsaturation,
-            radical=probabilities.radical,
-        )
-
-        p_emit_best_adduct = p_emit * best_adduct.probability
-
-        return NodeGenerationFlowProbabilities(
-            p_reach=p_reach,
-            p_emit=p_emit,
-            p_emit_best_adduct=p_emit_best_adduct,
-            p_expand_node=p_expand_node,
-            p_expand_edge=p_expand_edge,
-            best_adduct=best_adduct,
         )
 
     def _build_flat_adduct_candidate_table(
@@ -2405,616 +1905,6 @@ class FragmentTreeProbabilityModel(nn.Module):
                     f"for sample {sample_id}."
                 )
 
-    def convert_local_pathway_sequences_to_batch_indices(
-        seq_local: torch.Tensor,
-        pathway_ptr: torch.Tensor,
-        node_ptr: torch.Tensor,
-        edge_ptr: torch.Tensor,
-        *,
-        edge_positions: str = "odd0",
-    ) -> torch.Tensor:
-        """
-        Convert local node/edge ids in pathway sequences to PyG-batch-global ids.
-
-        seq_local:
-            [P, L]
-            Local node-edge-node sequences.
-
-        pathway_ptr:
-            [G + 1]
-            CSR pointer that groups pathway rows by sample graph.
-
-        node_ptr:
-            [G + 1]
-            PyG Batch node pointer.
-
-        edge_ptr:
-            [G + 1]
-            PyG Batch edge pointer.
-        """
-
-        device = seq_local.device
-
-        seq = seq_local.long().clone()
-        pathway_ptr = pathway_ptr.long().to(device)
-        node_ptr = node_ptr.long().to(device)
-        edge_ptr = edge_ptr.long().to(device)
-
-        num_sequences, sequence_width = seq.shape
-        num_graphs = int(pathway_ptr.numel() - 1)
-
-        if node_ptr.numel() != num_graphs + 1:
-            raise ValueError(
-                "node_ptr must have shape [G + 1] aligned with pathway_ptr."
-            )
-
-        if edge_ptr.numel() != num_graphs + 1:
-            raise ValueError(
-                "edge_ptr must have shape [G + 1] aligned with pathway_ptr."
-            )
-
-        sequence_counts = (
-            pathway_ptr[1:] - pathway_ptr[:-1]
-        ).clamp_min(0)
-
-        graph_id_by_sequence = torch.repeat_interleave(
-            torch.arange(
-                num_graphs,
-                device=device,
-                dtype=torch.long,
-            ),
-            sequence_counts,
-        )
-        # [P]
-
-        if graph_id_by_sequence.numel() != num_sequences:
-            raise ValueError(
-                "pathway_ptr does not match seq_local rows."
-            )
-
-        node_offset_by_sequence = node_ptr[graph_id_by_sequence]
-        edge_offset_by_sequence = edge_ptr[graph_id_by_sequence]
-
-        positions = torch.arange(
-            sequence_width,
-            device=device,
-        )
-
-        if edge_positions == "odd0":
-            is_edge_position = positions % 2 == 1
-        elif edge_positions == "even0":
-            is_edge_position = positions % 2 == 0
-        else:
-            raise ValueError(
-                'edge_positions must be "odd0" or "even0".'
-            )
-
-        is_edge = is_edge_position.view(1, sequence_width).expand(
-            num_sequences,
-            sequence_width,
-        )
-
-        is_node = ~is_edge
-        is_valid = seq >= 0
-
-        node_valid = is_valid & is_node
-        edge_valid = is_valid & is_edge
-
-        if node_valid.any():
-            node_offsets = node_offset_by_sequence.view(
-                num_sequences,
-                1,
-            ).expand(
-                num_sequences,
-                sequence_width,
-            )
-
-            seq[node_valid] = seq[node_valid] + node_offsets[node_valid]
-
-        if edge_valid.any():
-            edge_offsets = edge_offset_by_sequence.view(
-                num_sequences,
-                1,
-            ).expand(
-                num_sequences,
-                sequence_width,
-            )
-
-            seq[edge_valid] = seq[edge_valid] + edge_offsets[edge_valid]
-
-        return seq
-
-    @staticmethod
-    def _build_node_precursor_single_candidate_mask(
-        *,
-        num_nodes: int,
-        num_choices: int,
-        node_is_precursor_root: Tensor,
-        known_precursor_flat_index: Tensor,
-        device: torch.device,
-    ) -> Tensor:
-        """Build a node-wise mask that fixes precursor candidates.
-
-        Non-precursor nodes keep all candidate columns available here.
-        Precursor root nodes keep only their known precursor flat candidate.
-        This mask is combined with the static role/adduct mask later.
-        """
-
-        node_is_precursor_root = node_is_precursor_root.to(device).bool()
-        known_precursor_flat_index = known_precursor_flat_index.to(device).long()
-
-        if node_is_precursor_root.dim() != 1:
-            raise ValueError(
-                "node_is_precursor_root must be 1D, "
-                f"got shape {tuple(node_is_precursor_root.shape)}."
-            )
-
-        if known_precursor_flat_index.dim() != 1:
-            raise ValueError(
-                "known_precursor_flat_index must be 1D, "
-                f"got shape {tuple(known_precursor_flat_index.shape)}."
-            )
-
-        if node_is_precursor_root.size(0) != num_nodes:
-            raise ValueError(
-                "node_is_precursor_root has invalid length. "
-                f"Got {node_is_precursor_root.size(0)}, expected {num_nodes}."
-            )
-
-        if known_precursor_flat_index.size(0) != num_nodes:
-            raise ValueError(
-                "known_precursor_flat_index has invalid length. "
-                f"Got {known_precursor_flat_index.size(0)}, expected "
-                f"{num_nodes}."
-            )
-
-        mask = torch.ones(
-            (num_nodes, num_choices),
-            dtype=torch.bool,
-            device=device,
-        )
-
-        precursor_node_index = node_is_precursor_root.nonzero(
-            as_tuple=False
-        ).view(-1)
-
-        if precursor_node_index.numel() == 0:
-            return mask
-
-        target_index = known_precursor_flat_index[precursor_node_index]
-
-        if (target_index < 0).any():
-            bad_nodes = precursor_node_index[target_index < 0]
-            raise ValueError(
-                "Some precursor root nodes do not have known precursor "
-                "candidate indexes. "
-                f"bad_nodes={bad_nodes.detach().cpu().tolist()}."
-            )
-
-        if target_index.max().item() >= num_choices:
-            raise IndexError(
-                "known precursor candidate index is out of range. "
-                f"max={target_index.max().item()}, "
-                f"num_choices={num_choices}."
-            )
-
-        mask[precursor_node_index] = False
-        mask[precursor_node_index, target_index] = True
-
-        return mask
-
-    def _compute_fragment_generation_probabilities(
-        self,
-        *,
-        ft_features: FragmentTreeFeatures,
-        sample_tree_batch: Batch,
-    ) -> FragmentGenerationProbabilities:
-        """
-        Compute fragment generation probabilities from encoded sample tree batch.
-
-        Precursor-specific probabilities are not computed. Precursor roots use
-        the same p_expand / p_stop as other nodes.
-
-        Adduct candidate probabilities are still predicted for precursor
-        roots. Their valid candidate columns are selected by role/adduct masks
-        with shape [2, num_adduct_types, C_flat].
-        """
-
-        tree_node_emb = sample_tree_batch.x
-        # [N_tree, tree_dim]
-
-        edge_src, edge_dst = sample_tree_batch.edge_index
-        # [E_tree], [E_tree]
-
-        edge_input = torch.cat(
-            [
-                tree_node_emb[edge_src],
-                tree_node_emb[edge_dst],
-                sample_tree_batch.edge_attr,
-            ],
-            dim=-1,
-        )
-        # [E_tree, tree_dim * 2 + edge_dim]
-
-        edge_logit = self.edge_select_head(edge_input).squeeze(-1)
-        # [E_tree]
-
-        p_edge = _softmax_by_group(
-            logits=edge_logit,
-            group=edge_src,
-            num_groups=int(tree_node_emb.size(0)),
-        )
-        # [E_tree]
-
-        expand_logit = self.node_expand_head(tree_node_emb).squeeze(-1)
-        # [N_tree]
-
-        p_expand = torch.sigmoid(expand_logit)
-        # [N_tree]
-
-        p_stop = 1.0 - p_expand
-        # [N_tree]
-
-        ion_node_candidate_valid_mask = (
-            self._build_node_precursor_single_candidate_mask(
-                num_nodes=int(tree_node_emb.size(0)),
-                num_choices=int(self.ion_flat_candidates.shape[0]),
-                node_is_precursor_root=sample_tree_batch.node_is_precursor_root,
-                known_precursor_flat_index=(
-                    sample_tree_batch.node_precursor_ion_flat_index
-                ),
-                device=tree_node_emb.device,
-            )
-        )
-
-        unsaturation_node_candidate_valid_mask = (
-            self._build_node_precursor_single_candidate_mask(
-                num_nodes=int(tree_node_emb.size(0)),
-                num_choices=int(self.unsaturation_flat_candidates.shape[0]),
-                node_is_precursor_root=sample_tree_batch.node_is_precursor_root,
-                known_precursor_flat_index=(
-                    sample_tree_batch.node_precursor_unsaturation_flat_index
-                ),
-                device=tree_node_emb.device,
-            )
-        )
-
-        radical_node_candidate_valid_mask = (
-            self._build_node_precursor_single_candidate_mask(
-                num_nodes=int(tree_node_emb.size(0)),
-                num_choices=int(self.radical_flat_candidates.shape[0]),
-                node_is_precursor_root=sample_tree_batch.node_is_precursor_root,
-                known_precursor_flat_index=(
-                    sample_tree_batch.node_precursor_radical_flat_index
-                ),
-                device=tree_node_emb.device,
-            )
-        )
-
-        ion = self._compute_flat_adduct_node_choice_probabilities(
-            node_emb=tree_node_emb,
-            node_main_adduct_type_index=sample_tree_batch.node_main_adduct_type_index,
-            head_by_adduct_str=self.node_ion_heads_by_adduct_str,
-            flat_candidates=self.ion_flat_candidates,
-            candidate_slice_by_adduct=self.ion_candidate_slice_by_adduct,
-            candidate_valid_mask_by_role_adduct=(
-                self.ion_candidate_valid_mask_by_role_adduct
-            ),
-            node_is_precursor_root=sample_tree_batch.node_is_precursor_root,
-            node_candidate_valid_mask=ion_node_candidate_valid_mask,
-        )
-
-        unsaturation = self._compute_flat_adduct_node_choice_probabilities(
-            node_emb=tree_node_emb,
-            node_main_adduct_type_index=sample_tree_batch.node_main_adduct_type_index,
-            head_by_adduct_str=self.node_unsaturation_heads_by_adduct_str,
-            flat_candidates=self.unsaturation_flat_candidates,
-            candidate_slice_by_adduct=self.unsaturation_candidate_slice_by_adduct,
-            candidate_valid_mask_by_role_adduct=(
-                self.unsaturation_candidate_valid_mask_by_role_adduct
-            ),
-            node_is_precursor_root=sample_tree_batch.node_is_precursor_root,
-            node_candidate_valid_mask=unsaturation_node_candidate_valid_mask,
-        )
-
-        radical = self._compute_flat_adduct_node_choice_probabilities(
-            node_emb=tree_node_emb,
-            node_main_adduct_type_index=sample_tree_batch.node_main_adduct_type_index,
-            head_by_adduct_str=self.node_radical_heads_by_adduct_str,
-            flat_candidates=self.radical_flat_candidates,
-            candidate_slice_by_adduct=self.radical_candidate_slice_by_adduct,
-            candidate_valid_mask_by_role_adduct=(
-                self.radical_candidate_valid_mask_by_role_adduct
-            ),
-            node_is_precursor_root=sample_tree_batch.node_is_precursor_root,
-            node_candidate_valid_mask=radical_node_candidate_valid_mask,
-        )
-
-        return FragmentGenerationProbabilities(
-            edge_logit=edge_logit,
-            p_edge=p_edge,
-            expand_logit=expand_logit,
-            p_expand=p_expand,
-            p_stop=p_stop,
-            ion=ion,
-            unsaturation=unsaturation,
-            radical=radical,
-        )
-
-    def _compute_flat_adduct_node_choice_probabilities(
-        self,
-        *,
-        node_emb: Tensor,
-        node_main_adduct_type_index: Tensor,
-        head_by_adduct_str: nn.ModuleDict,
-        flat_candidates: np.ndarray,
-        candidate_slice_by_adduct: Dict[Adduct, slice],
-        candidate_valid_mask_by_role_adduct: Tensor,
-        node_is_precursor_root: Tensor,
-        node_candidate_valid_mask: Optional[Tensor] = None,
-    ) -> FlatAdductNodeChoiceProbabilities:
-        """Compute flat node-wise choice probabilities with masking.
-
-        Invalid columns are assigned:
-            logit = -inf
-            prob = 0
-            valid_mask = False
-
-        Candidate masking
-        -----------------
-        Candidate validity is controlled by two masks.
-
-        ``candidate_valid_mask_by_role_adduct`` is a static mask with shape:
-
-            [2, num_adduct_types, C_flat]
-
-        where:
-
-            role 0:
-                non-precursor fragment node
-
-            role 1:
-                precursor root node
-
-        ``node_candidate_valid_mask`` is an optional dynamic mask with shape:
-
-            [N_tree, C_flat]
-
-        It is used to fix precursor root nodes to their computed precursor
-        ion / unsaturation / radical candidate. The final valid mask is:
-
-            static role/adduct mask AND node-specific mask
-        """
-
-        device = node_emb.device
-        dtype = node_emb.dtype
-
-        if node_is_precursor_root.dim() != 1:
-            raise ValueError(
-                "node_is_precursor_root must be 1D, "
-                f"got shape {tuple(node_is_precursor_root.shape)}."
-            )
-
-        if node_is_precursor_root.size(0) != node_emb.size(0):
-            raise ValueError(
-                "node_is_precursor_root and node_emb must have the same "
-                "node dimension. "
-                f"Got {node_is_precursor_root.size(0)} and {node_emb.size(0)}."
-            )
-
-        num_nodes = int(node_emb.size(0))
-        num_choices = int(flat_candidates.shape[0])
-        num_adduct_types = len(self.main_adduct_types)
-
-        candidate_valid_mask_by_role_adduct = (
-            candidate_valid_mask_by_role_adduct.to(device).bool()
-        )
-
-        expected_mask_shape = (2, num_adduct_types, num_choices)
-        if tuple(candidate_valid_mask_by_role_adduct.shape) != expected_mask_shape:
-            raise ValueError(
-                "candidate_valid_mask_by_role_adduct must have shape "
-                f"{expected_mask_shape}, got "
-                f"{tuple(candidate_valid_mask_by_role_adduct.shape)}."
-            )
-
-        if node_candidate_valid_mask is not None:
-            node_candidate_valid_mask = node_candidate_valid_mask.to(device).bool()
-
-            if node_candidate_valid_mask.dim() != 2:
-                raise ValueError(
-                    "node_candidate_valid_mask must be 2D, "
-                    f"got shape {tuple(node_candidate_valid_mask.shape)}."
-                )
-
-            if node_candidate_valid_mask.size(0) != num_nodes:
-                raise ValueError(
-                    "node_candidate_valid_mask must have the same node "
-                    "dimension as node_emb. "
-                    f"Got {node_candidate_valid_mask.size(0)} and "
-                    f"{num_nodes}."
-                )
-
-            if node_candidate_valid_mask.size(1) != num_choices:
-                raise ValueError(
-                    "node_candidate_valid_mask must have the same candidate "
-                    "dimension as flat_candidates. "
-                    f"Got {node_candidate_valid_mask.size(1)} and "
-                    f"{num_choices}."
-                )
-
-        flat_logit = torch.full(
-            (num_nodes, num_choices),
-            -float("inf"),
-            dtype=dtype,
-            device=device,
-        )
-
-        flat_prob = torch.zeros(
-            (num_nodes, num_choices),
-            dtype=dtype,
-            device=device,
-        )
-
-        valid_mask = torch.zeros(
-            (num_nodes, num_choices),
-            dtype=torch.bool,
-            device=device,
-        )
-
-        node_is_precursor_root = node_is_precursor_root.to(device).bool()
-        node_role_index = node_is_precursor_root.long()
-        # 0: non-precursor node
-        # 1: precursor root node
-
-        node_main_adduct_type_index = node_main_adduct_type_index.to(
-            device
-        ).long()
-
-        for adduct_index, main_adduct_type in self.main_adduct_types.items():
-            adduct_key = str(main_adduct_type)
-
-            if adduct_key not in head_by_adduct_str:
-                continue
-
-            node_index = (
-                node_main_adduct_type_index == int(adduct_index)
-            ).nonzero(
-                as_tuple=False,
-            ).view(-1)
-            # [N_adduct]
-
-            if node_index.numel() == 0:
-                continue
-
-            if main_adduct_type not in candidate_slice_by_adduct:
-                raise KeyError(
-                    f"No candidate slice found for adduct type: "
-                    f"{main_adduct_type}"
-                )
-
-            candidate_slice = candidate_slice_by_adduct[main_adduct_type]
-
-            candidate_index = torch.arange(
-                candidate_slice.start,
-                candidate_slice.stop,
-                dtype=torch.long,
-                device=device,
-            )
-            # [C_adduct]
-
-            node_emb_for_adduct = node_emb[node_index]
-            # [N_adduct, tree_dim]
-
-            local_logit = head_by_adduct_str[adduct_key](
-                node_emb_for_adduct
-            )
-            # [N_adduct, C_adduct]
-
-            if local_logit.size(1) != candidate_index.numel():
-                raise ValueError(
-                    "Head output size and candidate slice size mismatch. "
-                    f"adduct_type={main_adduct_type}, "
-                    f"local_logit.size(1)={local_logit.size(1)}, "
-                    f"candidate_count={candidate_index.numel()}."
-                )
-
-            local_role_index = node_role_index[node_index]
-            # [N_adduct]
-
-            role_adduct_mask = candidate_valid_mask_by_role_adduct[
-                :,
-                int(adduct_index),
-                :,
-            ]
-            # [2, C_flat]
-
-            local_valid_mask = role_adduct_mask[
-                local_role_index
-            ][:, candidate_index]
-            # [N_adduct, C_adduct]
-
-            if node_candidate_valid_mask is not None:
-                local_node_candidate_valid_mask = node_candidate_valid_mask[
-                    node_index
-                ][:, candidate_index]
-                # [N_adduct, C_adduct]
-
-                local_valid_mask = (
-                    local_valid_mask
-                    & local_node_candidate_valid_mask
-                )
-
-            if (~local_valid_mask.any(dim=1)).any():
-                bad_local_rows = (~local_valid_mask.any(dim=1)).nonzero(
-                    as_tuple=False,
-                ).view(-1)
-                bad_nodes = node_index[bad_local_rows]
-                raise ValueError(
-                    "Some nodes have no valid candidates after role/adduct "
-                    "masking. "
-                    f"adduct_type={main_adduct_type}, "
-                    f"bad_nodes={bad_nodes.detach().cpu().tolist()}."
-                )
-
-            local_logit = local_logit.masked_fill(
-                ~local_valid_mask,
-                -float("inf"),
-            )
-
-            local_prob = torch.softmax(
-                local_logit,
-                dim=-1,
-            )
-            # [N_adduct, C_adduct]
-
-            flat_logit[
-                node_index[:, None],
-                candidate_index[None, :],
-            ] = local_logit
-
-            flat_prob[
-                node_index[:, None],
-                candidate_index[None, :],
-            ] = local_prob
-
-            valid_mask[
-                node_index[:, None],
-                candidate_index[None, :],
-            ] = local_valid_mask
-
-        return FlatAdductNodeChoiceProbabilities(
-            logit=flat_logit,
-            prob=flat_prob,
-            valid_mask=valid_mask,
-        )
-
-    @staticmethod
-    def _make_node_choice_head(
-        *,
-        tree_dim: int,
-        num_candidates: int,
-        dropout: float,
-    ) -> nn.Module:
-        """Create a node-wise candidate selection head."""
-
-        if num_candidates <= 0:
-            raise ValueError(
-                "num_candidates must be positive."
-            )
-
-        return nn.Sequential(
-            nn.Linear(
-                tree_dim,
-                tree_dim,
-            ),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(
-                tree_dim,
-                num_candidates,
-            ),
-        )
 
     @staticmethod
     def _convert_local_pathway_sequences_to_batch_indices(
@@ -3167,124 +2057,3 @@ class FragmentTreeProbabilityModel(nn.Module):
             seq[edge_valid] = seq[edge_valid] + edge_offsets[edge_valid]
 
         return seq
-
-
-
-
-    @staticmethod
-    def compute_best_flat_adduct_combination(
-        *,
-        ion: FlatAdductNodeChoiceProbabilities,
-        unsaturation: FlatAdductNodeChoiceProbabilities,
-        radical: FlatAdductNodeChoiceProbabilities,
-    ) -> BestFlatAdductCombination:
-        """Compute best ion * unsaturation * radical probability for each node."""
-
-        ion_prob = ion.prob.masked_fill(~ion.valid_mask, -1.0)
-        unsaturation_prob = unsaturation.prob.masked_fill(~unsaturation.valid_mask, -1.0)
-        radical_prob = radical.prob.masked_fill(~radical.valid_mask, -1.0)
-
-        best_ion_prob, ion_index = ion_prob.max(dim=1)
-        best_unsaturation_prob, unsaturation_index = unsaturation_prob.max(dim=1)
-        best_radical_prob, radical_index = radical_prob.max(dim=1)
-
-        best_ion_prob = best_ion_prob.clamp_min(0.0)
-        best_unsaturation_prob = best_unsaturation_prob.clamp_min(0.0)
-        best_radical_prob = best_radical_prob.clamp_min(0.0)
-
-        probability = best_ion_prob * best_unsaturation_prob * best_radical_prob
-
-        return BestFlatAdductCombination(
-            ion_index=ion_index,
-            unsaturation_index=unsaturation_index,
-            radical_index=radical_index,
-            probability=probability,
-        )
-
-
-def _softmax_by_group(
-    logits: Tensor,
-    group: Tensor,
-    num_groups: int,
-    eps: float = 1e-12,
-) -> Tensor:
-    """
-    Compute softmax over values that belong to the same group.
-
-    Parameters
-    ----------
-    logits:
-        [N]
-
-    group:
-        [N]
-        group[i] is the group id of logits[i].
-
-    num_groups:
-        Number of groups.
-
-    Returns
-    -------
-    Tensor
-        [N]
-        Softmax-normalized values within each group.
-    """
-
-    if logits.numel() == 0:
-        return logits
-
-    if logits.dim() != 1:
-        raise ValueError(
-            f"logits must be 1D, got shape {tuple(logits.shape)}."
-        )
-
-    if group.dim() != 1:
-        raise ValueError(
-            f"group must be 1D, got shape {tuple(group.shape)}."
-        )
-
-    if logits.size(0) != group.size(0):
-        raise ValueError(
-            "logits and group must have the same length. "
-            f"Got logits={logits.size(0)}, group={group.size(0)}."
-        )
-
-    if group.min().item() < 0 or group.max().item() >= num_groups:
-        raise IndexError(
-            "group index out of range. "
-            f"min={group.min().item()}, "
-            f"max={group.max().item()}, "
-            f"num_groups={num_groups}."
-        )
-
-    max_per_group = torch.full(
-        (num_groups,),
-        -float("inf"),
-        dtype=logits.dtype,
-        device=logits.device,
-    )
-
-    max_per_group.scatter_reduce_(
-        dim=0,
-        index=group,
-        src=logits,
-        reduce="amax",
-        include_self=True,
-    )
-
-    shifted_logits = logits - max_per_group[group]
-    exp_logits = torch.exp(shifted_logits)
-
-    denom = torch.zeros(
-        (num_groups,),
-        dtype=logits.dtype,
-        device=logits.device,
-    )
-
-    denom.scatter_add_(
-        dim=0,
-        index=group,
-        src=exp_logits,
-    )
-
-    return exp_logits / (denom[group] + eps)
