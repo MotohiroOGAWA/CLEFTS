@@ -204,6 +204,7 @@ def build_fragment_tree_structure_files(
     instrument_column: Optional[str] = None,
     overwrite: bool = False,
     manifest_file: Optional[str | Path] = None,
+    valid_record_indexes: Optional[List[int]] = None,
 ) -> List[Path]:
     """Build and save one FragmentTreeStructure file per SMILES group."""
 
@@ -233,6 +234,16 @@ def build_fragment_tree_structure_files(
 
         if structure_file.exists() and not overwrite:
             saved_files.append(structure_file)
+            if valid_record_indexes is not None:
+                try:
+                    payload = torch.load(structure_file, map_location="cpu")
+                    metadata = dict(payload.get("metadata", {})) if isinstance(payload, dict) else {}
+                    saved_sample_indexes = metadata.get("sample_indexes", [])
+                    for record_index, sample_index in zip(record_indexes, saved_sample_indexes):
+                        if int(sample_index) >= 0:
+                            valid_record_indexes.append(int(record_index))
+                except Exception:
+                    pass
             manifest_rows.append(
                 {
                     "file": structure_file.name,
@@ -284,6 +295,10 @@ def build_fragment_tree_structure_files(
                 metadata=metadata,
             )
             saved_files.append(structure_file)
+            if valid_record_indexes is not None:
+                for record_index, sample_index in zip(record_indexes, sample_indexes.tolist()):
+                    if int(sample_index) >= 0:
+                        valid_record_indexes.append(int(record_index))
             manifest_rows.append({"file": structure_file.name, "status": "ok", **metadata})
         except Exception as exc:
             print(

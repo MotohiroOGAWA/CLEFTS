@@ -270,7 +270,7 @@ class FragmentTreeSelectionTrainingLoss(nn.Module):
                     continue
                 seen_nodes.add(batch_node_index)
 
-                role_index = int(bool(batch.node_is_precursor_root[batch_node_index].detach().cpu().item()))
+                role_index = 0 if bool(batch.node_is_precursor_root[batch_node_index].detach().cpu().item()) else 1
                 main_adduct_index = int(batch.node_main_adduct_type_index[batch_node_index].detach().cpu().item())
                 node_weight = peak_weight * prob_by_batch_node[int(batch_node_index)]
 

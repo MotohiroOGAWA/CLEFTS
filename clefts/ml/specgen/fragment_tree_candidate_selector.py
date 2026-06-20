@@ -158,7 +158,7 @@ class FragmentTreeCandidateSelector(nn.Module):
         device = keep_logit.device
         base_formula = structure.node_formula[global_node_id].to(device).float()
         main_adduct_index = int(sample_tree_batch.node_main_adduct_type_index[batch_node_index].detach().cpu().item())
-        role_index = int(bool(sample_tree_batch.node_is_precursor_root[batch_node_index].detach().cpu().item()))
+        role_index = 0 if bool(sample_tree_batch.node_is_precursor_root[batch_node_index].detach().cpu().item()) else 1
         ion_indices = self._valid_candidate_indices(self.feature_model.ion_candidate_valid_mask_by_role_adduct, role_index=role_index, main_adduct_index=main_adduct_index, device=device)
         unsaturation_indices = self._valid_candidate_indices(self.feature_model.unsaturation_candidate_valid_mask_by_role_adduct, role_index=role_index, main_adduct_index=main_adduct_index, device=device)
         radical_indices = self._valid_candidate_indices(self.feature_model.radical_candidate_valid_mask_by_role_adduct, role_index=role_index, main_adduct_index=main_adduct_index, device=device)

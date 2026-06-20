@@ -586,7 +586,7 @@ class TrainingFragmentTreeStructureBuilder(SingleFragmentTreeStructureBuilder):
         terminal_formula = fragment_pathway.terminal_node.to_compound().formula
 
         adduct_index = self._model.main_adduct_types.inverse[main_adduct_type]
-        role_index = 0
+        role_index = 0 if fragment_pathway.terminal_node.is_precursor else 1
         ion_mask = self._model.ion_candidate_valid_mask_by_role_adduct[
             role_index, int(adduct_index)
         ]

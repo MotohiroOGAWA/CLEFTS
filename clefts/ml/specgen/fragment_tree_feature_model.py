@@ -388,10 +388,10 @@ class FragmentTreeFeatureModel(nn.Module):
             Boolean tensor with shape [2, A, C_flat].
 
             role 0:
-                Non-precursor fragment node.
+                Precursor root node.
 
             role 1:
-                Precursor root node.
+                Non-precursor fragment node.
 
             A:
                 Number of main adduct types.
@@ -460,10 +460,11 @@ class FragmentTreeFeatureModel(nn.Module):
                 is_precursor_candidate = candidate == precursor_candidate
 
                 if is_precursor_candidate:
+                    mask[0, int(adduct_index), flat_index] = True
                     mask[1, int(adduct_index), flat_index] = True
                     found_precursor_candidate = True
                 else:
-                    mask[0, int(adduct_index), flat_index] = True
+                    mask[1, int(adduct_index), flat_index] = True
 
             if not found_precursor_candidate:
                 raise ValueError(
