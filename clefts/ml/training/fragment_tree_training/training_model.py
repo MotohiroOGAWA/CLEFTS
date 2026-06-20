@@ -418,17 +418,18 @@ def main(
         )
         global_step += len(train_loader)
 
-        if len(val_loader) > 0:
-            with torch.no_grad():
-                val_loss, _ = run_epoch(
-                    model=model,
-                    loader=val_loader,
-                    device=device,
-                    optimizer=None,
-                    desc=f"Val({epoch_index}/{max_epoch})",
-                )
-        else:
-            val_loss = train_loss
+        # if len(val_loader) > 0:
+        #     with torch.no_grad():
+        #         val_loss, _ = run_epoch(
+        #             model=model,
+        #             loader=val_loader,
+        #             device=device,
+        #             optimizer=None,
+        #             desc=f"Val({epoch_index}/{max_epoch})",
+        #         )
+        # else:
+        #     val_loss = train_loss
+        val_loss = train_loss
 
         step_scheduler(scheduler, val_loss)
 

@@ -1498,10 +1498,10 @@ class FragmentTreeFeatureModel(nn.Module):
         node_precursor_radical_flat_index: Tensor,
         sample_id: int,
     ) -> None:
-        """Assign precursor path-level flat indexes to root nodes.
+        """Assign precursor path-level flat indexes to terminal nodes.
 
         The assignment is done in-place on the node-level tensors.
-        A single precursor root node must not have conflicting known
+        A single precursor terminal node must not have conflicting known
         precursor states.
         """
 
@@ -1535,18 +1535,22 @@ class FragmentTreeFeatureModel(nn.Module):
                     f"Got {value.size(0)} and {path_count}."
                 )
 
-        local_precursor_root_node_index = local_precursor_sequence[:, 0].long()
+        local_precursor_terminal_node_index = (
+            FragmentTreeFeatureModel._get_last_valid_nodes_from_node_edge_sequences(
+                local_precursor_sequence
+            ).long()
+        )
         # [P_s]
 
         for local_path_index in range(path_count):
-            root_node_index = int(
-                local_precursor_root_node_index[local_path_index].item()
+            terminal_node_index = int(
+                local_precursor_terminal_node_index[local_path_index].item()
             )
 
-            if root_node_index < 0:
+            if terminal_node_index < 0:
                 raise ValueError(
                     f"Precursor path {local_path_index} in sample {sample_id} "
-                    "has no valid root node."
+                    "has no valid terminal node."
                 )
 
             ion_index = int(precursor_ion_flat_index[local_path_index].item())
@@ -1558,21 +1562,21 @@ class FragmentTreeFeatureModel(nn.Module):
             )
 
             current_ion_index = int(
-                node_precursor_ion_flat_index[root_node_index].item()
+                node_precursor_ion_flat_index[terminal_node_index].item()
             )
             current_unsaturation_index = int(
-                node_precursor_unsaturation_flat_index[root_node_index].item()
+                node_precursor_unsaturation_flat_index[terminal_node_index].item()
             )
             current_radical_index = int(
-                node_precursor_radical_flat_index[root_node_index].item()
+                node_precursor_radical_flat_index[terminal_node_index].item()
             )
 
             if current_ion_index >= 0 and current_ion_index != ion_index:
                 raise ValueError(
-                    "Conflicting precursor ion targets for the same root "
+                    "Conflicting precursor ion targets for the same terminal "
                     "node. "
                     f"sample_id={sample_id}, "
-                    f"root_node_index={root_node_index}."
+                    f"terminal_node_index={terminal_node_index}."
                 )
 
             if (
@@ -1581,24 +1585,24 @@ class FragmentTreeFeatureModel(nn.Module):
             ):
                 raise ValueError(
                     "Conflicting precursor unsaturation targets for the same "
-                    "root node. "
+                    "terminal node. "
                     f"sample_id={sample_id}, "
-                    f"root_node_index={root_node_index}."
+                    f"terminal_node_index={terminal_node_index}."
                 )
 
             if current_radical_index >= 0 and current_radical_index != radical_index:
                 raise ValueError(
-                    "Conflicting precursor radical targets for the same root "
+                    "Conflicting precursor radical targets for the same terminal "
                     "node. "
                     f"sample_id={sample_id}, "
-                    f"root_node_index={root_node_index}."
+                    f"terminal_node_index={terminal_node_index}."
                 )
 
-            node_precursor_ion_flat_index[root_node_index] = ion_index
-            node_precursor_unsaturation_flat_index[root_node_index] = (
+            node_precursor_ion_flat_index[terminal_node_index] = ion_index
+            node_precursor_unsaturation_flat_index[terminal_node_index] = (
                 unsaturation_index
             )
-            node_precursor_radical_flat_index[root_node_index] = radical_index
+            node_precursor_radical_flat_index[terminal_node_index] = radical_index
 
     @staticmethod
     def _get_last_valid_nodes_from_node_edge_sequences(

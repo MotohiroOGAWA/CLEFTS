@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import List
 
@@ -289,6 +290,59 @@ class TestBuildSampleTreePygBatch(unittest.TestCase):
             sample_tree_batch.sample_id,
             torch.tensor(
                 [0, 1],
+                dtype=torch.long,
+            ),
+        )
+
+    def test_precursor_targets_are_assigned_to_terminal_nodes(self) -> None:
+        model = self._make_model()
+        ft_features = self._make_fragment_tree_features()
+        ft_features.structure = replace(
+            ft_features.structure,
+            precursor_edge_index_path=torch.tensor(
+                [
+                    [0, 1],
+                    [2, -1],
+                    [3, 4],
+                ],
+                dtype=torch.long,
+            ),
+            precursor_unsaturation_index=torch.tensor(
+                [0, 1, 1],
+                dtype=torch.long,
+            ),
+            precursor_radical_index=torch.tensor(
+                [0, 1, 1],
+                dtype=torch.long,
+            ),
+            precursor_sample_index=torch.tensor(
+                [0, 0, 1],
+                dtype=torch.long,
+            ),
+        )
+
+        sample_tree_batch, _, _ = model._build_sample_tree_pyg_batch(
+            ft_features
+        )
+
+        self.assertTensorEqual(
+            sample_tree_batch.node_precursor_ion_flat_index,
+            torch.tensor(
+                [-1, -1, 0, 0, -1, -1, 0],
+                dtype=torch.long,
+            ),
+        )
+        self.assertTensorEqual(
+            sample_tree_batch.node_precursor_unsaturation_flat_index,
+            torch.tensor(
+                [-1, -1, 0, 1, -1, -1, 1],
+                dtype=torch.long,
+            ),
+        )
+        self.assertTensorEqual(
+            sample_tree_batch.node_precursor_radical_flat_index,
+            torch.tensor(
+                [-1, -1, 0, 1, -1, -1, 1],
                 dtype=torch.long,
             ),
         )
