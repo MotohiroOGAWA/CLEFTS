@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Iterable, List, Tuple, Dict, Set
+from typing import Any, Iterable, List, Tuple, Dict, Set, Optional
 import json
 from pathlib import Path
 from collections import defaultdict
@@ -14,6 +14,7 @@ from .tree import *
 from .ion_tree import *
 from .pathway import *
 from .pathway.build_pathway import build_pathway_items_for_node, PathwayItem
+from .cleavage import CleavagePatternSet, CleavagePattern, CleavageResult
 
 
 @dataclass(frozen=True)
@@ -38,7 +39,7 @@ class Fragmenter:
         return self.fragment_ion_tree_builder.min_depth_only_from
     
     @property
-    def cleavage_pattern_set(self) -> Any:
+    def cleavage_pattern_set(self) -> CleavagePatternSet:
         return self.fragment_ion_tree_builder.cleavage_pattern_set
     
     @property
@@ -54,18 +55,42 @@ class Fragmenter:
             )
         return mapper[main_adduct_type]
 
+    def get_precursor_delta_h_state_by_adduct_type(self, main_adduct_type: Adduct, adduct_type: Adduct) -> Tuple[Adduct, ...]:
+        main_adduct_type = self._resolve_main_adduct_type(main_adduct_type)
+        return self.fragment_ion_tree_builder.fragment_ion_adduct_rule_set.get_precursor_delta_h_state_by_adduct_type(main_adduct_type, adduct_type)
+
+    def get_ion_shift_adducts_by_adduct_type(self, adduct_type: Adduct) -> Tuple[Adduct, ...]:
+        main_adduct_type = self._resolve_main_adduct_type(adduct_type)
+        return self.fragment_ion_tree_builder.fragment_ion_adduct_rule_set.get_ion_shift_adducts_by_adduct_type(
+            main_adduct_type
+        )
+    
+    def get_unsaturation_adduct_candidates_by_adduct_type(self, adduct_type: Adduct) -> Tuple[Adduct, ...]:
+        main_adduct_type = self._resolve_main_adduct_type(adduct_type)
+        return self.fragment_ion_tree_builder.fragment_ion_adduct_rule_set.get_unsaturation_adduct_candidates_by_adduct_type(
+            main_adduct_type
+        )
+
+    def get_radical_adduct_candidates_by_adduct_type(self, adduct_type: Adduct) -> Tuple[Adduct, ...]:
+        main_adduct_type = self._resolve_main_adduct_type(adduct_type)
+        return self.fragment_ion_tree_builder.fragment_ion_adduct_rule_set.get_radical_adduct_candidates_by_adduct_type(
+            main_adduct_type
+        )
+
     def build_fragment_tree(
         self,
         compound: Compound,
         *,
         max_node: int = -1,
         max_edge: int = -1,
+        max_depth: Optional[int] = None,
         print_info: bool = False,
     ) -> FragmentTree:
         return self.fragment_ion_tree_builder.build_fragment_tree(
             compound,
             max_node=max_node,
             max_edge=max_edge,
+            max_depth=max_depth,
             print_info=print_info,
         )
     
@@ -75,6 +100,7 @@ class Fragmenter:
         *,
         max_node: int = -1,
         max_edge: int = -1,
+        max_depth: Optional[int] = None,
         print_info: bool = False,
         _include_fragment_compound_cache: bool = False,
     ) -> FragmentIonTree:
@@ -82,6 +108,7 @@ class Fragmenter:
             compound,
             max_node=max_node,
             max_edge=max_edge,
+            max_depth=max_depth,
             print_info=print_info,
             _include_fragment_compound_cache=_include_fragment_compound_cache,
         )
@@ -214,6 +241,12 @@ class Fragmenter:
             )
 
         return tuple(results)
+
+    def fragment_all(
+        self,
+        compound: Compound,
+    ) -> Tuple[CleavageResult, ...]:
+        return self.cleavage_pattern_set.fragment_all(compound)
 
     def _make_fragment_compound_cache(
         self,

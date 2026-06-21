@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Tuple
+from typing import Any, Tuple, List
 import json
 
+from ..tree.FragmentEdge import FragmentEdge
 from .CleavageStep import CleavageStep
 
 
@@ -67,7 +68,32 @@ class FragmentPathwayEdge:
     @classmethod
     def from_json_str(cls, text: str) -> FragmentPathwayEdge:
         return cls.parse(text)
-    
+
+    @classmethod
+    def from_fragment_edge(cls, edge: FragmentEdge) -> "FragmentPathwayEdge":
+        """Create a FragmentPathwayEdge from a FragmentEdge.
+
+        Parameters
+        ----------
+        edge:
+            FragmentEdge containing one or more CleavageEvent objects.
+
+        Returns
+        -------
+        FragmentPathwayEdge
+            Pathway edge whose steps correspond to edge.events.
+        """
+
+        if not isinstance(edge, FragmentEdge):
+            raise TypeError("edge must be a FragmentEdge instance.")
+
+        return cls(
+            steps=tuple(
+                CleavageStep.from_cleavage_event(event)
+                for event in edge.events
+            )
+        )
+
     def copy(self) -> FragmentPathwayEdge:
         return FragmentPathwayEdge(
             steps=tuple(step.copy() for step in self.steps)

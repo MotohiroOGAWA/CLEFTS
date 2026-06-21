@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Dict, Optional
 
 from ....libs.mmkit.mmkit import Compound
 from ..cleavage.CleavagePatternSet import CleavagePatternSet
@@ -49,6 +49,7 @@ class FragmentIonTreeBuilder(FragmentTreeBuilder):
         *,
         max_node: int = -1,
         max_edge: int = -1,
+        max_depth: Optional[int] = None,
         print_info: bool = False,
         _include_fragment_compound_cache: bool = False,
     ) -> FragmentIonTree:
@@ -58,6 +59,7 @@ class FragmentIonTreeBuilder(FragmentTreeBuilder):
             compound,
             max_node=max_node,
             max_edge=max_edge,
+            max_depth=max_depth,
             print_info=print_info,
         )
 
@@ -97,6 +99,7 @@ class FragmentIonTreeBuilder(FragmentTreeBuilder):
         *,
         max_node: int = -1,
         max_edge: int = -1,
+        max_depth: Optional[int] = None,
         print_info: bool = False,
     ) -> FragmentTree:
         """Build only FragmentTree."""
@@ -105,6 +108,7 @@ class FragmentIonTreeBuilder(FragmentTreeBuilder):
             compound,
             max_node=max_node,
             max_edge=max_edge,
+            max_depth=max_depth,
             print_info=print_info,
         )
 

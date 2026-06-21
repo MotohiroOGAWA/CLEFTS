@@ -2,7 +2,7 @@ from typing import Tuple
 import torch
 import torch.nn as nn
 
-from ....common.nn_utils import build_fc_layers
+from ....common.torch_utils.nn_utils import build_fc_layers
 
 class CollisionEnergyFeatureLayer(nn.Module):
     def __init__(

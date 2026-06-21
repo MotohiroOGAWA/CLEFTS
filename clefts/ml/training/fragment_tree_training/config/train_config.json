@@ -1,0 +1,18 @@
+{
+  "experiment_name": "exp_test",
+  "ckpt_id": null,
+  "batch_size": 2,
+  "device": "cuda",
+  "epoch": 1000,
+  "validation_interval_steps": null,
+  "save_interval": 100,
+  "optimizer": {
+    "name": "AdamW",
+    "lr": 0.00001,
+    "weight_decay": 0.0,
+    "grad_clip_norm": 1.0
+  },
+  "training_structure_dir": "data/training/project_single_bond/train_structures",
+  "validation_structure_dir": "data/training/project_single_bond/validation_structures",
+  "shuffle": true
+}

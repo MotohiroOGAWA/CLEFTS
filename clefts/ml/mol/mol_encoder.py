@@ -23,6 +23,7 @@ class MolEncoder(nn.Module):
         self,
         symbols,
         node_dim: int,
+        graph_dim: int,
         num_layers: int,
         # Graphormer-specific
         num_heads: int,
@@ -39,11 +40,14 @@ class MolEncoder(nn.Module):
         atom_dim = self.graph_builder.atom_dim
         bond_dim = self.graph_builder.bond_dim
 
-        self.node_dim = node_dim
+        self._node_dim = node_dim
+        self._num_graph_tokens = graph_dim // node_dim
+        self._graph_dim = self._num_graph_tokens * node_dim
 
         self.encoder = GraphormerEncoder(
             in_dim=atom_dim,
             dim=node_dim,
+            num_graph_tokens=self._num_graph_tokens,
             edge_dim=bond_dim,
             num_heads=num_heads,
             num_layers=num_layers,
@@ -57,6 +61,26 @@ class MolEncoder(nn.Module):
             start_cap=64,
             cap_growth=2.0,
         )
+    
+    @property
+    def node_dim(self) -> int:
+        return self._node_dim
+    
+    @property
+    def graph_dim(self) -> int:
+        return self._graph_dim
+
+    @property
+    def atom_dim(self) -> int:
+        return self.graph_builder.atom_dim
+
+    @property
+    def bond_dim(self) -> int:
+        return self.graph_builder.bond_dim
+    
+    @property
+    def symbols(self) -> Tuple[str]:
+        return self.graph_builder.symbols
 
     def encode_components(self, compound: Compound) -> Data:
         """
@@ -74,7 +98,7 @@ class MolEncoder(nn.Module):
 
         batch.x = node_h
         if graph_h is not None:
-            batch.embeddings = graph_h  # [G, node_dim]
+            batch.embeddings = graph_h  # [G, graph_dim]
 
         return batch
 
@@ -139,15 +163,3 @@ class MolEncoder(nn.Module):
         batch = self.forward(batch)
 
         return batch, valid_indices_t
-
-    @property
-    def atom_dim(self) -> int:
-        return self.graph_builder.atom_dim
-
-    @property
-    def bond_dim(self) -> int:
-        return self.graph_builder.bond_dim
-    
-    @property
-    def symbols(self) -> Tuple[str]:
-        return self.graph_builder.symbols

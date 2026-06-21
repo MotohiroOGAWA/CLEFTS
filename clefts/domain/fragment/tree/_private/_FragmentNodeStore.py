@@ -54,6 +54,13 @@ class _FragmentNodeStore:
             id=int(self.node_ids[index]),
             smiles=str(self.node_smiles[index]),
         )
+    
+    def get_node_by_smiles(self, smiles: str) -> FragmentNode | None:
+        try:
+            index = np.where(self.node_smiles == smiles)[0][0]
+            return self.get_node(index)
+        except IndexError:
+            return None
 
     def copy(self) -> "_FragmentNodeStore":
         return _FragmentNodeStore(

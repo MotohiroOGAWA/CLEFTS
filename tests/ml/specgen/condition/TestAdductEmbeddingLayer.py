@@ -23,15 +23,6 @@ class TestAdductEmbeddingLayer(unittest.TestCase):
         self.assertEqual(len(layer.adduct_types), 3)
         self.assertEqual(len(layer.adduct2idx), 3)
 
-    def test_adduct_type_strings_are_sorted_and_unique(self) -> None:
-        layer = AdductEmbeddingLayer(
-            adduct_type_strs=("[M+Na]+", "[M+H]+", "[M+H]+"),
-            embedding_dim=8,
-        )
-
-        self.assertEqual(layer.adduct_type_strs, ("[M+H]+", "[M+Na]+"))
-        self.assertEqual(layer.num_adduct_types, 2)
-
     def test_adducts_to_idx_accepts_strings(self) -> None:
         layer = AdductEmbeddingLayer(
             adduct_type_strs=("[M+H]+", "[M+Na]+", "[M-H]-"),

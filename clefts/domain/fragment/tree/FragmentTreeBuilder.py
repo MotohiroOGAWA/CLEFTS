@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from typing import Callable, Any, Dict, Tuple
+from typing import Callable, Any, Dict, Optional, Tuple
 
 from ....libs.mmkit.mmkit import Compound
 from ..cleavage._CleavagePattern import _CleavagePattern
@@ -117,12 +117,14 @@ class FragmentTreeBuilder:
         *,
         max_node: int = -1,
         max_edge: int = -1,
+        max_depth: Optional[int] = None,
         print_info: bool = False,
     ) -> FragmentTree:
         result = self._build_result(
             compound,
             max_node=max_node,
             max_edge=max_edge,
+            max_depth=max_depth,
             print_info=print_info
         )
         return result['fragment_tree']
@@ -133,6 +135,7 @@ class FragmentTreeBuilder:
         *,
         max_node: int = -1,
         max_edge: int = -1,
+        max_depth: Optional[int] = None,
         print_info: bool = False,
     ) -> dict[str, Any]:
         if not isinstance(compound, Compound):
@@ -145,6 +148,13 @@ class FragmentTreeBuilder:
 
         if not isinstance(max_edge, int) or max_edge < -1:
             raise ValueError("max_edge must be -1 or a non-negative integer.")
+
+        if max_depth is None:
+            build_max_depth = self.max_depth
+        else:
+            if not isinstance(max_depth, int) or max_depth < 0:
+                raise ValueError("max_depth must be None or a non-negative integer.")
+            build_max_depth = max_depth
 
         start_time = time.time()
         fragment_compound_by_index: Dict[int, Compound] = {}
@@ -159,7 +169,7 @@ class FragmentTreeBuilder:
             min_depth_only_from=self.min_depth_only_from,
         )
 
-        for depth in range(1, self.max_depth + 1):
+        for depth in range(1, build_max_depth + 1):
             if not state.next_node_indices:
                 break
 
