@@ -10,7 +10,6 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
-import pandas as pd
 import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -22,10 +21,14 @@ except ImportError:  # pragma: no cover
 
 from ...common.torch_utils.check_point_manager import CheckPointManager, CkptNode
 from ...common.torch_utils.training_setup import get_optimizer
-from ...input.training_fragment_tree_structure import TrainingFragmentTreeStructure
+from ...input.fragment_tree_structure import FragmentTreeStructure
 from ...input.fragment_tree_training_data import (
     FragmentTreeStructureFileDataset,
     collate_fragment_tree_structure_items,
+    group_record_indexes_by_smiles,
+)
+from ...input.single_fragment_tree_structure_builder import (
+    SingleFragmentTreeStructureBuilder,
 )
 from ...specgen.fragment_tree_spectrum_predictor import (
     FragmentSpectrumGenerator,
@@ -34,7 +37,6 @@ from ...specgen.fragment_tree_spectrum_predictor import (
 )
 from ...specgen.fragment_tree_training_model import FragmentTreeTrainingModel
 from ....libs.msentity.msentity import MSDataset
-from ....libs.msentity.msentity.core.PeakSeries import PeakSeries
 from ....libs.msentity.msentity.processing.spectrum_similarity import cosine_similarity_pair
 
 METRIC_COLUMNS = (
@@ -171,9 +173,18 @@ def prepare_train(
         raise ValueError("train_config requires training_structure_dir.")
     if not validation_structure_dir:
         raise ValueError("train_config requires validation_structure_dir.")
+    validation_valid_records_file = train_config.get(
+        "validation_valid_records_file",
+        train_config.get("validation_msdataset_file"),
+    )
+    if not validation_valid_records_file:
+        validation_valid_records_file = (
+            Path(validation_structure_dir) / "valid_records.msds"
+        )
     dataset_info = {
         "training_structure_dir": str(training_structure_dir),
         "validation_structure_dir": str(validation_structure_dir),
+        "validation_valid_records_file": str(validation_valid_records_file),
         "pattern": "*.pt",
     }
 
@@ -233,6 +244,9 @@ def setup_dataset(
     extra_data = {
         "training_structure_dir": str(dataset_info["training_structure_dir"]),
         "validation_structure_dir": str(dataset_info["validation_structure_dir"]),
+        "validation_valid_records_file": str(
+            dataset_info["validation_valid_records_file"]
+        ),
         "pattern": pattern,
         "train_size": len(train_dataset),
         "val_size": len(val_dataset),
@@ -339,11 +353,55 @@ def run_epoch(
 def evaluate_validation_cosine(
     *,
     model: FragmentTreeTrainingModel,
-    loader: DataLoader,
-    device: torch.device,
+    dataset: MSDataset,
+    batch_size: int = 128,
 ) -> float:
     if model.intensity_predictor is None:
         return float("nan")
+
+    device = next(model.parameters()).device
+    predicted_dataset, target_dataset = predict_validation_msdataset(
+        model=model,
+        dataset=dataset,
+        device=device,
+        batch_size=batch_size,
+    )
+    if predicted_dataset is None or target_dataset is None:
+        return float("nan")
+
+    count = min(len(target_dataset), len(predicted_dataset))
+    if count <= 0:
+        return float("nan")
+
+    scores = cosine_similarity_pair(
+        target_dataset,
+        np.arange(count, dtype=np.int64),
+        predicted_dataset,
+        np.arange(count, dtype=np.int64),
+        show_progress=True,
+    )
+    if scores.size == 0:
+        return float("nan")
+    return float(scores.mean())
+
+
+def predict_validation_msdataset(
+    *,
+    model: FragmentTreeTrainingModel,
+    dataset: MSDataset,
+    device: torch.device,
+    batch_size: int = 128,
+) -> Tuple[Optional[MSDataset], Optional[MSDataset]]:
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive.")
+
+    feature_model = model.candidate_selector.feature_model
+    builder = SingleFragmentTreeStructureBuilder(feature_model)
+    groups = group_record_indexes_by_smiles(dataset, smiles_column="SMILES")
+
+    target_record_indexes: List[int] = []
+    predicted_data_parts: List[np.ndarray] = []
+    predicted_lengths: List[int] = []
 
     predictor = FragmentTreeSpectrumPredictor(
         model.candidate_selector,
@@ -353,78 +411,80 @@ def evaluate_validation_cosine(
     ).to(device)
     predictor.eval()
 
-    scores: List[float] = []
-    iterator = tqdm(loader, desc="ValCosine")
-    with torch.no_grad():
-        for batch in iterator:
-            structure = batch["structure"].to(device)
-            if not isinstance(structure, TrainingFragmentTreeStructure):
+    for smiles, record_indexes in tqdm(
+        groups.items(),
+        desc="Building validation structures from MSDataset",
+        mininterval=1.0,
+    ):
+        record_indexes = [int(index) for index in record_indexes]
+        for batch_start in range(0, len(record_indexes), batch_size):
+            batch_record_indexes = record_indexes[batch_start:batch_start + batch_size]
+            sub_dataset = dataset[batch_record_indexes]
+            builder.reset()
+            try:
+                sample_indexes = builder.add_same_smiles_dataset_first_cleavage(
+                    sub_dataset,
+                    precursor_mz_column="PrecursorMZ",
+                    adduct_type_column="AdductType",
+                    collision_energy_column="CollisionEnergy",
+                    smiles_column="SMILES",
+                    instrument_column=None,
+                )
+            except Exception as exc:
+                print(f"[WARN] validation prediction skipped smiles={smiles!r}: {exc}")
                 continue
-            generated = predictor(structure)
-            predicted_ds = fragment_spectrum_output_to_msdataset(generated)
-            target_ds = target_structure_to_msdataset(
-                structure,
-                model.candidate_selector.feature_model.formula_tensorizer,
-            )
-            count = min(len(predicted_ds), len(target_ds))
-            if count <= 0:
+
+            valid_pairs = [
+                (int(record_index), int(sample_index))
+                for record_index, sample_index in enumerate(sample_indexes.tolist())
+                if int(sample_index) >= 0 and int(record_index) < len(batch_record_indexes)
+            ]
+            if not valid_pairs:
                 continue
-            batch_scores = cosine_similarity_pair(
-                target_ds,
-                np.arange(count, dtype=np.int64),
-                predicted_ds,
-                np.arange(count, dtype=np.int64),
-                show_progress=False,
+
+            valid_pairs.sort(key=lambda pair: pair[1])
+            structure = FragmentTreeStructure.from_structures(
+                [builder.to_structure()],
+                device=device,
             )
-            scores.extend(float(value) for value in batch_scores.tolist())
-            if scores:
-                iterator.set_postfix(cosine=sum(scores) / len(scores))
 
-    if not scores:
-        return float("nan")
-    return sum(scores) / len(scores)
+            with torch.no_grad():
+                output = predictor(structure)
 
+            batch_predicted_dataset = fragment_spectrum_output_to_msdataset(output)
+            batch_peak_data = batch_predicted_dataset.peaks.data
+            batch_offsets = batch_predicted_dataset.peaks.offsets
+            record_index_by_sample_index = {
+                sample_index: record_index
+                for record_index, sample_index in valid_pairs
+            }
+            for sample_index in sorted(record_index_by_sample_index):
+                if sample_index >= len(batch_offsets) - 1:
+                    continue
+                start = int(batch_offsets[sample_index])
+                end = int(batch_offsets[sample_index + 1])
+                predicted_data_parts.append(batch_peak_data[start:end])
+                predicted_lengths.append(end - start)
+                target_record_indexes.append(
+                    batch_record_indexes[record_index_by_sample_index[sample_index]]
+                )
 
-def target_structure_to_msdataset(
-    structure: TrainingFragmentTreeStructure,
-    formula_tensorizer,
-) -> MSDataset:
-    peak_rows: List[Tuple[float, float]] = []
-    peak_metadata_rows: List[Dict[str, object]] = []
-    offsets = [0]
+    if not predicted_lengths or not target_record_indexes:
+        return None, None
 
-    target_sample_index = structure.target_sample_index.detach().cpu().long()
-    target_formula = structure.target_formula.detach().cpu()
-    target_intensity = structure.target_intensity.detach().cpu().float()
-
-    for sample_id in range(int(structure.num_samples)):
-        mask = target_sample_index == int(sample_id)
-        rows = mask.nonzero(as_tuple=False).view(-1).tolist()
-        for row in rows:
-            formula = formula_tensorizer.tensor_to_formula(target_formula[int(row)])
-            charge = int(getattr(formula, "charge", 0))
-            mz = float(formula.exact_mass) if charge == 0 else float(formula.exact_mass) / abs(charge)
-            peak_rows.append((mz, float(target_intensity[int(row)].item())))
-            peak_metadata_rows.append({"sample_id": int(sample_id), "formula": str(formula)})
-        offsets.append(len(peak_rows))
-
-    data = np.asarray(peak_rows, dtype=np.float64)
-    if data.size == 0:
-        data = np.empty((0, 2), dtype=np.float64)
-    metadata = pd.DataFrame({"sample_id": list(range(int(structure.num_samples)))})
-    peak_series = PeakSeries(
-        data=data,
-        offsets=np.asarray(offsets, dtype=np.int64),
-        metadata=pd.DataFrame(peak_metadata_rows),
-        metadata_columns=["sample_id", "formula"],
-        sort_by_mz=True,
+    predicted_data = (
+        np.concatenate(predicted_data_parts, axis=0)
+        if predicted_data_parts
+        else np.empty((0, 2), dtype=np.float64)
     )
-    return MSDataset(
-        spectrum_metadata=metadata,
-        peak_series=peak_series,
-        columns=metadata.columns.tolist(),
-        description="Validation target spectra from FragmentTreeStructure targets",
-    )
+    predicted_offsets = np.empty(len(predicted_lengths) + 1, dtype=np.int64)
+    predicted_offsets[0] = 0
+    predicted_offsets[1:] = np.cumsum(np.asarray(predicted_lengths, dtype=np.int64))
+
+    target_dataset = dataset[target_record_indexes].copy()
+    predicted_dataset = target_dataset.copy()
+    predicted_dataset.peaks.replace_data(predicted_data, predicted_offsets)
+    return predicted_dataset, target_dataset
 
 
 def save_managed_checkpoint(
@@ -509,6 +569,17 @@ def main(
 
     max_epoch = state.initial_epoch + int(epoch) - 1
     writer = ckpt_manager.summary_writer
+    validation_valid_records_file = Path(extra_data["validation_valid_records_file"])
+    validation_dataset = (
+        MSDataset.load(str(validation_valid_records_file))
+        if validation_valid_records_file.exists()
+        else None
+    )
+    if validation_dataset is None:
+        print(
+            f"[WARN] validation valid-record MSDataset was not found: "
+            f"{validation_valid_records_file}"
+        )
 
     for epoch_index in range(state.initial_epoch, max_epoch + 1):
         train_loss, train_samples = run_epoch(
@@ -530,10 +601,14 @@ def main(
                     optimizer=None,
                     desc=f"Val({epoch_index}/{max_epoch})",
                 )
-                val_cosine = evaluate_validation_cosine(
-                    model=model,
-                    loader=val_loader,
-                    device=device,
+                val_cosine = (
+                    evaluate_validation_cosine(
+                        model=model,
+                        dataset=validation_dataset,
+                        batch_size=batch_size,
+                    )
+                    if validation_dataset is not None
+                    else float("nan")
                 )
         else:
             val_loss = train_loss

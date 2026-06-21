@@ -64,7 +64,7 @@ class FragmentTreeCandidateSelector(nn.Module):
         feature_model: FragmentTreeFeatureModel,
         *,
         max_fragment_ion_candidates: int = 30,
-        max_next_cleavage_candidates: int = 30,
+        max_next_cleavage_candidates: int = 3,
         max_nodes_for_ion_candidates: Optional[int] = None,
         hidden_dim: Optional[int] = None,
     ) -> None:

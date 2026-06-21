@@ -798,12 +798,22 @@ class SingleFragmentTreeStructureBuilder:
                     edge_index = int(edge_index)
 
                     sample.edge_indexes.add(edge_index)
-                if len(sample.precursor_edge_indexes) == len(sample.precursor_unsaturation_indexes) == len(sample.precursor_radical_indexes):
-                    if len(sample.precursor_edge_indexes) > 0:
-                        self.samples[int(sample_index)] = sample
-                        sample_indexes.append(int(sample_index))
-                else:
-                    raise ValueError("Mismatch in lengths of precursor_edge_indexes, precursor_unsaturation_indexes, and precursor_radical_indexes")
+            if not (
+                len(sample.precursor_edge_indexes)
+                == len(sample.precursor_unsaturation_indexes)
+                == len(sample.precursor_radical_indexes)
+            ):
+                raise ValueError(
+                    "Mismatch in lengths of precursor_edge_indexes, "
+                    "precursor_unsaturation_indexes, and "
+                    "precursor_radical_indexes"
+                )
+
+            if len(sample.precursor_edge_indexes) > 0:
+                self.samples[int(sample_index)] = sample
+                sample_indexes.append(int(sample_index))
+            else:
+                sample_indexes.append(-1)
 
         return np.asarray(sample_indexes, dtype=int)
 
