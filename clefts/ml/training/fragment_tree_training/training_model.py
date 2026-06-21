@@ -7,7 +7,7 @@ import math
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -40,10 +40,18 @@ from ....libs.msentity.msentity import MSDataset
 from ....libs.msentity.msentity.processing.spectrum_similarity import cosine_similarity_pair
 
 METRIC_COLUMNS = (
+    "event",
     "epoch",
     "global_step",
     "train_loss",
+    "train_selection_loss",
+    "train_intensity_loss",
+    "train_window_loss",
+    "train_window_selection_loss",
+    "train_window_intensity_loss",
     "val_loss",
+    "val_selection_loss",
+    "val_intensity_loss",
     "val_cosine",
     "lr",
 )
@@ -57,6 +65,53 @@ class TrainState:
     initial_epoch: int
     global_step: int
     best_val_loss: float
+
+
+@dataclass(frozen=True)
+class EpochLossMetrics:
+    loss: float
+    selection_loss: float
+    intensity_loss: float
+    samples: int
+    steps: int = 0
+
+
+def make_loss_metrics(
+    *,
+    total_loss: float,
+    total_selection_loss: float,
+    total_intensity_loss: float,
+    total_samples: int,
+    total_selection_samples: int,
+    total_intensity_samples: int,
+    steps: int = 0,
+    empty_value: float = 0.0,
+) -> EpochLossMetrics:
+    if total_samples <= 0:
+        return EpochLossMetrics(
+            loss=empty_value,
+            selection_loss=empty_value,
+            intensity_loss=empty_value,
+            samples=0,
+            steps=int(steps),
+        )
+    return EpochLossMetrics(
+        loss=total_loss / total_samples,
+        selection_loss=total_selection_loss / max(total_selection_samples, 1),
+        intensity_loss=total_intensity_loss / max(total_intensity_samples, 1),
+        samples=total_samples,
+        steps=int(steps),
+    )
+
+
+def nan_loss_metrics() -> EpochLossMetrics:
+    return EpochLossMetrics(
+        loss=float("nan"),
+        selection_loss=float("nan"),
+        intensity_loss=float("nan"),
+        samples=0,
+        steps=0,
+    )
 
 
 def load_config(path: str | Path) -> Dict[str, Any]:
@@ -144,7 +199,7 @@ def prepare_train(
     train_config_path: str | Path,
     *,
     root_run_dir: Optional[str | Path] = None,
-) -> Tuple[Path, Optional[str], int, torch.device, int, int, Dict[str, Any], Dict[str, Any], Dict[str, Any], Path]:
+) -> Tuple[Path, Optional[str], int, torch.device, int, int, Dict[str, Any], Dict[str, Any], Dict[str, Any], Optional[int], Path]:
     train_config = load_config(train_config_path)
 
     load_name = train_config.get("experiment_name")
@@ -159,6 +214,14 @@ def prepare_train(
     device = torch.device(train_config.get("device", "cpu"))
     epochs = int(train_config.get("epoch", train_config.get("epochs", 10)))
     save_interval = int(train_config.get("save_interval", 1))
+    validation_interval_steps_value = train_config.get("validation_interval_steps")
+    validation_interval_steps = (
+        None
+        if validation_interval_steps_value in {None, ""}
+        else int(validation_interval_steps_value)
+    )
+    if validation_interval_steps is not None and validation_interval_steps <= 0:
+        raise ValueError("validation_interval_steps must be positive when specified.")
     optimizer_info = dict(train_config.get("optimizer", {"name": "AdamW", "lr": 1e-4}))
     early_stopping_info = dict(train_config.get("early_stopping", {}))
     training_structure_dir = train_config.get(
@@ -185,6 +248,8 @@ def prepare_train(
         "training_structure_dir": str(training_structure_dir),
         "validation_structure_dir": str(validation_structure_dir),
         "validation_valid_records_file": str(validation_valid_records_file),
+        "shuffle": bool(train_config.get("shuffle", True)),
+        "validation_interval_steps": validation_interval_steps,
         "pattern": "*.pt",
     }
 
@@ -203,6 +268,7 @@ def prepare_train(
         optimizer_info,
         early_stopping_info,
         dataset_info,
+        validation_interval_steps,
         run_dir,
     )
 
@@ -250,6 +316,7 @@ def setup_dataset(
         "pattern": pattern,
         "train_size": len(train_dataset),
         "val_size": len(val_dataset),
+        "validation_interval_steps": dataset_info.get("validation_interval_steps"),
     }
     return train_dataset, val_dataset, train_loader, val_loader, extra_data
 
@@ -318,17 +385,34 @@ def run_epoch(
     optimizer: Optional[torch.optim.Optimizer] = None,
     grad_clip_norm: Optional[float] = None,
     desc: str,
-) -> Tuple[float, int]:
+    start_global_step: int = 0,
+    validation_interval_steps: Optional[int] = None,
+    on_validation_step: Optional[
+        Callable[[int, EpochLossMetrics, EpochLossMetrics], None]
+    ] = None,
+) -> EpochLossMetrics:
     is_train = optimizer is not None
     model.train(is_train)
 
     total_loss = 0.0
+    total_selection_loss = 0.0
+    total_intensity_loss = 0.0
     total_samples = 0
+    total_selection_samples = 0
+    total_intensity_samples = 0
+    window_loss = 0.0
+    window_selection_loss = 0.0
+    window_intensity_loss = 0.0
+    window_samples = 0
+    window_selection_samples = 0
+    window_intensity_samples = 0
+    step_count = 0
     iterator = tqdm(loader, desc=desc)
 
     for batch in iterator:
         structure = batch["structure"].to(device)
         num_samples = int(structure.num_samples)
+        sample_weight = max(num_samples, 1)
 
         with torch.set_grad_enabled(is_train):
             output = model(structure)
@@ -341,13 +425,87 @@ def run_epoch(
                     torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
                 optimizer.step()
 
-        total_loss += float(loss.detach().cpu().item()) * max(num_samples, 1)
-        total_samples += max(num_samples, 1)
-        iterator.set_postfix(loss=total_loss / max(total_samples, 1))
+        step_count += 1
+        selection_loss = output.get("selection_loss")
+        intensity_loss = output.get("intensity_loss")
+        loss_value = float(loss.detach().cpu().item())
+        selection_loss_value = (
+            float(selection_loss.detach().cpu().item())
+            if selection_loss is not None
+            else float("nan")
+        )
+        intensity_loss_value = (
+            float(intensity_loss.detach().cpu().item())
+            if intensity_loss is not None
+            else float("nan")
+        )
 
-    if total_samples == 0:
-        return 0.0, 0
-    return total_loss / total_samples, total_samples
+        total_loss += loss_value * sample_weight
+        window_loss += loss_value * sample_weight
+        if not math.isnan(selection_loss_value):
+            total_selection_loss += selection_loss_value * sample_weight
+            total_selection_samples += sample_weight
+            window_selection_loss += selection_loss_value * sample_weight
+            window_selection_samples += sample_weight
+        if not math.isnan(intensity_loss_value):
+            total_intensity_loss += intensity_loss_value * sample_weight
+            total_intensity_samples += sample_weight
+            window_intensity_loss += intensity_loss_value * sample_weight
+            window_intensity_samples += sample_weight
+        total_samples += sample_weight
+        window_samples += sample_weight
+
+        cumulative_metrics = make_loss_metrics(
+            total_loss=total_loss,
+            total_selection_loss=total_selection_loss,
+            total_intensity_loss=total_intensity_loss,
+            total_samples=total_samples,
+            total_selection_samples=total_selection_samples,
+            total_intensity_samples=total_intensity_samples,
+            steps=step_count,
+        )
+        window_metrics = make_loss_metrics(
+            total_loss=window_loss,
+            total_selection_loss=window_selection_loss,
+            total_intensity_loss=window_intensity_loss,
+            total_samples=window_samples,
+            total_selection_samples=window_selection_samples,
+            total_intensity_samples=window_intensity_samples,
+            steps=step_count,
+        )
+        iterator.set_postfix(
+            loss=cumulative_metrics.loss,
+            selection_loss=cumulative_metrics.selection_loss,
+            intensity_loss=cumulative_metrics.intensity_loss,
+            window_loss=window_metrics.loss,
+        )
+
+        global_step = int(start_global_step) + step_count
+        if (
+            is_train
+            and validation_interval_steps is not None
+            and validation_interval_steps > 0
+            and on_validation_step is not None
+            and global_step % validation_interval_steps == 0
+        ):
+            on_validation_step(global_step, cumulative_metrics, window_metrics)
+            model.train(is_train)
+            window_loss = 0.0
+            window_selection_loss = 0.0
+            window_intensity_loss = 0.0
+            window_samples = 0
+            window_selection_samples = 0
+            window_intensity_samples = 0
+
+    return make_loss_metrics(
+        total_loss=total_loss,
+        total_selection_loss=total_selection_loss,
+        total_intensity_loss=total_intensity_loss,
+        total_samples=total_samples,
+        total_selection_samples=total_selection_samples,
+        total_intensity_samples=total_intensity_samples,
+        steps=step_count,
+    )
 
 
 def evaluate_validation_cosine(
@@ -382,7 +540,12 @@ def evaluate_validation_cosine(
     )
     if scores.size == 0:
         return float("nan")
-    return float(scores.mean())
+
+    val_cosine = float(scores.mean())
+    with tqdm(total=1, desc="ValCosine", leave=True) as iterator:
+        iterator.set_postfix(val_cosine=val_cosine)
+        iterator.update(1)
+    return val_cosine
 
 
 def predict_validation_msdataset(
@@ -535,12 +698,14 @@ def main(
     device: torch.device,
     epoch: int,
     save_interval: int,
+    batch_size: int,
     train_loader: DataLoader,
     val_loader: DataLoader,
     optimizer_info: Dict[str, Any],
     early_stopping_info: Dict[str, Any],
     run_dir: Path,
     extra_data: Dict[str, Any],
+    validation_interval_steps: Optional[int] = None,
 ) -> None:
     ckpt_manager = CheckPointManager(str(experiment_dir))
     ckpt_manager.set_run_dir(str(run_dir))
@@ -581,65 +746,238 @@ def main(
             f"{validation_valid_records_file}"
         )
 
+    def add_scalar_if_finite(tag: str, value: float, step: int) -> None:
+        if not math.isnan(float(value)):
+            writer.add_scalar(tag, float(value), step)
+
+    def add_scalars_if_finite(
+        main_tag: str,
+        values: Dict[str, float],
+        step: int,
+    ) -> None:
+        finite_values = {
+            key: float(value)
+            for key, value in values.items()
+            if not math.isnan(float(value))
+        }
+        if finite_values:
+            writer.add_scalars(main_tag, finite_values, step)
+
+    def evaluate_current_validation(desc: str) -> Tuple[EpochLossMetrics, float]:
+        if val_loader is None or len(val_loader) <= 0:
+            return nan_loss_metrics(), float("nan")
+        with torch.no_grad():
+            metrics = run_epoch(
+                model=model,
+                loader=val_loader,
+                device=device,
+                optimizer=None,
+                desc=desc,
+            )
+            cosine = (
+                evaluate_validation_cosine(
+                    model=model,
+                    dataset=validation_dataset,
+                    batch_size=batch_size,
+                )
+                if validation_dataset is not None
+                else float("nan")
+            )
+        return metrics, cosine
+
+    def log_training_metrics(
+        *,
+        event: str,
+        epoch_value: int,
+        step_value: int,
+        train_metrics: EpochLossMetrics,
+        train_window_metrics: Optional[EpochLossMetrics],
+        val_metrics: EpochLossMetrics,
+        val_cosine: float,
+    ) -> None:
+        lr = float(optimizer.param_groups[0]["lr"])
+        window_metrics = train_window_metrics or nan_loss_metrics()
+        metric_row = {
+            "event": event,
+            "epoch": int(epoch_value),
+            "global_step": int(step_value),
+            "train_loss": train_metrics.loss,
+            "train_selection_loss": train_metrics.selection_loss,
+            "train_intensity_loss": train_metrics.intensity_loss,
+            "train_window_loss": window_metrics.loss,
+            "train_window_selection_loss": window_metrics.selection_loss,
+            "train_window_intensity_loss": window_metrics.intensity_loss,
+            "val_loss": val_metrics.loss,
+            "val_selection_loss": val_metrics.selection_loss,
+            "val_intensity_loss": val_metrics.intensity_loss,
+            "val_cosine": val_cosine,
+            "lr": lr,
+        }
+        ckpt_manager.log_metrics(**metric_row)
+        ckpt_manager.flush_metrics(flush_dir=str(run_dir))
+        add_scalars_if_finite(
+            "loss/total",
+            {
+                "train": train_metrics.loss,
+                "train_window": window_metrics.loss,
+                "val": val_metrics.loss,
+            },
+            step_value,
+        )
+        add_scalars_if_finite(
+            "loss/selection",
+            {
+                "train": train_metrics.selection_loss,
+                "train_window": window_metrics.selection_loss,
+                "val": val_metrics.selection_loss,
+            },
+            step_value,
+        )
+        add_scalars_if_finite(
+            "loss/intensity",
+            {
+                "train": train_metrics.intensity_loss,
+                "train_window": window_metrics.intensity_loss,
+                "val": val_metrics.intensity_loss,
+            },
+            step_value,
+        )
+        add_scalars_if_finite("similarity/cosine", {"val": val_cosine}, step_value)
+        add_scalar_if_finite("similarity/val_cosine", val_cosine, step_value)
+        writer.add_scalar("optimizer/lr", lr, step_value)
+        print(
+            f"event={event} epoch={epoch_value} step={step_value} "
+            f"train_loss={train_metrics.loss:.6f} "
+            f"train_selection_loss={train_metrics.selection_loss:.6f} "
+            f"train_intensity_loss={train_metrics.intensity_loss:.6f} "
+            f"train_window_loss={window_metrics.loss:.6f} "
+            f"train_window_selection_loss={window_metrics.selection_loss:.6f} "
+            f"train_window_intensity_loss={window_metrics.intensity_loss:.6f} "
+            f"val_loss={val_metrics.loss:.6f} "
+            f"val_selection_loss={val_metrics.selection_loss:.6f} "
+            f"val_intensity_loss={val_metrics.intensity_loss:.6f} "
+            f"val_cosine={val_cosine:.6f} "
+            f"lr={lr:.6g} samples={train_metrics.samples} "
+            f"branch_id={ckpt_manager.current_branch_id}"
+        )
+
+    last_epoch_index = state.initial_epoch - 1
+    last_train_metrics = nan_loss_metrics()
+
     for epoch_index in range(state.initial_epoch, max_epoch + 1):
-        train_loss, train_samples = run_epoch(
+        validation_epoch = epoch_index - 1
+        val_metrics, val_cosine = evaluate_current_validation(
+            desc=f"ValStart({validation_epoch})"
+        )
+        log_training_metrics(
+            event="epoch_start",
+            epoch_value=validation_epoch,
+            step_value=global_step,
+            train_metrics=last_train_metrics,
+            train_window_metrics=None,
+            val_metrics=val_metrics,
+            val_cosine=val_cosine,
+        )
+
+        if validation_epoch >= state.initial_epoch:
+            val_loss = val_metrics.loss
+            step_scheduler(scheduler, val_loss)
+            improved = val_loss < best_val_loss - min_delta
+            if improved:
+                best_val_loss = val_loss
+                bad_epochs = 0
+                ckpt_manager.update_topk(
+                    score=val_loss,
+                    epoch=validation_epoch,
+                    iter=global_step,
+                    model=model,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    optimizer_info=optimizer_config_for_torch(optimizer_info),
+                    extra_data={
+                        **extra_data,
+                        "best_val_loss": float(best_val_loss),
+                        "optimizer_info": dict(optimizer_info),
+                    },
+                    topk=topk,
+                    comment="best_val_loss",
+                )
+            else:
+                bad_epochs += 1
+
+            if patience is not None and bad_epochs >= patience:
+                print(f"Early stopping before epoch {epoch_index}.")
+                break
+
+        def on_validation_step(
+            step_value: int,
+            train_epoch_metrics: EpochLossMetrics,
+            train_window_metrics: EpochLossMetrics,
+        ) -> None:
+            step_val_metrics, step_val_cosine = evaluate_current_validation(
+                desc=f"ValStep({step_value})"
+            )
+            log_training_metrics(
+                event="step",
+                epoch_value=epoch_index,
+                step_value=step_value,
+                train_metrics=train_epoch_metrics,
+                train_window_metrics=train_window_metrics,
+                val_metrics=step_val_metrics,
+                val_cosine=step_val_cosine,
+            )
+
+        train_metrics = run_epoch(
             model=model,
             loader=train_loader,
             device=device,
             optimizer=optimizer,
             grad_clip_norm=grad_clip_norm,
             desc=f"Train({epoch_index}/{max_epoch})",
+            start_global_step=global_step,
+            validation_interval_steps=validation_interval_steps,
+            on_validation_step=on_validation_step,
         )
-        global_step += len(train_loader)
+        global_step += train_metrics.steps
+        last_epoch_index = epoch_index
+        last_train_metrics = train_metrics
 
-        if val_loader is not None and len(val_loader) > 0:
-            with torch.no_grad():
-                val_loss, _ = run_epoch(
-                    model=model,
-                    loader=val_loader,
-                    device=device,
-                    optimizer=None,
-                    desc=f"Val({epoch_index}/{max_epoch})",
-                )
-                val_cosine = (
-                    evaluate_validation_cosine(
-                        model=model,
-                        dataset=validation_dataset,
-                        batch_size=batch_size,
-                    )
-                    if validation_dataset is not None
-                    else float("nan")
-                )
-        else:
-            val_loss = train_loss
-            val_cosine = float("nan")
+        should_save = save_interval > 0 and epoch_index % save_interval == 0
+        if should_save:
+            save_managed_checkpoint(
+                ckpt_manager=ckpt_manager,
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                epoch=epoch_index,
+                global_step=global_step,
+                best_val_loss=best_val_loss,
+                optimizer_info=optimizer_info,
+                extra_data=extra_data,
+                comment="interval",
+            )
 
+    if last_epoch_index >= state.initial_epoch:
+        val_metrics, val_cosine = evaluate_current_validation(
+            desc=f"ValFinal({last_epoch_index})"
+        )
+        log_training_metrics(
+            event="epoch_end",
+            epoch_value=last_epoch_index,
+            step_value=global_step,
+            train_metrics=last_train_metrics,
+            train_window_metrics=None,
+            val_metrics=val_metrics,
+            val_cosine=val_cosine,
+        )
+        val_loss = val_metrics.loss
         step_scheduler(scheduler, val_loss)
-
-        lr = float(optimizer.param_groups[0]["lr"])
-        metric_row = {
-            "epoch": epoch_index,
-            "global_step": global_step,
-            "train_loss": train_loss,
-            "val_loss": val_loss,
-            "val_cosine": val_cosine,
-            "lr": lr,
-        }
-        ckpt_manager.log_metrics(**metric_row)
-        ckpt_manager.flush_metrics(flush_dir=str(run_dir))
-        writer.add_scalar("loss/train", train_loss, global_step)
-        writer.add_scalar("loss/val", val_loss, global_step)
-        if not math.isnan(val_cosine):
-            writer.add_scalar("similarity/val_cosine", val_cosine, global_step)
-        writer.add_scalar("optimizer/lr", lr, global_step)
-
         improved = val_loss < best_val_loss - min_delta
         if improved:
             best_val_loss = val_loss
-            bad_epochs = 0
             ckpt_manager.update_topk(
                 score=val_loss,
-                epoch=epoch_index,
+                epoch=last_epoch_index,
                 iter=global_step,
                 model=model,
                 optimizer=optimizer,
@@ -653,41 +991,13 @@ def main(
                 topk=topk,
                 comment="best_val_loss",
             )
-        else:
-            bad_epochs += 1
-
-        should_save = improved or (save_interval > 0 and epoch_index % save_interval == 0)
-        if should_save:
-            save_managed_checkpoint(
-                ckpt_manager=ckpt_manager,
-                model=model,
-                optimizer=optimizer,
-                scheduler=scheduler,
-                epoch=epoch_index,
-                global_step=global_step,
-                best_val_loss=best_val_loss,
-                optimizer_info=optimizer_info,
-                extra_data=extra_data,
-                comment="best" if improved else "interval",
-            )
-
-        print(
-            f"epoch={epoch_index} train_loss={train_loss:.6f} "
-            f"val_loss={val_loss:.6f} val_cosine={val_cosine:.6f} "
-            f"lr={lr:.6g} samples={train_samples} "
-            f"branch_id={ckpt_manager.current_branch_id}"
-        )
-
-        if patience is not None and bad_epochs >= patience:
-            print(f"Early stopping at epoch {epoch_index}.")
-            break
 
     save_managed_checkpoint(
         ckpt_manager=ckpt_manager,
         model=model,
         optimizer=optimizer,
         scheduler=scheduler,
-        epoch=epoch_index,
+        epoch=last_epoch_index,
         global_step=global_step,
         best_val_loss=best_val_loss,
         optimizer_info=optimizer_info,
@@ -719,6 +1029,7 @@ if __name__ == "__main__":
         optimizer_info,
         early_stopping_info,
         dataset_info,
+        validation_interval_steps,
         run_dir,
     ) = prepare_train(
         args.project_dir,
@@ -742,10 +1053,12 @@ if __name__ == "__main__":
         device=device,
         epoch=epochs,
         save_interval=save_interval,
+        batch_size=batch_size,
         train_loader=train_loader,
         val_loader=val_loader,
         optimizer_info=optimizer_info,
         early_stopping_info=early_stopping_info,
         run_dir=run_dir,
         extra_data=extra_data,
+        validation_interval_steps=validation_interval_steps,
     )

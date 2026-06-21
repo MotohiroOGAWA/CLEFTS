@@ -4,6 +4,7 @@
   "batch_size": 2,
   "device": "cuda",
   "epoch": 1000,
+  "validation_interval_steps": null,
   "save_interval": 100,
   "optimizer": {
     "name": "AdamW",

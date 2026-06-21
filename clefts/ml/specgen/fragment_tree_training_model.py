@@ -163,14 +163,18 @@ class FragmentTreeSelectionTrainingLoss(nn.Module):
 
         if target.target_node_index.numel() > 0:
             losses.append(self._peak_fragment_loss(output, target, device=device))
+            losses.append(self._keep_negative_loss(output, target, device=device))
             losses.append(self._state_loss(output, target, device=device))
 
         cleave_target, cleave_mask = self._build_cleave_targets(output, target, device=device)
         if cleave_mask.any():
             losses.append(
-                F.binary_cross_entropy_with_logits(
-                    output.cleave_logit[cleave_mask],
-                    cleave_target[cleave_mask],
+                self._balanced_node_bce_loss(
+                    logit=output.cleave_logit,
+                    target=cleave_target,
+                    mask=cleave_mask,
+                    output=output,
+                    device=device,
                 )
             )
 
@@ -212,7 +216,6 @@ class FragmentTreeSelectionTrainingLoss(nn.Module):
     ) -> Tensor:
         batch_node_by_sample_node = self._batch_node_by_sample_node(output, device=device)
         losses: List[Tensor] = []
-        weights: List[Tensor] = []
 
         for peak_key in self._target_peak_keys(target, device=device):
             row_index = self._target_peak_mask(target, peak_key=peak_key, device=device)
@@ -225,9 +228,53 @@ class FragmentTreeSelectionTrainingLoss(nn.Module):
                 continue
             peak_logit = output.keep_logit[batch_node_indexes]
             losses.append(F.softplus(-torch.logsumexp(peak_logit, dim=0)))
-            weights.append(target.target_intensity[row_index].to(device).float().max())
 
-        return self._weighted_mean(losses, weights, output.keep_logit)
+        if len(losses) == 0:
+            return output.keep_logit.sum() * 0.0
+        return torch.stack(losses).mean()
+
+    def _keep_negative_loss(
+        self,
+        output: FragmentTreeCandidateSelectionOutput,
+        target: TrainingFragmentTreeStructure,
+        *,
+        device: torch.device,
+    ) -> Tensor:
+        batch = output.sample_tree_batch
+        kept_sample_ids = batch.kept_sample_ids.to(device).long()
+        graph_index_by_node = batch.batch.to(device).long()
+        node_global_ids = batch.node_id_global.to(device).long()
+        node_is_precursor_root = batch.node_is_precursor_root.to(device).bool()
+        positive_pairs = self._target_sample_node_pairs(
+            target_sample_index=target.target_sample_index.to(device).long(),
+            target_node_index=target.target_node_index.to(device).long(),
+        )
+        sample_losses: List[Tensor] = []
+        for graph_index in range(int(kept_sample_ids.numel())):
+            sample_id = int(kept_sample_ids[graph_index].detach().cpu().item())
+            node_mask = (graph_index_by_node == graph_index) & (~node_is_precursor_root)
+            if not node_mask.any():
+                continue
+            node_indexes = node_mask.nonzero(as_tuple=False).view(-1)
+            negative_indexes = []
+            for batch_node_index in node_indexes.detach().cpu().tolist():
+                batch_node_index = int(batch_node_index)
+                node_id = int(node_global_ids[batch_node_index].detach().cpu().item())
+                if (sample_id, node_id) not in positive_pairs:
+                    negative_indexes.append(batch_node_index)
+            if not negative_indexes:
+                continue
+            index_tensor = torch.tensor(negative_indexes, dtype=torch.long, device=device)
+            sample_losses.append(
+                F.binary_cross_entropy_with_logits(
+                    output.keep_logit[index_tensor],
+                    output.keep_logit.new_zeros((index_tensor.numel(),)),
+                )
+            )
+
+        if len(sample_losses) == 0:
+            return output.keep_logit.sum() * 0.0
+        return torch.stack(sample_losses).mean()
 
     def _state_loss(
         self,
@@ -391,6 +438,47 @@ class FragmentTreeSelectionTrainingLoss(nn.Module):
             return loss_tensor.mean()
         return (loss_tensor * weight_tensor).sum() / weight_tensor.sum()
 
+    @staticmethod
+    def _balanced_node_bce_loss(
+        *,
+        logit: Tensor,
+        target: Tensor,
+        mask: Tensor,
+        output: FragmentTreeCandidateSelectionOutput,
+        device: torch.device,
+    ) -> Tensor:
+        batch = output.sample_tree_batch
+        kept_sample_ids = batch.kept_sample_ids.to(device).long()
+        graph_index_by_node = batch.batch.to(device).long()
+        sample_losses: List[Tensor] = []
+        for graph_index in range(int(kept_sample_ids.numel())):
+            sample_mask = mask & (graph_index_by_node == graph_index)
+            if not sample_mask.any():
+                continue
+            positive_mask = sample_mask & (target > 0.5)
+            negative_mask = sample_mask & (target <= 0.5)
+            component_losses: List[Tensor] = []
+            if positive_mask.any():
+                component_losses.append(
+                    F.binary_cross_entropy_with_logits(
+                        logit[positive_mask],
+                        target[positive_mask],
+                    )
+                )
+            if negative_mask.any():
+                component_losses.append(
+                    F.binary_cross_entropy_with_logits(
+                        logit[negative_mask],
+                        target[negative_mask],
+                    )
+                )
+            if component_losses:
+                sample_losses.append(torch.stack(component_losses).mean())
+
+        if len(sample_losses) == 0:
+            return logit.sum() * 0.0
+        return torch.stack(sample_losses).mean()
+
     def _build_cleave_targets(
         self,
         output: FragmentTreeCandidateSelectionOutput,
@@ -456,7 +544,7 @@ class FragmentTreeSelectionTrainingLoss(nn.Module):
 
 
 class FragmentTreeIntensityTrainingLoss(nn.Module):
-    """Loss for normalized intensities over predicted formula nodes."""
+    """Loss for per-formula intensities over selected formula nodes."""
 
     def forward(
         self,
@@ -478,14 +566,20 @@ class FragmentTreeIntensityTrainingLoss(nn.Module):
                 sample_id=sample_id,
                 device=device,
             )
-            if float(target_weight.sum().detach().cpu().item()) <= 0.0:
-                # No required formula is present among this sample's predicted formulas.
-                # Selection loss handles missing formulas; intensity has no positive
-                # class to normalize against here.
-                continue
-            target_prob = target_weight / target_weight.sum()
-            log_prob = F.log_softmax(intensity_output.logit[pred_index], dim=0)
-            losses.append(-(target_prob * log_prob).sum())
+            sample_target_mask = target.target_sample_index.to(device).long() == sample_id
+            if sample_target_mask.any():
+                max_target_intensity = target.target_intensity.to(device).float()[
+                    sample_target_mask
+                ].max().clamp_min(1e-12)
+                target_intensity = (target_weight / max_target_intensity).clamp(0.0, 1.0)
+            else:
+                target_intensity = target_weight
+            losses.append(
+                F.binary_cross_entropy_with_logits(
+                    intensity_output.logit[pred_index],
+                    target_intensity,
+                )
+            )
 
         if len(losses) == 0:
             return intensity_output.logit.sum() * 0.0

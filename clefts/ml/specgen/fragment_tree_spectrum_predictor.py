@@ -102,7 +102,7 @@ class FragmentTreeSpectrumPredictor(nn.Module):
         include_fragment_ion_annotation: bool = False,
     ) -> FragmentSpectrumGeneratorOutput:
         candidate_output = self.candidate_selector.generate_depth_limited_candidates(data, max_depth=self.max_generation_steps)
-        formula_intensity_output = self.formula_intensity_predictor.predict_from_candidates(candidate_output.kept_candidates)
+        formula_intensity_output = self.formula_intensity_predictor.predict_from_candidate_output(candidate_output)
         peaks_by_sample: Dict[int, List[GeneratedSpectrumPeak]] = {}
         feature_model = self.candidate_selector.feature_model
         for prediction in formula_intensity_output.formula_predictions:

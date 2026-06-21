@@ -223,6 +223,38 @@ class FragmentTreeFormulaIntensityPredictor(nn.Module):
             encoded[mask] = self.formula_node_encoder(node_repr[mask][None, :, :]).squeeze(0)
         return encoded
 
+    def predict_from_candidate_output(
+        self,
+        candidate_output: FragmentTreeCandidateSelectionOutput,
+    ) -> FormulaIntensityOutput:
+        if self.formula_node_input is None:
+            return self.predict_from_candidates(candidate_output.kept_candidates)
+
+        training_output = self.forward_candidate_output(candidate_output)
+        if training_output.logit.numel() == 0:
+            return FormulaIntensityOutput(formula_predictions=[])
+
+        intensities = torch.sigmoid(training_output.logit)
+        predictions: List[FormulaIntensityPrediction] = []
+        for index, group in enumerate(training_output.candidates):
+            if len(group) == 0:
+                continue
+            formula = group[0].formula
+            charge = int(getattr(formula, "charge", 0))
+            mz = float(formula.exact_mass) if charge == 0 else float(formula.exact_mass) / abs(charge)
+            predictions.append(
+                FormulaIntensityPrediction(
+                    sample_id=int(training_output.sample_index[index].detach().cpu().item()),
+                    formula=formula,
+                    formula_tensor=training_output.formula_tensor[index].detach().cpu(),
+                    mz=mz,
+                    intensity=float(intensities[index].detach().cpu().item()),
+                    score=float(training_output.logit[index].detach().cpu().item()),
+                    candidates=group,
+                )
+            )
+        return FormulaIntensityOutput(formula_predictions=predictions)
+
     def predict_from_candidates(self, candidates: List[FragmentIonCandidate]) -> FormulaIntensityOutput:
         if len(candidates) == 0:
             return FormulaIntensityOutput(formula_predictions=[])

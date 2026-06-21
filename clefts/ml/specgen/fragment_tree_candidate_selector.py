@@ -119,40 +119,122 @@ class FragmentTreeCandidateSelector(nn.Module):
             raise ValueError("max_depth must be non-negative.")
         output = self.forward(data)
         for _ in range(max_depth):
-            output = self.forward(output.features)
+            if len(output.next_cleavage_candidates) == 0:
+                break
+            next_features = self._expand_features_for_next_cleavage(output)
+            if next_features is None:
+                break
+            output = self.forward(next_features)
         return output
+
+    def _expand_features_for_next_cleavage(
+        self,
+        output: FragmentTreeCandidateSelectionOutput,
+    ) -> Optional[FragmentTreeFeatures]:
+        features = output.features
+        structure = features.structure
+        device = structure.edge_index.device
+        if structure.edge_index.numel() == 0:
+            return None
+
+        edge_src = structure.edge_index[0].to(device).long()
+        sample_edge_pairs = []
+        if structure.sample_edge_index.numel() > 0:
+            sample_edge_pairs.extend(
+                (int(sample_id), int(edge_id))
+                for sample_id, edge_id in structure.sample_edge_index.detach().cpu().t().tolist()
+                if int(edge_id) >= 0
+            )
+
+        existing_pairs = set(sample_edge_pairs)
+        added = False
+        for candidate in output.next_cleavage_candidates:
+            outgoing_edges = (edge_src == int(candidate.global_node_id)).nonzero(as_tuple=False).view(-1)
+            for edge_id_tensor in outgoing_edges.detach().cpu().tolist():
+                pair = (int(candidate.sample_id), int(edge_id_tensor))
+                if pair in existing_pairs:
+                    continue
+                existing_pairs.add(pair)
+                sample_edge_pairs.append(pair)
+                added = True
+
+        if not added:
+            return None
+
+        sample_edge_pairs.sort()
+        sample_edge_index = torch.tensor(
+            sample_edge_pairs,
+            dtype=torch.long,
+            device=device,
+        ).t().contiguous()
+
+        expanded_structure = FragmentTreeStructure(
+            node_smiles=structure.node_smiles,
+            node_graph=structure.node_graph,
+            node_graph_offset=structure.node_graph_offset,
+            node_formula=structure.node_formula,
+            formula_element_order=structure.formula_element_order,
+            edge_index=structure.edge_index,
+            cleavage_event_edge_index=structure.cleavage_event_edge_index,
+            cleavage_event=structure.cleavage_event,
+            cleavage_atom_idxs=structure.cleavage_atom_idxs,
+            reactant_tuple_length_table=structure.reactant_tuple_length_table,
+            product_tuple_length_table=structure.product_tuple_length_table,
+            ion_formula_delta=structure.ion_formula_delta,
+            unsaturation_formula_delta=structure.unsaturation_formula_delta,
+            radical_formula_delta=structure.radical_formula_delta,
+            sample_adduct_type_index=structure.sample_adduct_type_index,
+            sample_ce_value=structure.sample_ce_value,
+            sample_edge_index=sample_edge_index,
+            precursor_edge_index_path=structure.precursor_edge_index_path,
+            precursor_unsaturation_index=structure.precursor_unsaturation_index,
+            precursor_radical_index=structure.precursor_radical_index,
+            precursor_sample_index=structure.precursor_sample_index,
+        )
+        return FragmentTreeFeatures(
+            node_graphs=features.node_graphs,
+            edge_attr=features.edge_attr,
+            structure=expanded_structure,
+        )
 
     def _select_fragment_ion_candidates(self, *, features, sample_tree_batch, keep_logit: Tensor, ion_logit: Tensor, unsaturation_logit: Tensor, radical_logit: Tensor) -> List[FragmentIonCandidate]:
         structure = features.structure
         device = keep_logit.device
         node_is_precursor_root = sample_tree_batch.node_is_precursor_root.to(device).bool()
-        non_precursor_node_index = (~node_is_precursor_root).nonzero(as_tuple=False).view(-1)
-        if non_precursor_node_index.numel() == 0:
-            return []
-        node_score = keep_logit[non_precursor_node_index]
-        k = int(node_score.numel()) if self.max_nodes_for_ion_candidates is None else min(int(self.max_nodes_for_ion_candidates), int(node_score.numel()))
-        node_order = non_precursor_node_index[torch.topk(node_score, k=k).indices]
         kept_sample_ids = sample_tree_batch.kept_sample_ids.to(device).long()
         graph_index_by_node = sample_tree_batch.batch.to(device).long()
         candidates: List[FragmentIonCandidate] = []
-        for batch_node_index_tensor in node_order:
-            batch_node_index = int(batch_node_index_tensor.detach().cpu().item())
-            graph_index = int(graph_index_by_node[batch_node_index].detach().cpu().item())
-            candidates.extend(
-                self._score_joint_ion_candidates_for_node(
-                    structure=structure,
-                    sample_tree_batch=sample_tree_batch,
-                    batch_node_index=batch_node_index,
-                    global_node_id=int(sample_tree_batch.node_id_global[batch_node_index].detach().cpu().item()),
-                    sample_id=int(kept_sample_ids[graph_index].detach().cpu().item()),
-                    keep_logit=keep_logit,
-                    ion_logit=ion_logit,
-                    unsaturation_logit=unsaturation_logit,
-                    radical_logit=radical_logit,
+
+        for graph_index in range(int(kept_sample_ids.numel())):
+            sample_node_index = (graph_index_by_node == graph_index).nonzero(as_tuple=False).view(-1)
+            sample_node_index = sample_node_index[~node_is_precursor_root[sample_node_index]]
+            if sample_node_index.numel() == 0:
+                continue
+            node_score = keep_logit[sample_node_index]
+            k = int(node_score.numel())
+            if self.max_nodes_for_ion_candidates is not None:
+                k = min(int(self.max_nodes_for_ion_candidates), k)
+            node_order = sample_node_index[torch.topk(node_score, k=k).indices]
+            sample_candidates: List[FragmentIonCandidate] = []
+            for batch_node_index_tensor in node_order:
+                batch_node_index = int(batch_node_index_tensor.detach().cpu().item())
+                sample_candidates.extend(
+                    self._score_joint_ion_candidates_for_node(
+                        structure=structure,
+                        sample_tree_batch=sample_tree_batch,
+                        batch_node_index=batch_node_index,
+                        global_node_id=int(sample_tree_batch.node_id_global[batch_node_index].detach().cpu().item()),
+                        sample_id=int(kept_sample_ids[graph_index].detach().cpu().item()),
+                        keep_logit=keep_logit,
+                        ion_logit=ion_logit,
+                        unsaturation_logit=unsaturation_logit,
+                        radical_logit=radical_logit,
+                    )
                 )
-            )
-        candidates.sort(key=lambda item: item.score, reverse=True)
-        return candidates[: self.max_fragment_ion_candidates]
+            sample_candidates.sort(key=lambda item: item.score, reverse=True)
+            candidates.extend(sample_candidates[: self.max_fragment_ion_candidates])
+
+        return candidates
 
     def _score_joint_ion_candidates_for_node(self, *, structure: FragmentTreeStructure, sample_tree_batch, batch_node_index: int, global_node_id: int, sample_id: int, keep_logit: Tensor, ion_logit: Tensor, unsaturation_logit: Tensor, radical_logit: Tensor) -> List[FragmentIonCandidate]:
         device = keep_logit.device
@@ -200,18 +282,33 @@ class FragmentTreeCandidateSelector(nn.Module):
 
     def _select_next_cleavage_candidates(self, *, sample_tree_batch, cleave_logit: Tensor) -> List[NextCleavageCandidate]:
         device = cleave_logit.device
-        node_index = (~sample_tree_batch.node_is_precursor_root.to(device).bool()).nonzero(as_tuple=False).view(-1)
-        if node_index.numel() == 0:
-            return []
-        selected_node_index = node_index[torch.topk(cleave_logit[node_index], k=min(self.max_next_cleavage_candidates, int(node_index.numel()))).indices]
+        node_is_precursor_root = sample_tree_batch.node_is_precursor_root.to(device).bool()
         kept_sample_ids = sample_tree_batch.kept_sample_ids.to(device).long()
         graph_index_by_node = sample_tree_batch.batch.to(device).long()
         candidates: List[NextCleavageCandidate] = []
-        for batch_node_index_tensor in selected_node_index:
-            batch_node_index = int(batch_node_index_tensor.detach().cpu().item())
-            graph_index = int(graph_index_by_node[batch_node_index].detach().cpu().item())
-            score = cleave_logit[batch_node_index]
-            candidates.append(NextCleavageCandidate(sample_id=int(kept_sample_ids[graph_index].detach().cpu().item()), batch_node_index=batch_node_index, global_node_id=int(sample_tree_batch.node_id_global[batch_node_index].detach().cpu().item()), score=float(score.detach().cpu().item()), probability=float(torch.sigmoid(score).detach().cpu().item())))
+        for graph_index in range(int(kept_sample_ids.numel())):
+            node_index = (graph_index_by_node == graph_index).nonzero(as_tuple=False).view(-1)
+            node_index = node_index[~node_is_precursor_root[node_index]]
+            if node_index.numel() == 0:
+                continue
+            selected_node_index = node_index[
+                torch.topk(
+                    cleave_logit[node_index],
+                    k=min(self.max_next_cleavage_candidates, int(node_index.numel())),
+                ).indices
+            ]
+            for batch_node_index_tensor in selected_node_index:
+                batch_node_index = int(batch_node_index_tensor.detach().cpu().item())
+                score = cleave_logit[batch_node_index]
+                candidates.append(
+                    NextCleavageCandidate(
+                        sample_id=int(kept_sample_ids[graph_index].detach().cpu().item()),
+                        batch_node_index=batch_node_index,
+                        global_node_id=int(sample_tree_batch.node_id_global[batch_node_index].detach().cpu().item()),
+                        score=float(score.detach().cpu().item()),
+                        probability=float(torch.sigmoid(score).detach().cpu().item()),
+                    )
+                )
         return candidates
 
     @staticmethod
