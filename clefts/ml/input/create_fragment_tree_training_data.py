@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 from typing import Optional
 
+import numpy as np
 import pandas as pd
 import torch
 from tqdm import tqdm
@@ -13,16 +14,20 @@ from tqdm import tqdm
 from clefts.libs.msentity.msentity import MSDataset
 from clefts.utils.parallel_subprocess import run_parallel_subprocesses
 
+ORIGINAL_INDEX_COLUMN = "__fragment_tree_original_index"
+
 try:
     from .fragment_tree_training_data import (
         build_fragment_tree_structure_files,
         group_record_indexes_by_smiles,
+        load_fragment_tree_structure_file,
     )
     from ..specgen.fragment_tree_spectrum_predictor import FragmentSpectrumGenerator
 except ImportError:
     from clefts.ml.input.fragment_tree_training_data import (
         build_fragment_tree_structure_files,
         group_record_indexes_by_smiles,
+        load_fragment_tree_structure_file,
     )
     from clefts.ml.specgen.fragment_tree_spectrum_predictor import FragmentSpectrumGenerator
 
@@ -96,6 +101,16 @@ def parse_args() -> argparse.Namespace:
         help="Output .msds path for valid validation records.",
     )
     parser.add_argument(
+        "--train-assignment-score-output",
+        default=None,
+        help="Output TSV path for training peak assignment scores.",
+    )
+    parser.add_argument(
+        "--validation-assignment-score-output",
+        default=None,
+        help="Output TSV path for validation peak assignment scores.",
+    )
+    parser.add_argument(
         "--num-workers",
         type=int,
         default=1,
@@ -133,6 +148,11 @@ def parse_args() -> argparse.Namespace:
         help=argparse.SUPPRESS,
     )
     parser.add_argument(
+        "--assignment-score-output",
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
         "--save-valid-records",
         action="store_true",
         help=argparse.SUPPRESS,
@@ -161,6 +181,106 @@ def save_valid_records(
     print(f"saved valid records: {len(unique_indexes)} -> {output_path}")
 
 
+def _metadata_value(row: pd.Series, column: str) -> object:
+    if column not in row.index:
+        return ""
+    value = row[column]
+    if pd.isna(value):
+        return ""
+    return value
+
+
+def _assigned_peak_indexes_by_sample(structure) -> dict[int, set[int]]:
+    sample_to_peak_indexes: dict[int, set[int]] = {}
+    if not hasattr(structure, "target_sample_index") or structure.target_sample_index.numel() == 0:
+        return sample_to_peak_indexes
+
+    sample_indexes = structure.target_sample_index.detach().cpu().tolist()
+    peak_indexes = structure.target_peak_index.detach().cpu().tolist()
+    for sample_index, peak_index in zip(sample_indexes, peak_indexes):
+        sample_to_peak_indexes.setdefault(int(sample_index), set()).add(int(peak_index))
+    return sample_to_peak_indexes
+
+
+def write_assignment_score_tsv(
+    *,
+    dataset: MSDataset,
+    structure_files: list[Path],
+    output_file: str | Path,
+    smiles_column: str,
+) -> None:
+    rows: list[dict[str, object]] = []
+    metadata = dataset.metadata
+
+    for structure_file in tqdm(
+        structure_files,
+        desc="Writing assignment score TSV",
+        mininterval=1.0,
+    ):
+        item = load_fragment_tree_structure_file(structure_file, map_location="cpu")
+        structure = item.structure
+        record_indexes = [int(index) for index in item.metadata.get("record_indexes", [])]
+        sample_indexes = [int(index) for index in item.metadata.get("sample_indexes", [])]
+        assigned_by_sample = _assigned_peak_indexes_by_sample(structure)
+
+        for local_record_index, sample_index in zip(record_indexes, sample_indexes):
+            if int(sample_index) < 0:
+                continue
+            if local_record_index < 0 or local_record_index >= len(dataset):
+                continue
+
+            row = metadata.iloc[local_record_index]
+            spectrum = dataset[local_record_index]
+            intensities = np.asarray(
+                [float(peak.intensity) for peak in spectrum.peaks],
+                dtype=np.float64,
+            )
+            finite_mask = np.isfinite(intensities)
+            total_intensity = float(intensities[finite_mask].sum()) if intensities.size else 0.0
+            total_peak_count = int(intensities.size)
+
+            assigned_peak_indexes = sorted(
+                peak_index
+                for peak_index in assigned_by_sample.get(int(sample_index), set())
+                if 0 <= int(peak_index) < total_peak_count
+            )
+            assigned_intensity = float(intensities[assigned_peak_indexes].sum()) if assigned_peak_indexes else 0.0
+            assignment_score = assigned_intensity / total_intensity if total_intensity > 0 else 0.0
+            source_index = _metadata_value(row, ORIGINAL_INDEX_COLUMN)
+            if source_index == "":
+                source_index = int(local_record_index)
+
+            rows.append(
+                {
+                    "index": int(source_index),
+                    "SpecID": _metadata_value(row, "SpecID"),
+                    "assignment_score": assignment_score,
+                    "assigned_intensity": assigned_intensity,
+                    "total_intensity": total_intensity,
+                    "assigned_peak_count": int(len(assigned_peak_indexes)),
+                    "total_peak_count": total_peak_count,
+                    "smiles": _metadata_value(row, smiles_column),
+                    "structure_file": Path(structure_file).name,
+                }
+            )
+
+    output_path = Path(output_file)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    columns = [
+        "index",
+        "SpecID",
+        "assignment_score",
+        "assigned_intensity",
+        "total_intensity",
+        "assigned_peak_count",
+        "total_peak_count",
+        "smiles",
+        "structure_file",
+    ]
+    pd.DataFrame(rows, columns=columns).to_csv(output_path, sep="\t", index=False)
+    print(f"saved assignment scores: {len(rows)} -> {output_path}")
+
+
 def build_structure_files_for_input(
     *,
     input_path: str,
@@ -170,6 +290,7 @@ def build_structure_files_for_input(
     manifest_file: str | Path | None = None,
     save_valid: bool = False,
     valid_records_output: str | Path | None = None,
+    assignment_score_output: str | Path | None = None,
 ) -> list[Path]:
     dataset = MSDataset.load(input_path)
     print(f"input: {input_path}")
@@ -197,6 +318,14 @@ def build_structure_files_for_input(
             dataset=dataset,
             valid_record_indexes=valid_record_indexes,
             output_file=valid_records_output,
+        )
+
+    if assignment_score_output is not None:
+        write_assignment_score_tsv(
+            dataset=dataset,
+            structure_files=saved_files,
+            output_file=assignment_score_output,
+            smiles_column=args.smiles_column,
         )
 
     print(f"saved structure files: {len(saved_files)}")
@@ -250,6 +379,7 @@ def run_parallel_for_input(
     manifest_file: Path,
     save_valid: bool,
     valid_records_output: Optional[Path],
+    assignment_score_output: Path,
     split_name: str,
 ) -> None:
     if args.num_workers <= 1:
@@ -279,6 +409,7 @@ def run_parallel_for_input(
     commands: list[list[str]] = []
     part_manifests: list[Path] = []
     part_valid_outputs: list[Path] = []
+    part_score_outputs: list[Path] = []
     script_path = Path(__file__).resolve()
 
     for chunk_index, record_indexes in enumerate(
@@ -287,7 +418,10 @@ def run_parallel_for_input(
         temp_input = temp_root / f"part_{chunk_index:06d}.msds"
         temp_manifest = temp_root / f"part_{chunk_index:06d}_manifest.tsv"
         temp_valid = temp_root / f"part_{chunk_index:06d}_valid.msds"
-        dataset[record_indexes].save(str(temp_input))
+        temp_score = temp_root / f"part_{chunk_index:06d}_assignment_scores.tsv"
+        chunk_dataset = dataset[record_indexes].copy()
+        chunk_dataset[ORIGINAL_INDEX_COLUMN] = list(record_indexes)
+        chunk_dataset.save(str(temp_input))
 
         command = [
             sys.executable,
@@ -314,7 +448,10 @@ def run_parallel_for_input(
             str(temp_manifest),
             "--num-workers",
             "1",
+            "--assignment-score-output",
+            str(temp_score),
         ]
+        part_score_outputs.append(temp_score)
         if args.instrument_column is not None:
             command.extend(["--instrument-column", str(args.instrument_column)])
         if args.overwrite:
@@ -338,6 +475,8 @@ def run_parallel_for_input(
     )
 
     merge_tsv_files(part_manifests, manifest_file)
+    merge_tsv_files(part_score_outputs, assignment_score_output)
+    print(f"saved merged assignment scores: {assignment_score_output}")
     if save_valid:
         if valid_records_output is None:
             raise ValueError("valid_records_output is required when save_valid=True.")
@@ -354,6 +493,10 @@ def run_parallel_for_input(
 
 def default_valid_output(structure_dir: Path) -> Path:
     return structure_dir / "valid_records.msds"
+
+
+def default_assignment_score_output(structure_dir: Path) -> Path:
+    return structure_dir / "assignment_scores.tsv"
 
 
 def main() -> None:
@@ -373,6 +516,7 @@ def main() -> None:
             manifest_file=args.manifest_file,
             save_valid=args.save_valid_records,
             valid_records_output=args.valid_records_output,
+            assignment_score_output=args.assignment_score_output,
         )
         return
 
@@ -393,6 +537,16 @@ def main() -> None:
         if args.validation_valid_output is not None
         else default_valid_output(validation_structure_dir)
     )
+    train_assignment_score_output = (
+        Path(args.train_assignment_score_output)
+        if args.train_assignment_score_output is not None
+        else default_assignment_score_output(train_structure_dir)
+    )
+    validation_assignment_score_output = (
+        Path(args.validation_assignment_score_output)
+        if args.validation_assignment_score_output is not None
+        else default_assignment_score_output(validation_structure_dir)
+    )
 
     if args.num_workers > 1:
         run_parallel_for_input(
@@ -402,6 +556,7 @@ def main() -> None:
             manifest_file=train_manifest_file,
             save_valid=bool(args.save_train_valid_records),
             valid_records_output=train_valid_output,
+            assignment_score_output=train_assignment_score_output,
             split_name="train",
         )
         if args.validation_input is not None:
@@ -412,6 +567,7 @@ def main() -> None:
                 manifest_file=validation_structure_dir / "manifest.tsv",
                 save_valid=bool(args.save_validation_valid_records),
                 valid_records_output=validation_valid_output,
+                assignment_score_output=validation_assignment_score_output,
                 split_name="validation",
             )
         return
@@ -425,6 +581,7 @@ def main() -> None:
         manifest_file=train_manifest_file,
         save_valid=bool(args.save_train_valid_records),
         valid_records_output=train_valid_output,
+        assignment_score_output=train_assignment_score_output,
     )
 
     if args.validation_input is not None:
@@ -436,6 +593,7 @@ def main() -> None:
             manifest_file=None,
             save_valid=bool(args.save_validation_valid_records),
             valid_records_output=validation_valid_output,
+            assignment_score_output=validation_assignment_score_output,
         )
 
 
