@@ -91,6 +91,11 @@ class AssignFormulaCommand(CLICommand):
             default=1,
             help="Additional hydrogen count allowed during subformula generation.",
         )
+        parser.add_argument(
+            "--enable-neutral-loss",
+            action="store_true",
+            help="Output neutral-loss labels such as C5H3(-CH3) when possible.",
+        )
 
     def run(self, args: argparse.Namespace) -> None:
         mass_tolerance = parse_mass_tolerance(args.tolerance)
@@ -122,6 +127,7 @@ class AssignFormulaCommand(CLICommand):
                 max_formula_candidates=args.max_formula_candidates,
                 hydrogen_delta=args.hydrogen_delta,
                 report_file=args.report_file,
+                enable_neutral_loss=args.enable_neutral_loss,
             )
         else:
             assign_formulas(
@@ -138,6 +144,7 @@ class AssignFormulaCommand(CLICommand):
                 hydrogen_delta=args.hydrogen_delta,
                 add_finished_tag=args.add_finished_tag,
                 report_file=args.report_file,
+                enable_neutral_loss=args.enable_neutral_loss,
             )
 
         end_time = time.time()

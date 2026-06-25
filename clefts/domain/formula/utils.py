@@ -2,10 +2,153 @@ from __future__ import annotations
 
 import time
 from itertools import product
-from typing import Any, Generator, Dict, List, Tuple
+from dataclasses import dataclass
+from typing import Any, Generator, Dict, List, Tuple, Sequence, Union
 
 from ...libs.mmkit.mmkit import Formula
 from ..mass import MassTolerance
+
+
+@dataclass(frozen=True)
+class FormulaAssignmentCandidate:
+    formula: Formula
+    label: str
+
+
+def _validate_formula_element_signs(
+    formula: Formula,
+    *,
+    allow_zero: bool,
+    sign: str,
+    label: str,
+) -> None:
+    counts = list(formula.elements.values())
+    if sign == "positive":
+        valid = all(count >= 0 if allow_zero else count > 0 for count in counts)
+        message = "ordinary formula terms must be positive"
+    elif sign == "negative":
+        valid = all(count <= 0 if allow_zero else count < 0 for count in counts)
+        message = "neutral-loss terms must be negative"
+    else:
+        raise ValueError(f"Unsupported sign validation: {sign}")
+
+    if not valid:
+        raise ValueError(f"Invalid formula label {label!r}: {message}.")
+
+
+def parse_neutral_loss_formula(loss_text: str) -> Formula:
+    text = str(loss_text).strip()
+    if not text:
+        raise ValueError("Neutral-loss formula must not be empty.")
+
+    if text.startswith("-") and len(text) > 1 and text[1].isalpha():
+        positive_loss = Formula.parse(text[1:])
+        return positive_loss * -1
+
+    return Formula.parse(text)
+
+
+def format_neutral_loss_formula(loss_formula: Formula) -> str:
+    elements = loss_formula.elements
+    if elements and all(count <= 0 for count in elements.values()):
+        positive_elements = {element: -int(count) for element, count in elements.items()}
+        return "-" + str(Formula(elements=positive_elements, charge=0))
+
+    return str(loss_formula)
+
+
+def parse_formula_assignment_label(label: str) -> FormulaAssignmentCandidate:
+    """Parse ordinary or neutral-loss assignment label.
+
+    Examples
+    --------
+    C6H6 -> formula C6H6, label C6H6
+    C5H3(-CH3) -> formula C5H3, label C5H3(-CH3)
+    """
+
+    text = str(label).strip()
+    if not text:
+        raise ValueError("Formula label must not be empty.")
+
+    if "(" not in text and ")" not in text:
+        formula = Formula.parse(text)
+        _validate_formula_element_signs(
+            formula,
+            allow_zero=True,
+            sign="positive",
+            label=text,
+        )
+        return FormulaAssignmentCandidate(formula=formula, label=str(formula))
+
+    if not text.endswith(")") or text.count("(") != 1 or text.count(")") != 1:
+        raise ValueError(
+            "Neutral-loss formula labels must look like C5H3(-CH3). "
+            f"Got {text!r}."
+        )
+
+    formula_text, loss_text = text[:-1].split("(", maxsplit=1)
+    formula = Formula.parse(formula_text)
+    loss_formula = parse_neutral_loss_formula(loss_text)
+    _validate_formula_element_signs(
+        formula,
+        allow_zero=True,
+        sign="positive",
+        label=text,
+    )
+    _validate_formula_element_signs(
+        loss_formula,
+        allow_zero=True,
+        sign="negative",
+        label=text,
+    )
+    return FormulaAssignmentCandidate(
+        formula=formula,
+        label=f"{formula}({format_neutral_loss_formula(loss_formula)})",
+    )
+
+
+def _neutral_loss_label_for_formula(
+    formula: Formula,
+    original_formula: Formula | None,
+) -> str:
+    if original_formula is None:
+        return str(formula)
+
+    loss_formula = formula - original_formula.plain
+    loss_counts = list(loss_formula.elements.values())
+
+    if loss_counts and all(count <= 0 for count in loss_counts) and any(
+        count < 0 for count in loss_counts
+    ):
+        return f"{formula}({format_neutral_loss_formula(loss_formula)})"
+
+    return str(formula)
+
+
+def make_formula_assignment_candidate(
+    candidate: Union[Formula, str, FormulaAssignmentCandidate],
+    *,
+    original_formula: Formula | None = None,
+) -> FormulaAssignmentCandidate:
+    if isinstance(candidate, FormulaAssignmentCandidate):
+        return candidate
+
+    if isinstance(candidate, str):
+        return parse_formula_assignment_label(candidate)
+
+    if isinstance(candidate, Formula):
+        _validate_formula_element_signs(
+            candidate,
+            allow_zero=True,
+            sign="positive",
+            label=str(candidate),
+        )
+        return FormulaAssignmentCandidate(
+            formula=candidate,
+            label=_neutral_loss_label_for_formula(candidate, original_formula),
+        )
+
+    raise TypeError(f"Unsupported formula candidate type: {type(candidate).__name__}")
 
 
 def calculate_dbe(elements: dict[str, int]) -> float:
@@ -84,8 +227,10 @@ def get_possible_sub_formulas(formula: Formula, hydrogen_delta: int = 0, timeout
     
 def assign_formulas_to_peaks(
     peaks_mz: List[float],
-    formula_candidates: List[Formula],
+    formula_candidates: Sequence[Union[Formula, str, FormulaAssignmentCandidate]],
     mass_tolerance: MassTolerance,
+    *,
+    original_formula: Formula | None = None,
 ) -> List[Dict[str, Any]]:
     """Assign candidate formulas to peaks using mass tolerance."""
 
@@ -94,10 +239,22 @@ def assign_formulas_to_peaks(
         key=lambda item: item[0],
     )
 
+    assignment_candidates = [
+        make_formula_assignment_candidate(
+            formula_candidate,
+            original_formula=original_formula,
+        )
+        for formula_candidate in formula_candidates
+    ]
+
     sorted_formulas = sorted(
         (
-            (formula_index, str(formula), float(formula.exact_mass))
-            for formula_index, formula in enumerate(formula_candidates)
+            (
+                formula_index,
+                formula_candidate.label,
+                float(formula_candidate.formula.exact_mass),
+            )
+            for formula_index, formula_candidate in enumerate(assignment_candidates)
         ),
         key=lambda item: item[2],
     )

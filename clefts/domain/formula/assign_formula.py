@@ -9,7 +9,7 @@ from typing import Dict, List, Optional
 from tqdm import tqdm
 
 from clefts.libs.msentity.msentity import MSDataset, load_ms_dataset
-from clefts.libs.mmkit.mmkit import Formula
+from clefts.libs.mmkit.mmkit import Compound, Formula
 from clefts.domain.mass.tolerance import MassTolerance
 from clefts.utils.parallel_subprocess import run_parallel_subprocesses
 
@@ -58,6 +58,7 @@ def assign_formulas(
     save_interval_sec: float = float("inf"),
     add_finished_tag: bool = False,
     report_file: Optional[str] = None,
+    enable_neutral_loss: bool = False,
 ) -> MSDataset:
     """Assign possible subformulas to MS/MS peaks.
 
@@ -263,12 +264,19 @@ def assign_formulas(
                     pbar.update(1)
                     continue
 
+                original_formula = (
+                    Compound.from_smiles(str(record[smiles_column])).formula.plain
+                    if enable_neutral_loss
+                    else None
+                )
+
                 assign_record_formulas(
                     record=record,
                     formula_candidates=possible_formulas,
                     mass_tolerance=mass_tolerance,
                     calc_formula_column=calc_formula_column,
                     calc_formula_coverage_column=calc_formula_coverage_column,
+                    original_formula=original_formula,
                 )
 
                 success_record_indexes.append(int(record_index))
@@ -361,6 +369,7 @@ def parallel_assign_formulas(
     max_formula_candidates: Optional[int] = None,
     hydrogen_delta: int = 1,
     report_file: Optional[str] = None,
+    enable_neutral_loss: bool = False,
 ) -> None:
     """Assign formulas in parallel by precursor-formula chunks.
 
@@ -476,6 +485,9 @@ def parallel_assign_formulas(
             "--hydrogen_delta",
             str(hydrogen_delta),
         )
+
+        if enable_neutral_loss:
+            try_add_arg(cmd_args, "--enable-neutral-loss")
 
         if timeout_sec != float("inf"):
             try_add_arg(
