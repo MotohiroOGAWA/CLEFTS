@@ -58,6 +58,20 @@ METRIC_COLUMNS = (
 )
 
 
+DEFAULT_TRAIN_CONFIG_NAME = "train_config.json"
+DEFAULT_MODEL_CONFIG_NAMES = (
+    "fragment_spectrum_generator_param.json",
+    "fragment_spectrum_generator_pos_param.json",
+)
+DEFAULT_EXPERIMENT_NAME = "exp_main"
+DEFAULT_OPTIMIZER_INFO = {
+    "name": "AdamW",
+    "lr": 1e-5,
+    "weight_decay": 0.0,
+    "grad_clip_norm": 1.0,
+}
+
+
 @dataclass(frozen=True)
 class TrainState:
     model: FragmentTreeTrainingModel
@@ -195,69 +209,178 @@ def step_scheduler(
         scheduler.step()
 
 
-def prepare_train(
+def normalize_train_config(
     project_dir: str | Path,
-    train_config_path: str | Path,
+    train_config: Dict[str, Any],
+) -> Dict[str, Any]:
+    project_path = Path(project_dir)
+    config = dict(train_config)
+
+    config["experiment_name"] = config.get("experiment_name") or DEFAULT_EXPERIMENT_NAME
+    config["ckpt_id"] = None if config.get("ckpt_id") in {"", None} else config.get("ckpt_id")
+    config["batch_size"] = int(config.get("batch_size", 1))
+    config["device"] = str(config.get("device", "cpu"))
+    config["epoch"] = int(config.get("epoch", config.get("epochs", 10)))
+
+    validation_interval_steps = config.get("validation_interval_steps", 100)
+    config["validation_interval_steps"] = (
+        None
+        if validation_interval_steps in {None, ""}
+        else int(validation_interval_steps)
+    )
+    if (
+        config["validation_interval_steps"] is not None
+        and config["validation_interval_steps"] <= 0
+    ):
+        raise ValueError("validation_interval_steps must be positive when specified.")
+
+    config["save_interval"] = int(config.get("save_interval", 1))
+    save_interval_steps = config.get(
+        "save_interval_steps",
+        config.get("save_interval_iters", 100),
+    )
+    config["save_interval_steps"] = (
+        None
+        if save_interval_steps in {None, ""}
+        else int(save_interval_steps)
+    )
+    if config["save_interval"] < 0:
+        raise ValueError("save_interval must be zero or positive.")
+    if config["save_interval_steps"] is not None and config["save_interval_steps"] < 0:
+        raise ValueError("save_interval_steps must be zero or positive when specified.")
+
+    optimizer_info = dict(DEFAULT_OPTIMIZER_INFO)
+    optimizer_info.update(dict(config.get("optimizer") or {}))
+    config["optimizer"] = optimizer_info
+    config["early_stopping"] = dict(config.get("early_stopping", {}))
+
+    training_structure_dir = config.get(
+        "training_structure_dir",
+        config.get("traing_structure_dir"),
+    )
+    validation_structure_dir = config.get(
+        "validation_structure_dir",
+        config.get("val_structure_dir"),
+    )
+    config["training_structure_dir"] = str(
+        training_structure_dir or project_path / "train_structures"
+    )
+    config["validation_structure_dir"] = str(
+        validation_structure_dir or project_path / "validation_structures"
+    )
+
+    validation_valid_records_file = config.get(
+        "validation_valid_records_file",
+        config.get("validation_msdataset_file"),
+    )
+    if not validation_valid_records_file:
+        validation_valid_records_file = (
+            Path(config["validation_structure_dir"]) / "valid_records.msds"
+        )
+    config["validation_valid_records_file"] = str(validation_valid_records_file)
+    config["shuffle"] = bool(config.get("shuffle", True))
+
+    return config
+
+
+def build_train_config(
     *,
-    root_run_dir: Optional[str | Path] = None,
-) -> Tuple[Path, Optional[str], int, torch.device, int, int, Dict[str, Any], Dict[str, Any], Dict[str, Any], Optional[int], Path]:
-    train_config = load_config(train_config_path)
+    project_dir: str | Path,
+    experiment_name: str = DEFAULT_EXPERIMENT_NAME,
+    ckpt_id: Optional[str] = None,
+    batch_size: int = 1,
+    device: str = "cpu",
+    epoch: int = 10,
+    validation_interval_steps: Optional[int] = 100,
+    save_interval: int = 1,
+    save_interval_steps: Optional[int] = 100,
+    optimizer_name: str = "AdamW",
+    lr: float = 1e-5,
+    weight_decay: float = 0.0,
+    grad_clip_norm: Optional[float] = 1.0,
+    training_structure_dir: Optional[str | Path] = None,
+    validation_structure_dir: Optional[str | Path] = None,
+    shuffle: bool = True,
+) -> Dict[str, Any]:
+    optimizer_info: Dict[str, Any] = {
+        "name": optimizer_name,
+        "lr": float(lr),
+        "weight_decay": float(weight_decay),
+    }
+    if grad_clip_norm is not None:
+        optimizer_info["grad_clip_norm"] = float(grad_clip_norm)
 
-    load_name = train_config.get("experiment_name")
-    if not load_name:
-        load_name = "exp_" + datetime.now().strftime("%Y%m%d%H%M%S")
+    return normalize_train_config(
+        project_dir,
+        {
+            "experiment_name": experiment_name,
+            "ckpt_id": ckpt_id,
+            "batch_size": int(batch_size),
+            "device": device,
+            "epoch": int(epoch),
+            "validation_interval_steps": validation_interval_steps,
+            "save_interval": int(save_interval),
+            "save_interval_steps": save_interval_steps,
+            "optimizer": optimizer_info,
+            "training_structure_dir": (
+                None if training_structure_dir is None else str(training_structure_dir)
+            ),
+            "validation_structure_dir": (
+                None if validation_structure_dir is None else str(validation_structure_dir)
+            ),
+            "shuffle": bool(shuffle),
+        },
+    )
 
+
+def prepare_train_from_config(
+    project_dir: str | Path,
+    train_config: Dict[str, Any],
+    *,
+    train_config_source: Optional[str | Path] = None,
+) -> Tuple[Path, Optional[str], int, torch.device, int, int, Optional[int], Dict[str, Any], Dict[str, Any], Dict[str, Any], Optional[int], Path]:
+    train_config = normalize_train_config(project_dir, train_config)
+
+    load_name = train_config.get("experiment_name") or DEFAULT_EXPERIMENT_NAME
     experiment_dir = Path(project_dir) / "experiments" / str(load_name)
     experiment_dir.mkdir(parents=True, exist_ok=True)
 
     ckpt_id = train_config.get("ckpt_id")
-    batch_size = int(train_config.get("batch_size", 1))
-    device = torch.device(train_config.get("device", "cpu"))
-    epochs = int(train_config.get("epoch", train_config.get("epochs", 10)))
-    save_interval = int(train_config.get("save_interval", 1))
-    validation_interval_steps_value = train_config.get("validation_interval_steps")
+    batch_size = int(train_config["batch_size"])
+    device = torch.device(train_config["device"])
+    epochs = int(train_config["epoch"])
+    save_interval = int(train_config["save_interval"])
+    save_interval_steps = train_config.get("save_interval_steps")
+    save_interval_steps = (
+        None
+        if save_interval_steps in {None, ""}
+        else int(save_interval_steps)
+    )
+    validation_interval_steps = train_config.get("validation_interval_steps")
     validation_interval_steps = (
         None
-        if validation_interval_steps_value in {None, ""}
-        else int(validation_interval_steps_value)
+        if validation_interval_steps in {None, ""}
+        else int(validation_interval_steps)
     )
-    if validation_interval_steps is not None and validation_interval_steps <= 0:
-        raise ValueError("validation_interval_steps must be positive when specified.")
-    optimizer_info = dict(train_config.get("optimizer", {"name": "AdamW", "lr": 1e-4}))
+    optimizer_info = dict(train_config["optimizer"])
     early_stopping_info = dict(train_config.get("early_stopping", {}))
-    training_structure_dir = train_config.get(
-        "training_structure_dir",
-        train_config.get("traing_structure_dir"),
-    )
-    validation_structure_dir = train_config.get(
-        "validation_structure_dir",
-        train_config.get("val_structure_dir"),
-    )
-    if not training_structure_dir:
-        raise ValueError("train_config requires training_structure_dir.")
-    if not validation_structure_dir:
-        raise ValueError("train_config requires validation_structure_dir.")
-    validation_valid_records_file = train_config.get(
-        "validation_valid_records_file",
-        train_config.get("validation_msdataset_file"),
-    )
-    if not validation_valid_records_file:
-        validation_valid_records_file = (
-            Path(validation_structure_dir) / "valid_records.msds"
-        )
+
     dataset_info = {
-        "training_structure_dir": str(training_structure_dir),
-        "validation_structure_dir": str(validation_structure_dir),
-        "validation_valid_records_file": str(validation_valid_records_file),
+        "training_structure_dir": str(train_config["training_structure_dir"]),
+        "validation_structure_dir": str(train_config["validation_structure_dir"]),
+        "validation_valid_records_file": str(train_config["validation_valid_records_file"]),
         "shuffle": bool(train_config.get("shuffle", True)),
         "validation_interval_steps": validation_interval_steps,
         "pattern": "*.pt",
     }
 
     now_str = datetime.now().strftime("%Y%m%d%H%M%S")
-    run_dir = Path(root_run_dir) / now_str if root_run_dir is not None else experiment_dir / "runs" / now_str
+    run_dir = experiment_dir / "runs" / now_str
     run_dir.mkdir(parents=True, exist_ok=True)
-    shutil.copy(train_config_path, run_dir / Path(train_config_path).name)
+    if train_config_source is not None:
+        shutil.copy(train_config_source, run_dir / Path(train_config_source).name)
+    else:
+        save_config(train_config, run_dir / DEFAULT_TRAIN_CONFIG_NAME)
 
     return (
         experiment_dir,
@@ -266,6 +389,56 @@ def prepare_train(
         device,
         epochs,
         save_interval,
+        save_interval_steps,
+        optimizer_info,
+        early_stopping_info,
+        dataset_info,
+        validation_interval_steps,
+        run_dir,
+    )
+
+
+def prepare_train(
+    project_dir: str | Path,
+    train_config_path: str | Path,
+    *,
+    root_run_dir: Optional[str | Path] = None,
+) -> Tuple[Path, Optional[str], int, torch.device, int, int, Optional[int], Dict[str, Any], Dict[str, Any], Dict[str, Any], Optional[int], Path]:
+    train_config = load_config(train_config_path)
+    prepared = prepare_train_from_config(
+        project_dir,
+        train_config,
+        train_config_source=train_config_path,
+    )
+    if root_run_dir is None:
+        return prepared
+
+    (
+        experiment_dir,
+        ckpt_id,
+        batch_size,
+        device,
+        epochs,
+        save_interval,
+        save_interval_steps,
+        optimizer_info,
+        early_stopping_info,
+        dataset_info,
+        validation_interval_steps,
+        old_run_dir,
+    ) = prepared
+    now_str = old_run_dir.name
+    run_dir = Path(root_run_dir) / now_str
+    run_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy(train_config_path, run_dir / Path(train_config_path).name)
+    return (
+        experiment_dir,
+        ckpt_id,
+        batch_size,
+        device,
+        epochs,
+        save_interval,
+        save_interval_steps,
         optimizer_info,
         early_stopping_info,
         dataset_info,
@@ -391,6 +564,9 @@ def run_epoch(
     on_validation_step: Optional[
         Callable[[int, EpochLossMetrics, EpochLossMetrics], None]
     ] = None,
+    on_step_end: Optional[
+        Callable[[int, EpochLossMetrics, EpochLossMetrics], None]
+    ] = None,
 ) -> EpochLossMetrics:
     is_train = optimizer is not None
     model.train(is_train)
@@ -498,6 +674,9 @@ def run_epoch(
                 window_samples = 0
                 window_selection_samples = 0
                 window_intensity_samples = 0
+
+            if on_step_end is not None:
+                on_step_end(global_step, cumulative_metrics, window_metrics)
         except Exception as exc:
             if is_train and optimizer is not None:
                 optimizer.zero_grad(set_to_none=True)
@@ -676,7 +855,10 @@ def save_managed_checkpoint(
     comment: str,
 ) -> None:
     ckpt_node = ckpt_manager.checkout_new_ckpt()
-    ckpt_node.name = f"epoch_{epoch:04d}"
+    if comment == "iter_interval":
+        ckpt_node.name = f"epoch_{epoch:04d}_step_{global_step:08d}"
+    else:
+        ckpt_node.name = f"epoch_{epoch:04d}"
     ckpt_node.epoch = int(epoch)
     ckpt_node.iter = int(global_step)
     ckpt_node.comment = comment
@@ -710,6 +892,7 @@ def main(
     device: torch.device,
     epoch: int,
     save_interval: int,
+    save_interval_steps: Optional[int],
     batch_size: int,
     train_loader: DataLoader,
     val_loader: DataLoader,
@@ -939,6 +1122,34 @@ def main(
                 val_cosine=step_val_cosine,
             )
 
+        def on_step_end(
+            step_value: int,
+            train_epoch_metrics: EpochLossMetrics,
+            train_window_metrics: EpochLossMetrics,
+        ) -> None:
+            if (
+                save_interval_steps is None
+                or save_interval_steps <= 0
+                or step_value % save_interval_steps != 0
+            ):
+                return
+            save_managed_checkpoint(
+                ckpt_manager=ckpt_manager,
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                epoch=epoch_index,
+                global_step=step_value,
+                best_val_loss=best_val_loss,
+                optimizer_info=optimizer_info,
+                extra_data={
+                    **extra_data,
+                    "train_loss": train_epoch_metrics.loss,
+                    "train_window_loss": train_window_metrics.loss,
+                },
+                comment="iter_interval",
+            )
+
         train_metrics = run_epoch(
             model=model,
             loader=train_loader,
@@ -949,6 +1160,7 @@ def main(
             start_global_step=global_step,
             validation_interval_steps=validation_interval_steps,
             on_validation_step=on_validation_step,
+            on_step_end=on_step_end,
         )
         global_step += train_metrics.steps
         last_epoch_index = epoch_index
@@ -1018,18 +1230,94 @@ def main(
     )
     writer.close()
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train FragmentTreeTrainingModel.")
-    parser.add_argument("-project", "--project-dir", default="data/training/fragment_tree_model")
-    parser.add_argument("-model", "--model-config-path", default="clefts/ml/specgen/presets/fragment_spectrum_generator_param.json")
-    parser.add_argument("-train", "--train-config-path", required=True)
-    parser.add_argument("--root-run-dir", default=None)
-    parser.add_argument("--num-workers", type=int, default=0)
-    return parser.parse_args()
+def _candidate_config_paths(
+    project_dir: str | Path,
+    value: Optional[str | Path],
+    *,
+    default_names: Tuple[str, ...],
+) -> List[Path]:
+    project_path = Path(project_dir)
+    config_dir = project_path / "config"
+
+    if value is None or str(value) == "":
+        return [config_dir / name for name in default_names]
+
+    value_path = Path(value)
+    candidates: List[Path] = []
+
+    def add_candidate(candidate: Path) -> None:
+        if candidate not in candidates:
+            candidates.append(candidate)
+
+    add_candidate(value_path)
+    if value_path.suffix == "":
+        add_candidate(value_path.with_suffix(".json"))
+
+    if not value_path.is_absolute():
+        add_candidate(config_dir / value_path)
+        if value_path.suffix == "":
+            add_candidate(config_dir / f"{value_path}.json")
+
+    return candidates
 
 
-if __name__ == "__main__":
-    args = parse_args()
+def resolve_config_path(
+    project_dir: str | Path,
+    value: Optional[str | Path],
+    *,
+    default_names: Tuple[str, ...],
+    label: str,
+) -> Path:
+    candidates = _candidate_config_paths(
+        project_dir,
+        value,
+        default_names=default_names,
+    )
+
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+
+    candidate_text = "\n  - ".join(str(candidate) for candidate in candidates)
+    raise FileNotFoundError(
+        f"Could not find {label} config. Tried:\n  - {candidate_text}"
+    )
+
+
+def resolve_train_config_path(
+    project_dir: str | Path,
+    train_config_path: Optional[str | Path] = None,
+) -> Path:
+    return resolve_config_path(
+        project_dir,
+        train_config_path,
+        default_names=(DEFAULT_TRAIN_CONFIG_NAME,),
+        label="train",
+    )
+
+
+def resolve_model_config_path(
+    project_dir: str | Path,
+    model_config_path: Optional[str | Path] = None,
+) -> Path:
+    return resolve_config_path(
+        project_dir,
+        model_config_path,
+        default_names=DEFAULT_MODEL_CONFIG_NAMES,
+        label="model",
+    )
+
+
+def run_training_from_config(
+    *,
+    project_dir: str | Path,
+    model_config_path: Optional[str | Path] = None,
+    train_config: Dict[str, Any],
+) -> None:
+    model_config_resolved = resolve_model_config_path(
+        project_dir,
+        model_config_path,
+    )
 
     (
         experiment_dir,
@@ -1038,25 +1326,26 @@ if __name__ == "__main__":
         device,
         epochs,
         save_interval,
+        save_interval_steps,
         optimizer_info,
         early_stopping_info,
         dataset_info,
         validation_interval_steps,
         run_dir,
-    ) = prepare_train(
-        args.project_dir,
-        args.train_config_path,
-        root_run_dir=args.root_run_dir,
+    ) = prepare_train_from_config(
+        project_dir,
+        train_config,
+        train_config_source=None,
     )
 
     _, _, train_loader, val_loader, extra_data = setup_dataset(
         dataset_info,
         batch_size,
-        num_workers=args.num_workers,
+        num_workers=0,
     )
 
-    model_config = load_config(args.model_config_path)
-    shutil.copy(args.model_config_path, run_dir / Path(args.model_config_path).name)
+    model_config = load_config(model_config_resolved)
+    shutil.copy(model_config_resolved, run_dir / model_config_resolved.name)
 
     main(
         model_config=model_config,
@@ -1065,6 +1354,7 @@ if __name__ == "__main__":
         device=device,
         epoch=epochs,
         save_interval=save_interval,
+        save_interval_steps=save_interval_steps,
         batch_size=batch_size,
         train_loader=train_loader,
         val_loader=val_loader,
@@ -1073,4 +1363,117 @@ if __name__ == "__main__":
         run_dir=run_dir,
         extra_data=extra_data,
         validation_interval_steps=validation_interval_steps,
+    )
+
+def run_training(
+    *,
+    project_dir: str | Path,
+    model_config_path: Optional[str | Path] = None,
+    train_config_path: Optional[str | Path] = None,
+    root_run_dir: Optional[str | Path] = None,
+    num_workers: int = 0,
+) -> None:
+    train_config_resolved = resolve_train_config_path(
+        project_dir,
+        train_config_path,
+    )
+    model_config_resolved = resolve_model_config_path(
+        project_dir,
+        model_config_path,
+    )
+
+    (
+        experiment_dir,
+        ckpt_id,
+        batch_size,
+        device,
+        epochs,
+        save_interval,
+        save_interval_steps,
+        optimizer_info,
+        early_stopping_info,
+        dataset_info,
+        validation_interval_steps,
+        run_dir,
+    ) = prepare_train(
+        project_dir,
+        train_config_resolved,
+        root_run_dir=root_run_dir,
+    )
+
+    _, _, train_loader, val_loader, extra_data = setup_dataset(
+        dataset_info,
+        batch_size,
+        num_workers=num_workers,
+    )
+
+    model_config = load_config(model_config_resolved)
+    shutil.copy(model_config_resolved, run_dir / model_config_resolved.name)
+
+    main(
+        model_config=model_config,
+        experiment_dir=experiment_dir,
+        ckpt_id=ckpt_id,
+        device=device,
+        epoch=epochs,
+        save_interval=save_interval,
+        save_interval_steps=save_interval_steps,
+        batch_size=batch_size,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        optimizer_info=optimizer_info,
+        early_stopping_info=early_stopping_info,
+        run_dir=run_dir,
+        extra_data=extra_data,
+        validation_interval_steps=validation_interval_steps,
+    )
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Train FragmentTreeTrainingModel.")
+    parser.add_argument(
+        "project_dir",
+        nargs="?",
+        default="data/training/fragment_tree_model",
+        help="Training project directory.",
+    )
+    parser.add_argument(
+        "-project",
+        "--project-dir",
+        dest="project_dir_option",
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "-m",
+        "-model",
+        "--model-config",
+        "--model-config-path",
+        default=None,
+        help=(
+            "Model config path or name under PROJECT/config. "
+            "If omitted, a default fragment_spectrum_generator*.json is used."
+        ),
+    )
+    parser.add_argument(
+        "-t",
+        "-train",
+        "--train-config",
+        "--train-config-path",
+        default=None,
+        help="Train config path or name under PROJECT/config. Defaults to train_config.json.",
+    )
+    parser.add_argument("--root-run-dir", default=None)
+    parser.add_argument("--num-workers", type=int, default=0)
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+    args = parse_args()
+    project_dir = args.project_dir_option or args.project_dir
+    run_training(
+        project_dir=project_dir,
+        model_config_path=args.model_config,
+        train_config_path=args.train_config,
+        root_run_dir=args.root_run_dir,
+        num_workers=args.num_workers,
     )
