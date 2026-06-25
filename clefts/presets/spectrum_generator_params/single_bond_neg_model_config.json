@@ -1,0 +1,94 @@
+{
+  "probability_model_params": {
+    "mol_encoder_params": {
+      "symbols": ["C", "N", "O", "P", "S", "F", "Cl", "Br", "I"],
+      "node_dim": 32,
+      "graph_dim": 128,
+      "num_layers": 4,
+      "num_heads": 8,
+      "max_degree": 4,
+      "max_spatial_dist": 3,
+      "max_edge_dist": 3
+    },
+    "condition_encoder_params": {
+      "adduct_embedding_dim": 16,
+      "ce_feature_dim": 16,
+      "ce_fc_dims": [32],
+      "feature_dim": 64,
+      "fc_dims": [128, 64]
+    },
+    "cleavage_edge_fnet_params": {
+      "feature_dim": 64,
+      "fc_dims": [128, 256, 128],
+      "aggregation_model_params": {
+        "name": "set_transformer",
+        "hidden_dim": 128,
+        "num_layers": 2,
+        "num_heads": 16,
+        "block_type": "sab",
+        "num_inducing_points": 16,
+        "num_seeds": 1,
+        "ffn_mult": 2
+      }
+    },
+    "tree_encoder_params": {
+      "dim": 128,
+      "num_layers": 2,
+      "num_heads": 8,
+      "max_degree": 16
+    },
+    "fragmenter_params": {
+      "fragment_ion_tree_builder": {
+        "max_depth": 3,
+        "cleavage_pattern_set": {
+          "name": "single_bond_cleavage_pattern_set",
+          "patterns": [
+            {
+              "name": "single_bond_cleavage",
+              "reactant_smarts": "[!#1:1]-[!#1:2]",
+              "products": [
+                { "name": "single_bond_cleavage", "smarts": "[!#1:1]" }
+              ]
+            }
+          ]
+        },
+        "fragment_ion_adduct_rule_set": {
+          "name": "",
+          "adduct_rules": [
+            {
+              "name": "neg_H_r1_u2",
+              "adduct_type": "[M-H]-",
+              "radical": true,
+              "unsaturation": 2,
+              "ion_shifts": [
+                { "ion_shift": "[M-H]-", "atoms": ["C", "N", "O", "P", "S"] }
+              ]
+            },
+            {
+              "name": "neg_2M_H_to_M_r1_u2",
+              "adduct_type": "[2M-H]-",
+              "radical": true,
+              "unsaturation": 2,
+              "ion_shifts": [
+                { "ion_shift": "[M-H]-", "atoms": ["C", "N", "O", "P", "S"] },
+                { "ion_shift": "[2M-H]-", "atoms": ["C", "N", "O", "P", "S"] }
+              ]
+            }
+          ]
+        }
+      },
+      "precursor_candidate_max_depth": 1,
+      "mass_tolerance": "0.01Da,10ppm"
+    },
+    "dropout": 0.1
+  },
+  "max_generation_steps": 3,
+  "min_peak_intensity": 1e-3,
+  "include_precursor_peaks": true,
+  "include_fragment_peaks": true,
+  "max_fragment_ion_annotations_per_node": null,
+  "min_fragment_ion_probability": 0.0,
+  "formula_mz_resolver": null,
+  "normalize_intensity": true,
+  "max_peaks_per_sample": null
+}
