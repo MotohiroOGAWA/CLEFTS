@@ -323,45 +323,39 @@ class TestFragmentTreeBuilder(unittest.TestCase):
                         case.expected_min_events,
                     )
 
-    def test_build_respects_max_node_for_all_cases(self) -> None:
+    def test_build_raises_when_max_node_is_exceeded_for_all_cases(self) -> None:
         for question in make_fragment_tree_builder_questions():
             for case in question.cases:
                 with self.subTest(question=question.name, case=case.name):
                     compound = Compound.from_smiles(case.smiles)
 
-                    tree = question.builder.build(
-                        compound,
-                        max_node=1,
-                        max_edge=-1,
-                        print_info=False,
-                    )
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        "Fragment tree node limit exceeded",
+                    ):
+                        question.builder.build(
+                            compound,
+                            max_node=1,
+                            max_edge=-1,
+                            print_info=False,
+                        )
 
-                    self.assertEqual(tree.num_nodes, 1)
-                    self.assertEqual(tree.num_edges, 0)
-                    self.assertEqual(tree.num_events, 0)
-
-                    root_node = tree.get_node(0)
-                    self.assertEqual(root_node.smiles, compound.smiles)
-
-    def test_build_respects_max_edge_for_all_cases(self) -> None:
+    def test_build_raises_when_max_edge_is_exceeded_for_all_cases(self) -> None:
         for question in make_fragment_tree_builder_questions():
             for case in question.cases:
                 with self.subTest(question=question.name, case=case.name):
                     compound = Compound.from_smiles(case.smiles)
 
-                    tree = question.builder.build(
-                        compound,
-                        max_node=-1,
-                        max_edge=0,
-                        print_info=False,
-                    )
-
-                    self.assertEqual(tree.num_nodes, 1)
-                    self.assertEqual(tree.num_edges, 0)
-                    self.assertEqual(tree.num_events, 0)
-
-                    root_node = tree.get_node(0)
-                    self.assertEqual(root_node.smiles, compound.smiles)
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        "Fragment tree edge limit exceeded",
+                    ):
+                        question.builder.build(
+                            compound,
+                            max_node=-1,
+                            max_edge=0,
+                            print_info=False,
+                        )
 
     def test_copy(self) -> None:
         question = make_fragment_tree_builder_questions()[0]

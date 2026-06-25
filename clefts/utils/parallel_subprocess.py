@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sys
 import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Generator, List
@@ -72,12 +73,28 @@ def run_in_subprocess(
             check=True,
         )
     else:
-        subprocess.run(
+        result = subprocess.run(
             commands,
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
         )
+        if result.returncode != 0:
+            print(
+                "Subprocess failed: " + " ".join(commands),
+                file=sys.stderr,
+            )
+            if result.stdout:
+                print(result.stdout, file=sys.stderr, end="")
+            if result.stderr:
+                print(result.stderr, file=sys.stderr, end="")
+            raise subprocess.CalledProcessError(
+                result.returncode,
+                commands,
+                output=result.stdout,
+                stderr=result.stderr,
+            )
 
 
 def run_parallel_subprocesses(

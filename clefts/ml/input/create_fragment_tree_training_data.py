@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import sys
 from pathlib import Path
 from typing import Optional
@@ -72,6 +73,18 @@ def parse_args() -> argparse.Namespace:
         "--device",
         default="cpu",
         help="Torch device for model construction while building structures.",
+    )
+    parser.add_argument(
+        "--max-node",
+        type=int,
+        default=-1,
+        help="Maximum number of nodes when building fragment_ion_tree. Use -1 for no limit.",
+    )
+    parser.add_argument(
+        "--max-edge",
+        type=int,
+        default=-1,
+        help="Maximum number of edges when building fragment_ion_tree. Use -1 for no limit.",
     )
     parser.add_argument(
         "--overwrite",
@@ -217,6 +230,13 @@ def write_assignment_score_tsv(
         desc="Writing assignment score TSV",
         mininterval=1.0,
     ):
+        if not structure_file.exists():
+            print(
+                f"[WARN] Missing structure file while writing assignment scores: {structure_file}",
+                file=sys.stderr,
+            )
+            continue
+
         item = load_fragment_tree_structure_file(structure_file, map_location="cpu")
         structure = item.structure
         record_indexes = [int(index) for index in item.metadata.get("record_indexes", [])]
@@ -306,6 +326,8 @@ def build_structure_files_for_input(
         adduct_type_column=args.adduct_type_column,
         collision_energy_column=args.collision_energy_column,
         instrument_column=args.instrument_column,
+        max_node=args.max_node,
+        max_edge=args.max_edge,
         overwrite=args.overwrite,
         manifest_file=manifest_file,
         valid_record_indexes=valid_record_indexes if save_valid else None,
@@ -394,11 +416,7 @@ def run_parallel_for_input(
     if not chunks:
         raise RuntimeError(f"No SMILES groups were found for {split_name}.")
 
-    temp_root = (
-        Path(args.parallel_temp_dir) / split_name
-        if args.parallel_temp_dir is not None
-        else Path(args.output_dir) / f"_{split_name}_parallel_tmp"
-    )
+    temp_root = parallel_temp_dir(args, Path(args.output_dir), split_name)
     temp_root.mkdir(parents=True, exist_ok=True)
 
     print(
@@ -410,7 +428,7 @@ def run_parallel_for_input(
     part_manifests: list[Path] = []
     part_valid_outputs: list[Path] = []
     part_score_outputs: list[Path] = []
-    script_path = Path(__file__).resolve()
+    module_name = "clefts.ml.input.create_fragment_tree_training_data"
 
     for chunk_index, record_indexes in enumerate(
         tqdm(chunks, desc=f"Preparing {split_name} chunks", mininterval=1.0)
@@ -425,7 +443,8 @@ def run_parallel_for_input(
 
         command = [
             sys.executable,
-            str(script_path),
+            "-m",
+            module_name,
             "--train-input",
             str(temp_input),
             "--output-dir",
@@ -444,6 +463,10 @@ def run_parallel_for_input(
             str(args.collision_energy_column),
             "--device",
             str(args.device),
+            "--max-node",
+            str(args.max_node),
+            "--max-edge",
+            str(args.max_edge),
             "--manifest-file",
             str(temp_manifest),
             "--num-workers",
@@ -454,8 +477,6 @@ def run_parallel_for_input(
         part_score_outputs.append(temp_score)
         if args.instrument_column is not None:
             command.extend(["--instrument-column", str(args.instrument_column)])
-        if args.overwrite:
-            command.append("--overwrite")
         if save_valid:
             command.extend(
                 [
@@ -497,6 +518,22 @@ def default_valid_output(structure_dir: Path) -> Path:
 
 def default_assignment_score_output(structure_dir: Path) -> Path:
     return structure_dir / "assignment_scores.tsv"
+
+
+def parallel_temp_dir(args: argparse.Namespace, output_root: Path, split_name: str) -> Path:
+    if args.parallel_temp_dir is not None:
+        return Path(args.parallel_temp_dir) / split_name
+    return output_root / f"_{split_name}_parallel_tmp"
+
+
+def remove_existing_dirs(directories: list[Path], *, description: str) -> None:
+    for directory in directories:
+        if not directory.exists():
+            continue
+        if not directory.is_dir() or directory.is_symlink():
+            raise NotADirectoryError(f"Expected a {description} directory: {directory}")
+        shutil.rmtree(directory)
+        print(f"removed existing {description} directory: {directory}")
 
 
 def main() -> None:
@@ -547,6 +584,15 @@ def main() -> None:
         if args.validation_assignment_score_output is not None
         else default_assignment_score_output(validation_structure_dir)
     )
+
+    if args.overwrite:
+        structure_dirs = [train_structure_dir]
+        parallel_temp_dirs = [parallel_temp_dir(args, output_root, "train")]
+        if args.validation_input is not None:
+            structure_dirs.append(validation_structure_dir)
+            parallel_temp_dirs.append(parallel_temp_dir(args, output_root, "validation"))
+        remove_existing_dirs(structure_dirs, description="structure")
+        remove_existing_dirs(parallel_temp_dirs, description="parallel temp")
 
     if args.num_workers > 1:
         run_parallel_for_input(
