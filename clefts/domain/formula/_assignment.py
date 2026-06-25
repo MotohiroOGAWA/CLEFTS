@@ -13,6 +13,24 @@ from clefts.domain.mass.tolerance import MassTolerance
 from .utils import assign_formulas_to_peaks
 
 
+def max_neutral_precursor_formula(
+    original_formula: Formula,
+    precursor_formula: Formula,
+) -> Formula:
+    """Element-wise max of the original molecule and precursor formula."""
+
+    original_elements = original_formula.plain.elements
+    precursor_elements = precursor_formula.plain.elements
+    elements = {
+        element: max(
+            int(original_elements.get(element, 0)),
+            int(precursor_elements.get(element, 0)),
+        )
+        for element in set(original_elements) | set(precursor_elements)
+    }
+    return Formula(elements=elements, charge=0)
+
+
 def formula_to_label(formula: Formula) -> str:
     """Return stable formula label."""
 
@@ -68,13 +86,18 @@ def group_record_indexes_by_precursor_formula(
             compound = Compound.from_smiles(smiles)
             adduct_type = Adduct.parse(adduct_type_str)
 
+            original_formula = compound.formula.plain
             precursor_formula = adduct_type.apply_to_formula(compound.formula)
+            grouping_formula = max_neutral_precursor_formula(
+                original_formula=original_formula,
+                precursor_formula=precursor_formula,
+            )
             calculated_precursor_mz = adduct_type.apply_to_mz(
                 compound.formula.exact_mass
             )
 
             if mass_tolerance.within(precursor_mz, calculated_precursor_mz):
-                groups[formula_to_label(precursor_formula)].append(record_index)
+                groups[formula_to_label(grouping_formula)].append(record_index)
                 success_count += 1
             else:
                 message = (
@@ -121,6 +144,7 @@ def assign_record_formulas(
     mass_tolerance: MassTolerance,
     calc_formula_column: str,
     calc_formula_coverage_column: str,
+    original_formula: Optional[Formula] = None,
 ) -> float:
     """Assign formulas to peaks in one spectrum record.
 
@@ -143,6 +167,7 @@ def assign_record_formulas(
         peaks_mz=peaks_mz,
         formula_candidates=list(formula_candidates),
         mass_tolerance=mass_tolerance,
+        original_formula=original_formula,
     )
 
     assigned_formula_texts = [
