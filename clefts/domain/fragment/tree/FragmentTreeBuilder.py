@@ -192,26 +192,51 @@ class FragmentTreeBuilder:
                         reaction_id = cleavage_product.id
 
                         for product_molecule in cleavage_product.product_molecules:
-                            target_exists = state.node_exists(product_molecule.compound.smiles)
+                            target_smiles = product_molecule.compound.smiles
+                            target_exists = state.node_exists(target_smiles)
 
-                            if (
-                                not target_exists
-                                and (
-                                    not state.can_add_node()
-                                    or not state.can_add_edge()
+                            if not target_exists and not state.can_add_node():
+                                raise ValueError(
+                                    "Fragment tree node limit exceeded: "
+                                    f"max_node={max_node}, "
+                                    f"num_nodes={len(state.nodes)}, "
+                                    f"depth={depth}, "
+                                    f"source_smiles={source_smiles}, "
+                                    f"target_smiles={target_smiles}"
                                 )
-                            ):
-                                continue
+
+                            if not target_exists and not state.can_add_edge():
+                                raise ValueError(
+                                    "Fragment tree edge limit exceeded: "
+                                    f"max_edge={max_edge}, "
+                                    f"num_edges={len(state.edges)}, "
+                                    f"depth={depth}, "
+                                    f"source_smiles={source_smiles}, "
+                                    f"target_smiles={target_smiles}"
+                                )
 
                             target_index = state.get_or_create_node_index(
-                                smiles=product_molecule.compound.smiles,
+                                smiles=target_smiles,
                                 depth=depth,
                             )
-                            fragment_compound_by_index[target_index] = product_molecule.compound
-
 
                             if target_index is None:
                                 continue
+
+                            fragment_compound_by_index[target_index] = product_molecule.compound
+
+                            if (
+                                not state.edge_exists(source_index, target_index)
+                                and not state.can_add_edge()
+                            ):
+                                raise ValueError(
+                                    "Fragment tree edge limit exceeded: "
+                                    f"max_edge={max_edge}, "
+                                    f"num_edges={len(state.edges)}, "
+                                    f"depth={depth}, "
+                                    f"source_smiles={source_smiles}, "
+                                    f"target_smiles={target_smiles}"
+                                )
 
                             edge_index = state.add_fragment_edge(
                                 source_index=source_index,
@@ -331,6 +356,9 @@ class _FragmentTreeBuildState:
 
     def can_add_edge(self) -> bool:
         return self.max_edge < 0 or len(self.edges) < self.max_edge
+
+    def edge_exists(self, source_index: int, target_index: int) -> bool:
+        return (source_index, target_index) in self.edges
 
     def node_exists(self, smiles: str) -> bool:
         return smiles in self.smiles_to_node_index

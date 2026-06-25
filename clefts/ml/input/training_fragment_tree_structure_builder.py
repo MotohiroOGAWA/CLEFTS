@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sys
+
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
@@ -189,18 +191,28 @@ class TrainingFragmentTreeStructureBuilder(SingleFragmentTreeStructureBuilder):
                 peak_intensity=[float(peak.intensity) for peak in record.peaks],
             )
 
-            self._add_precursor_pathways_to_sample(
-                sample=sample,
-                precursor_fragment_pathways=precursor_fragment_pathways,
-                adduct_type_index=int(adduct_type_index),
-                fragment_compound_by_smiles=fragment_compound_by_smiles,
-            )
-            self._add_peak_pathways_to_sample(
-                sample=sample,
-                fragment_ion_tree=fragment_ion_tree,
-                fragment_pathways_by_peaks=fragment_pathways_by_peaks,
-                fragment_compound_by_smiles=fragment_compound_by_smiles,
-            )
+            try:
+                self._add_precursor_pathways_to_sample(
+                    sample=sample,
+                    precursor_fragment_pathways=precursor_fragment_pathways,
+                    adduct_type_index=int(adduct_type_index),
+                    fragment_compound_by_smiles=fragment_compound_by_smiles,
+                )
+                self._add_peak_pathways_to_sample(
+                    sample=sample,
+                    fragment_ion_tree=fragment_ion_tree,
+                    fragment_pathways_by_peaks=fragment_pathways_by_peaks,
+                    fragment_compound_by_smiles=fragment_compound_by_smiles,
+                )
+            except Exception as exc:
+                print(
+                    "[WARN] Failed to add training sample "
+                    f"record_index={record_index}, smiles={smiles!r}, "
+                    f"adduct_type={self._model.fragmenter.adduct_types[int(adduct_type_index)]}: {exc}",
+                    file=sys.stderr,
+                )
+                sample_indexes.append(-1)
+                continue
 
             if not (
                 len(sample.precursor_edge_indexes)

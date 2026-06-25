@@ -202,6 +202,8 @@ def build_fragment_tree_structure_files(
     adduct_type_column: str = "AdductType",
     collision_energy_column: str = "CollisionEnergy",
     instrument_column: Optional[str] = None,
+    max_node: int = -1,
+    max_edge: int = -1,
     overwrite: bool = False,
     manifest_file: Optional[str | Path] = None,
     valid_record_indexes: Optional[List[int]] = None,
@@ -265,6 +267,8 @@ def build_fragment_tree_structure_files(
                 collision_energy_column=collision_energy_column,
                 smiles_column=smiles_column,
                 instrument_column=instrument_column,
+                max_node=max_node,
+                max_edge=max_edge,
             )
             valid_sample_count = int((sample_indexes >= 0).sum())
 
@@ -288,13 +292,20 @@ def build_fragment_tree_structure_files(
                 "num_valid_samples": int(structure.num_samples),
                 "num_nodes": int(structure.num_nodes),
                 "num_edges": int(structure.num_edges),
+                "max_node": int(max_node),
+                "max_edge": int(max_edge),
             }
             save_fragment_tree_structure(
                 structure=structure,
                 output_file=structure_file,
                 metadata=metadata,
             )
-            saved_files.append(structure_file)
+            if structure_file.exists():
+                saved_files.append(structure_file)
+            else:
+                raise FileNotFoundError(
+                    f"Structure file was not created: {structure_file}"
+                )
             if valid_record_indexes is not None:
                 for record_index, sample_index in zip(record_indexes, sample_indexes.tolist()):
                     if int(sample_index) >= 0:

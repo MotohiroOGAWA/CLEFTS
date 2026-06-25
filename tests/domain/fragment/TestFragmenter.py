@@ -115,7 +115,7 @@ class TestFragmenter(unittest.TestCase):
                         case.expected_num_edges,
                     )
 
-    def test_build_fragment_tree_respects_max_node_for_all_cases(self) -> None:
+    def test_build_fragment_tree_raises_when_max_node_is_exceeded_for_all_cases(self) -> None:
         for question in make_fragment_tree_builder_questions():
             if question.fragment_ion_adduct_rule_set is None:
                 continue
@@ -127,19 +127,18 @@ class TestFragmenter(unittest.TestCase):
                 with self.subTest(question=question.name, case=case.name):
                     compound = Compound.from_smiles(case.smiles)
 
-                    fragment_tree = fragmenter.build_fragment_tree(
-                        compound,
-                        max_node=1,
-                        max_edge=-1,
-                        print_info=False,
-                    )
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        "Fragment tree node limit exceeded",
+                    ):
+                        fragmenter.build_fragment_tree(
+                            compound,
+                            max_node=1,
+                            max_edge=-1,
+                            print_info=False,
+                        )
 
-                    self.assertEqual(fragment_tree.num_nodes, 1)
-                    self.assertEqual(fragment_tree.num_edges, 0)
-                    self.assertEqual(fragment_tree.num_events, 0)
-                    self.assertEqual(fragment_tree.get_node(0).smiles, compound.smiles)
-
-    def test_build_fragment_tree_respects_max_edge_for_all_cases(self) -> None:
+    def test_build_fragment_tree_raises_when_max_edge_is_exceeded_for_all_cases(self) -> None:
         for question in make_fragment_tree_builder_questions():
             if question.fragment_ion_adduct_rule_set is None:
                 continue
@@ -151,19 +150,18 @@ class TestFragmenter(unittest.TestCase):
                 with self.subTest(question=question.name, case=case.name):
                     compound = Compound.from_smiles(case.smiles)
 
-                    fragment_tree = fragmenter.build_fragment_tree(
-                        compound,
-                        max_node=-1,
-                        max_edge=0,
-                        print_info=False,
-                    )
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        "Fragment tree edge limit exceeded",
+                    ):
+                        fragmenter.build_fragment_tree(
+                            compound,
+                            max_node=-1,
+                            max_edge=0,
+                            print_info=False,
+                        )
 
-                    self.assertEqual(fragment_tree.num_nodes, 1)
-                    self.assertEqual(fragment_tree.num_edges, 0)
-                    self.assertEqual(fragment_tree.num_events, 0)
-                    self.assertEqual(fragment_tree.get_node(0).smiles, compound.smiles)
-
-    def test_build_fragment_ion_tree_respects_max_node_for_all_cases(self) -> None:
+    def test_build_fragment_ion_tree_raises_when_max_node_is_exceeded_for_all_cases(self) -> None:
         for question in make_fragment_tree_builder_questions():
             if question.fragment_ion_adduct_rule_set is None:
                 continue
@@ -175,18 +173,18 @@ class TestFragmenter(unittest.TestCase):
                 with self.subTest(question=question.name, case=case.name):
                     compound = Compound.from_smiles(case.smiles)
 
-                    fragment_ion_tree = fragmenter.build_fragment_ion_tree(
-                        compound,
-                        max_node=1,
-                        max_edge=-1,
-                        print_info=False,
-                    )
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        "Fragment tree node limit exceeded",
+                    ):
+                        fragmenter.build_fragment_ion_tree(
+                            compound,
+                            max_node=1,
+                            max_edge=-1,
+                            print_info=False,
+                        )
 
-                    self.assertEqual(fragment_ion_tree.num_nodes, 1)
-                    self.assertEqual(fragment_ion_tree.num_edges, 0)
-                    self.assertEqual(fragment_ion_tree.get_node(0).smiles, compound.smiles)
-
-    def test_build_fragment_ion_tree_respects_max_edge_for_all_cases(self) -> None:
+    def test_build_fragment_ion_tree_raises_when_max_edge_is_exceeded_for_all_cases(self) -> None:
         for question in make_fragment_tree_builder_questions():
             if question.fragment_ion_adduct_rule_set is None:
                 continue
@@ -198,16 +196,16 @@ class TestFragmenter(unittest.TestCase):
                 with self.subTest(question=question.name, case=case.name):
                     compound = Compound.from_smiles(case.smiles)
 
-                    fragment_ion_tree = fragmenter.build_fragment_ion_tree(
-                        compound,
-                        max_node=-1,
-                        max_edge=0,
-                        print_info=False,
-                    )
-
-                    self.assertEqual(fragment_ion_tree.num_nodes, 1)
-                    self.assertEqual(fragment_ion_tree.num_edges, 0)
-                    self.assertEqual(fragment_ion_tree.get_node(0).smiles, compound.smiles)
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        "Fragment tree edge limit exceeded",
+                    ):
+                        fragmenter.build_fragment_ion_tree(
+                            compound,
+                            max_node=-1,
+                            max_edge=0,
+                            print_info=False,
+                        )
 
     def test_to_dict(self) -> None:
         for question in make_fragment_tree_builder_questions():
