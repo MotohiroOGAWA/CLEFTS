@@ -4,6 +4,7 @@ import argparse
 import json
 import shutil
 import math
+import traceback
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -410,92 +411,103 @@ def run_epoch(
     iterator = tqdm(loader, desc=desc)
 
     for batch in iterator:
-        structure = batch["structure"].to(device)
-        num_samples = int(structure.num_samples)
-        sample_weight = max(num_samples, 1)
+        try:
+            structure = batch["structure"].to(device)
+            num_samples = int(structure.num_samples)
+            sample_weight = max(num_samples, 1)
 
-        with torch.set_grad_enabled(is_train):
-            output = model(structure)
-            loss = output["loss"]
+            with torch.set_grad_enabled(is_train):
+                output = model(structure)
+                loss = output["loss"]
 
-            if is_train:
+                if is_train:
+                    optimizer.zero_grad(set_to_none=True)
+                    loss.backward()
+                    if grad_clip_norm is not None and grad_clip_norm > 0:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+                    optimizer.step()
+
+            step_count += 1
+            selection_loss = output.get("selection_loss")
+            intensity_loss = output.get("intensity_loss")
+            loss_value = float(loss.detach().cpu().item())
+            selection_loss_value = (
+                float(selection_loss.detach().cpu().item())
+                if selection_loss is not None
+                else float("nan")
+            )
+            intensity_loss_value = (
+                float(intensity_loss.detach().cpu().item())
+                if intensity_loss is not None
+                else float("nan")
+            )
+
+            total_loss += loss_value * sample_weight
+            window_loss += loss_value * sample_weight
+            if not math.isnan(selection_loss_value):
+                total_selection_loss += selection_loss_value * sample_weight
+                total_selection_samples += sample_weight
+                window_selection_loss += selection_loss_value * sample_weight
+                window_selection_samples += sample_weight
+            if not math.isnan(intensity_loss_value):
+                total_intensity_loss += intensity_loss_value * sample_weight
+                total_intensity_samples += sample_weight
+                window_intensity_loss += intensity_loss_value * sample_weight
+                window_intensity_samples += sample_weight
+            total_samples += sample_weight
+            window_samples += sample_weight
+
+            cumulative_metrics = make_loss_metrics(
+                total_loss=total_loss,
+                total_selection_loss=total_selection_loss,
+                total_intensity_loss=total_intensity_loss,
+                total_samples=total_samples,
+                total_selection_samples=total_selection_samples,
+                total_intensity_samples=total_intensity_samples,
+                steps=step_count,
+            )
+            window_metrics = make_loss_metrics(
+                total_loss=window_loss,
+                total_selection_loss=window_selection_loss,
+                total_intensity_loss=window_intensity_loss,
+                total_samples=window_samples,
+                total_selection_samples=window_selection_samples,
+                total_intensity_samples=window_intensity_samples,
+                steps=step_count,
+            )
+            iterator.set_postfix(
+                loss=cumulative_metrics.loss,
+                selection_loss=cumulative_metrics.selection_loss,
+                intensity_loss=cumulative_metrics.intensity_loss,
+                window_loss=window_metrics.loss,
+            )
+
+            global_step = int(start_global_step) + step_count
+            if (
+                is_train
+                and validation_interval_steps is not None
+                and validation_interval_steps > 0
+                and on_validation_step is not None
+                and global_step % validation_interval_steps == 0
+            ):
+                on_validation_step(global_step, cumulative_metrics, window_metrics)
+                model.train(is_train)
+                window_loss = 0.0
+                window_selection_loss = 0.0
+                window_intensity_loss = 0.0
+                window_samples = 0
+                window_selection_samples = 0
+                window_intensity_samples = 0
+        except Exception as exc:
+            if is_train and optimizer is not None:
                 optimizer.zero_grad(set_to_none=True)
-                loss.backward()
-                if grad_clip_norm is not None and grad_clip_norm > 0:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
-                optimizer.step()
-
-        step_count += 1
-        selection_loss = output.get("selection_loss")
-        intensity_loss = output.get("intensity_loss")
-        loss_value = float(loss.detach().cpu().item())
-        selection_loss_value = (
-            float(selection_loss.detach().cpu().item())
-            if selection_loss is not None
-            else float("nan")
-        )
-        intensity_loss_value = (
-            float(intensity_loss.detach().cpu().item())
-            if intensity_loss is not None
-            else float("nan")
-        )
-
-        total_loss += loss_value * sample_weight
-        window_loss += loss_value * sample_weight
-        if not math.isnan(selection_loss_value):
-            total_selection_loss += selection_loss_value * sample_weight
-            total_selection_samples += sample_weight
-            window_selection_loss += selection_loss_value * sample_weight
-            window_selection_samples += sample_weight
-        if not math.isnan(intensity_loss_value):
-            total_intensity_loss += intensity_loss_value * sample_weight
-            total_intensity_samples += sample_weight
-            window_intensity_loss += intensity_loss_value * sample_weight
-            window_intensity_samples += sample_weight
-        total_samples += sample_weight
-        window_samples += sample_weight
-
-        cumulative_metrics = make_loss_metrics(
-            total_loss=total_loss,
-            total_selection_loss=total_selection_loss,
-            total_intensity_loss=total_intensity_loss,
-            total_samples=total_samples,
-            total_selection_samples=total_selection_samples,
-            total_intensity_samples=total_intensity_samples,
-            steps=step_count,
-        )
-        window_metrics = make_loss_metrics(
-            total_loss=window_loss,
-            total_selection_loss=window_selection_loss,
-            total_intensity_loss=window_intensity_loss,
-            total_samples=window_samples,
-            total_selection_samples=window_selection_samples,
-            total_intensity_samples=window_intensity_samples,
-            steps=step_count,
-        )
-        iterator.set_postfix(
-            loss=cumulative_metrics.loss,
-            selection_loss=cumulative_metrics.selection_loss,
-            intensity_loss=cumulative_metrics.intensity_loss,
-            window_loss=window_metrics.loss,
-        )
-
-        global_step = int(start_global_step) + step_count
-        if (
-            is_train
-            and validation_interval_steps is not None
-            and validation_interval_steps > 0
-            and on_validation_step is not None
-            and global_step % validation_interval_steps == 0
-        ):
-            on_validation_step(global_step, cumulative_metrics, window_metrics)
-            model.train(is_train)
-            window_loss = 0.0
-            window_selection_loss = 0.0
-            window_intensity_loss = 0.0
-            window_samples = 0
-            window_selection_samples = 0
-            window_intensity_samples = 0
+            # print(
+            #     "[WARN] Skipping failed batch "
+            #     f"in {desc} at attempted_step={int(start_global_step) + step_count + 1}: "
+            #     f"{type(exc).__name__}: {exc}"
+            # )
+            # traceback.print_exc()
+            continue
 
     return make_loss_metrics(
         total_loss=total_loss,
