@@ -42,9 +42,16 @@ class FragmentTreeTrainCommand(CLICommand):
             default=None,
             help="Checkpoint id to resume from. Default: null/new run.",
         )
-        parser.add_argument("--batch-size", type=int, default=1)
-        parser.add_argument("--device", default="cpu")
-        parser.add_argument("--epoch", "--epochs", dest="epoch", type=int, default=10)
+        parser.add_argument("--batch-size", type=int, default=1, help="default: %(default)s")
+        parser.add_argument("--device", default="cpu", help="default: %(default)s")
+        parser.add_argument(
+            "--epoch",
+            "--epochs",
+            dest="epoch",
+            type=int,
+            default=10,
+            help="default: %(default)s",
+        )
         parser.add_argument(
             "--validation-interval-steps",
             type=int,

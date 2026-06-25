@@ -59,10 +59,6 @@ METRIC_COLUMNS = (
 
 
 DEFAULT_TRAIN_CONFIG_NAME = "train_config.json"
-DEFAULT_MODEL_CONFIG_NAMES = (
-    "fragment_spectrum_generator_param.json",
-    "fragment_spectrum_generator_pos_param.json",
-)
 DEFAULT_EXPERIMENT_NAME = "exp_main"
 DEFAULT_OPTIMIZER_INFO = {
     "name": "AdamW",
@@ -1298,12 +1294,15 @@ def resolve_train_config_path(
 
 def resolve_model_config_path(
     project_dir: str | Path,
-    model_config_path: Optional[str | Path] = None,
+    model_config_path: str | Path,
 ) -> Path:
+    if model_config_path is None or str(model_config_path) == "":
+        raise ValueError("model_config_path is required.")
+
     return resolve_config_path(
         project_dir,
         model_config_path,
-        default_names=DEFAULT_MODEL_CONFIG_NAMES,
+        default_names=(),
         label="model",
     )
 
@@ -1311,7 +1310,7 @@ def resolve_model_config_path(
 def run_training_from_config(
     *,
     project_dir: str | Path,
-    model_config_path: Optional[str | Path] = None,
+    model_config_path: str | Path,
     train_config: Dict[str, Any],
 ) -> None:
     model_config_resolved = resolve_model_config_path(
@@ -1368,7 +1367,7 @@ def run_training_from_config(
 def run_training(
     *,
     project_dir: str | Path,
-    model_config_path: Optional[str | Path] = None,
+    model_config_path: str | Path,
     train_config_path: Optional[str | Path] = None,
     root_run_dir: Optional[str | Path] = None,
     num_workers: int = 0,
@@ -1448,11 +1447,8 @@ def parse_args() -> argparse.Namespace:
         "-model",
         "--model-config",
         "--model-config-path",
-        default=None,
-        help=(
-            "Model config path or name under PROJECT/config. "
-            "If omitted, a default fragment_spectrum_generator*.json is used."
-        ),
+        required=True,
+        help="Model config path or name under PROJECT/config.",
     )
     parser.add_argument(
         "-t",
