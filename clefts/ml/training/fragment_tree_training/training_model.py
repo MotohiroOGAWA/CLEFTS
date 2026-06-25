@@ -59,6 +59,7 @@ METRIC_COLUMNS = (
 
 
 DEFAULT_TRAIN_CONFIG_NAME = "train_config.json"
+DEFAULT_PROJECT_MODEL_CONFIG_NAME = "model_config.json"
 DEFAULT_EXPERIMENT_NAME = "exp_main"
 DEFAULT_OPTIMIZER_INFO = {
     "name": "AdamW",
@@ -259,10 +260,10 @@ def normalize_train_config(
         config.get("val_structure_dir"),
     )
     config["training_structure_dir"] = str(
-        training_structure_dir or project_path / "train_structures"
+        training_structure_dir or project_path / "train_structures" / "data"
     )
     config["validation_structure_dir"] = str(
-        validation_structure_dir or project_path / "validation_structures"
+        validation_structure_dir or project_path / "validation_structures" / "data"
     )
 
     validation_valid_records_file = config.get(
@@ -1294,10 +1295,10 @@ def resolve_train_config_path(
 
 def resolve_model_config_path(
     project_dir: str | Path,
-    model_config_path: str | Path,
+    model_config_path: Optional[str | Path] = None,
 ) -> Path:
     if model_config_path is None or str(model_config_path) == "":
-        raise ValueError("model_config_path is required.")
+        return Path(project_dir) / "config" / DEFAULT_PROJECT_MODEL_CONFIG_NAME
 
     return resolve_config_path(
         project_dir,
@@ -1310,7 +1311,7 @@ def resolve_model_config_path(
 def run_training_from_config(
     *,
     project_dir: str | Path,
-    model_config_path: str | Path,
+    model_config_path: Optional[str | Path] = None,
     train_config: Dict[str, Any],
 ) -> None:
     model_config_resolved = resolve_model_config_path(
@@ -1367,7 +1368,7 @@ def run_training_from_config(
 def run_training(
     *,
     project_dir: str | Path,
-    model_config_path: str | Path,
+    model_config_path: Optional[str | Path] = None,
     train_config_path: Optional[str | Path] = None,
     root_run_dir: Optional[str | Path] = None,
     num_workers: int = 0,
@@ -1447,8 +1448,8 @@ def parse_args() -> argparse.Namespace:
         "-model",
         "--model-config",
         "--model-config-path",
-        required=True,
-        help="Model config path or name under PROJECT/config.",
+        default=None,
+        help="Model config path or name under PROJECT/config. Defaults to PROJECT/config/model_config.json.",
     )
     parser.add_argument(
         "-t",

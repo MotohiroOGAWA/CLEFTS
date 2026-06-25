@@ -16,6 +16,8 @@ from clefts.libs.msentity.msentity import MSDataset
 from clefts.utils.parallel_subprocess import run_parallel_subprocesses
 
 ORIGINAL_INDEX_COLUMN = "__fragment_tree_original_index"
+STRUCTURE_DATA_DIR_NAME = "data"
+DEFAULT_PROJECT_MODEL_CONFIG_NAME = "model_config.json"
 
 try:
     from .fragment_tree_training_data import (
@@ -33,7 +35,7 @@ except ImportError:
     from clefts.ml.specgen.fragment_tree_spectrum_predictor import FragmentSpectrumGenerator
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Build training FragmentTreeStructure files from an MSDataset. "
@@ -54,15 +56,28 @@ def parse_args() -> argparse.Namespace:
         "--output-dir",
         default="data/test/fragment_tree_training_structures",
         help=(
-            "Output root directory. Training files are written under "
-            "train_structures, and validation files under validation_structures "
-            "when --validation-input is provided."
+            "Output root directory. Structure .pt files are written under "
+            "train_structures/data, and validation .pt files under "
+            "validation_structures/data when --validation-input is provided."
         ),
     )
     parser.add_argument(
         "--params",
         default="clefts/ml/specgen/presets/fragment_spectrum_generator_param.json",
         help="FragmentSpectrumGenerator parameter JSON used to construct the feature model.",
+    )
+    parser.add_argument(
+        "--model-config-output",
+        default=None,
+        help=(
+            "Path to copy the model config after the model is constructed. "
+            "Defaults to OUTPUT_DIR/config/model_config.json."
+        ),
+    )
+    parser.add_argument(
+        "--overwrite-model-config",
+        action="store_true",
+        help="Overwrite an existing copied model config without prompting.",
     )
     parser.add_argument("--smiles-column", default="SMILES")
     parser.add_argument("--precursor-mz-column", default="PrecursorMZ")
@@ -170,7 +185,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help=argparse.SUPPRESS,
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def load_generator(params_path: str, device: torch.device) -> FragmentSpectrumGenerator:
@@ -179,6 +194,34 @@ def load_generator(params_path: str, device: torch.device) -> FragmentSpectrumGe
     generator = FragmentSpectrumGenerator(**params).to(device)
     generator.eval()
     return generator
+
+
+def default_model_config_output(output_root: str | Path) -> Path:
+    return Path(output_root) / "config" / DEFAULT_PROJECT_MODEL_CONFIG_NAME
+
+
+def copy_model_config_after_model_creation(
+    *,
+    source_file: str | Path,
+    output_file: str | Path,
+    overwrite: bool = False,
+) -> None:
+    source_path = Path(source_file)
+    output_path = Path(output_file)
+
+    if output_path.exists() and not overwrite:
+        answer = input(f"Model config already exists: {output_path}. Overwrite? [y/N] ")
+        if answer.strip().lower() not in {"y", "yes"}:
+            print(f"kept existing model config: {output_path}")
+            return
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy(source_path, output_path)
+    print(f"copied model config: {source_path} -> {output_path}")
+
+
+def structure_data_dir(structure_dir: str | Path) -> Path:
+    return Path(structure_dir) / STRUCTURE_DATA_DIR_NAME
 
 
 def save_valid_records(
@@ -536,8 +579,9 @@ def remove_existing_dirs(directories: list[Path], *, description: str) -> None:
         print(f"removed existing {description} directory: {directory}")
 
 
-def main() -> None:
-    args = parse_args()
+def main(args: Optional[argparse.Namespace] = None) -> None:
+    if args is None:
+        args = parse_args()
 
     device = torch.device(args.device)
     generator = None
@@ -559,6 +603,8 @@ def main() -> None:
 
     train_structure_dir = output_root / "train_structures"
     validation_structure_dir = output_root / "validation_structures"
+    train_structure_data_dir = structure_data_dir(train_structure_dir)
+    validation_structure_data_dir = structure_data_dir(validation_structure_dir)
     train_manifest_file = (
         Path(args.manifest_file)
         if args.manifest_file is not None
@@ -594,10 +640,22 @@ def main() -> None:
         remove_existing_dirs(structure_dirs, description="structure")
         remove_existing_dirs(parallel_temp_dirs, description="parallel temp")
 
+    generator = load_generator(args.params, device=device)
+    model_config_output = (
+        Path(args.model_config_output)
+        if args.model_config_output is not None
+        else default_model_config_output(output_root)
+    )
+    copy_model_config_after_model_creation(
+        source_file=args.params,
+        output_file=model_config_output,
+        overwrite=bool(args.overwrite_model_config),
+    )
+
     if args.num_workers > 1:
         run_parallel_for_input(
             input_path=args.train_input,
-            structure_output_dir=train_structure_dir,
+            structure_output_dir=train_structure_data_dir,
             args=args,
             manifest_file=train_manifest_file,
             save_valid=bool(args.save_train_valid_records),
@@ -608,7 +666,7 @@ def main() -> None:
         if args.validation_input is not None:
             run_parallel_for_input(
                 input_path=args.validation_input,
-                structure_output_dir=validation_structure_dir,
+                structure_output_dir=validation_structure_data_dir,
                 args=args,
                 manifest_file=validation_structure_dir / "manifest.tsv",
                 save_valid=bool(args.save_validation_valid_records),
@@ -618,10 +676,9 @@ def main() -> None:
             )
         return
 
-    generator = load_generator(args.params, device=device)
     build_structure_files_for_input(
         input_path=args.train_input,
-        output_dir=train_structure_dir,
+        output_dir=train_structure_data_dir,
         args=args,
         generator=generator,
         manifest_file=train_manifest_file,
@@ -633,10 +690,10 @@ def main() -> None:
     if args.validation_input is not None:
         build_structure_files_for_input(
             input_path=args.validation_input,
-            output_dir=validation_structure_dir,
+            output_dir=validation_structure_data_dir,
             args=args,
             generator=generator,
-            manifest_file=None,
+            manifest_file=validation_structure_dir / "manifest.tsv",
             save_valid=bool(args.save_validation_valid_records),
             valid_records_output=validation_valid_output,
             assignment_score_output=validation_assignment_score_output,

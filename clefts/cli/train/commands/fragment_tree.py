@@ -18,19 +18,17 @@ class FragmentTreeTrainCommand(CLICommand):
     order = 10
 
     def configure(self, parser: argparse.ArgumentParser) -> None:
-        parser.usage = "%(prog)s PROJECT_DIR MODEL_CONFIG [options]"
+        parser.usage = "%(prog)s PROJECT_DIR [options]"
         parser.add_argument(
             "project_dir",
             metavar="PROJECT_DIR",
             help="Training project directory, e.g. data/training/project_single_bond_pos.",
         )
         parser.add_argument(
-            "model_config",
-            metavar="MODEL_CONFIG",
-            help=(
-                "Model config path or name under PROJECT_DIR/config, "
-                "e.g. fragment_spectrum_generator_pos_param."
-            ),
+            "-m",
+            "--model-config",
+            default=None,
+            help="Model config path or name under PROJECT_DIR/config. Defaults to PROJECT_DIR/config/model_config.json.",
         )
         parser.add_argument(
             "--experiment-name",
@@ -77,12 +75,12 @@ class FragmentTreeTrainCommand(CLICommand):
         parser.add_argument(
             "--training-structure-dir",
             default=None,
-            help="Training structure directory. Defaults to PROJECT_DIR/train_structures.",
+            help="Training structure directory. Defaults to PROJECT_DIR/train_structures/data.",
         )
         parser.add_argument(
             "--validation-structure-dir",
             default=None,
-            help="Validation structure directory. Defaults to PROJECT_DIR/validation_structures.",
+            help="Validation structure directory. Defaults to PROJECT_DIR/validation_structures/data.",
         )
 
     def run(self, args: argparse.Namespace) -> None:
