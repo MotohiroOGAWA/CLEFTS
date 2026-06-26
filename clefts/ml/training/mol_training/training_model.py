@@ -1,9 +1,11 @@
+#!/usr/bin/env python
 from __future__ import annotations
 
 import argparse
 import csv
 import itertools
 import json
+import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, List, Sequence, Tuple
@@ -11,17 +13,36 @@ from typing import Dict, List, Sequence, Tuple
 import torch
 from tqdm import tqdm
 
-from ....libs.mmkit.mmkit import Compound
-from ...mol.mol_encoder import MolEncoder
-from .dataset import (
-    DEFAULT_DESCRIPTOR_NAMES,
-    DEFAULT_SMILES_COLUMN,
-    DescriptorNormalizer,
-    MolPretrainingDataset,
-    load_smiles_from_msds,
-)
-from .pretraining_model import MolPretrainingModel
-from .trainer import make_loader, save_checkpoint, train_epochs
+if __package__ in {None, ""}:
+    app_root = Path(__file__).resolve().parents[4]
+    if str(app_root) not in sys.path:
+        sys.path.insert(0, str(app_root))
+
+    from clefts.libs.mmkit.mmkit import Compound
+    from clefts.ml.mol.mol_encoder import MolEncoder
+    from clefts.ml.training.mol_training.dataset import (
+        DEFAULT_DESCRIPTOR_NAMES,
+        DEFAULT_SMILES_COLUMN,
+        DescriptorNormalizer,
+        MolPretrainingDataset,
+        load_smiles_from_msds,
+    )
+    from clefts.ml.training.mol_training.feature_schema import atom_feature_groups, bond_feature_groups
+    from clefts.ml.training.mol_training.pretraining_model import MolPretrainingModel
+    from clefts.ml.training.mol_training.trainer import make_loader, save_checkpoint, train_epochs
+else:
+    from ....libs.mmkit.mmkit import Compound
+    from ...mol.mol_encoder import MolEncoder
+    from .dataset import (
+        DEFAULT_DESCRIPTOR_NAMES,
+        DEFAULT_SMILES_COLUMN,
+        DescriptorNormalizer,
+        MolPretrainingDataset,
+        load_smiles_from_msds,
+    )
+    from .feature_schema import atom_feature_groups, bond_feature_groups
+    from .pretraining_model import MolPretrainingModel
+    from .trainer import make_loader, save_checkpoint, train_epochs
 
 
 @dataclass(frozen=True)
@@ -217,6 +238,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--node-mask-ratio", type=float, default=0.15)
     parser.add_argument("--edge-mask-ratio", type=float, default=0.15)
+    parser.add_argument("--disable-balanced-attribute-masking", action="store_true")
+    parser.add_argument("--mask-balance-patience", type=int, default=20)
+    parser.add_argument("--mask-balance-max-forced-per-batch", type=int, default=8)
+    parser.add_argument("--disable-balanced-validation-masks", action="store_true")
+    parser.add_argument("--min-validation-target-count", type=int, default=1)
 
     parser.add_argument("--disable-node-attribute", action="store_true")
     parser.add_argument("--disable-node-context", action="store_true")
@@ -309,6 +335,10 @@ def make_pretraining_model(
         graph_contrastive_node_mask_ratio=args.graph_contrastive_node_mask_ratio,
         graph_contrastive_edge_drop_ratio=args.graph_contrastive_edge_drop_ratio,
         graph_contrastive_temperature=args.graph_contrastive_temperature,
+        balanced_attribute_masking=not args.disable_balanced_attribute_masking,
+        mask_balance_patience=args.mask_balance_patience,
+        mask_balance_max_forced_per_batch=args.mask_balance_max_forced_per_batch,
+        balanced_validation_masks=not args.disable_balanced_validation_masks,
     )
 
 
@@ -325,6 +355,51 @@ def write_summary_table(rows: List[Dict[str, object]], path: Path) -> None:
         writer = csv.DictWriter(f, fieldnames=keys)
         writer.writeheader()
         writer.writerows(rows)
+
+
+def write_feature_target_summary(
+    *,
+    train_dataset: MolPretrainingDataset,
+    val_dataset: MolPretrainingDataset,
+    symbols: Sequence[str],
+    output_dir: Path,
+    min_validation_target_count: int,
+) -> Dict[str, object]:
+    atom_groups = atom_feature_groups(symbols)
+    bond_groups = bond_feature_groups()
+    summary: Dict[str, object] = {
+        "train_node": train_dataset.feature_target_counts("x", atom_groups),
+        "val_node": val_dataset.feature_target_counts("x", atom_groups),
+        "train_edge": train_dataset.feature_target_counts("edge_attr", bond_groups),
+        "val_edge": val_dataset.feature_target_counts("edge_attr", bond_groups),
+        "min_validation_target_count": int(min_validation_target_count),
+        "validation_warnings": [],
+    }
+
+    warnings = []
+    for level in ("node", "edge"):
+        counts_by_group = summary[f"val_{level}"]
+        for group_name, counts in counts_by_group.items():
+            for label, count in counts.items():
+                if int(count) < int(min_validation_target_count):
+                    warnings.append(
+                        {
+                            "level": level,
+                            "group": group_name,
+                            "label": label,
+                            "count": int(count),
+                        }
+                    )
+    summary["validation_warnings"] = warnings
+    with open(output_dir / "feature_target_summary.json", "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
+    if warnings:
+        print(
+            "Validation target warning: "
+            f"{len(warnings)} node/edge classes have fewer than "
+            f"{min_validation_target_count} targets. See feature_target_summary.json."
+        )
+    return summary
 
 
 def run_pretraining_stage(
@@ -417,6 +492,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         descriptor_normalizer=normalizer,
         progress_desc="Building validation dataset",
     )
+    feature_target_summary = write_feature_target_summary(
+        train_dataset=train_dataset,
+        val_dataset=val_dataset,
+        symbols=symbols,
+        output_dir=output_dir,
+        min_validation_target_count=args.min_validation_target_count,
+    )
 
     config_record = {
         "args": vars(args),
@@ -428,6 +510,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "num_train_molecules": len(train_dataset),
         "num_val_molecules": len(val_dataset),
         "smiles_split_summary": smiles_split_summary,
+        "feature_target_summary": feature_target_summary,
     }
     with open(output_dir / "pretraining_config.json", "w", encoding="utf-8") as f:
         json.dump(config_record, f, indent=2)

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import torch
 from rdkit import Chem
@@ -125,6 +125,27 @@ class MolPretrainingDataset(Dataset):
 
     def descriptor_matrix(self) -> torch.Tensor:
         return torch.stack([data.descriptors for data in self.items], dim=0)
+
+    def feature_target_counts(self, attr_name: str, groups) -> Dict[str, Dict[str, int]]:
+        counts: Dict[str, Dict[str, int]] = {}
+        for group in groups:
+            counts[group.name] = {label: 0 for label in group.labels}
+
+        for data in self.items:
+            features = getattr(data, attr_name)
+            if features.numel() == 0:
+                continue
+            if features.dim() == 1:
+                features = features.view(1, -1)
+            for group in groups:
+                target_slice = features[:, group.start : group.stop]
+                valid = target_slice.sum(dim=-1) > 0
+                if not bool(valid.any()):
+                    continue
+                target = target_slice[valid].argmax(dim=-1)
+                for class_idx, label in enumerate(group.labels):
+                    counts[group.name][label] += int((target == class_idx).sum().item())
+        return counts
 
 
 def collate_mol_graphs(items: Sequence[Data]) -> Batch:

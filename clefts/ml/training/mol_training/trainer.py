@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import re
 from pathlib import Path
 from typing import Dict, Iterable, Optional
 
@@ -31,9 +32,95 @@ def mean_metrics(rows: Iterable[Dict[str, float]]) -> Dict[str, float]:
     keys = sorted({key for row in rows for key in row.keys()})
     out = {}
     for key in keys:
-        vals = [row[key] for row in rows if key in row]
+        vals = [float(row[key]) for row in rows if key in row]
+        if key.endswith("_count"):
+            out[key] = float(sum(vals))
+            continue
+        count_key = key[:-4] + "_count" if key.endswith("_acc") else None
+        if count_key and any(count_key in row for row in rows):
+            weighted_sum = 0.0
+            total_count = 0.0
+            for row in rows:
+                if key not in row or count_key not in row:
+                    continue
+                count = float(row[count_key])
+                weighted_sum += float(row[key]) * count
+                total_count += count
+            if total_count > 0.0:
+                out[key] = weighted_sum / total_count
+                continue
         out[key] = float(sum(vals) / max(len(vals), 1))
     return out
+
+
+FEATURE_GROUP_PATTERN = "symbol|charge|ring_type|hybridization|num_hydrogens|valence_electrons|bond_type"
+CLASS_METRIC_RE = re.compile(rf"^(node|edge)_({FEATURE_GROUP_PATTERN})_(.+)_(acc|count)$")
+GROUP_METRIC_RE = re.compile(rf"^(node|edge)_({FEATURE_GROUP_PATTERN})_(.+)$")
+DESCRIPTOR_ITEM_LOSS_RE = re.compile(r"^descriptor_(.+)_loss$")
+FEATURE_DISPLAY_NAMES = {
+    "symbol": "element",
+    "charge": "charge",
+    "ring_type": "ring_type",
+    "hybridization": "hybridization",
+    "num_hydrogens": "hydrogen_count",
+    "valence_electrons": "valence_electrons",
+    "bond_type": "bond_type",
+}
+
+
+def tensorboard_metric_tag(name: str) -> str:
+    match = GROUP_METRIC_RE.match(name)
+    if not match:
+        return name
+    prefix, group_name, metric_name = match.groups()
+    return f"{prefix}/{FEATURE_DISPLAY_NAMES.get(group_name, group_name)}_{metric_name}"
+
+
+def should_skip_metric_pair(name: str) -> bool:
+    descriptor_match = DESCRIPTOR_ITEM_LOSS_RE.match(name)
+    if descriptor_match and descriptor_match.group(1) != "":
+        return name != "descriptor_loss"
+    return CLASS_METRIC_RE.match(name) is not None
+
+
+def write_tensorboard_grouped_class_metrics(
+    writer: SummaryWriter,
+    *,
+    train_metrics: Dict[str, float],
+    val_metrics: Dict[str, float],
+    epoch: int,
+) -> None:
+    grouped: Dict[str, Dict[str, float]] = {}
+    for split, metrics in (("train", train_metrics), ("val", val_metrics)):
+        for name, value in metrics.items():
+            match = CLASS_METRIC_RE.match(name)
+            if not match:
+                continue
+            prefix, group_name, label, metric_name = match.groups()
+            display_name = FEATURE_DISPLAY_NAMES.get(group_name, group_name)
+            tag = f"{prefix}/{display_name}_{metric_name}_by_class"
+            grouped.setdefault(tag, {})[f"{split}/{label}"] = float(value)
+    for tag, values in grouped.items():
+        if values:
+            writer.add_scalars(tag, values, epoch)
+
+
+def write_tensorboard_grouped_descriptor_losses(
+    writer: SummaryWriter,
+    *,
+    train_metrics: Dict[str, float],
+    val_metrics: Dict[str, float],
+    epoch: int,
+) -> None:
+    values = {}
+    for split, metrics in (("train", train_metrics), ("val", val_metrics)):
+        for name, value in metrics.items():
+            match = DESCRIPTOR_ITEM_LOSS_RE.match(name)
+            if not match or name == "descriptor_loss":
+                continue
+            values[f"{split}/{match.group(1)}"] = float(value)
+    if values:
+        writer.add_scalars("descriptor/loss_by_target", values, epoch)
 
 
 def write_tensorboard_metric_pairs(
@@ -44,12 +131,14 @@ def write_tensorboard_metric_pairs(
     epoch: int,
 ) -> None:
     for name in sorted(set(train_metrics) | set(val_metrics)):
+        if should_skip_metric_pair(name):
+            continue
         values = {}
         if name in train_metrics:
             values["train"] = float(train_metrics[name])
         if name in val_metrics:
             values["val"] = float(val_metrics[name])
-        writer.add_scalars(name, values, epoch)
+        writer.add_scalars(tensorboard_metric_tag(name), values, epoch)
 
 
 def write_tensorboard_command(log_dir: Path) -> None:
@@ -143,6 +232,18 @@ def train_epochs(
             writer.writerow(record)
             f.flush()
             write_tensorboard_metric_pairs(
+                tb_writer,
+                train_metrics=train_metrics,
+                val_metrics=val_metrics,
+                epoch=epoch,
+            )
+            write_tensorboard_grouped_class_metrics(
+                tb_writer,
+                train_metrics=train_metrics,
+                val_metrics=val_metrics,
+                epoch=epoch,
+            )
+            write_tensorboard_grouped_descriptor_losses(
                 tb_writer,
                 train_metrics=train_metrics,
                 val_metrics=val_metrics,

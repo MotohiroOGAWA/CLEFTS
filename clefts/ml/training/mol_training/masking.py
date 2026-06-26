@@ -1,16 +1,124 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Sequence
 
 import torch
 from torch_geometric.data import Batch
+
+from .feature_schema import FeatureGroup
 
 
 @dataclass(frozen=True)
 class PredictionMaskInfo:
     node_mask: torch.Tensor
     edge_mask: torch.Tensor
+
+
+class FeatureMaskBalancer:
+    def __init__(
+        self,
+        groups: Sequence[FeatureGroup],
+        *,
+        patience: int = 20,
+        max_forced_per_batch: int = 8,
+    ) -> None:
+        self.groups = tuple(groups)
+        self.patience = int(max(1, patience))
+        self.max_forced_per_batch = int(max(0, max_forced_per_batch))
+        self.steps_since_masked = {
+            group.name: [self.patience for _ in range(group.dim)] for group in self.groups
+        }
+
+    def apply(self, features: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        if self.max_forced_per_batch <= 0 or features.numel() == 0:
+            self._update(features, mask)
+            return mask
+
+        out = mask.clone()
+        forced = 0
+        for group in self.groups:
+            target_slice = features[:, group.start : group.stop]
+            valid = target_slice.sum(dim=-1) > 0
+            if not bool(valid.any()):
+                continue
+            target = target_slice.argmax(dim=-1)
+            masked_target = target[out & valid]
+            covered = set(masked_target.detach().cpu().tolist())
+            candidates = sorted(
+                range(group.dim),
+                key=lambda class_idx: self.steps_since_masked[group.name][class_idx],
+                reverse=True,
+            )
+            for class_idx in candidates:
+                if forced >= self.max_forced_per_batch:
+                    self._update(features, out)
+                    return out
+                if class_idx in covered:
+                    continue
+                if self.steps_since_masked[group.name][class_idx] < self.patience:
+                    continue
+                idx = ((target == class_idx) & valid).nonzero(as_tuple=False).view(-1)
+                if idx.numel() == 0:
+                    continue
+                selected = idx[torch.randint(idx.numel(), (1,), device=features.device)]
+                out[selected] = True
+                covered.add(class_idx)
+                forced += 1
+
+        self._update(features, out)
+        return out
+
+    def _update(self, features: torch.Tensor, mask: torch.Tensor) -> None:
+        if features.numel() == 0:
+            return
+        for group in self.groups:
+            target_slice = features[:, group.start : group.stop]
+            valid = target_slice.sum(dim=-1) > 0
+            if not bool(valid.any()):
+                continue
+            target = target_slice.argmax(dim=-1)
+            masked_target = target[mask & valid]
+            covered = set(masked_target.detach().cpu().tolist())
+            for class_idx in range(group.dim):
+                if class_idx in covered:
+                    self.steps_since_masked[group.name][class_idx] = 0
+                else:
+                    self.steps_since_masked[group.name][class_idx] += 1
+
+
+def force_feature_class_coverage(
+    features: torch.Tensor,
+    mask: torch.Tensor,
+    groups: Sequence[FeatureGroup],
+    *,
+    max_forced_per_group: int = 32,
+) -> torch.Tensor:
+    if features.numel() == 0 or max_forced_per_group <= 0:
+        return mask
+    out = mask.clone()
+    for group in groups:
+        forced = 0
+        target_slice = features[:, group.start : group.stop]
+        valid = target_slice.sum(dim=-1) > 0
+        if not bool(valid.any()):
+            continue
+        target = target_slice.argmax(dim=-1)
+        masked_target = target[out & valid]
+        covered = set(masked_target.detach().cpu().tolist())
+        present = sorted(set(target[valid].detach().cpu().tolist()))
+        for class_idx in present:
+            if forced >= max_forced_per_group:
+                break
+            if class_idx in covered:
+                continue
+            idx = ((target == class_idx) & valid).nonzero(as_tuple=False).view(-1)
+            if idx.numel() == 0:
+                continue
+            selected = idx[torch.randint(idx.numel(), (1,), device=features.device)]
+            out[selected] = True
+            forced += 1
+    return out
 
 
 def _sample_at_least_one_per_graph(
@@ -40,6 +148,13 @@ def make_prediction_masks(
     *,
     node_mask_ratio: float,
     edge_mask_ratio: float,
+    node_features: torch.Tensor | None = None,
+    edge_features: torch.Tensor | None = None,
+    node_groups: Sequence[FeatureGroup] = (),
+    edge_groups: Sequence[FeatureGroup] = (),
+    node_balancer: FeatureMaskBalancer | None = None,
+    edge_balancer: FeatureMaskBalancer | None = None,
+    force_eval_coverage: bool = False,
 ) -> PredictionMaskInfo:
     num_graphs = int(batch.num_graphs)
     node_mask = _sample_at_least_one_per_graph(batch.batch, num_graphs, node_mask_ratio)
@@ -50,6 +165,17 @@ def make_prediction_masks(
         edge_graph = batch.batch[batch.edge_index[0]]
 
     edge_mask = _sample_at_least_one_per_graph(edge_graph, num_graphs, edge_mask_ratio)
+
+    if node_features is not None:
+        if node_balancer is not None:
+            node_mask = node_balancer.apply(node_features, node_mask)
+        elif force_eval_coverage:
+            node_mask = force_feature_class_coverage(node_features, node_mask, node_groups)
+    if edge_features is not None:
+        if edge_balancer is not None:
+            edge_mask = edge_balancer.apply(edge_features, edge_mask)
+        elif force_eval_coverage:
+            edge_mask = force_feature_class_coverage(edge_features, edge_mask, edge_groups)
 
     return PredictionMaskInfo(
         node_mask=node_mask,

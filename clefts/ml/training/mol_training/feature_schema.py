@@ -15,10 +15,15 @@ class FeatureGroup:
     name: str
     start: int
     stop: int
+    values: Tuple[object, ...]
 
     @property
     def dim(self) -> int:
         return self.stop - self.start
+
+    @property
+    def labels(self) -> Tuple[str, ...]:
+        return tuple(str(value) for value in self.values)
 
 
 def _groups_from_feature_sets(feature_sets: Dict[str, Tuple[object, ...]]) -> Tuple[FeatureGroup, ...]:
@@ -26,7 +31,7 @@ def _groups_from_feature_sets(feature_sets: Dict[str, Tuple[object, ...]]) -> Tu
     offset = 0
     for name, values in feature_sets.items():
         stop = offset + len(values)
-        groups.append(FeatureGroup(name=name, start=offset, stop=stop))
+        groups.append(FeatureGroup(name=name, start=offset, stop=stop, values=tuple(values)))
         offset = stop
     return tuple(groups)
 
@@ -40,6 +45,14 @@ def bond_feature_groups() -> Tuple[FeatureGroup, ...]:
     layer = BondFeatureLayer()
     return _groups_from_feature_sets(layer.feature_sets)
 
+
+
+
+def metric_label(text: object) -> str:
+    label = str(text).strip()
+    for old, new in ((" ", "_"), ("/", "_"), ("\\", "_"), (",", "_"), (":", "_")):
+        label = label.replace(old, new)
+    return label
 
 def grouped_cross_entropy(
     logits_by_group: Dict[str, torch.Tensor],
@@ -63,7 +76,18 @@ def grouped_cross_entropy(
         losses.append(loss)
         metrics[f"{group.name}_loss"] = float(loss.detach().cpu())
         pred = logits.argmax(dim=-1)
-        metrics[f"{group.name}_acc"] = float((pred == target).float().mean().detach().cpu())
+        correct = pred == target
+        metrics[f"{group.name}_acc"] = float(correct.float().mean().detach().cpu())
+        metrics[f"{group.name}_count"] = float(target.numel())
+        for class_idx, label in enumerate(group.labels):
+            class_mask = target == class_idx
+            class_count = int(class_mask.sum().detach().cpu())
+            if class_count == 0:
+                continue
+            class_acc = correct[class_mask].float().mean()
+            safe_label = metric_label(label)
+            metrics[f"{group.name}_{safe_label}_acc"] = float(class_acc.detach().cpu())
+            metrics[f"{group.name}_{safe_label}_count"] = float(class_count)
 
     if not losses:
         device = target_features.device

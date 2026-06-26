@@ -16,6 +16,7 @@ from .feature_schema import (
     grouped_cross_entropy,
 )
 from .masking import (
+    FeatureMaskBalancer,
     edge_pair_repr,
     make_contrastive_view,
     make_prediction_masks,
@@ -62,6 +63,10 @@ class MolPretrainingModel(nn.Module):
         graph_contrastive_node_mask_ratio: float = 0.15,
         graph_contrastive_edge_drop_ratio: float = 0.15,
         graph_contrastive_temperature: float = 0.2,
+        balanced_attribute_masking: bool = True,
+        mask_balance_patience: int = 20,
+        mask_balance_max_forced_per_batch: int = 8,
+        balanced_validation_masks: bool = True,
     ) -> None:
         super().__init__()
         self.mol_encoder = mol_encoder
@@ -92,6 +97,26 @@ class MolPretrainingModel(nn.Module):
         self.graph_contrastive_node_mask_ratio = float(graph_contrastive_node_mask_ratio)
         self.graph_contrastive_edge_drop_ratio = float(graph_contrastive_edge_drop_ratio)
         self.graph_contrastive_temperature = float(graph_contrastive_temperature)
+        self.balanced_attribute_masking = bool(balanced_attribute_masking)
+        self.balanced_validation_masks = bool(balanced_validation_masks)
+        self.node_mask_balancer = (
+            FeatureMaskBalancer(
+                self.atom_groups,
+                patience=mask_balance_patience,
+                max_forced_per_batch=mask_balance_max_forced_per_batch,
+            )
+            if self.balanced_attribute_masking
+            else None
+        )
+        self.edge_mask_balancer = (
+            FeatureMaskBalancer(
+                self.bond_groups,
+                patience=mask_balance_patience,
+                max_forced_per_batch=mask_balance_max_forced_per_batch,
+            )
+            if self.balanced_attribute_masking
+            else None
+        )
 
         node_dim = mol_encoder.node_dim
         graph_dim = mol_encoder.graph_dim
@@ -135,13 +160,22 @@ class MolPretrainingModel(nn.Module):
         node_mask_ratio: float,
         edge_mask_ratio: float,
     ) -> MolPretrainingOutput:
+        original_x = batch.x.clone()
+        original_edge_attr = batch.edge_attr.clone()
+        train_balancing = self.training and self.balanced_attribute_masking
+        eval_coverage = (not self.training) and self.balanced_validation_masks
         mask_info = make_prediction_masks(
             batch,
             node_mask_ratio=node_mask_ratio,
             edge_mask_ratio=edge_mask_ratio,
+            node_features=original_x,
+            edge_features=original_edge_attr,
+            node_groups=self.atom_groups,
+            edge_groups=self.bond_groups,
+            node_balancer=self.node_mask_balancer if train_balancing else None,
+            edge_balancer=self.edge_mask_balancer if train_balancing else None,
+            force_eval_coverage=eval_coverage,
         )
-        original_x = batch.x.clone()
-        original_edge_attr = batch.edge_attr.clone()
         original_batch = batch.clone()
         original_batch.x = original_x.clone()
         original_batch.edge_attr = original_edge_attr.clone()
