@@ -289,11 +289,13 @@ def make_pretraining_model(
     symbols: Sequence[str],
     config: MolEncoderConfig,
     descriptor_dim: int,
+    descriptor_names: Sequence[str],
 ) -> MolPretrainingModel:
     mol_encoder = make_mol_encoder(config, symbols=symbols)
     return MolPretrainingModel(
         mol_encoder=mol_encoder,
         descriptor_dim=descriptor_dim,
+        descriptor_names=descriptor_names,
         use_node_attribute=not args.disable_node_attribute,
         use_node_context=not args.disable_node_context,
         use_edge_attribute=not args.disable_edge_attribute,
@@ -342,6 +344,7 @@ def run_pretraining_stage(
         symbols=symbols,
         config=config,
         descriptor_dim=len(train_dataset.descriptor_names),
+        descriptor_names=train_dataset.descriptor_names,
     ).to(device)
 
     stage_dir = output_dir / "runs" / config.id

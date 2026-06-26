@@ -19,7 +19,7 @@ from ...mol.graph_builder import MolGraphBuilder
 DEFAULT_SMILES_COLUMN = "SMILES"
 DEFAULT_DESCRIPTOR_NAMES = (
     "MolWt",
-    "ExactMolWt",
+    # "ExactMolWt",  # Mostly redundant with MolWt for this pretraining target.
     "TPSA",
     "MolLogP",
     "NumHAcceptors",
@@ -27,7 +27,7 @@ DEFAULT_DESCRIPTOR_NAMES = (
     "NumRotatableBonds",
     "RingCount",
     "FractionCSP3",
-    "HeavyAtomCount",
+    # "HeavyAtomCount",  # Largely a molecule-size target and easy to infer from graph size.
 )
 
 

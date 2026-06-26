@@ -173,6 +173,7 @@ def save_checkpoint(model: MolPretrainingModel, path: Path, *, extra: Optional[D
     payload = {
         "model_state_dict": model.state_dict(),
         "mol_encoder_state_dict": mol_encoder.state_dict(),
+        "descriptor_names": tuple(getattr(model, "descriptor_names", ())),
         "mol_encoder_params": {
             "symbols": mol_encoder.symbols,
             "node_dim": mol_encoder.node_dim,

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Tuple
+from typing import Dict, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -48,6 +48,7 @@ class MolPretrainingModel(nn.Module):
         *,
         mol_encoder: MolEncoder,
         descriptor_dim: int,
+        descriptor_names: Sequence[str] | None = None,
         use_node_attribute: bool = True,
         use_node_context: bool = True,
         use_edge_attribute: bool = True,
@@ -67,6 +68,15 @@ class MolPretrainingModel(nn.Module):
         self.atom_groups = atom_feature_groups(mol_encoder.symbols)
         self.bond_groups = bond_feature_groups()
         self.descriptor_dim = int(descriptor_dim)
+        if descriptor_names is None:
+            self.descriptor_names = tuple(f"descriptor_{idx}" for idx in range(self.descriptor_dim))
+        else:
+            self.descriptor_names = tuple(descriptor_names)
+        if len(self.descriptor_names) != self.descriptor_dim:
+            raise ValueError(
+                f"descriptor_names length ({len(self.descriptor_names)}) must match "
+                f"descriptor_dim ({self.descriptor_dim})."
+            )
 
         self.use_node_attribute = use_node_attribute
         self.use_node_context = use_node_context
@@ -203,9 +213,12 @@ class MolPretrainingModel(nn.Module):
         if self.use_graph_descriptors:
             target = batch.descriptors.view(int(batch.num_graphs), self.descriptor_dim).to(graph_h.device)
             pred = self.descriptor_decoder(graph_h)
-            loss = F.mse_loss(pred, target)
+            per_descriptor_loss = F.mse_loss(pred, target, reduction="none").mean(dim=0)
+            loss = per_descriptor_loss.mean()
             total = total + self.descriptor_loss_weight * loss
             metrics["descriptor_loss"] = float(loss.detach().cpu())
+            for name, item_loss in zip(self.descriptor_names, per_descriptor_loss):
+                metrics[f"descriptor_{name}_loss"] = float(item_loss.detach().cpu())
 
         metrics["loss"] = float(total.detach().cpu())
         return MolPretrainingOutput(loss=total, metrics=metrics)
