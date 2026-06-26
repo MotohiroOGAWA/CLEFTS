@@ -217,19 +217,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--node-mask-ratio", type=float, default=0.15)
     parser.add_argument("--edge-mask-ratio", type=float, default=0.15)
-    parser.add_argument("--graph-mask-ratio", type=float, default=0.30)
 
     parser.add_argument("--disable-node-attribute", action="store_true")
     parser.add_argument("--disable-node-context", action="store_true")
     parser.add_argument("--disable-edge-attribute", action="store_true")
-    parser.add_argument("--disable-graph-masked-attributes", action="store_true")
+    parser.add_argument("--disable-graph-contrastive", action="store_true")
     parser.add_argument("--disable-graph-descriptors", action="store_true")
+    parser.add_argument("--graph-contrastive-node-mask-ratio", type=float, default=0.15)
+    parser.add_argument("--graph-contrastive-edge-drop-ratio", type=float, default=0.15)
+    parser.add_argument("--graph-contrastive-temperature", type=float, default=0.2)
     parser.add_argument("--descriptor-names", default=",".join(DEFAULT_DESCRIPTOR_NAMES))
 
     parser.add_argument("--node-loss-weight", type=float, default=1.0)
     parser.add_argument("--context-loss-weight", type=float, default=0.5)
     parser.add_argument("--edge-loss-weight", type=float, default=1.0)
-    parser.add_argument("--graph-mask-loss-weight", type=float, default=0.5)
+    parser.add_argument("--graph-contrastive-loss-weight", type=float, default=0.5)
     parser.add_argument("--descriptor-loss-weight", type=float, default=0.2)
     parser.add_argument(
         "--dimension-penalty",
@@ -295,13 +297,16 @@ def make_pretraining_model(
         use_node_attribute=not args.disable_node_attribute,
         use_node_context=not args.disable_node_context,
         use_edge_attribute=not args.disable_edge_attribute,
-        use_graph_masked_attributes=not args.disable_graph_masked_attributes,
+        use_graph_contrastive=not args.disable_graph_contrastive,
         use_graph_descriptors=not args.disable_graph_descriptors,
         node_loss_weight=args.node_loss_weight,
         context_loss_weight=args.context_loss_weight,
         edge_loss_weight=args.edge_loss_weight,
-        graph_mask_loss_weight=args.graph_mask_loss_weight,
+        graph_contrastive_loss_weight=args.graph_contrastive_loss_weight,
         descriptor_loss_weight=args.descriptor_loss_weight,
+        graph_contrastive_node_mask_ratio=args.graph_contrastive_node_mask_ratio,
+        graph_contrastive_edge_drop_ratio=args.graph_contrastive_edge_drop_ratio,
+        graph_contrastive_temperature=args.graph_contrastive_temperature,
     )
 
 
@@ -349,7 +354,6 @@ def run_pretraining_stage(
         lr=args.lr,
         node_mask_ratio=args.node_mask_ratio,
         edge_mask_ratio=args.edge_mask_ratio,
-        graph_mask_ratio=args.graph_mask_ratio,
         output_dir=stage_dir,
         stage_name="pretraining",
     )

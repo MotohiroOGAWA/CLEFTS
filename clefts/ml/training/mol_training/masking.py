@@ -11,8 +11,6 @@ from torch_geometric.data import Batch
 class PredictionMaskInfo:
     node_mask: torch.Tensor
     edge_mask: torch.Tensor
-    graph_node_mask: torch.Tensor
-    graph_edge_mask: torch.Tensor
 
 
 def _sample_at_least_one_per_graph(
@@ -42,7 +40,6 @@ def make_prediction_masks(
     *,
     node_mask_ratio: float,
     edge_mask_ratio: float,
-    graph_mask_ratio: float,
 ) -> PredictionMaskInfo:
     num_graphs = int(batch.num_graphs)
     node_mask = _sample_at_least_one_per_graph(batch.batch, num_graphs, node_mask_ratio)
@@ -53,14 +50,10 @@ def make_prediction_masks(
         edge_graph = batch.batch[batch.edge_index[0]]
 
     edge_mask = _sample_at_least_one_per_graph(edge_graph, num_graphs, edge_mask_ratio)
-    graph_node_mask = _sample_at_least_one_per_graph(batch.batch, num_graphs, graph_mask_ratio)
-    graph_edge_mask = _sample_at_least_one_per_graph(edge_graph, num_graphs, graph_mask_ratio)
 
     return PredictionMaskInfo(
         node_mask=node_mask,
         edge_mask=edge_mask,
-        graph_node_mask=graph_node_mask,
-        graph_edge_mask=graph_edge_mask,
     )
 
 def edge_pair_repr(node_h: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
@@ -68,18 +61,6 @@ def edge_pair_repr(node_h: torch.Tensor, edge_index: torch.Tensor) -> torch.Tens
     h_src = node_h[src]
     h_dst = node_h[dst]
     return torch.cat([h_src + h_dst, h_src * h_dst, torch.abs(h_src - h_dst)], dim=-1)
-
-
-def graph_mean_by_mask(values: torch.Tensor, graph_ids: torch.Tensor, mask: torch.Tensor, num_graphs: int) -> torch.Tensor:
-    out = values.new_zeros((num_graphs, values.size(-1)))
-    counts = values.new_zeros((num_graphs, 1))
-    if values.numel() == 0 or not bool(mask.any()):
-        return out
-    selected_values = values[mask]
-    selected_graphs = graph_ids[mask]
-    out.index_add_(0, selected_graphs, selected_values)
-    counts.index_add_(0, selected_graphs, torch.ones((selected_values.size(0), 1), device=values.device, dtype=values.dtype))
-    return out / counts.clamp_min(1.0)
 
 
 def node_context_targets(
@@ -99,3 +80,53 @@ def node_context_targets(
     if mask is not None:
         targets = targets[mask]
     return targets
+
+
+def _drop_undirected_edge_pairs(batch: Batch, drop_ratio: float) -> tuple[torch.Tensor, torch.Tensor]:
+    edge_index = batch.edge_index
+    edge_attr = batch.edge_attr
+    if edge_index.numel() == 0 or drop_ratio <= 0.0:
+        return edge_index, edge_attr
+
+    device = edge_index.device
+    src = edge_index[0].detach().cpu().tolist()
+    dst = edge_index[1].detach().cpu().tolist()
+    pair_to_indices: dict[tuple[int, int], list[int]] = {}
+    for idx, (u, v) in enumerate(zip(src, dst)):
+        key = (u, v) if u <= v else (v, u)
+        pair_to_indices.setdefault(key, []).append(idx)
+
+    keep = torch.ones(edge_index.size(1), dtype=torch.bool, device=device)
+    for indices in pair_to_indices.values():
+        if torch.rand((), device=device).item() < drop_ratio:
+            keep[torch.tensor(indices, dtype=torch.long, device=device)] = False
+
+    return edge_index[:, keep], edge_attr[keep]
+
+
+def make_contrastive_view(
+    batch: Batch,
+    *,
+    node_mask_ratio: float,
+    edge_drop_ratio: float,
+    node_mask_token: torch.Tensor,
+) -> Batch:
+    graphs = batch.to_data_list()
+    out = []
+    for data in graphs:
+        view = data.clone()
+        node_graph_ids = torch.zeros(view.x.size(0), dtype=torch.long, device=view.x.device)
+        node_mask = _sample_at_least_one_per_graph(
+            node_graph_ids,
+            1,
+            node_mask_ratio,
+        )
+        if bool(node_mask.any()):
+            view.x[node_mask] = node_mask_token.to(view.x.device, view.x.dtype)
+        view.edge_index, view.edge_attr = _drop_undirected_edge_pairs(
+            view,
+            float(max(0.0, min(1.0, edge_drop_ratio))),
+        )
+        out.append(view)
+    return Batch.from_data_list(out)
+

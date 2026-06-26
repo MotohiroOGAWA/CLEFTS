@@ -67,7 +67,6 @@ def evaluate(
     device: torch.device,
     node_mask_ratio: float,
     edge_mask_ratio: float,
-    graph_mask_ratio: float,
 ) -> Dict[str, float]:
     model.eval()
     metrics = []
@@ -77,7 +76,6 @@ def evaluate(
             batch,
             node_mask_ratio=node_mask_ratio,
             edge_mask_ratio=edge_mask_ratio,
-            graph_mask_ratio=graph_mask_ratio,
         )
         metrics.append(output.metrics)
     return mean_metrics(metrics)
@@ -93,7 +91,6 @@ def train_epochs(
     lr: float,
     node_mask_ratio: float,
     edge_mask_ratio: float,
-    graph_mask_ratio: float,
     output_dir: Path,
     stage_name: str,
 ) -> Dict[str, float]:
@@ -120,7 +117,6 @@ def train_epochs(
                     batch,
                     node_mask_ratio=node_mask_ratio,
                     edge_mask_ratio=edge_mask_ratio,
-                    graph_mask_ratio=graph_mask_ratio,
                 )
                 output.loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), DEFAULT_GRAD_CLIP_NORM)
@@ -135,7 +131,6 @@ def train_epochs(
                 device=device,
                 node_mask_ratio=node_mask_ratio,
                 edge_mask_ratio=edge_mask_ratio,
-                graph_mask_ratio=graph_mask_ratio,
             )
             record = {
                 "epoch": epoch,
@@ -187,6 +182,9 @@ def save_checkpoint(model: MolPretrainingModel, path: Path, *, extra: Optional[D
             "max_degree": mol_encoder.encoder.max_degree,
             "max_spatial_dist": mol_encoder.encoder.max_spatial_dist,
             "max_edge_dist": mol_encoder.encoder.max_edge_dist,
+            "dropout": mol_encoder.encoder.blocks[0].mha.self_attn.mha.dropout.p
+            if mol_encoder.encoder.num_layers > 0
+            else 0.0,
         },
         "extra": dict(extra or {}),
     }

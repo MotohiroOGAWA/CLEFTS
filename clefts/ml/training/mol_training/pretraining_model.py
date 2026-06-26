@@ -14,9 +14,13 @@ from .feature_schema import (
     atom_feature_groups,
     bond_feature_groups,
     grouped_cross_entropy,
-    grouped_soft_cross_entropy,
 )
-from .masking import edge_pair_repr, graph_mean_by_mask, make_prediction_masks, node_context_targets
+from .masking import (
+    edge_pair_repr,
+    make_contrastive_view,
+    make_prediction_masks,
+    node_context_targets,
+)
 
 
 def _group_decoders(in_dim: int, groups: Tuple[FeatureGroup, ...]) -> nn.ModuleDict:
@@ -47,13 +51,16 @@ class MolPretrainingModel(nn.Module):
         use_node_attribute: bool = True,
         use_node_context: bool = True,
         use_edge_attribute: bool = True,
-        use_graph_masked_attributes: bool = True,
+        use_graph_contrastive: bool = True,
         use_graph_descriptors: bool = True,
         node_loss_weight: float = 1.0,
         context_loss_weight: float = 0.5,
         edge_loss_weight: float = 1.0,
-        graph_mask_loss_weight: float = 0.5,
+        graph_contrastive_loss_weight: float = 0.5,
         descriptor_loss_weight: float = 0.2,
+        graph_contrastive_node_mask_ratio: float = 0.15,
+        graph_contrastive_edge_drop_ratio: float = 0.15,
+        graph_contrastive_temperature: float = 0.2,
     ) -> None:
         super().__init__()
         self.mol_encoder = mol_encoder
@@ -64,14 +71,17 @@ class MolPretrainingModel(nn.Module):
         self.use_node_attribute = use_node_attribute
         self.use_node_context = use_node_context
         self.use_edge_attribute = use_edge_attribute
-        self.use_graph_masked_attributes = use_graph_masked_attributes
+        self.use_graph_contrastive = use_graph_contrastive
         self.use_graph_descriptors = use_graph_descriptors
 
         self.node_loss_weight = float(node_loss_weight)
         self.context_loss_weight = float(context_loss_weight)
         self.edge_loss_weight = float(edge_loss_weight)
-        self.graph_mask_loss_weight = float(graph_mask_loss_weight)
+        self.graph_contrastive_loss_weight = float(graph_contrastive_loss_weight)
         self.descriptor_loss_weight = float(descriptor_loss_weight)
+        self.graph_contrastive_node_mask_ratio = float(graph_contrastive_node_mask_ratio)
+        self.graph_contrastive_edge_drop_ratio = float(graph_contrastive_edge_drop_ratio)
+        self.graph_contrastive_temperature = float(graph_contrastive_temperature)
 
         node_dim = mol_encoder.node_dim
         graph_dim = mol_encoder.graph_dim
@@ -82,13 +92,31 @@ class MolPretrainingModel(nn.Module):
             nn.GELU(),
             nn.Linear(node_dim, self.atom_groups[0].dim),
         )
-        self.graph_atom_decoders = _group_decoders(graph_dim, self.atom_groups)
-        self.graph_edge_decoders = _group_decoders(graph_dim, self.bond_groups)
+        self.graph_contrastive_node_mask_token = nn.Parameter(torch.zeros(mol_encoder.atom_dim))
+        self.graph_projection = nn.Sequential(
+            nn.Linear(graph_dim, graph_dim),
+            nn.ReLU(),
+            nn.Linear(graph_dim, graph_dim),
+        )
         self.descriptor_decoder = nn.Sequential(
             nn.Linear(graph_dim, graph_dim),
             nn.GELU(),
             nn.Linear(graph_dim, self.descriptor_dim),
         )
+
+
+    def _graph_contrastive_loss(self, z1: torch.Tensor, z2: torch.Tensor) -> torch.Tensor:
+        if z1.size(0) <= 1:
+            return z1.sum() * 0.0
+        z1 = F.normalize(z1, dim=-1)
+        z2 = F.normalize(z2, dim=-1)
+        logits = torch.matmul(z1, z2.t()) / max(self.graph_contrastive_temperature, 1e-6)
+        labels = torch.arange(z1.size(0), device=z1.device)
+        return 0.5 * (F.cross_entropy(logits, labels) + F.cross_entropy(logits.t(), labels))
+
+    def _encode_graph_projection(self, batch: Batch) -> torch.Tensor:
+        encoded = self.mol_encoder(batch)
+        return self.graph_projection(encoded.embeddings)
 
     def forward(
         self,
@@ -96,16 +124,17 @@ class MolPretrainingModel(nn.Module):
         *,
         node_mask_ratio: float,
         edge_mask_ratio: float,
-        graph_mask_ratio: float,
     ) -> MolPretrainingOutput:
         mask_info = make_prediction_masks(
             batch,
             node_mask_ratio=node_mask_ratio,
             edge_mask_ratio=edge_mask_ratio,
-            graph_mask_ratio=graph_mask_ratio,
         )
         original_x = batch.x.clone()
         original_edge_attr = batch.edge_attr.clone()
+        original_batch = batch.clone()
+        original_batch.x = original_x.clone()
+        original_batch.edge_attr = original_edge_attr.clone()
         encoded = self.mol_encoder(batch)
         node_h = encoded.x
         graph_h = encoded.embeddings
@@ -152,48 +181,24 @@ class MolPretrainingModel(nn.Module):
             metrics["edge_attr_loss"] = float(loss.detach().cpu())
             metrics.update({f"edge_{k}": v for k, v in group_metrics.items()})
 
-        if self.use_graph_masked_attributes:
-            graph_node_target = graph_mean_by_mask(
-                original_x,
-                batch.batch,
-                mask_info.graph_node_mask,
-                int(batch.num_graphs),
+        if self.use_graph_contrastive:
+            view1 = make_contrastive_view(
+                original_batch,
+                node_mask_ratio=self.graph_contrastive_node_mask_ratio,
+                edge_drop_ratio=self.graph_contrastive_edge_drop_ratio,
+                node_mask_token=self.graph_contrastive_node_mask_token,
             )
-            graph_node_logits = {
-                name: head(graph_h) for name, head in self.graph_atom_decoders.items()
-            }
-            node_loss, node_metrics = grouped_soft_cross_entropy(
-                graph_node_logits,
-                graph_node_target,
-                self.atom_groups,
+            view2 = make_contrastive_view(
+                original_batch,
+                node_mask_ratio=self.graph_contrastive_node_mask_ratio,
+                edge_drop_ratio=self.graph_contrastive_edge_drop_ratio,
+                node_mask_token=self.graph_contrastive_node_mask_token,
             )
-
-            if batch.edge_index.numel() > 0:
-                edge_graph = batch.batch[batch.edge_index[0]]
-                graph_edge_target = graph_mean_by_mask(
-                    original_edge_attr,
-                    edge_graph,
-                    mask_info.graph_edge_mask,
-                    int(batch.num_graphs),
-                )
-                graph_edge_logits = {
-                    name: head(graph_h) for name, head in self.graph_edge_decoders.items()
-                }
-                edge_loss, edge_metrics = grouped_soft_cross_entropy(
-                    graph_edge_logits,
-                    graph_edge_target,
-                    self.bond_groups,
-                )
-            else:
-                edge_loss = node_h.new_zeros(())
-                edge_metrics = {}
-
-            loss = node_loss + edge_loss
-            total = total + self.graph_mask_loss_weight * loss
-            metrics["graph_mask_node_loss"] = float(node_loss.detach().cpu())
-            metrics["graph_mask_edge_loss"] = float(edge_loss.detach().cpu())
-            metrics.update({f"graph_node_{k}": v for k, v in node_metrics.items()})
-            metrics.update({f"graph_edge_{k}": v for k, v in edge_metrics.items()})
+            z1 = self._encode_graph_projection(view1)
+            z2 = self._encode_graph_projection(view2)
+            loss = self._graph_contrastive_loss(z1, z2)
+            total = total + self.graph_contrastive_loss_weight * loss
+            metrics["graph_contrastive_loss"] = float(loss.detach().cpu())
 
         if self.use_graph_descriptors:
             target = batch.descriptors.view(int(batch.num_graphs), self.descriptor_dim).to(graph_h.device)
