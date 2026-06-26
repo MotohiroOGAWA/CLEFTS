@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import numpy as np
 import torch
 import torch.nn as nn
+from pathlib import Path
 from bidict import bidict
 from torch import Tensor
 from torch_geometric.data import Batch, Data
@@ -71,6 +72,7 @@ class FragmentTreeFeatureModel(nn.Module):
         mol_encoder_params = mol_encoder_params.copy()
         mol_encoder_params["dropout"] = dropout
         self._mol_encoder = MolEncoder(**mol_encoder_params)
+        self._freeze_mol_encoder = False
         self._fragmenter = Fragmenter.from_dict(fragmenter_params)
 
         condition_encoder_params = condition_encoder_params.copy()
@@ -194,6 +196,80 @@ class FragmentTreeFeatureModel(nn.Module):
             ),
             persistent=False,
         )
+
+    def _validate_mol_encoder_params(self, params: Dict) -> None:
+        expected = {
+            "symbols": tuple(self._mol_encoder.symbols),
+            "node_dim": self._mol_encoder.node_dim,
+            "graph_dim": self._mol_encoder.graph_dim,
+            "num_layers": self._mol_encoder.encoder.num_layers,
+            "num_heads": self._mol_encoder.encoder.num_heads,
+            "max_degree": self._mol_encoder.encoder.max_degree,
+            "max_spatial_dist": self._mol_encoder.encoder.max_spatial_dist,
+            "max_edge_dist": self._mol_encoder.encoder.max_edge_dist,
+        }
+        actual = dict(params)
+        if "symbols" in actual:
+            actual["symbols"] = tuple(actual["symbols"])
+        mismatches = {
+            key: (expected[key], actual.get(key))
+            for key in expected
+            if key in actual and expected[key] != actual.get(key)
+        }
+        if mismatches:
+            raise ValueError(
+                "MolEncoder params do not match current model: "
+                f"{mismatches}"
+            )
+
+    def set_mol_encoder_state_dict(self, state_dict: Dict, *, strict: bool = True) -> None:
+        missing_keys, unexpected_keys = self._mol_encoder.load_state_dict(
+            state_dict,
+            strict=strict,
+        )
+        if missing_keys or unexpected_keys:
+            raise RuntimeError(
+                "Failed to load MolEncoder state_dict cleanly: "
+                f"missing_keys={missing_keys}, unexpected_keys={unexpected_keys}"
+            )
+
+    def set_mol_encoder(self, mol_encoder: MolEncoder, *, strict_params: bool = True) -> None:
+        if strict_params:
+            self._validate_mol_encoder_params(
+                {
+                    "symbols": mol_encoder.symbols,
+                    "node_dim": mol_encoder.node_dim,
+                    "graph_dim": mol_encoder.graph_dim,
+                    "num_layers": mol_encoder.encoder.num_layers,
+                    "num_heads": mol_encoder.encoder.num_heads,
+                    "max_degree": mol_encoder.encoder.max_degree,
+                    "max_spatial_dist": mol_encoder.encoder.max_spatial_dist,
+                    "max_edge_dist": mol_encoder.encoder.max_edge_dist,
+                }
+            )
+        self._mol_encoder.load_state_dict(mol_encoder.state_dict(), strict=True)
+
+    def load_mol_encoder_checkpoint(self, checkpoint: Dict | str | Path, *, strict: bool = True) -> None:
+        if isinstance(checkpoint, (str, Path)):
+            checkpoint = torch.load(checkpoint, map_location="cpu")
+        checkpoint_params = checkpoint.get("mol_encoder_params")
+        if checkpoint_params is not None:
+            self._validate_mol_encoder_params(checkpoint_params)
+        state_dict = checkpoint.get("mol_encoder_state_dict", checkpoint)
+        self.set_mol_encoder_state_dict(state_dict, strict=strict)
+
+    def freeze_mol_encoder(self) -> None:
+        self._freeze_mol_encoder = True
+        self._mol_encoder.eval()
+        for param in self._mol_encoder.parameters():
+            param.requires_grad = False
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if getattr(self, "_freeze_mol_encoder", False):
+            self._mol_encoder.eval()
+        return self
+
 
     @property
     def formula_tensorizer(self) -> FormulaTensorizer:
