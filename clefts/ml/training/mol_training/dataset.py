@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence
 
 import torch
 from rdkit import Chem
@@ -12,11 +12,9 @@ from torch_geometric.data import Batch, Data
 from tqdm import tqdm
 
 from ....libs.mmkit.mmkit import Compound
-from ....libs.msentity.msentity import MSDataset
 from ...mol.graph_builder import MolGraphBuilder
 
 
-DEFAULT_SMILES_COLUMN = "SMILES"
 DEFAULT_DESCRIPTOR_NAMES = (
     "MolWt",
     # "ExactMolWt",  # Mostly redundant with MolWt for this pretraining target.
@@ -31,16 +29,10 @@ DEFAULT_DESCRIPTOR_NAMES = (
 )
 
 
-def load_smiles_from_msds(path: str | Path, smiles_column: str = DEFAULT_SMILES_COLUMN) -> List[str]:
-    dataset = MSDataset.load(str(path), load_peak_metadata=False)
-    metadata = dataset.metadata
-    if smiles_column not in metadata.columns:
-        raise KeyError(
-            f"SMILES column '{smiles_column}' was not found in {path}. "
-            f"Available columns: {list(metadata.columns)}"
-        )
-    smiles = metadata[smiles_column].dropna().astype(str).unique().tolist()
-    return smiles
+def load_smiles_file(path: str | Path) -> List[str]:
+    with open(path, encoding="utf-8") as f:
+        return [line.strip() for line in f if line.strip()]
+
 
 def compute_descriptors(mol: Chem.Mol, names: Sequence[str] = DEFAULT_DESCRIPTOR_NAMES) -> torch.Tensor:
     values = []

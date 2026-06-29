@@ -22,27 +22,25 @@ if __package__ in {None, ""}:
     from clefts.ml.mol.mol_encoder import MolEncoder
     from clefts.ml.training.mol_training.dataset import (
         DEFAULT_DESCRIPTOR_NAMES,
-        DEFAULT_SMILES_COLUMN,
         DescriptorNormalizer,
         MolPretrainingDataset,
-        load_smiles_from_msds,
+        load_smiles_file,
     )
     from clefts.ml.training.mol_training.feature_schema import atom_feature_groups, bond_feature_groups
     from clefts.ml.training.mol_training.pretraining_model import MolPretrainingModel
-    from clefts.ml.training.mol_training.trainer import make_loader, save_checkpoint, train_epochs
+    from clefts.ml.training.mol_training.trainer import make_loader, train_epochs
 else:
     from ....libs.mmkit.mmkit import Compound
     from ...mol.mol_encoder import MolEncoder
     from .dataset import (
         DEFAULT_DESCRIPTOR_NAMES,
-        DEFAULT_SMILES_COLUMN,
         DescriptorNormalizer,
         MolPretrainingDataset,
-        load_smiles_from_msds,
+        load_smiles_file,
     )
     from .feature_schema import atom_feature_groups, bond_feature_groups
     from .pretraining_model import MolPretrainingModel
-    from .trainer import make_loader, save_checkpoint, train_epochs
+    from .trainer import make_loader, train_epochs
 
 
 @dataclass(frozen=True)
@@ -92,12 +90,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
 
-    args.train_msds = normalize_path_list(args.train_msds)
-    args.val_msds = normalize_path_list(args.val_msds)
-    if not args.train_msds:
-        parser.error("--train-msds is required.")
-    if not args.val_msds:
-        parser.error("--val-msds is required.")
+    args.train_smiles = normalize_path_list(args.train_smiles)
+    args.val_smiles = normalize_path_list(args.val_smiles)
+    if not args.train_smiles:
+        parser.error("--train-smiles is required.")
+    if not args.val_smiles:
+        parser.error("--val-smiles is required.")
     if args.output_dir in {None, ""}:
         parser.error("--output-dir is required.")
     if args.symbols in {None, ""}:
@@ -137,25 +135,24 @@ def canonicalize_unique_smiles(
     return out, invalid_count
 
 
-def load_raw_smiles_from_msds_files(paths: Sequence[str], smiles_column: str) -> Tuple[List[str], List[Dict[str, object]]]:
+def load_raw_smiles_files(paths: Sequence[str]) -> Tuple[List[str], List[Dict[str, object]]]:
     all_smiles: List[str] = []
     per_file = []
     for path in paths:
-        smiles = load_smiles_from_msds(path, smiles_column)
+        smiles = load_smiles_file(path)
         all_smiles.extend(smiles)
-        per_file.append({"path": str(path), "unique_raw_smiles": len(smiles)})
+        per_file.append({"path": str(path), "raw_smiles": len(smiles)})
     return all_smiles, per_file
 
 
 def prepare_smiles_split(
     *,
-    train_msds_paths: Sequence[str],
-    val_msds_paths: Sequence[str],
-    smiles_column: str,
+    train_smiles_paths: Sequence[str],
+    val_smiles_paths: Sequence[str],
     output_dir: Path,
 ) -> Tuple[List[str], List[str], Dict[str, object]]:
-    train_raw, train_files = load_raw_smiles_from_msds_files(train_msds_paths, smiles_column)
-    val_raw, val_files = load_raw_smiles_from_msds_files(val_msds_paths, smiles_column)
+    train_raw, train_files = load_raw_smiles_files(train_smiles_paths)
+    val_raw, val_files = load_raw_smiles_files(val_smiles_paths)
 
     train_raw_unique = unique_preserve_order(train_raw)
     val_raw_unique = unique_preserve_order(val_raw)
@@ -178,9 +175,8 @@ def prepare_smiles_split(
         raise ValueError("No validation SMILES remain after removing molecules already present in training.")
 
     summary: Dict[str, object] = {
-        "train_msds": list(map(str, train_msds_paths)),
-        "val_msds": list(map(str, val_msds_paths)),
-        "smiles_column": smiles_column,
+        "train_smiles": list(map(str, train_smiles_paths)),
+        "val_smiles": list(map(str, val_smiles_paths)),
         "train_files": train_files,
         "val_files": val_files,
         "train_raw_total": len(train_raw),
@@ -214,9 +210,8 @@ def prepare_smiles_split(
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Pretrain MolEncoder with node, edge, and graph-level tasks.")
-    parser.add_argument("--train-msds", nargs="+", default=None)
-    parser.add_argument("--val-msds", nargs="+", default=None)
-    parser.add_argument("--smiles-column", default=DEFAULT_SMILES_COLUMN)
+    parser.add_argument("--train-smiles", nargs="+", default=None, help="Newline-delimited SMILES file(s) for training.")
+    parser.add_argument("--val-smiles", nargs="+", default=None, help="Newline-delimited SMILES file(s) for validation.")
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--device", default="cpu")
 
@@ -455,6 +450,7 @@ def save_selected_checkpoint(summary_row: Dict[str, object], output_dir: Path) -
     checkpoint["extra"].update({"selected": True, "selection_source": str(source)})
     torch.save(checkpoint, output_dir / "mol_encoder_pretrained.pt")
 
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     output_dir = Path(args.output_dir)
@@ -463,9 +459,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     configs = mol_encoder_configs(args)
     train_smiles, val_smiles, smiles_split_summary = prepare_smiles_split(
-        train_msds_paths=args.train_msds,
-        val_msds_paths=args.val_msds,
-        smiles_column=args.smiles_column,
+        train_smiles_paths=args.train_smiles,
+        val_smiles_paths=args.val_smiles,
         output_dir=output_dir,
     )
     symbols = parse_csv_strings(args.symbols)
