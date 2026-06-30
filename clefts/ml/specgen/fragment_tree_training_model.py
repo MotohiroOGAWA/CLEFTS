@@ -178,6 +178,11 @@ class FragmentTreeSelectionTrainingLoss(nn.Module):
                 )
             )
 
+        edge_group_loss = self._edge_group_coverage_loss(output, target, device=device)
+        edge_negative_loss = self._edge_negative_loss(output, target, device=device)
+        losses.append(edge_group_loss)
+        losses.append(edge_negative_loss)
+
         if len(losses) == 0:
             return output.keep_logit.sum() * 0.0
         return torch.stack(losses).mean()
@@ -478,6 +483,127 @@ class FragmentTreeSelectionTrainingLoss(nn.Module):
         if len(sample_losses) == 0:
             return logit.sum() * 0.0
         return torch.stack(sample_losses).mean()
+
+    def _edge_group_coverage_loss(
+        self,
+        output: FragmentTreeCandidateSelectionOutput,
+        target: TrainingFragmentTreeStructure,
+        *,
+        device: torch.device,
+    ) -> Tensor:
+        if target.target_edge_index.numel() == 0 or output.edge_cleave_logit.numel() == 0:
+            return output.edge_cleave_logit.sum() * 0.0
+
+        batch_edge_by_sample_edge = self._batch_edge_by_sample_edge(output, device=device)
+        target_edge_index = target.target_edge_index.to(device).long()
+        target_edge_group_index = target.target_edge_group_index.to(device).long()
+        if target_edge_index.size(1) != target_edge_group_index.numel():
+            raise ValueError("target_edge_index and target_edge_group_index are misaligned.")
+
+        losses: List[Tensor] = []
+        seen: set[Tuple[int, int]] = set()
+        for row in range(int(target_edge_group_index.numel())):
+            group_key = (
+                int(target_edge_index[0, row].detach().cpu().item()),
+                int(target_edge_group_index[row].detach().cpu().item()),
+            )
+            if group_key in seen:
+                continue
+            seen.add(group_key)
+
+            group_mask = (
+                (target_edge_index[0] == int(group_key[0]))
+                & (target_edge_group_index == int(group_key[1]))
+            )
+            batch_edge_indexes: List[int] = []
+            for edge_id in target_edge_index[1, group_mask].detach().cpu().tolist():
+                batch_edge_index = batch_edge_by_sample_edge.get((int(group_key[0]), int(edge_id)))
+                if batch_edge_index is not None:
+                    batch_edge_indexes.append(int(batch_edge_index))
+
+            if not batch_edge_indexes:
+                continue
+
+            index_tensor = torch.tensor(
+                sorted(set(batch_edge_indexes)),
+                dtype=torch.long,
+                device=device,
+            )
+            losses.append(F.softplus(-torch.logsumexp(output.edge_cleave_logit[index_tensor], dim=0)))
+
+        if len(losses) == 0:
+            return output.edge_cleave_logit.sum() * 0.0
+        return torch.stack(losses).mean()
+
+    def _edge_negative_loss(
+        self,
+        output: FragmentTreeCandidateSelectionOutput,
+        target: TrainingFragmentTreeStructure,
+        *,
+        device: torch.device,
+    ) -> Tensor:
+        if output.edge_cleave_logit.numel() == 0 or target.target_edge_index.numel() == 0:
+            return output.edge_cleave_logit.sum() * 0.0
+
+        batch = output.sample_tree_batch
+        target_edge_index = target.target_edge_index.to(device).long()
+        positive_pairs = {
+            (int(sample_id), int(edge_id))
+            for sample_id, edge_id in target_edge_index.detach().cpu().t().tolist()
+        }
+
+        edge_global_ids = batch.edge_id_global.to(device).long()
+        edge_ptr = batch.edge_ptr.to(device).long()
+        kept_sample_ids = batch.kept_sample_ids.to(device).long()
+        sample_losses: List[Tensor] = []
+
+        for graph_index in range(int(kept_sample_ids.numel())):
+            sample_id = int(kept_sample_ids[graph_index].detach().cpu().item())
+            start = int(edge_ptr[graph_index].detach().cpu().item())
+            end = int(edge_ptr[graph_index + 1].detach().cpu().item())
+            if end <= start:
+                continue
+
+            negative_indexes = []
+            for batch_edge_index in range(start, end):
+                edge_id = int(edge_global_ids[batch_edge_index].detach().cpu().item())
+                if (sample_id, edge_id) not in positive_pairs:
+                    negative_indexes.append(batch_edge_index)
+
+            if not negative_indexes:
+                continue
+
+            index_tensor = torch.tensor(negative_indexes, dtype=torch.long, device=device)
+            sample_losses.append(
+                F.binary_cross_entropy_with_logits(
+                    output.edge_cleave_logit[index_tensor],
+                    output.edge_cleave_logit.new_zeros((index_tensor.numel(),)),
+                )
+            )
+
+        if len(sample_losses) == 0:
+            return output.edge_cleave_logit.sum() * 0.0
+        return torch.stack(sample_losses).mean()
+
+    @staticmethod
+    def _batch_edge_by_sample_edge(
+        output: FragmentTreeCandidateSelectionOutput,
+        *,
+        device: torch.device,
+    ) -> Dict[Tuple[int, int], int]:
+        batch = output.sample_tree_batch
+        edge_global_ids = batch.edge_id_global.to(device).long()
+        edge_ptr = batch.edge_ptr.to(device).long()
+        kept_sample_ids = batch.kept_sample_ids.to(device).long()
+        mapping: Dict[Tuple[int, int], int] = {}
+        for graph_index in range(int(kept_sample_ids.numel())):
+            sample_id = int(kept_sample_ids[graph_index].item())
+            start = int(edge_ptr[graph_index].item())
+            end = int(edge_ptr[graph_index + 1].item())
+            for batch_edge_index in range(start, end):
+                edge_id = int(edge_global_ids[batch_edge_index].item())
+                mapping[(sample_id, edge_id)] = int(batch_edge_index)
+        return mapping
 
     def _build_cleave_targets(
         self,

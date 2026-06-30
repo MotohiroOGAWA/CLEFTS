@@ -3,20 +3,24 @@ from typing import List, Tuple, Optional
 import torch
 import torch.nn as nn
 from torch_geometric.data import Data, Batch
-from torch_geometric.nn.aggr import AttentionalAggregation
-
 from ...libs.mmkit.mmkit import Compound
 from .graph_builder import MolGraphBuilder
 
-from ..common.layers.graphormer import GraphormerEncoder
+from .mol_graphormer import (
+    DEFAULT_MOL_GRAPHORMER_DROPOUT,
+    DEFAULT_MOL_GRAPHORMER_MAX_DEGREE,
+    DEFAULT_MOL_GRAPHORMER_MAX_EDGE_DIST,
+    DEFAULT_MOL_GRAPHORMER_MAX_SPATIAL_DIST,
+    MolGraphormerEncoder,
+)
 
 class MolEncoder(nn.Module):
     """
     MolEncoder based on GraphormerEncoder.
 
     - GraphormerEncoder returns:
-        node_h: [N_total, dim]
-        graph_h: [num_graphs, dim] if add_virtual_node=True else None
+        node_h: [N_total, node_dim]
+        graph_h: [num_graphs, graph_dim]
     """
 
     def __init__(
@@ -27,10 +31,10 @@ class MolEncoder(nn.Module):
         num_layers: int,
         # Graphormer-specific
         num_heads: int,
-        max_degree: int = 4,
-        max_spatial_dist: int = 3,
-        max_edge_dist: int = 3,
-        dropout: float = 0.0,
+        max_degree: int = DEFAULT_MOL_GRAPHORMER_MAX_DEGREE,
+        max_spatial_dist: int = DEFAULT_MOL_GRAPHORMER_MAX_SPATIAL_DIST,
+        max_edge_dist: int = DEFAULT_MOL_GRAPHORMER_MAX_EDGE_DIST,
+        dropout: float = DEFAULT_MOL_GRAPHORMER_DROPOUT,
     ):
         super().__init__()
 
@@ -40,27 +44,20 @@ class MolEncoder(nn.Module):
         atom_dim = self.graph_builder.atom_dim
         bond_dim = self.graph_builder.bond_dim
 
-        self._node_dim = node_dim
-        self._num_graph_tokens = graph_dim // node_dim
-        self._graph_dim = self._num_graph_tokens * node_dim
-
-        self.encoder = GraphormerEncoder(
-            in_dim=atom_dim,
-            dim=node_dim,
-            num_graph_tokens=self._num_graph_tokens,
-            edge_dim=bond_dim,
+        self.encoder = MolGraphormerEncoder(
+            atom_dim=atom_dim,
+            bond_dim=bond_dim,
+            node_dim=node_dim,
+            graph_dim=graph_dim,
             num_heads=num_heads,
             num_layers=num_layers,
             max_degree=max_degree,
             max_spatial_dist=max_spatial_dist,
             max_edge_dist=max_edge_dist,
             dropout=dropout,
-            add_virtual_node=True,
-            undirected_for_spd=True,
-            undirected_for_path=True,
-            start_cap=64,
-            cap_growth=2.0,
         )
+        self._node_dim = self.encoder.mol_node_dim
+        self._graph_dim = self.encoder.mol_graph_dim
     
     @property
     def node_dim(self) -> int:
@@ -129,7 +126,7 @@ class MolEncoder(nn.Module):
 
             n = data.x.size(0)
             data.x = batch.x[:n]                  # [num_atoms, node_dim]
-            data.embedding = batch.embeddings[0]  # [node_dim]
+            data.embedding = batch.embeddings[0]  # [graph_dim]
             data.compound = compound
             return data
         except Exception:

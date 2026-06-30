@@ -45,6 +45,7 @@ class FragmentTreeCandidateSelectionOutput:
     sample_tree_batch: object
     keep_logit: Tensor
     cleave_logit: Tensor
+    edge_cleave_logit: Tensor
     ion_logit: Tensor
     unsaturation_logit: Tensor
     radical_logit: Tensor
@@ -82,10 +83,15 @@ class FragmentTreeCandidateSelector(nn.Module):
         self.max_fragment_ion_candidates = int(max_fragment_ion_candidates)
         self.max_next_cleavage_candidates = int(max_next_cleavage_candidates)
         self.max_nodes_for_ion_candidates = max_nodes_for_ion_candidates
-        tree_dim = int(feature_model.tree_encoder.dim)
+        tree_dim = int(feature_model.tree_encoder.hidden_dim)
         hidden_dim = int(hidden_dim or tree_dim)
         self.node_keep_head = nn.Sequential(nn.Linear(tree_dim, hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, 1))
         self.node_cleave_head = nn.Sequential(nn.Linear(tree_dim, hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, 1))
+        self.edge_cleave_head = nn.Sequential(
+            nn.Linear(tree_dim * 2 + feature_model.cleavage_edge_fnet.feature_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1),
+        )
         self.ion_head = nn.Sequential(nn.Linear(tree_dim, hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, len(feature_model.ion_flat_candidates)))
         self.unsaturation_head = nn.Sequential(nn.Linear(tree_dim, hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, len(feature_model.unsaturation_flat_candidates)))
         self.radical_head = nn.Sequential(nn.Linear(tree_dim, hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, len(feature_model.radical_flat_candidates)))
@@ -96,6 +102,7 @@ class FragmentTreeCandidateSelector(nn.Module):
         sample_tree_batch = feature_output.sample_tree_batch
         keep_logit = self.node_keep_head(sample_tree_batch.x).squeeze(-1)
         cleave_logit = self.node_cleave_head(sample_tree_batch.x).squeeze(-1)
+        edge_cleave_logit = self._edge_cleave_logit(sample_tree_batch)
         ion_logit = self.ion_head(sample_tree_batch.x)
         unsaturation_logit = self.unsaturation_head(sample_tree_batch.x)
         radical_logit = self.radical_head(sample_tree_batch.x)
@@ -104,6 +111,7 @@ class FragmentTreeCandidateSelector(nn.Module):
             sample_tree_batch=sample_tree_batch,
             keep_logit=keep_logit,
             cleave_logit=cleave_logit,
+            edge_cleave_logit=edge_cleave_logit,
             ion_logit=ion_logit,
             unsaturation_logit=unsaturation_logit,
             radical_logit=radical_logit,
@@ -113,6 +121,21 @@ class FragmentTreeCandidateSelector(nn.Module):
             kept_candidates=self._select_fragment_ion_candidates(features=features, sample_tree_batch=sample_tree_batch, keep_logit=keep_logit, ion_logit=ion_logit, unsaturation_logit=unsaturation_logit, radical_logit=radical_logit),
             next_cleavage_candidates=self._select_next_cleavage_candidates(sample_tree_batch=sample_tree_batch, cleave_logit=cleave_logit),
         )
+
+    def _edge_cleave_logit(self, sample_tree_batch) -> Tensor:
+        if sample_tree_batch.edge_index.numel() == 0:
+            return sample_tree_batch.x.new_empty((0,))
+        src = sample_tree_batch.edge_index[0].long()
+        dst = sample_tree_batch.edge_index[1].long()
+        edge_repr = torch.cat(
+            [
+                sample_tree_batch.x[src],
+                sample_tree_batch.x[dst],
+                sample_tree_batch.edge_attr,
+            ],
+            dim=-1,
+        )
+        return self.edge_cleave_head(edge_repr).squeeze(-1)
 
     def generate_depth_limited_candidates(self, data: Union[FragmentTreeStructure, FragmentTreeFeatures], *, max_depth: int) -> FragmentTreeCandidateSelectionOutput:
         if max_depth < 0:

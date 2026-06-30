@@ -137,7 +137,17 @@ class MultiheadAttention(nn.Module):
             attn_weights = attn_weights.view(bsz * self.num_heads, tq, tk)
 
         # ---- softmax ----
-        attn_probs = self.dropout(torch.softmax(attn_weights, dim=-1))
+        # Fully masked query rows occur for padded tokens when pairwise masks are
+        # used. softmax([-inf, ...]) produces NaN, so keep those rows at zero.
+        valid_query = torch.isfinite(attn_weights).any(dim=-1, keepdim=True)
+        safe_attn_weights = torch.where(
+            valid_query,
+            attn_weights,
+            torch.zeros_like(attn_weights),
+        )
+        attn_probs = torch.softmax(safe_attn_weights, dim=-1)
+        attn_probs = torch.where(valid_query, attn_probs, torch.zeros_like(attn_probs))
+        attn_probs = self.dropout(attn_probs)
         attn = torch.bmm(attn_probs, v)
 
         # ---- back to [T,B,C] ----

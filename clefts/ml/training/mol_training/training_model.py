@@ -20,6 +20,12 @@ if __package__ in {None, ""}:
 
     from clefts.libs.mmkit.mmkit import Compound
     from clefts.ml.mol.mol_encoder import MolEncoder
+    from clefts.ml.mol.mol_graphormer import (
+        DEFAULT_MOL_GRAPHORMER_DROPOUT,
+        DEFAULT_MOL_GRAPHORMER_MAX_DEGREE,
+        DEFAULT_MOL_GRAPHORMER_MAX_EDGE_DIST,
+        DEFAULT_MOL_GRAPHORMER_MAX_SPATIAL_DIST,
+    )
     from clefts.ml.training.mol_training.dataset import (
         DEFAULT_DESCRIPTOR_NAMES,
         DescriptorNormalizer,
@@ -32,6 +38,12 @@ if __package__ in {None, ""}:
 else:
     from ....libs.mmkit.mmkit import Compound
     from ...mol.mol_encoder import MolEncoder
+    from ...mol.mol_graphormer import (
+        DEFAULT_MOL_GRAPHORMER_DROPOUT,
+        DEFAULT_MOL_GRAPHORMER_MAX_DEGREE,
+        DEFAULT_MOL_GRAPHORMER_MAX_EDGE_DIST,
+        DEFAULT_MOL_GRAPHORMER_MAX_SPATIAL_DIST,
+    )
     from .dataset import (
         DEFAULT_DESCRIPTOR_NAMES,
         DescriptorNormalizer,
@@ -216,14 +228,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", default="cpu")
 
     parser.add_argument("--symbols", default=None, help="Comma-separated atom symbols. Required.")
-    parser.add_argument("--node-dim", "--atom-dim", default="64,128,256", help="Comma-separated MolEncoder node embedding dims. One value means fixed.")
+    parser.add_argument("--node-dim", "--node_dim", default="64,128,256", help="Comma-separated MolEncoder node embedding dims. One value means fixed.")
     parser.add_argument("--graph-dim", "--graph_dim", default="128", help="Comma-separated MolEncoder graph dims.")
     parser.add_argument("--num-layers", default="4", help="Comma-separated Graphormer layer counts.")
     parser.add_argument("--num-heads", default="8", help="Comma-separated attention head counts.")
-    parser.add_argument("--max-degree", default="8", help="Comma-separated max degree values.")
-    parser.add_argument("--max-spatial-dist", default="5", help="Comma-separated max shortest-path distances.")
-    parser.add_argument("--max-edge-dist", default="5", help="Comma-separated max edge-path distances.")
-    parser.add_argument("--dropout", type=float, default=0.1, help="MolEncoder dropout. This is a single value, not a candidate list.")
+    parser.add_argument("--max-degree", default=str(DEFAULT_MOL_GRAPHORMER_MAX_DEGREE), help="Comma-separated max degree values.")
+    parser.add_argument("--max-spatial-dist", default=str(DEFAULT_MOL_GRAPHORMER_MAX_SPATIAL_DIST), help="Comma-separated max shortest-path distances.")
+    parser.add_argument("--max-edge-dist", default=str(DEFAULT_MOL_GRAPHORMER_MAX_EDGE_DIST), help="Comma-separated max edge-path distances.")
+    parser.add_argument("--dropout", type=float, default=DEFAULT_MOL_GRAPHORMER_DROPOUT, help="MolEncoder dropout. This is a single value, not a candidate list.")
 
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--num-workers", type=int, default=0)

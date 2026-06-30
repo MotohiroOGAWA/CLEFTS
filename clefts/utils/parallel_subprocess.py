@@ -4,7 +4,7 @@ import os
 import sys
 import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Generator, List
+from typing import Dict, Generator, List, Optional
 
 from tqdm import tqdm
 
@@ -54,6 +54,7 @@ def to_module_name(path: str) -> str:
 def run_in_subprocess(
     commands: List[str],
     print_output: bool = False,
+    env: Optional[Dict[str, str]] = None,
 ) -> None:
     """Run a single task in a subprocess.
 
@@ -71,6 +72,7 @@ def run_in_subprocess(
         subprocess.run(
             commands,
             check=True,
+            env=env,
         )
     else:
         result = subprocess.run(
@@ -79,6 +81,7 @@ def run_in_subprocess(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            env=env,
         )
         if result.returncode != 0:
             print(
@@ -101,6 +104,8 @@ def run_parallel_subprocesses(
     commands_list: List[List[str]],
     max_workers: int = 4,
     print_output: bool = False,
+    env: Optional[Dict[str, str]] = None,
+    desc: str = "Parallel tasks",
 ) -> None:
     """Run multiple subprocesses in parallel.
 
@@ -123,6 +128,7 @@ def run_parallel_subprocesses(
                 run_in_subprocess,
                 commands,
                 print_output,
+                env,
             )
             for commands in commands_list
         ]
@@ -130,6 +136,6 @@ def run_parallel_subprocesses(
         for future in tqdm(
             as_completed(futures),
             total=len(futures),
-            desc="Parallel tasks",
+            desc=desc,
         ):
             future.result()
