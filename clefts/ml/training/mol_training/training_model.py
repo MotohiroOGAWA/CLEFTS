@@ -8,7 +8,7 @@ import json
 import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Sequence, Tuple
 
 import torch
 from tqdm import tqdm
@@ -129,17 +129,28 @@ def canonicalize_unique_smiles(
     smiles_values: Sequence[str],
     *,
     desc: str = "Canonicalizing SMILES",
+    canonical_cache: Dict[str, str | None] | None = None,
 ) -> Tuple[List[str], int]:
     out = []
     seen = set()
     invalid_count = 0
     for smiles in tqdm(smiles_values, desc=desc, unit="smiles"):
-        try:
-            compound = Compound.from_smiles(smiles)
-        except Exception:
-            invalid_count += 1
-            continue
-        canonical = compound.smiles
+        if canonical_cache is not None and smiles in canonical_cache:
+            canonical = canonical_cache[smiles]
+            if canonical is None:
+                invalid_count += 1
+                continue
+        else:
+            try:
+                compound = Compound.from_smiles(smiles)
+            except Exception:
+                invalid_count += 1
+                if canonical_cache is not None:
+                    canonical_cache[smiles] = None
+                continue
+            canonical = compound.smiles
+            if canonical_cache is not None:
+                canonical_cache[smiles] = canonical
         if canonical in seen:
             continue
         seen.add(canonical)
@@ -152,9 +163,34 @@ def load_raw_smiles_files(paths: Sequence[str]) -> Tuple[List[str], List[Dict[st
     per_file = []
     for path in paths:
         smiles = load_smiles_file(path)
+        unique_smiles = unique_preserve_order(smiles)
         all_smiles.extend(smiles)
-        per_file.append({"path": str(path), "raw_smiles": len(smiles)})
+        per_file.append(
+            {
+                "path": str(path),
+                "raw_smiles": len(smiles),
+                "unique_raw_smiles": len(unique_smiles),
+            }
+        )
     return all_smiles, per_file
+
+
+def annotate_per_file_canonical_smiles_counts(
+    per_file: List[Dict[str, object]],
+    *,
+    desc_prefix: str,
+    canonical_cache: Dict[str, str | None],
+) -> None:
+    for entry in per_file:
+        path = str(entry["path"])
+        raw_unique = unique_preserve_order(load_smiles_file(path))
+        canonical_unique, invalid_count = canonicalize_unique_smiles(
+            raw_unique,
+            desc=f"{desc_prefix} {Path(path).name}",
+            canonical_cache=canonical_cache,
+        )
+        entry["invalid_after_raw_unique"] = invalid_count
+        entry["canonical_unique_smiles"] = len(canonical_unique)
 
 
 def prepare_smiles_split(
@@ -165,16 +201,29 @@ def prepare_smiles_split(
 ) -> Tuple[List[str], List[str], Dict[str, object]]:
     train_raw, train_files = load_raw_smiles_files(train_smiles_paths)
     val_raw, val_files = load_raw_smiles_files(val_smiles_paths)
+    canonical_cache: Dict[str, str | None] = {}
+    annotate_per_file_canonical_smiles_counts(
+        train_files,
+        desc_prefix="Canonicalizing train file",
+        canonical_cache=canonical_cache,
+    )
+    annotate_per_file_canonical_smiles_counts(
+        val_files,
+        desc_prefix="Canonicalizing validation file",
+        canonical_cache=canonical_cache,
+    )
 
     train_raw_unique = unique_preserve_order(train_raw)
     val_raw_unique = unique_preserve_order(val_raw)
     train_smiles, train_invalid = canonicalize_unique_smiles(
         train_raw_unique,
         desc="Canonicalizing train SMILES",
+        canonical_cache=canonical_cache,
     )
     val_canonical, val_invalid = canonicalize_unique_smiles(
         val_raw_unique,
         desc="Canonicalizing validation SMILES",
+        canonical_cache=canonical_cache,
     )
 
     train_set = set(train_smiles)
@@ -220,6 +269,111 @@ def prepare_smiles_split(
     return train_smiles, val_smiles, summary
 
 
+def input_file_manifest(paths: Sequence[str]) -> List[Dict[str, object]]:
+    out = []
+    for path in paths:
+        p = Path(path)
+        stat = p.stat()
+        out.append(
+            {
+                "path": str(path),
+                "size": int(stat.st_size),
+                "mtime_ns": int(stat.st_mtime_ns),
+            }
+        )
+    return out
+
+
+def smiles_split_cache_manifest(
+    *,
+    train_smiles_paths: Sequence[str],
+    val_smiles_paths: Sequence[str],
+) -> Dict[str, object]:
+    return {
+        "train_files": input_file_manifest(train_smiles_paths),
+        "val_files": input_file_manifest(val_smiles_paths),
+    }
+
+
+def write_smiles_split_outputs(
+    *,
+    output_dir: Path,
+    train_smiles: Sequence[str],
+    val_smiles: Sequence[str],
+    summary: Dict[str, object],
+) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    with open(output_dir / "smiles_split_summary.json", "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
+    with open(output_dir / "train_smiles.txt", "w", encoding="utf-8") as f:
+        f.write("\n".join(train_smiles) + "\n")
+    with open(output_dir / "val_smiles.txt", "w", encoding="utf-8") as f:
+        f.write("\n".join(val_smiles) + "\n")
+
+
+def load_or_prepare_smiles_split(
+    *,
+    train_smiles_paths: Sequence[str],
+    val_smiles_paths: Sequence[str],
+    output_dir: Path,
+    rebuild_cache: bool = False,
+) -> Tuple[List[str], List[str], Dict[str, object]]:
+    cache_path = output_dir / "pretraining_smiles_split_cache.json"
+    manifest = smiles_split_cache_manifest(
+        train_smiles_paths=train_smiles_paths,
+        val_smiles_paths=val_smiles_paths,
+    )
+    if not rebuild_cache and cache_path.exists():
+        with open(cache_path, encoding="utf-8") as f:
+            payload = json.load(f)
+        if payload.get("input_manifest") == manifest:
+            train_smiles = list(payload["train_smiles"])
+            val_smiles = list(payload["val_smiles"])
+            summary = dict(payload["summary"])
+            summary["smiles_split_cache"] = {
+                "hit": True,
+                "path": str(cache_path),
+            }
+            write_smiles_split_outputs(
+                output_dir=output_dir,
+                train_smiles=train_smiles,
+                val_smiles=val_smiles,
+                summary=summary,
+            )
+            print(f"Loaded SMILES split cache: {cache_path}")
+            return train_smiles, val_smiles, summary
+        print(f"SMILES split cache input mismatch, rebuilding: {cache_path}")
+
+    train_smiles, val_smiles, summary = prepare_smiles_split(
+        train_smiles_paths=train_smiles_paths,
+        val_smiles_paths=val_smiles_paths,
+        output_dir=output_dir,
+    )
+    summary["smiles_split_cache"] = {
+        "hit": False,
+        "path": str(cache_path),
+        "rebuilt": bool(rebuild_cache),
+    }
+    write_smiles_split_outputs(
+        output_dir=output_dir,
+        train_smiles=train_smiles,
+        val_smiles=val_smiles,
+        summary=summary,
+    )
+    with open(cache_path, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "input_manifest": manifest,
+                "train_smiles": list(train_smiles),
+                "val_smiles": list(val_smiles),
+                "summary": summary,
+            },
+            f,
+            indent=2,
+        )
+    return train_smiles, val_smiles, summary
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Pretrain MolEncoder with node, edge, and graph-level tasks.")
     parser.add_argument("--train-smiles", nargs="+", default=None, help="Newline-delimited SMILES file(s) for training.")
@@ -240,12 +394,33 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument(
+        "--preprocessing-cache",
+        default=None,
+        help="Path to a torch cache for canonical SMILES, graph data, and descriptor statistics. Default: output-dir/pretraining_preprocessed_dataset.pt.",
+    )
+    parser.add_argument(
+        "--rebuild-preprocessing-cache",
+        action="store_true",
+        help="Ignore any existing preprocessing cache and rebuild it.",
+    )
 
     parser.add_argument("--epochs", "--full-epochs", dest="epochs", type=int, default=100)
+    parser.add_argument(
+        "--early-stopping-patience",
+        type=int,
+        default=None,
+        help="Enable early stopping after this many non-improving epochs. Default: disabled.",
+    )
+    parser.add_argument("--early-stopping-window-size", type=int, default=1)
+    parser.add_argument("--early-stopping-min-delta", type=float, default=1e-4)
+    parser.add_argument("--early-stopping-reset-step", type=float, default=1.0)
+    parser.add_argument("--early-stopping-verbose", action="store_true")
 
     parser.add_argument("--node-mask-ratio", type=float, default=0.15)
     parser.add_argument("--edge-mask-ratio", type=float, default=0.15)
     parser.add_argument("--disable-balanced-attribute-masking", action="store_true")
+    parser.add_argument("--disable-balanced-record-sampling", action="store_true")
     parser.add_argument("--mask-balance-patience", type=int, default=20)
     parser.add_argument("--mask-balance-max-forced-per-batch", type=int, default=8)
     parser.add_argument("--disable-balanced-validation-masks", action="store_true")
@@ -349,7 +524,7 @@ def make_pretraining_model(
     )
 
 
-def write_summary_table(rows: List[Dict[str, object]], path: Path) -> None:
+def write_summary_table(rows: List[Dict[str, object]], path: Path, *, delimiter: str = ",") -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if not rows:
         return
@@ -359,9 +534,206 @@ def write_summary_table(rows: List[Dict[str, object]], path: Path) -> None:
             if key not in keys:
                 keys.append(key)
     with open(path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=keys)
+        writer = csv.DictWriter(f, fieldnames=keys, delimiter=delimiter)
         writer.writeheader()
         writer.writerows(rows)
+
+
+def is_loss_or_accuracy_metric(name: str) -> bool:
+    return name == "loss" or name.endswith("_loss") or name.endswith("_acc")
+
+
+def final_metric_summary_columns(best: Dict[str, object]) -> Dict[str, object]:
+    out: Dict[str, object] = {
+        "final_epoch": int(best.get("final_epoch", best.get("epoch", -1))),
+        "stopped_epoch": int(best.get("stopped_epoch", best.get("final_epoch", -1))),
+        "early_stopping_enabled": bool(best.get("early_stopping_enabled", False)),
+        "early_stopping_counter": int(best.get("early_stopping_counter", 0)),
+        "last_validation_seconds": float(best.get("last_validation_seconds", 0.0)),
+    }
+    for split, metrics_key in (("train", "final_train_metrics"), ("val", "final_val_metrics")):
+        metrics = best.get(metrics_key, {})
+        if not isinstance(metrics, dict):
+            continue
+        for name in sorted(metrics):
+            if is_loss_or_accuracy_metric(str(name)):
+                out[f"final_{split}_{name}"] = metrics[name]
+    return out
+
+
+PREPROCESSING_CACHE_VERSION = 1
+
+
+def preprocessing_cache_path(args: argparse.Namespace, output_dir: Path) -> Path:
+    if args.preprocessing_cache not in {None, ""}:
+        return Path(args.preprocessing_cache)
+    return output_dir / "pretraining_preprocessed_dataset.pt"
+
+
+def preprocessing_cache_manifest(
+    *,
+    symbols: Sequence[str],
+    descriptor_names: Sequence[str],
+    train_smiles: Sequence[str],
+    val_smiles: Sequence[str],
+) -> Dict[str, object]:
+    return {
+        "version": PREPROCESSING_CACHE_VERSION,
+        "symbols": list(symbols),
+        "descriptor_names": list(descriptor_names),
+        "train_smiles": list(train_smiles),
+        "val_smiles": list(val_smiles),
+    }
+
+
+def load_preprocessing_cache(
+    path: Path,
+    *,
+    manifest: Dict[str, object],
+    symbols: Sequence[str],
+    descriptor_names: Sequence[str],
+) -> Tuple[MolPretrainingDataset, MolPretrainingDataset, DescriptorNormalizer, Dict[str, object]] | None:
+    if not path.exists():
+        return None
+    try:
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:
+        payload = torch.load(path, map_location="cpu")
+    if payload.get("manifest") != manifest:
+        print(f"Preprocessing cache manifest mismatch, rebuilding: {path}")
+        return None
+
+    normalizer = DescriptorNormalizer(
+        mean=payload["descriptor_mean"],
+        std=payload["descriptor_std"],
+    )
+    train_dataset = MolPretrainingDataset.from_items(
+        payload["train_items"],
+        symbols=symbols,
+        descriptor_names=descriptor_names,
+        descriptor_normalizer=normalizer,
+    )
+    val_dataset = MolPretrainingDataset.from_items(
+        payload["val_items"],
+        symbols=symbols,
+        descriptor_names=descriptor_names,
+        descriptor_normalizer=normalizer,
+    )
+    summary = {
+        "enabled": True,
+        "hit": True,
+        "path": str(path),
+        "version": PREPROCESSING_CACHE_VERSION,
+        "num_train_molecules": len(train_dataset),
+        "num_val_molecules": len(val_dataset),
+    }
+    return train_dataset, val_dataset, normalizer, summary
+
+
+def save_preprocessing_cache(
+    path: Path,
+    *,
+    manifest: Dict[str, object],
+    train_dataset: MolPretrainingDataset,
+    val_dataset: MolPretrainingDataset,
+    normalizer: DescriptorNormalizer,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "manifest": manifest,
+            "descriptor_mean": normalizer.mean.detach().cpu(),
+            "descriptor_std": normalizer.std.detach().cpu(),
+            "train_items": train_dataset.items,
+            "val_items": val_dataset.items,
+        },
+        path,
+    )
+
+
+def build_or_load_preprocessed_datasets(
+    *,
+    args: argparse.Namespace,
+    output_dir: Path,
+    train_smiles: Sequence[str],
+    val_smiles: Sequence[str],
+    symbols: Sequence[str],
+    descriptor_names: Sequence[str],
+) -> Tuple[MolPretrainingDataset, MolPretrainingDataset, DescriptorNormalizer, Dict[str, object]]:
+    cache_path = preprocessing_cache_path(args, output_dir)
+    manifest = preprocessing_cache_manifest(
+        symbols=symbols,
+        descriptor_names=descriptor_names,
+        train_smiles=train_smiles,
+        val_smiles=val_smiles,
+    )
+    if not args.rebuild_preprocessing_cache:
+        cached = load_preprocessing_cache(
+            cache_path,
+            manifest=manifest,
+            symbols=symbols,
+            descriptor_names=descriptor_names,
+        )
+        if cached is not None:
+            print(f"Loaded preprocessing cache: {cache_path}")
+            return cached
+
+    print(f"Building preprocessing cache: {cache_path}")
+    train_dataset = MolPretrainingDataset(
+        train_smiles,
+        symbols=symbols,
+        descriptor_names=descriptor_names,
+        progress_desc="Building train dataset",
+    )
+    normalizer = DescriptorNormalizer.fit(train_dataset.descriptor_matrix())
+    train_dataset.descriptor_normalizer = normalizer
+    val_dataset = MolPretrainingDataset(
+        val_smiles,
+        symbols=symbols,
+        descriptor_names=descriptor_names,
+        descriptor_normalizer=normalizer,
+        progress_desc="Building validation dataset",
+    )
+    save_preprocessing_cache(
+        cache_path,
+        manifest=manifest,
+        train_dataset=train_dataset,
+        val_dataset=val_dataset,
+        normalizer=normalizer,
+    )
+    summary = {
+        "enabled": True,
+        "hit": False,
+        "path": str(cache_path),
+        "version": PREPROCESSING_CACHE_VERSION,
+        "rebuilt": bool(args.rebuild_preprocessing_cache),
+        "num_train_molecules": len(train_dataset),
+        "num_val_molecules": len(val_dataset),
+    }
+    return train_dataset, val_dataset, normalizer, summary
+
+
+def build_feature_record_index(
+    dataset: MolPretrainingDataset,
+    *,
+    symbols: Sequence[str],
+) -> Dict[str, Dict[str, Dict[str, List[int]]]]:
+    return {
+        "node": dataset.feature_record_index("x", atom_feature_groups(symbols)),
+        "edge": dataset.feature_record_index("edge_attr", bond_feature_groups()),
+    }
+
+
+def feature_record_index_counts(
+    index: Dict[str, Dict[str, Dict[str, List[int]]]],
+) -> Dict[str, Dict[str, Dict[str, int]]]:
+    return {
+        level: {
+            group_name: {label: len(records) for label, records in labels.items()}
+            for group_name, labels in groups.items()
+        }
+        for level, groups in index.items()
+    }
 
 
 def write_feature_target_summary(
@@ -416,10 +788,22 @@ def run_pretraining_stage(
     config: MolEncoderConfig,
     train_dataset: MolPretrainingDataset,
     val_dataset: MolPretrainingDataset,
+    train_feature_record_index: Dict[str, Dict[str, Dict[str, List[int]]]],
     device: torch.device,
     output_dir: Path,
 ) -> Dict[str, object]:
-    train_loader = make_loader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
+    balanced_feature_record_index = None
+    if not args.disable_balanced_attribute_masking and not args.disable_balanced_record_sampling:
+        balanced_feature_record_index = train_feature_record_index
+    train_loader = make_loader(
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        balanced_feature_record_index=balanced_feature_record_index,
+        balance_patience=args.mask_balance_patience,
+        balance_max_forced_per_batch=args.mask_balance_max_forced_per_batch,
+    )
     val_loader = make_loader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
     model = make_pretraining_model(
         args,
@@ -441,6 +825,11 @@ def run_pretraining_stage(
         edge_mask_ratio=args.edge_mask_ratio,
         output_dir=stage_dir,
         stage_name="pretraining",
+        early_stopping_patience=args.early_stopping_patience,
+        early_stopping_window_size=args.early_stopping_window_size,
+        early_stopping_min_delta=args.early_stopping_min_delta,
+        early_stopping_reset_step=args.early_stopping_reset_step,
+        early_stopping_verbose=args.early_stopping_verbose,
     )
     return {
         **asdict(config),
@@ -450,6 +839,7 @@ def run_pretraining_stage(
         "best_val_loss": float(best["val_loss"]),
         "selection_score": float(best["val_loss"]) + float(args.dimension_penalty) * float(config.node_dim),
         "checkpoint_path": str(stage_dir / "pretraining_best.pt"),
+        **final_metric_summary_columns(best),
     }
 
 
@@ -470,34 +860,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     device = torch.device(args.device)
 
     configs = mol_encoder_configs(args)
-    train_smiles, val_smiles, smiles_split_summary = prepare_smiles_split(
+    train_smiles, val_smiles, smiles_split_summary = load_or_prepare_smiles_split(
         train_smiles_paths=args.train_smiles,
         val_smiles_paths=args.val_smiles,
         output_dir=output_dir,
+        rebuild_cache=args.rebuild_preprocessing_cache,
     )
     symbols = parse_csv_strings(args.symbols)
     descriptor_names = tuple(parse_csv_strings(args.descriptor_names) or DEFAULT_DESCRIPTOR_NAMES)
 
-    train_raw = MolPretrainingDataset(
-        train_smiles,
+    train_dataset, val_dataset, normalizer, preprocessing_cache_summary = build_or_load_preprocessed_datasets(
+        args=args,
+        output_dir=output_dir,
+        train_smiles=train_smiles,
+        val_smiles=val_smiles,
         symbols=symbols,
         descriptor_names=descriptor_names,
-        progress_desc="Computing train descriptors",
-    )
-    normalizer = DescriptorNormalizer.fit(train_raw.descriptor_matrix())
-    train_dataset = MolPretrainingDataset(
-        train_smiles,
-        symbols=symbols,
-        descriptor_names=descriptor_names,
-        descriptor_normalizer=normalizer,
-        progress_desc="Building train dataset",
-    )
-    val_dataset = MolPretrainingDataset(
-        val_smiles,
-        symbols=symbols,
-        descriptor_names=descriptor_names,
-        descriptor_normalizer=normalizer,
-        progress_desc="Building validation dataset",
     )
     feature_target_summary = write_feature_target_summary(
         train_dataset=train_dataset,
@@ -506,6 +884,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         output_dir=output_dir,
         min_validation_target_count=args.min_validation_target_count,
     )
+    train_feature_record_index = build_feature_record_index(train_dataset, symbols=symbols)
+    balanced_record_sampling_summary = {
+        "enabled": bool(
+            not args.disable_balanced_attribute_masking
+            and not args.disable_balanced_record_sampling
+        ),
+        "patience": int(args.mask_balance_patience),
+        "max_forced_per_batch": int(args.mask_balance_max_forced_per_batch),
+        "train_record_counts": feature_record_index_counts(train_feature_record_index),
+    }
 
     config_record = {
         "args": vars(args),
@@ -518,6 +906,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         "num_val_molecules": len(val_dataset),
         "smiles_split_summary": smiles_split_summary,
         "feature_target_summary": feature_target_summary,
+        "preprocessing_cache": preprocessing_cache_summary,
+        "balanced_record_sampling": balanced_record_sampling_summary,
     }
     with open(output_dir / "pretraining_config.json", "w", encoding="utf-8") as f:
         json.dump(config_record, f, indent=2)
@@ -531,6 +921,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 config=config,
                 train_dataset=train_dataset,
                 val_dataset=val_dataset,
+                train_feature_record_index=train_feature_record_index,
                 device=device,
                 output_dir=output_dir,
             )
@@ -554,6 +945,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     save_selected_checkpoint(selected_row, output_dir)
     write_summary_table(all_rows, output_dir / "mol_encoder_pretraining_summary.csv")
+    write_summary_table(all_rows, output_dir / "mol_encoder_pretraining_summary.tsv", delimiter="	")
     with open(output_dir / "mol_encoder_pretraining_summary.json", "w", encoding="utf-8") as f:
         json.dump(all_rows, f, indent=2)
     return 0

@@ -2,23 +2,111 @@ from __future__ import annotations
 
 import csv
 import json
+import math
+import random
 import re
+import time
 from pathlib import Path
-from typing import Dict, Iterable, Optional
+from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Sampler
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
+from ...common.torch_utils.early_stopping import EarlyStopping
 from .dataset import MolPretrainingDataset, collate_mol_graphs
 from .pretraining_model import MolPretrainingModel
 
 
 DEFAULT_WEIGHT_DECAY = 1e-2
 DEFAULT_GRAD_CLIP_NORM = 1.0
-DEFAULT_PATIENCE = 8
 DEFAULT_MIN_DELTA = 1e-4
+
+
+class BalancedFeatureBatchSampler(Sampler[List[int]]):
+    def __init__(
+        self,
+        *,
+        dataset_size: int,
+        batch_size: int,
+        feature_record_index: Dict[str, Dict[str, Dict[str, List[int]]]],
+        patience: int,
+        max_forced_per_batch: int,
+        shuffle: bool = True,
+    ) -> None:
+        self.dataset_size = int(dataset_size)
+        self.batch_size = int(max(1, batch_size))
+        self.patience = int(max(1, patience))
+        self.max_forced_per_batch = int(max(0, max_forced_per_batch))
+        self.shuffle = bool(shuffle)
+        self._rng = random.Random()
+        self._records_by_key: Dict[Tuple[str, str, str], List[int]] = {}
+        self._record_sets_by_key: Dict[Tuple[str, str, str], set[int]] = {}
+        for level, groups in feature_record_index.items():
+            for group_name, labels in groups.items():
+                for label, records in labels.items():
+                    clean_records = sorted({int(index) for index in records})
+                    if not clean_records:
+                        continue
+                    key = (str(level), str(group_name), str(label))
+                    self._records_by_key[key] = clean_records
+                    self._record_sets_by_key[key] = set(clean_records)
+        self._steps_since_sampled = {key: self.patience for key in self._records_by_key}
+
+    def __len__(self) -> int:
+        if self.dataset_size <= 0:
+            return 0
+        return int(math.ceil(self.dataset_size / self.batch_size))
+
+    def __iter__(self) -> Iterator[List[int]]:
+        if self.dataset_size <= 0:
+            return
+        if self.shuffle:
+            order = torch.randperm(self.dataset_size).tolist()
+        else:
+            order = list(range(self.dataset_size))
+        for start in range(0, self.dataset_size, self.batch_size):
+            batch = [int(index) for index in order[start : start + self.batch_size]]
+            if batch and self.max_forced_per_batch > 0 and self._records_by_key:
+                self._force_due_records(batch)
+            self._update_steps(batch)
+            yield batch
+
+    def _force_due_records(self, batch: List[int]) -> None:
+        batch_set = set(batch)
+        due_keys = sorted(
+            self._records_by_key,
+            key=lambda key: (
+                self._steps_since_sampled[key],
+                -len(self._records_by_key[key]),
+            ),
+            reverse=True,
+        )
+        replacement_slot = 0
+        forced = 0
+        for key in due_keys:
+            if forced >= self.max_forced_per_batch or replacement_slot >= len(batch):
+                break
+            if self._steps_since_sampled[key] < self.patience:
+                continue
+            if batch_set & self._record_sets_by_key[key]:
+                continue
+            record_index = self._rng.choice(self._records_by_key[key])
+            old_index = batch[replacement_slot]
+            batch[replacement_slot] = record_index
+            batch_set.discard(old_index)
+            batch_set.add(record_index)
+            replacement_slot += 1
+            forced += 1
+
+    def _update_steps(self, batch: Sequence[int]) -> None:
+        batch_set = set(int(index) for index in batch)
+        for key, record_set in self._record_sets_by_key.items():
+            if batch_set & record_set:
+                self._steps_since_sampled[key] = 0
+            else:
+                self._steps_since_sampled[key] += 1
 
 
 def move_batch(batch, device: torch.device):
@@ -170,6 +258,25 @@ def evaluate(
     return mean_metrics(metrics)
 
 
+def evaluate_timed(
+    model: MolPretrainingModel,
+    loader: DataLoader,
+    *,
+    device: torch.device,
+    node_mask_ratio: float,
+    edge_mask_ratio: float,
+) -> Tuple[Dict[str, float], float]:
+    start = time.perf_counter()
+    metrics = evaluate(
+        model,
+        loader,
+        device=device,
+        node_mask_ratio=node_mask_ratio,
+        edge_mask_ratio=edge_mask_ratio,
+    )
+    return metrics, time.perf_counter() - start
+
+
 def train_epochs(
     model: MolPretrainingModel,
     train_loader: DataLoader,
@@ -182,19 +289,113 @@ def train_epochs(
     edge_mask_ratio: float,
     output_dir: Path,
     stage_name: str,
-) -> Dict[str, float]:
+    early_stopping_patience: Optional[int] = None,
+    early_stopping_window_size: int = 1,
+    early_stopping_min_delta: float = DEFAULT_MIN_DELTA,
+    early_stopping_reset_step: float = 1.0,
+    early_stopping_verbose: bool = False,
+) -> Dict[str, object]:
     output_dir.mkdir(parents=True, exist_ok=True)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=DEFAULT_WEIGHT_DECAY)
-    best = {"val_loss": float("inf"), "epoch": -1}
-    stale_epochs = 0
+    best = {
+        "val_loss": float("inf"),
+        "epoch": -1,
+        "stopped_epoch": int(epochs),
+        "early_stopping_enabled": bool(early_stopping_patience is not None and early_stopping_patience > 0),
+    }
+    early_stopping = EarlyStopping(
+        patience=early_stopping_patience,
+        window_size=early_stopping_window_size,
+        min_delta=early_stopping_min_delta,
+        reset_step=early_stopping_reset_step,
+        mode="min",
+        verbose=early_stopping_verbose,
+    )
     metrics_path = output_dir / f"{stage_name}_metrics.csv"
     tensorboard_dir = output_dir / "tensorboard"
     tensorboard_dir.mkdir(parents=True, exist_ok=True)
     tb_writer = SummaryWriter(log_dir=str(tensorboard_dir))
     write_tensorboard_command(tensorboard_dir)
 
-    with open(metrics_path, "w", newline="", encoding="utf-8") as f:
-        writer = None
+    metric_records: List[Dict[str, float]] = []
+    metric_fieldnames = ["epoch"]
+
+    def write_epoch_record(
+        csv_file,
+        *,
+        epoch: int,
+        train_metrics: Dict[str, float],
+        val_metrics: Dict[str, float],
+    ) -> None:
+        record = {
+            "epoch": epoch,
+            **{f"train_{k}": v for k, v in train_metrics.items()},
+            **{f"val_{k}": v for k, v in val_metrics.items()},
+        }
+        metric_records.append(record)
+        for key in record.keys():
+            if key not in metric_fieldnames:
+                metric_fieldnames.append(key)
+
+        csv_file.seek(0)
+        csv_file.truncate()
+        csv_writer = csv.DictWriter(csv_file, fieldnames=metric_fieldnames)
+        csv_writer.writeheader()
+        csv_writer.writerows(metric_records)
+        csv_file.flush()
+        write_tensorboard_metric_pairs(
+            tb_writer,
+            train_metrics=train_metrics,
+            val_metrics=val_metrics,
+            epoch=epoch,
+        )
+        write_tensorboard_grouped_class_metrics(
+            tb_writer,
+            train_metrics=train_metrics,
+            val_metrics=val_metrics,
+            epoch=epoch,
+        )
+        write_tensorboard_grouped_descriptor_losses(
+            tb_writer,
+            train_metrics=train_metrics,
+            val_metrics=val_metrics,
+            epoch=epoch,
+        )
+        tb_writer.add_scalar("optimizer/lr", optimizer.param_groups[0]["lr"], epoch)
+        tb_writer.flush()
+
+    with open(metrics_path, "w+", newline="", encoding="utf-8") as f:
+
+        epoch0_train_metrics = evaluate(
+            model,
+            train_loader,
+            device=device,
+            node_mask_ratio=node_mask_ratio,
+            edge_mask_ratio=edge_mask_ratio,
+        )
+        epoch0_val_metrics, epoch0_val_seconds = evaluate_timed(
+            model,
+            val_loader,
+            device=device,
+            node_mask_ratio=node_mask_ratio,
+            edge_mask_ratio=edge_mask_ratio,
+        )
+        write_epoch_record(
+            f,
+            epoch=0,
+            train_metrics=epoch0_train_metrics,
+            val_metrics=epoch0_val_metrics,
+        )
+        val_loss = float(epoch0_val_metrics.get("loss", float("inf")))
+        early_stopping(val_loss)
+        final_epoch = 0
+        final_train_metrics = epoch0_train_metrics
+        final_val_metrics = epoch0_val_metrics
+        final_val_seconds = epoch0_val_seconds
+        if val_loss < best["val_loss"] - DEFAULT_MIN_DELTA:
+            best.update({"val_loss": val_loss, "epoch": 0})
+            save_checkpoint(model, output_dir / f"{stage_name}_best.pt", extra={"stage": stage_name, **best})
+
         for epoch in range(1, epochs + 1):
             model.train()
             rows = []
@@ -214,54 +415,38 @@ def train_epochs(
                 progress.set_postfix(loss=f"{output.metrics.get('loss', 0.0):.4f}")
 
             train_metrics = mean_metrics(rows)
-            val_metrics = evaluate(
+            val_metrics, val_seconds = evaluate_timed(
                 model,
                 val_loader,
                 device=device,
                 node_mask_ratio=node_mask_ratio,
                 edge_mask_ratio=edge_mask_ratio,
             )
-            record = {
-                "epoch": epoch,
-                **{f"train_{k}": v for k, v in train_metrics.items()},
-                **{f"val_{k}": v for k, v in val_metrics.items()},
-            }
-            if writer is None:
-                writer = csv.DictWriter(f, fieldnames=list(record.keys()))
-                writer.writeheader()
-            writer.writerow(record)
-            f.flush()
-            write_tensorboard_metric_pairs(
-                tb_writer,
+            write_epoch_record(
+                f,
+                epoch=epoch,
                 train_metrics=train_metrics,
                 val_metrics=val_metrics,
-                epoch=epoch,
             )
-            write_tensorboard_grouped_class_metrics(
-                tb_writer,
-                train_metrics=train_metrics,
-                val_metrics=val_metrics,
-                epoch=epoch,
-            )
-            write_tensorboard_grouped_descriptor_losses(
-                tb_writer,
-                train_metrics=train_metrics,
-                val_metrics=val_metrics,
-                epoch=epoch,
-            )
-            tb_writer.add_scalar("optimizer/lr", optimizer.param_groups[0]["lr"], epoch)
-            tb_writer.flush()
 
+            final_epoch = epoch
+            final_train_metrics = train_metrics
+            final_val_metrics = val_metrics
+            final_val_seconds = val_seconds
             val_loss = float(val_metrics.get("loss", float("inf")))
             if val_loss < best["val_loss"] - DEFAULT_MIN_DELTA:
-                best = {"val_loss": val_loss, "epoch": epoch}
-                stale_epochs = 0
+                best.update({"val_loss": val_loss, "epoch": epoch})
                 save_checkpoint(model, output_dir / f"{stage_name}_best.pt", extra={"stage": stage_name, **best})
-            else:
-                stale_epochs += 1
-                if DEFAULT_PATIENCE > 0 and stale_epochs >= DEFAULT_PATIENCE:
-                    break
+            early_stopping(val_loss)
+            if early_stopping.early_stop:
+                best["stopped_epoch"] = epoch
+                break
 
+    best["final_epoch"] = final_epoch
+    best["final_train_metrics"] = final_train_metrics
+    best["final_val_metrics"] = final_val_metrics
+    best["last_validation_seconds"] = final_val_seconds
+    best["early_stopping_counter"] = early_stopping.counter
     tb_writer.close()
     save_checkpoint(model, output_dir / f"{stage_name}_last.pt", extra={"stage": stage_name, **best})
     with open(output_dir / f"{stage_name}_summary.json", "w", encoding="utf-8") as f:
@@ -293,7 +478,32 @@ def save_checkpoint(model: MolPretrainingModel, path: Path, *, extra: Optional[D
     torch.save(payload, path)
 
 
-def make_loader(dataset: MolPretrainingDataset, *, batch_size: int, shuffle: bool, num_workers: int) -> DataLoader:
+def make_loader(
+    dataset: MolPretrainingDataset,
+    *,
+    batch_size: int,
+    shuffle: bool,
+    num_workers: int,
+    balanced_feature_record_index: Optional[Dict[str, Dict[str, Dict[str, List[int]]]]] = None,
+    balance_patience: int = 20,
+    balance_max_forced_per_batch: int = 8,
+) -> DataLoader:
+    if shuffle and balanced_feature_record_index is not None and balance_max_forced_per_batch > 0:
+        batch_sampler = BalancedFeatureBatchSampler(
+            dataset_size=len(dataset),
+            batch_size=batch_size,
+            feature_record_index=balanced_feature_record_index,
+            patience=balance_patience,
+            max_forced_per_batch=balance_max_forced_per_batch,
+            shuffle=True,
+        )
+        return DataLoader(
+            dataset,
+            batch_sampler=batch_sampler,
+            num_workers=num_workers,
+            collate_fn=collate_mol_graphs,
+        )
+
     return DataLoader(
         dataset,
         batch_size=batch_size,
