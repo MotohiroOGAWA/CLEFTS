@@ -138,6 +138,25 @@ def mean_metrics(rows: Iterable[Dict[str, float]]) -> Dict[str, float]:
                 out[key] = weighted_sum / total_count
                 continue
         out[key] = float(sum(vals) / max(len(vals), 1))
+
+    descriptor_names = sorted(
+        match.group(1)
+        for key in list(out.keys())
+        if (match := re.match(r"^descriptor_(.+)_sse$", key)) is not None
+    )
+    for name in descriptor_names:
+        sse = float(out.get(f"descriptor_{name}_sse", 0.0))
+        target_sum = float(out.get(f"descriptor_{name}_target_sum", 0.0))
+        target_sq_sum = float(out.get(f"descriptor_{name}_target_sq_sum", 0.0))
+        count = float(out.get(f"descriptor_{name}_count", 0.0))
+        denom = target_sq_sum - (target_sum * target_sum / count) if count > 0.0 else 0.0
+        if denom > 1e-12:
+            out[f"descriptor_{name}_r2"] = 1.0 - sse / denom
+        else:
+            out[f"descriptor_{name}_r2"] = 1.0 if sse <= 1e-12 else 0.0
+    for key in list(out.keys()):
+        if DESCRIPTOR_R2_ACCUM_RE.match(key):
+            del out[key]
     return out
 
 
@@ -145,6 +164,8 @@ FEATURE_GROUP_PATTERN = "symbol|charge|ring_type|hybridization|num_hydrogens|val
 CLASS_METRIC_RE = re.compile(rf"^(node|edge)_({FEATURE_GROUP_PATTERN})_(.+)_(acc|count)$")
 GROUP_METRIC_RE = re.compile(rf"^(node|edge)_({FEATURE_GROUP_PATTERN})_(.+)$")
 DESCRIPTOR_ITEM_LOSS_RE = re.compile(r"^descriptor_(.+)_loss$")
+DESCRIPTOR_ITEM_R2_RE = re.compile(r"^descriptor_(.+)_r2$")
+DESCRIPTOR_R2_ACCUM_RE = re.compile(r"^descriptor_(.+)_(sse|target_sum|target_sq_sum|count)$")
 FEATURE_DISPLAY_NAMES = {
     "symbol": "element",
     "charge": "charge",
@@ -161,13 +182,20 @@ def tensorboard_metric_tag(name: str) -> str:
     if not match:
         return name
     prefix, group_name, metric_name = match.groups()
-    return f"{prefix}/{FEATURE_DISPLAY_NAMES.get(group_name, group_name)}_{metric_name}"
+    display_name = FEATURE_DISPLAY_NAMES.get(group_name, group_name)
+    if metric_name == "acc":
+        return f"{prefix}_acc/{display_name}"
+    return f"{prefix}/{display_name}_{metric_name}"
 
 
 def should_skip_metric_pair(name: str) -> bool:
-    descriptor_match = DESCRIPTOR_ITEM_LOSS_RE.match(name)
-    if descriptor_match and descriptor_match.group(1) != "":
+    descriptor_loss_match = DESCRIPTOR_ITEM_LOSS_RE.match(name)
+    if descriptor_loss_match and descriptor_loss_match.group(1) != "":
         return name != "descriptor_loss"
+    if DESCRIPTOR_ITEM_R2_RE.match(name):
+        return True
+    if DESCRIPTOR_R2_ACCUM_RE.match(name):
+        return True
     return CLASS_METRIC_RE.match(name) is not None
 
 
@@ -186,7 +214,8 @@ def write_tensorboard_grouped_class_metrics(
                 continue
             prefix, group_name, label, metric_name = match.groups()
             display_name = FEATURE_DISPLAY_NAMES.get(group_name, group_name)
-            tag = f"{prefix}/{display_name}_{metric_name}_by_class"
+            tag_prefix = f"{prefix}_acc" if metric_name == "acc" else prefix
+            tag = f"{tag_prefix}/{display_name}_{metric_name}_by_class"
             grouped.setdefault(tag, {})[f"{split}/{label}"] = float(value)
     for tag, values in grouped.items():
         if values:
@@ -200,15 +229,21 @@ def write_tensorboard_grouped_descriptor_losses(
     val_metrics: Dict[str, float],
     epoch: int,
 ) -> None:
-    values = {}
+    loss_values = {}
+    r2_values = {}
     for split, metrics in (("train", train_metrics), ("val", val_metrics)):
         for name, value in metrics.items():
-            match = DESCRIPTOR_ITEM_LOSS_RE.match(name)
-            if not match or name == "descriptor_loss":
+            loss_match = DESCRIPTOR_ITEM_LOSS_RE.match(name)
+            if loss_match and name != "descriptor_loss":
+                loss_values[f"{split}/{loss_match.group(1)}"] = float(value)
                 continue
-            values[f"{split}/{match.group(1)}"] = float(value)
-    if values:
-        writer.add_scalars("descriptor/loss_by_target", values, epoch)
+            r2_match = DESCRIPTOR_ITEM_R2_RE.match(name)
+            if r2_match:
+                r2_values[f"{split}/{r2_match.group(1)}"] = float(value)
+    if loss_values:
+        writer.add_scalars("descriptor/loss_by_target", loss_values, epoch)
+    if r2_values:
+        writer.add_scalars("descriptor/r2_by_target", r2_values, epoch)
 
 
 def write_tensorboard_metric_pairs(

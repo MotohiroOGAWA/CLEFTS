@@ -6,7 +6,7 @@ from typing import Dict, List, Optional, Sequence
 
 import torch
 from rdkit import Chem
-from rdkit.Chem import Descriptors, rdMolDescriptors
+from rdkit.Chem import AllChem, Descriptors, rdMolDescriptors
 from torch.utils.data import Dataset
 from torch_geometric.data import Batch, Data
 from tqdm import tqdm
@@ -16,16 +16,20 @@ from ...mol.graph_builder import MolGraphBuilder
 
 
 DEFAULT_DESCRIPTOR_NAMES = (
-    "MolWt",
-    # "ExactMolWt",  # Mostly redundant with MolWt for this pretraining target.
+    "ExactMolWt",
+    "HeavyAtomCount",
     "TPSA",
     "MolLogP",
     "NumHAcceptors",
     "NumHDonors",
     "NumRotatableBonds",
     "RingCount",
+    "NumAromaticRings",
+    "NumAliphaticRings",
     "FractionCSP3",
-    # "HeavyAtomCount",  # Largely a molecule-size target and easy to infer from graph size.
+    "NumHeteroatoms",
+    "FormalCharge",
+    "BertzCT",
 )
 
 
@@ -53,14 +57,29 @@ def compute_descriptors(mol: Chem.Mol, names: Sequence[str] = DEFAULT_DESCRIPTOR
             value = rdMolDescriptors.CalcNumRotatableBonds(mol)
         elif name == "RingCount":
             value = rdMolDescriptors.CalcNumRings(mol)
+        elif name == "NumAromaticRings":
+            value = rdMolDescriptors.CalcNumAromaticRings(mol)
+        elif name == "NumAliphaticRings":
+            value = rdMolDescriptors.CalcNumAliphaticRings(mol)
         elif name == "FractionCSP3":
             value = rdMolDescriptors.CalcFractionCSP3(mol)
         elif name == "HeavyAtomCount":
             value = mol.GetNumHeavyAtoms()
+        elif name == "NumHeteroatoms":
+            value = Descriptors.NumHeteroatoms(mol)
+        elif name == "FormalCharge":
+            value = Chem.GetFormalCharge(mol)
+        elif name == "BertzCT":
+            value = Descriptors.BertzCT(mol)
         else:
             raise ValueError(f"Unsupported descriptor: {name}")
         values.append(float(value))
     return torch.tensor(values, dtype=torch.float32)
+
+
+def compute_ecfp(mol: Chem.Mol, *, radius: int = 2, n_bits: int = 2048) -> torch.Tensor:
+    fingerprint = AllChem.GetMorganFingerprintAsBitVect(mol, int(radius), nBits=int(n_bits))
+    return torch.tensor([float(bit) for bit in fingerprint.ToBitString()], dtype=torch.float32)
 
 
 @dataclass(frozen=True)
@@ -86,11 +105,15 @@ class MolPretrainingDataset(Dataset):
         symbols: Sequence[str],
         descriptor_names: Sequence[str] = DEFAULT_DESCRIPTOR_NAMES,
         descriptor_normalizer: Optional[DescriptorNormalizer] = None,
+        ecfp_radius: int = 2,
+        ecfp_n_bits: int = 2048,
         progress_desc: str = "Building molecule dataset",
     ) -> None:
         self.graph_builder = MolGraphBuilder(symbols=tuple(symbols))
         self.descriptor_names = tuple(descriptor_names)
         self.descriptor_normalizer = descriptor_normalizer
+        self.ecfp_radius = int(ecfp_radius)
+        self.ecfp_n_bits = int(ecfp_n_bits)
 
         self.items: List[Data] = []
         for smiles in tqdm(smiles_values, desc=progress_desc, unit="mol"):
@@ -99,6 +122,7 @@ class MolPretrainingDataset(Dataset):
                 data = self.graph_builder.build(compound)
                 data.smiles = compound.smiles
                 data.descriptors = compute_descriptors(compound.mol, self.descriptor_names)
+                data.ecfp = compute_ecfp(compound.mol, radius=self.ecfp_radius, n_bits=self.ecfp_n_bits)
                 self.items.append(data)
             except Exception:
                 continue
@@ -114,11 +138,15 @@ class MolPretrainingDataset(Dataset):
         symbols: Sequence[str],
         descriptor_names: Sequence[str] = DEFAULT_DESCRIPTOR_NAMES,
         descriptor_normalizer: Optional[DescriptorNormalizer] = None,
+        ecfp_radius: int = 2,
+        ecfp_n_bits: int = 2048,
     ) -> "MolPretrainingDataset":
         obj = cls.__new__(cls)
         obj.graph_builder = MolGraphBuilder(symbols=tuple(symbols))
         obj.descriptor_names = tuple(descriptor_names)
         obj.descriptor_normalizer = descriptor_normalizer
+        obj.ecfp_radius = int(ecfp_radius)
+        obj.ecfp_n_bits = int(ecfp_n_bits)
         obj.items = list(items)
         if not obj.items:
             raise ValueError("No valid molecules were loaded.")

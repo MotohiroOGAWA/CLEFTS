@@ -378,8 +378,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Pretrain MolEncoder with node, edge, and graph-level tasks.")
     parser.add_argument("--train-smiles", nargs="+", default=None, help="Newline-delimited SMILES file(s) for training.")
     parser.add_argument("--val-smiles", nargs="+", default=None, help="Newline-delimited SMILES file(s) for validation.")
-    parser.add_argument("--output-dir", default=None)
-    parser.add_argument("--device", default="cpu")
+    parser.add_argument("--output-dir", default=None, help="Directory where configs, logs, TensorBoard files, summaries, and checkpoints are written.")
+    parser.add_argument("--device", default="cpu", help="Torch device for training, for example cpu, cuda, or cuda:0.")
 
     parser.add_argument("--symbols", default=None, help="Comma-separated atom symbols. Required.")
     parser.add_argument("--node-dim", "--node_dim", default="64,128,256", help="Comma-separated MolEncoder node embedding dims. One value means fixed.")
@@ -391,9 +391,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-edge-dist", default=str(DEFAULT_MOL_GRAPHORMER_MAX_EDGE_DIST), help="Comma-separated max edge-path distances.")
     parser.add_argument("--dropout", type=float, default=DEFAULT_MOL_GRAPHORMER_DROPOUT, help="MolEncoder dropout. This is a single value, not a candidate list.")
 
-    parser.add_argument("--batch-size", type=int, default=32)
-    parser.add_argument("--num-workers", type=int, default=0)
-    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--batch-size", type=int, default=32, help="Number of molecules per training batch.")
+    parser.add_argument("--num-workers", type=int, default=0, help="Number of DataLoader worker processes.")
+    parser.add_argument("--lr", type=float, default=1e-4, help="AdamW learning rate.")
     parser.add_argument(
         "--preprocessing-cache",
         default=None,
@@ -405,42 +405,49 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Ignore any existing preprocessing cache and rebuild it.",
     )
 
-    parser.add_argument("--epochs", "--full-epochs", dest="epochs", type=int, default=100)
+    parser.add_argument("--epochs", "--full-epochs", dest="epochs", type=int, default=100, help="Maximum number of pretraining epochs.")
     parser.add_argument(
         "--early-stopping-patience",
         type=int,
         default=None,
         help="Enable early stopping after this many non-improving epochs. Default: disabled.",
     )
-    parser.add_argument("--early-stopping-window-size", type=int, default=1)
-    parser.add_argument("--early-stopping-min-delta", type=float, default=1e-4)
-    parser.add_argument("--early-stopping-reset-step", type=float, default=1.0)
-    parser.add_argument("--early-stopping-verbose", action="store_true")
+    parser.add_argument("--early-stopping-window-size", type=int, default=1, help="Number of recent validation losses to smooth inside early stopping.")
+    parser.add_argument("--early-stopping-min-delta", type=float, default=1e-4, help="Minimum validation-loss improvement required to reset early stopping.")
+    parser.add_argument("--early-stopping-reset-step", type=float, default=1.0, help="Counter reset amount used by the early stopping helper after improvement.")
+    parser.add_argument("--early-stopping-verbose", action="store_true", help="Print early stopping state updates.")
 
-    parser.add_argument("--node-mask-ratio", type=float, default=0.15)
-    parser.add_argument("--edge-mask-ratio", type=float, default=0.15)
-    parser.add_argument("--disable-balanced-attribute-masking", action="store_true")
-    parser.add_argument("--disable-balanced-record-sampling", action="store_true")
-    parser.add_argument("--mask-balance-patience", type=int, default=20)
-    parser.add_argument("--mask-balance-max-forced-per-batch", type=int, default=8)
-    parser.add_argument("--disable-balanced-validation-masks", action="store_true")
-    parser.add_argument("--min-validation-target-count", type=int, default=1)
+    parser.add_argument("--node-mask-ratio", type=float, default=0.25, help="Random node masking ratio for node attribute prediction.")
+    parser.add_argument("--edge-mask-ratio", type=float, default=0.25, help="Random edge masking ratio for edge attribute prediction.")
+    parser.add_argument("--disable-balanced-attribute-masking", action="store_true", help="Disable class-balancing when selecting node and edge attributes to mask.")
+    parser.add_argument("--disable-balanced-record-sampling", action="store_true", help="Disable forced molecule sampling for rare node and edge attribute classes.")
+    parser.add_argument("--mask-balance-patience", type=int, default=20, help="Number of batches a class may be absent before balanced masking or sampling forces it.")
+    parser.add_argument("--mask-balance-max-forced-per-batch", type=int, default=8, help="Maximum forced rare classes added per batch by balanced masking or sampling.")
+    parser.add_argument("--disable-balanced-validation-masks", action="store_true", help="Disable validation-time forced coverage for node and edge attribute classes present in a batch.")
+    parser.add_argument("--min-validation-target-count", type=int, default=1, help="Warn when validation has fewer targets than this for any node or edge attribute class.")
 
-    parser.add_argument("--disable-node-attribute", action="store_true")
-    parser.add_argument("--disable-node-context", action="store_true")
-    parser.add_argument("--disable-edge-attribute", action="store_true")
-    parser.add_argument("--disable-graph-contrastive", action="store_true")
-    parser.add_argument("--disable-graph-descriptors", action="store_true")
-    parser.add_argument("--graph-contrastive-node-mask-ratio", type=float, default=0.15)
-    parser.add_argument("--graph-contrastive-edge-drop-ratio", type=float, default=0.15)
-    parser.add_argument("--graph-contrastive-temperature", type=float, default=0.2)
-    parser.add_argument("--descriptor-names", default=",".join(DEFAULT_DESCRIPTOR_NAMES))
+    parser.add_argument("--disable-node-attribute", action="store_true", help="Disable masked node attribute prediction.")
+    parser.add_argument("--disable-node-context", action="store_true", help="Disable node context prediction between K-hop neighborhoods and context graphs.")
+    parser.add_argument("--disable-edge-attribute", action="store_true", help="Disable masked edge attribute prediction.")
+    parser.add_argument("--disable-graph-contrastive", action="store_true", help="Disable graph-level contrastive learning with augmented molecule views.")
+    parser.add_argument("--disable-graph-descriptors", action="store_true", help="Disable graph-level descriptor regression.")
+    parser.add_argument("--graph-contrastive-node-mask-ratio", type=float, default=0.25, help="Node masking ratio used when creating graph contrastive views.")
+    parser.add_argument("--graph-contrastive-edge-drop-ratio", type=float, default=0.25, help="Undirected bond deletion ratio used when creating graph contrastive views.")
+    parser.add_argument("--graph-contrastive-temperature", type=float, default=0.2, help="Temperature for graph contrastive and context pair logits.")
+    parser.add_argument("--context-k", type=int, default=2, help="K-hop radius for the center-node neighborhood in context prediction.")
+    parser.add_argument("--context-r1", type=int, default=1, help="Inner hop radius of the context graph ring.")
+    parser.add_argument("--context-r2", type=int, default=4, help="Outer hop radius of the context graph ring.")
+    parser.add_argument("--disable-graph-ecfp", action="store_true", help="Disable graph-level ECFP fingerprint prediction.")
+    parser.add_argument("--ecfp-radius", type=int, default=2, help="Morgan/ECFP fingerprint radius used as the graph-level target.")
+    parser.add_argument("--ecfp-n-bits", type=int, default=2048, help="Number of bits in the ECFP fingerprint target.")
+    parser.add_argument("--descriptor-names", default=",".join(DEFAULT_DESCRIPTOR_NAMES), help="Comma-separated RDKit descriptor targets for graph-level regression.")
 
-    parser.add_argument("--node-loss-weight", type=float, default=1.0)
-    parser.add_argument("--context-loss-weight", type=float, default=0.5)
-    parser.add_argument("--edge-loss-weight", type=float, default=1.0)
-    parser.add_argument("--graph-contrastive-loss-weight", type=float, default=0.5)
-    parser.add_argument("--descriptor-loss-weight", type=float, default=0.2)
+    parser.add_argument("--node-loss-weight", type=float, default=1.0, help="Loss weight for masked node attribute prediction.")
+    parser.add_argument("--context-loss-weight", type=float, default=1.0, help="Loss weight for node context prediction.")
+    parser.add_argument("--edge-loss-weight", type=float, default=1.0, help="Loss weight for masked edge attribute prediction.")
+    parser.add_argument("--graph-contrastive-loss-weight", type=float, default=1.0, help="Loss weight for graph-level contrastive learning.")
+    parser.add_argument("--descriptor-loss-weight", type=float, default=1.0, help="Loss weight for graph-level descriptor regression.")
+    parser.add_argument("--ecfp-loss-weight", type=float, default=1.0, help="Loss weight for graph-level ECFP fingerprint prediction.")
     parser.add_argument(
         "--dimension-penalty",
         type=float,
@@ -509,11 +516,17 @@ def make_pretraining_model(
         use_edge_attribute=not args.disable_edge_attribute,
         use_graph_contrastive=not args.disable_graph_contrastive,
         use_graph_descriptors=not args.disable_graph_descriptors,
+        use_graph_ecfp=not args.disable_graph_ecfp,
         node_loss_weight=args.node_loss_weight,
         context_loss_weight=args.context_loss_weight,
         edge_loss_weight=args.edge_loss_weight,
         graph_contrastive_loss_weight=args.graph_contrastive_loss_weight,
         descriptor_loss_weight=args.descriptor_loss_weight,
+        ecfp_loss_weight=args.ecfp_loss_weight,
+        context_k=args.context_k,
+        context_r1=args.context_r1,
+        context_r2=args.context_r2,
+        ecfp_dim=args.ecfp_n_bits,
         graph_contrastive_node_mask_ratio=args.graph_contrastive_node_mask_ratio,
         graph_contrastive_edge_drop_ratio=args.graph_contrastive_edge_drop_ratio,
         graph_contrastive_temperature=args.graph_contrastive_temperature,
@@ -540,7 +553,7 @@ def write_summary_table(rows: List[Dict[str, object]], path: Path, *, delimiter:
 
 
 def is_loss_or_accuracy_metric(name: str) -> bool:
-    return name == "loss" or name.endswith("_loss") or name.endswith("_acc")
+    return name == "loss" or name.endswith("_loss") or name.endswith("_acc") or name.endswith("_r2")
 
 
 def final_metric_summary_columns(best: Dict[str, object]) -> Dict[str, object]:
@@ -561,7 +574,7 @@ def final_metric_summary_columns(best: Dict[str, object]) -> Dict[str, object]:
     return out
 
 
-PREPROCESSING_CACHE_VERSION = 1
+PREPROCESSING_CACHE_VERSION = 2
 
 
 def preprocessing_cache_path(args: argparse.Namespace, output_dir: Path) -> Path:
@@ -576,6 +589,8 @@ def preprocessing_cache_manifest(
     descriptor_names: Sequence[str],
     train_smiles: Sequence[str],
     val_smiles: Sequence[str],
+    ecfp_radius: int,
+    ecfp_n_bits: int,
 ) -> Dict[str, object]:
     return {
         "version": PREPROCESSING_CACHE_VERSION,
@@ -583,6 +598,8 @@ def preprocessing_cache_manifest(
         "descriptor_names": list(descriptor_names),
         "train_smiles": list(train_smiles),
         "val_smiles": list(val_smiles),
+        "ecfp_radius": int(ecfp_radius),
+        "ecfp_n_bits": int(ecfp_n_bits),
     }
 
 
@@ -592,6 +609,8 @@ def load_preprocessing_cache(
     manifest: Dict[str, object],
     symbols: Sequence[str],
     descriptor_names: Sequence[str],
+    ecfp_radius: int,
+    ecfp_n_bits: int,
 ) -> Tuple[MolPretrainingDataset, MolPretrainingDataset, DescriptorNormalizer, Dict[str, object]] | None:
     if not path.exists():
         return None
@@ -612,12 +631,16 @@ def load_preprocessing_cache(
         symbols=symbols,
         descriptor_names=descriptor_names,
         descriptor_normalizer=normalizer,
+        ecfp_radius=ecfp_radius,
+        ecfp_n_bits=ecfp_n_bits,
     )
     val_dataset = MolPretrainingDataset.from_items(
         payload["val_items"],
         symbols=symbols,
         descriptor_names=descriptor_names,
         descriptor_normalizer=normalizer,
+        ecfp_radius=ecfp_radius,
+        ecfp_n_bits=ecfp_n_bits,
     )
     summary = {
         "enabled": True,
@@ -666,6 +689,8 @@ def build_or_load_preprocessed_datasets(
         descriptor_names=descriptor_names,
         train_smiles=train_smiles,
         val_smiles=val_smiles,
+        ecfp_radius=args.ecfp_radius,
+        ecfp_n_bits=args.ecfp_n_bits,
     )
     if not args.rebuild_preprocessing_cache:
         cached = load_preprocessing_cache(
@@ -673,6 +698,8 @@ def build_or_load_preprocessed_datasets(
             manifest=manifest,
             symbols=symbols,
             descriptor_names=descriptor_names,
+            ecfp_radius=args.ecfp_radius,
+            ecfp_n_bits=args.ecfp_n_bits,
         )
         if cached is not None:
             print(f"Loaded preprocessing cache: {cache_path}")
@@ -683,6 +710,8 @@ def build_or_load_preprocessed_datasets(
         train_smiles,
         symbols=symbols,
         descriptor_names=descriptor_names,
+        ecfp_radius=args.ecfp_radius,
+        ecfp_n_bits=args.ecfp_n_bits,
         progress_desc="Building train dataset",
     )
     normalizer = DescriptorNormalizer.fit(train_dataset.descriptor_matrix())
@@ -692,6 +721,8 @@ def build_or_load_preprocessed_datasets(
         symbols=symbols,
         descriptor_names=descriptor_names,
         descriptor_normalizer=normalizer,
+        ecfp_radius=args.ecfp_radius,
+        ecfp_n_bits=args.ecfp_n_bits,
         progress_desc="Building validation dataset",
     )
     save_preprocessing_cache(
@@ -902,6 +933,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         "descriptor_names": descriptor_names,
         "descriptor_mean": normalizer.mean.tolist(),
         "descriptor_std": normalizer.std.tolist(),
+        "ecfp_radius": int(args.ecfp_radius),
+        "ecfp_n_bits": int(args.ecfp_n_bits),
         "num_train_molecules": len(train_dataset),
         "num_val_molecules": len(val_dataset),
         "smiles_split_summary": smiles_split_summary,
