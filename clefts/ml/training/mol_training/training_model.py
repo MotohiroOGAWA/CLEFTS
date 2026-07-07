@@ -426,7 +426,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--disable-balanced-descriptor-sampling", action="store_true", help="Disable forced molecule sampling for descriptor target bins.")
     parser.add_argument("--mask-balance-patience", type=int, default=20, help="Number of batches a class may be absent before balanced masking or sampling forces it.")
     parser.add_argument("--mask-balance-max-forced-per-batch", type=int, default=8, help="Maximum forced rare classes added per batch by balanced masking or sampling.")
-    parser.add_argument("--descriptor-min-record-count", type=int, default=10, help="Ignore descriptor bins with fewer than this many molecules when forcing balanced sampling.")
+    parser.add_argument("--descriptor-min-record-count", type=int, default=100, help="Ignore descriptor bins with fewer than this many molecules when forcing balanced sampling.")
     parser.add_argument("--disable-balanced-validation-masks", action="store_true", help="Disable validation-time forced coverage for node and edge attribute classes present in a batch.")
     parser.add_argument("--min-validation-target-count", type=int, default=1, help="Warn when validation has fewer targets than this for any node or edge attribute class.")
 

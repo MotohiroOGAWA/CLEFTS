@@ -103,16 +103,50 @@ def build_descriptor_record_index(
             counts_by_name[name][bin_index] += 1
             records_by_name[name][bin_index].append(row_index)
 
+    descriptor_name_to_index = {name: index for index, name in enumerate(descriptor_names)}
     for name in descriptor_names:
         spec = specs[name]
         counts = counts_by_name[name]
         records = records_by_name[name]
+        descriptor_column_index = descriptor_name_to_index[name]
+        finite_values = []
+        for row in descriptor_rows:
+            value = float(row[descriptor_column_index])
+            if math.isfinite(value):
+                finite_values.append(value)
+        mean_value = sum(finite_values) / len(finite_values) if finite_values else float("nan")
+        eligible_bin_indices = {
+            bin_index
+            for bin_index, count in enumerate(counts)
+            if int(count) >= int(min_record_count)
+        }
+        center_bin_index = descriptor_bin_index(mean_value, spec) if finite_values else None
+        if center_bin_index is not None and center_bin_index not in eligible_bin_indices:
+            center_bin_index = None
+        if center_bin_index is None and eligible_bin_indices:
+            target = mean_value if finite_values else 0.0
+            center_bin_index = min(
+                eligible_bin_indices,
+                key=lambda bin_index: abs(sum(descriptor_bin_bounds(spec, bin_index)) / 2.0 - target),
+            )
+
+        active_bin_indices = set()
+        if center_bin_index is not None:
+            left = int(center_bin_index)
+            while left - 1 in eligible_bin_indices:
+                left -= 1
+            right = int(center_bin_index)
+            while right + 1 in eligible_bin_indices:
+                right += 1
+            active_bin_indices = set(range(left, right + 1))
+
         bins: Dict[str, List[int]] = {}
         bin_summary: List[Dict[str, object]] = []
         for bin_index, (count, row_indices) in enumerate(zip(counts, records)):
             label = descriptor_bin_label(bin_index)
             lower, upper = descriptor_bin_bounds(spec, bin_index)
-            included = int(count) >= int(min_record_count)
+            eligible = bin_index in eligible_bin_indices
+            included = bin_index in active_bin_indices
             bin_summary.append(
                 {
                     "label": label,
@@ -120,6 +154,7 @@ def build_descriptor_record_index(
                     "lower": float(lower),
                     "upper": float(upper),
                     "count": int(count),
+                    "eligible": bool(eligible),
                     "included": bool(included),
                 }
             )
@@ -134,7 +169,11 @@ def build_descriptor_record_index(
             "width": float(spec.width),
             "bin_count": int(spec.bin_count),
             "min_record_count": int(min_record_count),
-            "valid_bin_count": int(sum(1 for count in counts if count >= int(min_record_count))),
+            "center": "mean",
+            "center_value": float(mean_value),
+            "center_bin_index": int(center_bin_index) if center_bin_index is not None else None,
+            "eligible_bin_count": int(len(eligible_bin_indices)),
+            "valid_bin_count": int(len(active_bin_indices)),
             "ignored_bin_count": int(sum(1 for count in counts if 0 < count < int(min_record_count))),
             "bin_summary": bin_summary,
         }
