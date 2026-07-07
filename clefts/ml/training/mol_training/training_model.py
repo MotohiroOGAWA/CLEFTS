@@ -8,7 +8,7 @@ import json
 import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Sequence, Tuple
 
 import torch
 from tqdm import tqdm
@@ -20,24 +20,38 @@ if __package__ in {None, ""}:
 
     from clefts.libs.mmkit.mmkit import Compound
     from clefts.ml.mol.mol_encoder import MolEncoder
+    from clefts.ml.mol.mol_graphormer import (
+        DEFAULT_MOL_GRAPHORMER_DROPOUT,
+        DEFAULT_MOL_GRAPHORMER_MAX_DEGREE,
+        DEFAULT_MOL_GRAPHORMER_MAX_EDGE_DIST,
+        DEFAULT_MOL_GRAPHORMER_MAX_SPATIAL_DIST,
+    )
     from clefts.ml.training.mol_training.dataset import (
         DEFAULT_DESCRIPTOR_NAMES,
         DescriptorNormalizer,
         MolPretrainingDataset,
         load_smiles_file,
     )
+    from clefts.ml.training.mol_training.descriptor_coverage import DEFAULT_DESCRIPTOR_BIN_SPECS, build_descriptor_record_index
     from clefts.ml.training.mol_training.feature_schema import atom_feature_groups, bond_feature_groups
     from clefts.ml.training.mol_training.pretraining_model import MolPretrainingModel
     from clefts.ml.training.mol_training.trainer import make_loader, train_epochs
 else:
     from ....libs.mmkit.mmkit import Compound
     from ...mol.mol_encoder import MolEncoder
+    from ...mol.mol_graphormer import (
+        DEFAULT_MOL_GRAPHORMER_DROPOUT,
+        DEFAULT_MOL_GRAPHORMER_MAX_DEGREE,
+        DEFAULT_MOL_GRAPHORMER_MAX_EDGE_DIST,
+        DEFAULT_MOL_GRAPHORMER_MAX_SPATIAL_DIST,
+    )
     from .dataset import (
         DEFAULT_DESCRIPTOR_NAMES,
         DescriptorNormalizer,
         MolPretrainingDataset,
         load_smiles_file,
     )
+    from .descriptor_coverage import DEFAULT_DESCRIPTOR_BIN_SPECS, build_descriptor_record_index
     from .feature_schema import atom_feature_groups, bond_feature_groups
     from .pretraining_model import MolPretrainingModel
     from .trainer import make_loader, train_epochs
@@ -117,17 +131,28 @@ def canonicalize_unique_smiles(
     smiles_values: Sequence[str],
     *,
     desc: str = "Canonicalizing SMILES",
+    canonical_cache: Dict[str, str | None] | None = None,
 ) -> Tuple[List[str], int]:
     out = []
     seen = set()
     invalid_count = 0
     for smiles in tqdm(smiles_values, desc=desc, unit="smiles"):
-        try:
-            compound = Compound.from_smiles(smiles)
-        except Exception:
-            invalid_count += 1
-            continue
-        canonical = compound.smiles
+        if canonical_cache is not None and smiles in canonical_cache:
+            canonical = canonical_cache[smiles]
+            if canonical is None:
+                invalid_count += 1
+                continue
+        else:
+            try:
+                compound = Compound.from_smiles(smiles)
+            except Exception:
+                invalid_count += 1
+                if canonical_cache is not None:
+                    canonical_cache[smiles] = None
+                continue
+            canonical = compound.smiles
+            if canonical_cache is not None:
+                canonical_cache[smiles] = canonical
         if canonical in seen:
             continue
         seen.add(canonical)
@@ -140,9 +165,34 @@ def load_raw_smiles_files(paths: Sequence[str]) -> Tuple[List[str], List[Dict[st
     per_file = []
     for path in paths:
         smiles = load_smiles_file(path)
+        unique_smiles = unique_preserve_order(smiles)
         all_smiles.extend(smiles)
-        per_file.append({"path": str(path), "raw_smiles": len(smiles)})
+        per_file.append(
+            {
+                "path": str(path),
+                "raw_smiles": len(smiles),
+                "unique_raw_smiles": len(unique_smiles),
+            }
+        )
     return all_smiles, per_file
+
+
+def annotate_per_file_canonical_smiles_counts(
+    per_file: List[Dict[str, object]],
+    *,
+    desc_prefix: str,
+    canonical_cache: Dict[str, str | None],
+) -> None:
+    for entry in per_file:
+        path = str(entry["path"])
+        raw_unique = unique_preserve_order(load_smiles_file(path))
+        canonical_unique, invalid_count = canonicalize_unique_smiles(
+            raw_unique,
+            desc=f"{desc_prefix} {Path(path).name}",
+            canonical_cache=canonical_cache,
+        )
+        entry["invalid_after_raw_unique"] = invalid_count
+        entry["canonical_unique_smiles"] = len(canonical_unique)
 
 
 def prepare_smiles_split(
@@ -153,16 +203,29 @@ def prepare_smiles_split(
 ) -> Tuple[List[str], List[str], Dict[str, object]]:
     train_raw, train_files = load_raw_smiles_files(train_smiles_paths)
     val_raw, val_files = load_raw_smiles_files(val_smiles_paths)
+    canonical_cache: Dict[str, str | None] = {}
+    annotate_per_file_canonical_smiles_counts(
+        train_files,
+        desc_prefix="Canonicalizing train file",
+        canonical_cache=canonical_cache,
+    )
+    annotate_per_file_canonical_smiles_counts(
+        val_files,
+        desc_prefix="Canonicalizing validation file",
+        canonical_cache=canonical_cache,
+    )
 
     train_raw_unique = unique_preserve_order(train_raw)
     val_raw_unique = unique_preserve_order(val_raw)
     train_smiles, train_invalid = canonicalize_unique_smiles(
         train_raw_unique,
         desc="Canonicalizing train SMILES",
+        canonical_cache=canonical_cache,
     )
     val_canonical, val_invalid = canonicalize_unique_smiles(
         val_raw_unique,
         desc="Canonicalizing validation SMILES",
+        canonical_cache=canonical_cache,
     )
 
     train_set = set(train_smiles)
@@ -208,52 +271,187 @@ def prepare_smiles_split(
     return train_smiles, val_smiles, summary
 
 
+def input_file_manifest(paths: Sequence[str]) -> List[Dict[str, object]]:
+    out = []
+    for path in paths:
+        p = Path(path)
+        stat = p.stat()
+        out.append(
+            {
+                "path": str(path),
+                "size": int(stat.st_size),
+                "mtime_ns": int(stat.st_mtime_ns),
+            }
+        )
+    return out
+
+
+def smiles_split_cache_manifest(
+    *,
+    train_smiles_paths: Sequence[str],
+    val_smiles_paths: Sequence[str],
+) -> Dict[str, object]:
+    return {
+        "train_files": input_file_manifest(train_smiles_paths),
+        "val_files": input_file_manifest(val_smiles_paths),
+    }
+
+
+def write_smiles_split_outputs(
+    *,
+    output_dir: Path,
+    train_smiles: Sequence[str],
+    val_smiles: Sequence[str],
+    summary: Dict[str, object],
+) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    with open(output_dir / "smiles_split_summary.json", "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
+    with open(output_dir / "train_smiles.txt", "w", encoding="utf-8") as f:
+        f.write("\n".join(train_smiles) + "\n")
+    with open(output_dir / "val_smiles.txt", "w", encoding="utf-8") as f:
+        f.write("\n".join(val_smiles) + "\n")
+
+
+def load_or_prepare_smiles_split(
+    *,
+    train_smiles_paths: Sequence[str],
+    val_smiles_paths: Sequence[str],
+    output_dir: Path,
+    rebuild_cache: bool = False,
+) -> Tuple[List[str], List[str], Dict[str, object]]:
+    cache_path = output_dir / "pretraining_smiles_split_cache.json"
+    manifest = smiles_split_cache_manifest(
+        train_smiles_paths=train_smiles_paths,
+        val_smiles_paths=val_smiles_paths,
+    )
+    if not rebuild_cache and cache_path.exists():
+        with open(cache_path, encoding="utf-8") as f:
+            payload = json.load(f)
+        if payload.get("input_manifest") == manifest:
+            train_smiles = list(payload["train_smiles"])
+            val_smiles = list(payload["val_smiles"])
+            summary = dict(payload["summary"])
+            summary["smiles_split_cache"] = {
+                "hit": True,
+                "path": str(cache_path),
+            }
+            write_smiles_split_outputs(
+                output_dir=output_dir,
+                train_smiles=train_smiles,
+                val_smiles=val_smiles,
+                summary=summary,
+            )
+            print(f"Loaded SMILES split cache: {cache_path}")
+            return train_smiles, val_smiles, summary
+        print(f"SMILES split cache input mismatch, rebuilding: {cache_path}")
+
+    train_smiles, val_smiles, summary = prepare_smiles_split(
+        train_smiles_paths=train_smiles_paths,
+        val_smiles_paths=val_smiles_paths,
+        output_dir=output_dir,
+    )
+    summary["smiles_split_cache"] = {
+        "hit": False,
+        "path": str(cache_path),
+        "rebuilt": bool(rebuild_cache),
+    }
+    write_smiles_split_outputs(
+        output_dir=output_dir,
+        train_smiles=train_smiles,
+        val_smiles=val_smiles,
+        summary=summary,
+    )
+    with open(cache_path, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "input_manifest": manifest,
+                "train_smiles": list(train_smiles),
+                "val_smiles": list(val_smiles),
+                "summary": summary,
+            },
+            f,
+            indent=2,
+        )
+    return train_smiles, val_smiles, summary
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Pretrain MolEncoder with node, edge, and graph-level tasks.")
     parser.add_argument("--train-smiles", nargs="+", default=None, help="Newline-delimited SMILES file(s) for training.")
     parser.add_argument("--val-smiles", nargs="+", default=None, help="Newline-delimited SMILES file(s) for validation.")
-    parser.add_argument("--output-dir", default=None)
-    parser.add_argument("--device", default="cpu")
+    parser.add_argument("--output-dir", default=None, help="Directory where configs, logs, TensorBoard files, summaries, and checkpoints are written.")
+    parser.add_argument("--device", default="cpu", help="Torch device for training, for example cpu, cuda, or cuda:0.")
 
     parser.add_argument("--symbols", default=None, help="Comma-separated atom symbols. Required.")
-    parser.add_argument("--node-dim", "--atom-dim", default="64,128,256", help="Comma-separated MolEncoder node embedding dims. One value means fixed.")
+    parser.add_argument("--node-dim", "--node_dim", default="64,128,256", help="Comma-separated MolEncoder node embedding dims. One value means fixed.")
     parser.add_argument("--graph-dim", "--graph_dim", default="128", help="Comma-separated MolEncoder graph dims.")
     parser.add_argument("--num-layers", default="4", help="Comma-separated Graphormer layer counts.")
     parser.add_argument("--num-heads", default="8", help="Comma-separated attention head counts.")
-    parser.add_argument("--max-degree", default="8", help="Comma-separated max degree values.")
-    parser.add_argument("--max-spatial-dist", default="5", help="Comma-separated max shortest-path distances.")
-    parser.add_argument("--max-edge-dist", default="5", help="Comma-separated max edge-path distances.")
-    parser.add_argument("--dropout", type=float, default=0.1, help="MolEncoder dropout. This is a single value, not a candidate list.")
+    parser.add_argument("--max-degree", default=str(DEFAULT_MOL_GRAPHORMER_MAX_DEGREE), help="Comma-separated max degree values.")
+    parser.add_argument("--max-spatial-dist", default=str(DEFAULT_MOL_GRAPHORMER_MAX_SPATIAL_DIST), help="Comma-separated max shortest-path distances.")
+    parser.add_argument("--max-edge-dist", default=str(DEFAULT_MOL_GRAPHORMER_MAX_EDGE_DIST), help="Comma-separated max edge-path distances.")
+    parser.add_argument("--dropout", type=float, default=DEFAULT_MOL_GRAPHORMER_DROPOUT, help="MolEncoder dropout. This is a single value, not a candidate list.")
 
-    parser.add_argument("--batch-size", type=int, default=32)
-    parser.add_argument("--num-workers", type=int, default=0)
-    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--batch-size", type=int, default=32, help="Number of molecules per training batch.")
+    parser.add_argument("--num-workers", type=int, default=0, help="Number of DataLoader worker processes.")
+    parser.add_argument("--lr", type=float, default=1e-4, help="AdamW learning rate.")
+    parser.add_argument(
+        "--preprocessing-cache",
+        default=None,
+        help="Path to a torch cache for canonical SMILES, graph data, and descriptor statistics. Default: output-dir/pretraining_preprocessed_dataset.pt.",
+    )
+    parser.add_argument(
+        "--rebuild-preprocessing-cache",
+        action="store_true",
+        help="Ignore any existing preprocessing cache and rebuild it.",
+    )
 
-    parser.add_argument("--epochs", "--full-epochs", dest="epochs", type=int, default=100)
+    parser.add_argument("--epochs", "--full-epochs", dest="epochs", type=int, default=100, help="Maximum number of pretraining epochs.")
+    parser.add_argument(
+        "--early-stopping-patience",
+        type=int,
+        default=None,
+        help="Enable early stopping after this many non-improving epochs. Default: disabled.",
+    )
+    parser.add_argument("--early-stopping-window-size", type=int, default=1, help="Number of recent validation losses to smooth inside early stopping.")
+    parser.add_argument("--early-stopping-min-delta", type=float, default=1e-4, help="Minimum validation-loss improvement required to reset early stopping.")
+    parser.add_argument("--early-stopping-reset-step", type=float, default=1.0, help="Counter reset amount used by the early stopping helper after improvement.")
+    parser.add_argument("--early-stopping-verbose", action="store_true", help="Print early stopping state updates.")
 
-    parser.add_argument("--node-mask-ratio", type=float, default=0.15)
-    parser.add_argument("--edge-mask-ratio", type=float, default=0.15)
-    parser.add_argument("--disable-balanced-attribute-masking", action="store_true")
-    parser.add_argument("--mask-balance-patience", type=int, default=20)
-    parser.add_argument("--mask-balance-max-forced-per-batch", type=int, default=8)
-    parser.add_argument("--disable-balanced-validation-masks", action="store_true")
-    parser.add_argument("--min-validation-target-count", type=int, default=1)
+    parser.add_argument("--node-mask-ratio", type=float, default=0.25, help="Random node masking ratio for node attribute prediction.")
+    parser.add_argument("--edge-mask-ratio", type=float, default=0.25, help="Random edge masking ratio for edge attribute prediction.")
+    parser.add_argument("--disable-balanced-attribute-masking", action="store_true", help="Disable class-balancing when selecting node and edge attributes to mask.")
+    parser.add_argument("--disable-balanced-record-sampling", action="store_true", help="Disable forced molecule sampling for rare node and edge attribute classes.")
+    parser.add_argument("--disable-balanced-descriptor-sampling", action="store_true", help="Disable forced molecule sampling for descriptor target bins.")
+    parser.add_argument("--mask-balance-patience", type=int, default=20, help="Number of batches a class may be absent before balanced masking or sampling forces it.")
+    parser.add_argument("--mask-balance-max-forced-per-batch", type=int, default=8, help="Maximum forced rare classes added per batch by balanced masking or sampling.")
+    parser.add_argument("--descriptor-min-record-count", type=int, default=100, help="Ignore descriptor bins with fewer than this many molecules when forcing balanced sampling.")
+    parser.add_argument("--disable-balanced-validation-masks", action="store_true", help="Disable validation-time forced coverage for node and edge attribute classes present in a batch.")
+    parser.add_argument("--min-validation-target-count", type=int, default=1, help="Warn when validation has fewer targets than this for any node or edge attribute class.")
 
-    parser.add_argument("--disable-node-attribute", action="store_true")
-    parser.add_argument("--disable-node-context", action="store_true")
-    parser.add_argument("--disable-edge-attribute", action="store_true")
-    parser.add_argument("--disable-graph-contrastive", action="store_true")
-    parser.add_argument("--disable-graph-descriptors", action="store_true")
-    parser.add_argument("--graph-contrastive-node-mask-ratio", type=float, default=0.15)
-    parser.add_argument("--graph-contrastive-edge-drop-ratio", type=float, default=0.15)
-    parser.add_argument("--graph-contrastive-temperature", type=float, default=0.2)
-    parser.add_argument("--descriptor-names", default=",".join(DEFAULT_DESCRIPTOR_NAMES))
+    parser.add_argument("--disable-node-attribute", action="store_true", help="Disable masked node attribute prediction.")
+    parser.add_argument("--disable-node-context", action="store_true", help="Disable node context prediction between K-hop neighborhoods and context graphs.")
+    parser.add_argument("--disable-edge-attribute", action="store_true", help="Disable masked edge attribute prediction.")
+    parser.add_argument("--disable-graph-contrastive", action="store_true", help="Disable graph-level contrastive learning with augmented molecule views.")
+    parser.add_argument("--disable-graph-descriptors", action="store_true", help="Disable graph-level descriptor regression.")
+    parser.add_argument("--graph-contrastive-node-mask-ratio", type=float, default=0.25, help="Node masking ratio used when creating graph contrastive views.")
+    parser.add_argument("--graph-contrastive-edge-drop-ratio", type=float, default=0.25, help="Undirected bond deletion ratio used when creating graph contrastive views.")
+    parser.add_argument("--graph-contrastive-temperature", type=float, default=0.2, help="Temperature for graph contrastive and context pair logits.")
+    parser.add_argument("--context-k", type=int, default=2, help="K-hop radius for the center-node neighborhood in context prediction.")
+    parser.add_argument("--context-r1", type=int, default=1, help="Inner hop radius of the context graph ring.")
+    parser.add_argument("--context-r2", type=int, default=4, help="Outer hop radius of the context graph ring.")
+    parser.add_argument("--disable-graph-ecfp", action="store_true", help="Disable graph-level ECFP fingerprint prediction.")
+    parser.add_argument("--ecfp-radius", type=int, default=2, help="Morgan/ECFP fingerprint radius used as the graph-level target.")
+    parser.add_argument("--ecfp-n-bits", type=int, default=2048, help="Number of bits in the ECFP fingerprint target.")
+    parser.add_argument("--descriptor-names", default=",".join(DEFAULT_DESCRIPTOR_NAMES), help="Comma-separated RDKit descriptor targets for graph-level regression.")
 
-    parser.add_argument("--node-loss-weight", type=float, default=1.0)
-    parser.add_argument("--context-loss-weight", type=float, default=0.5)
-    parser.add_argument("--edge-loss-weight", type=float, default=1.0)
-    parser.add_argument("--graph-contrastive-loss-weight", type=float, default=0.5)
-    parser.add_argument("--descriptor-loss-weight", type=float, default=0.2)
+    parser.add_argument("--node-loss-weight", type=float, default=1.0, help="Loss weight for masked node attribute prediction.")
+    parser.add_argument("--context-loss-weight", type=float, default=1.0, help="Loss weight for node context prediction.")
+    parser.add_argument("--edge-loss-weight", type=float, default=1.0, help="Loss weight for masked edge attribute prediction.")
+    parser.add_argument("--graph-contrastive-loss-weight", type=float, default=1.0, help="Loss weight for graph-level contrastive learning.")
+    parser.add_argument("--descriptor-loss-weight", type=float, default=1.0, help="Loss weight for graph-level descriptor regression.")
+    parser.add_argument("--ecfp-loss-weight", type=float, default=1.0, help="Loss weight for graph-level ECFP fingerprint prediction.")
     parser.add_argument(
         "--dimension-penalty",
         type=float,
@@ -322,11 +520,17 @@ def make_pretraining_model(
         use_edge_attribute=not args.disable_edge_attribute,
         use_graph_contrastive=not args.disable_graph_contrastive,
         use_graph_descriptors=not args.disable_graph_descriptors,
+        use_graph_ecfp=not args.disable_graph_ecfp,
         node_loss_weight=args.node_loss_weight,
         context_loss_weight=args.context_loss_weight,
         edge_loss_weight=args.edge_loss_weight,
         graph_contrastive_loss_weight=args.graph_contrastive_loss_weight,
         descriptor_loss_weight=args.descriptor_loss_weight,
+        ecfp_loss_weight=args.ecfp_loss_weight,
+        context_k=args.context_k,
+        context_r1=args.context_r1,
+        context_r2=args.context_r2,
+        ecfp_dim=args.ecfp_n_bits,
         graph_contrastive_node_mask_ratio=args.graph_contrastive_node_mask_ratio,
         graph_contrastive_edge_drop_ratio=args.graph_contrastive_edge_drop_ratio,
         graph_contrastive_temperature=args.graph_contrastive_temperature,
@@ -337,7 +541,7 @@ def make_pretraining_model(
     )
 
 
-def write_summary_table(rows: List[Dict[str, object]], path: Path) -> None:
+def write_summary_table(rows: List[Dict[str, object]], path: Path, *, delimiter: str = ",") -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if not rows:
         return
@@ -347,9 +551,253 @@ def write_summary_table(rows: List[Dict[str, object]], path: Path) -> None:
             if key not in keys:
                 keys.append(key)
     with open(path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=keys)
+        writer = csv.DictWriter(f, fieldnames=keys, delimiter=delimiter)
         writer.writeheader()
         writer.writerows(rows)
+
+
+def is_loss_or_accuracy_metric(name: str) -> bool:
+    return name == "loss" or name.endswith("_loss") or name.endswith("_acc") or name.endswith("_r2")
+
+
+def final_metric_summary_columns(best: Dict[str, object]) -> Dict[str, object]:
+    out: Dict[str, object] = {
+        "final_epoch": int(best.get("final_epoch", best.get("epoch", -1))),
+        "stopped_epoch": int(best.get("stopped_epoch", best.get("final_epoch", -1))),
+        "early_stopping_enabled": bool(best.get("early_stopping_enabled", False)),
+        "early_stopping_counter": int(best.get("early_stopping_counter", 0)),
+        "last_validation_seconds": float(best.get("last_validation_seconds", 0.0)),
+    }
+    for split, metrics_key in (("train", "final_train_metrics"), ("val", "final_val_metrics")):
+        metrics = best.get(metrics_key, {})
+        if not isinstance(metrics, dict):
+            continue
+        for name in sorted(metrics):
+            if is_loss_or_accuracy_metric(str(name)):
+                out[f"final_{split}_{name}"] = metrics[name]
+    return out
+
+
+PREPROCESSING_CACHE_VERSION = 2
+
+
+def preprocessing_cache_path(args: argparse.Namespace, output_dir: Path) -> Path:
+    if args.preprocessing_cache not in {None, ""}:
+        return Path(args.preprocessing_cache)
+    return output_dir / "pretraining_preprocessed_dataset.pt"
+
+
+def preprocessing_cache_manifest(
+    *,
+    symbols: Sequence[str],
+    descriptor_names: Sequence[str],
+    train_smiles: Sequence[str],
+    val_smiles: Sequence[str],
+    ecfp_radius: int,
+    ecfp_n_bits: int,
+) -> Dict[str, object]:
+    return {
+        "version": PREPROCESSING_CACHE_VERSION,
+        "symbols": list(symbols),
+        "descriptor_names": list(descriptor_names),
+        "train_smiles": list(train_smiles),
+        "val_smiles": list(val_smiles),
+        "ecfp_radius": int(ecfp_radius),
+        "ecfp_n_bits": int(ecfp_n_bits),
+    }
+
+
+def load_preprocessing_cache(
+    path: Path,
+    *,
+    manifest: Dict[str, object],
+    symbols: Sequence[str],
+    descriptor_names: Sequence[str],
+    ecfp_radius: int,
+    ecfp_n_bits: int,
+) -> Tuple[MolPretrainingDataset, MolPretrainingDataset, DescriptorNormalizer, Dict[str, object]] | None:
+    if not path.exists():
+        return None
+    try:
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:
+        payload = torch.load(path, map_location="cpu")
+    if payload.get("manifest") != manifest:
+        print(f"Preprocessing cache manifest mismatch, rebuilding: {path}")
+        return None
+
+    normalizer = DescriptorNormalizer(
+        mean=payload["descriptor_mean"],
+        std=payload["descriptor_std"],
+    )
+    train_dataset = MolPretrainingDataset.from_items(
+        payload["train_items"],
+        symbols=symbols,
+        descriptor_names=descriptor_names,
+        descriptor_normalizer=normalizer,
+        ecfp_radius=ecfp_radius,
+        ecfp_n_bits=ecfp_n_bits,
+    )
+    val_dataset = MolPretrainingDataset.from_items(
+        payload["val_items"],
+        symbols=symbols,
+        descriptor_names=descriptor_names,
+        descriptor_normalizer=normalizer,
+        ecfp_radius=ecfp_radius,
+        ecfp_n_bits=ecfp_n_bits,
+    )
+    summary = {
+        "enabled": True,
+        "hit": True,
+        "path": str(path),
+        "version": PREPROCESSING_CACHE_VERSION,
+        "num_train_molecules": len(train_dataset),
+        "num_val_molecules": len(val_dataset),
+    }
+    return train_dataset, val_dataset, normalizer, summary
+
+
+def save_preprocessing_cache(
+    path: Path,
+    *,
+    manifest: Dict[str, object],
+    train_dataset: MolPretrainingDataset,
+    val_dataset: MolPretrainingDataset,
+    normalizer: DescriptorNormalizer,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "manifest": manifest,
+            "descriptor_mean": normalizer.mean.detach().cpu(),
+            "descriptor_std": normalizer.std.detach().cpu(),
+            "train_items": train_dataset.items,
+            "val_items": val_dataset.items,
+        },
+        path,
+    )
+
+
+def build_or_load_preprocessed_datasets(
+    *,
+    args: argparse.Namespace,
+    output_dir: Path,
+    train_smiles: Sequence[str],
+    val_smiles: Sequence[str],
+    symbols: Sequence[str],
+    descriptor_names: Sequence[str],
+) -> Tuple[MolPretrainingDataset, MolPretrainingDataset, DescriptorNormalizer, Dict[str, object]]:
+    cache_path = preprocessing_cache_path(args, output_dir)
+    manifest = preprocessing_cache_manifest(
+        symbols=symbols,
+        descriptor_names=descriptor_names,
+        train_smiles=train_smiles,
+        val_smiles=val_smiles,
+        ecfp_radius=args.ecfp_radius,
+        ecfp_n_bits=args.ecfp_n_bits,
+    )
+    if not args.rebuild_preprocessing_cache:
+        cached = load_preprocessing_cache(
+            cache_path,
+            manifest=manifest,
+            symbols=symbols,
+            descriptor_names=descriptor_names,
+            ecfp_radius=args.ecfp_radius,
+            ecfp_n_bits=args.ecfp_n_bits,
+        )
+        if cached is not None:
+            print(f"Loaded preprocessing cache: {cache_path}")
+            return cached
+
+    print(f"Building preprocessing cache: {cache_path}")
+    train_dataset = MolPretrainingDataset(
+        train_smiles,
+        symbols=symbols,
+        descriptor_names=descriptor_names,
+        ecfp_radius=args.ecfp_radius,
+        ecfp_n_bits=args.ecfp_n_bits,
+        progress_desc="Building train dataset",
+    )
+    normalizer = DescriptorNormalizer.fit(train_dataset.descriptor_matrix())
+    train_dataset.descriptor_normalizer = normalizer
+    val_dataset = MolPretrainingDataset(
+        val_smiles,
+        symbols=symbols,
+        descriptor_names=descriptor_names,
+        descriptor_normalizer=normalizer,
+        ecfp_radius=args.ecfp_radius,
+        ecfp_n_bits=args.ecfp_n_bits,
+        progress_desc="Building validation dataset",
+    )
+    save_preprocessing_cache(
+        cache_path,
+        manifest=manifest,
+        train_dataset=train_dataset,
+        val_dataset=val_dataset,
+        normalizer=normalizer,
+    )
+    summary = {
+        "enabled": True,
+        "hit": False,
+        "path": str(cache_path),
+        "version": PREPROCESSING_CACHE_VERSION,
+        "rebuilt": bool(args.rebuild_preprocessing_cache),
+        "num_train_molecules": len(train_dataset),
+        "num_val_molecules": len(val_dataset),
+    }
+    return train_dataset, val_dataset, normalizer, summary
+
+
+def build_feature_record_index(
+    dataset: MolPretrainingDataset,
+    *,
+    symbols: Sequence[str],
+) -> Dict[str, Dict[str, Dict[str, List[int]]]]:
+    return {
+        "node": dataset.feature_record_index("x", atom_feature_groups(symbols)),
+        "edge": dataset.feature_record_index("edge_attr", bond_feature_groups()),
+    }
+
+
+def build_descriptor_sampling_index(
+    dataset: MolPretrainingDataset,
+    *,
+    min_record_count: int,
+) -> Tuple[Dict[str, Dict[str, Dict[str, List[int]]]], Dict[str, Dict[str, object]]]:
+    descriptor_rows = [data.descriptors.detach().cpu().tolist() for data in dataset.items]
+    descriptor_index, descriptor_summary = build_descriptor_record_index(
+        descriptor_rows,
+        dataset.descriptor_names,
+        min_record_count=min_record_count,
+        specs_by_name={spec.name: spec for spec in DEFAULT_DESCRIPTOR_BIN_SPECS},
+    )
+    return {"descriptor": descriptor_index}, descriptor_summary
+
+
+def merge_record_indexes(
+    *indexes: Dict[str, Dict[str, Dict[str, List[int]]]] | None,
+) -> Dict[str, Dict[str, Dict[str, List[int]]]]:
+    merged: Dict[str, Dict[str, Dict[str, List[int]]]] = {}
+    for index in indexes:
+        if not index:
+            continue
+        for level, groups in index.items():
+            merged.setdefault(level, {})
+            for group_name, labels in groups.items():
+                merged[level][group_name] = {label: list(records) for label, records in labels.items()}
+    return merged
+
+
+def feature_record_index_counts(
+    index: Dict[str, Dict[str, Dict[str, List[int]]]],
+) -> Dict[str, Dict[str, Dict[str, int]]]:
+    return {
+        level: {
+            group_name: {label: len(records) for label, records in labels.items()}
+            for group_name, labels in groups.items()
+        }
+        for level, groups in index.items()
+    }
 
 
 def write_feature_target_summary(
@@ -404,10 +852,22 @@ def run_pretraining_stage(
     config: MolEncoderConfig,
     train_dataset: MolPretrainingDataset,
     val_dataset: MolPretrainingDataset,
+    train_feature_record_index: Dict[str, Dict[str, Dict[str, List[int]]]],
     device: torch.device,
     output_dir: Path,
 ) -> Dict[str, object]:
-    train_loader = make_loader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
+    balanced_feature_record_index = None
+    if not args.disable_balanced_record_sampling and train_feature_record_index:
+        balanced_feature_record_index = train_feature_record_index
+    train_loader = make_loader(
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        balanced_feature_record_index=balanced_feature_record_index,
+        balance_patience=args.mask_balance_patience,
+        balance_max_forced_per_batch=args.mask_balance_max_forced_per_batch,
+    )
     val_loader = make_loader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
     model = make_pretraining_model(
         args,
@@ -429,6 +889,11 @@ def run_pretraining_stage(
         edge_mask_ratio=args.edge_mask_ratio,
         output_dir=stage_dir,
         stage_name="pretraining",
+        early_stopping_patience=args.early_stopping_patience,
+        early_stopping_window_size=args.early_stopping_window_size,
+        early_stopping_min_delta=args.early_stopping_min_delta,
+        early_stopping_reset_step=args.early_stopping_reset_step,
+        early_stopping_verbose=args.early_stopping_verbose,
     )
     return {
         **asdict(config),
@@ -438,6 +903,7 @@ def run_pretraining_stage(
         "best_val_loss": float(best["val_loss"]),
         "selection_score": float(best["val_loss"]) + float(args.dimension_penalty) * float(config.node_dim),
         "checkpoint_path": str(stage_dir / "pretraining_best.pt"),
+        **final_metric_summary_columns(best),
     }
 
 
@@ -458,34 +924,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     device = torch.device(args.device)
 
     configs = mol_encoder_configs(args)
-    train_smiles, val_smiles, smiles_split_summary = prepare_smiles_split(
+    train_smiles, val_smiles, smiles_split_summary = load_or_prepare_smiles_split(
         train_smiles_paths=args.train_smiles,
         val_smiles_paths=args.val_smiles,
         output_dir=output_dir,
+        rebuild_cache=args.rebuild_preprocessing_cache,
     )
     symbols = parse_csv_strings(args.symbols)
     descriptor_names = tuple(parse_csv_strings(args.descriptor_names) or DEFAULT_DESCRIPTOR_NAMES)
 
-    train_raw = MolPretrainingDataset(
-        train_smiles,
+    train_dataset, val_dataset, normalizer, preprocessing_cache_summary = build_or_load_preprocessed_datasets(
+        args=args,
+        output_dir=output_dir,
+        train_smiles=train_smiles,
+        val_smiles=val_smiles,
         symbols=symbols,
         descriptor_names=descriptor_names,
-        progress_desc="Computing train descriptors",
-    )
-    normalizer = DescriptorNormalizer.fit(train_raw.descriptor_matrix())
-    train_dataset = MolPretrainingDataset(
-        train_smiles,
-        symbols=symbols,
-        descriptor_names=descriptor_names,
-        descriptor_normalizer=normalizer,
-        progress_desc="Building train dataset",
-    )
-    val_dataset = MolPretrainingDataset(
-        val_smiles,
-        symbols=symbols,
-        descriptor_names=descriptor_names,
-        descriptor_normalizer=normalizer,
-        progress_desc="Building validation dataset",
     )
     feature_target_summary = write_feature_target_summary(
         train_dataset=train_dataset,
@@ -494,6 +948,34 @@ def main(argv: Sequence[str] | None = None) -> int:
         output_dir=output_dir,
         min_validation_target_count=args.min_validation_target_count,
     )
+    attribute_record_index = build_feature_record_index(train_dataset, symbols=symbols)
+    descriptor_record_sampling_index, descriptor_sampling_summary = build_descriptor_sampling_index(
+        train_dataset,
+        min_record_count=args.descriptor_min_record_count,
+    )
+    train_feature_record_index = merge_record_indexes(
+        attribute_record_index
+        if not args.disable_balanced_attribute_masking
+        else None,
+        descriptor_record_sampling_index
+        if not args.disable_balanced_descriptor_sampling and not args.disable_graph_descriptors
+        else None,
+    )
+    balanced_record_sampling_summary = {
+        "enabled": bool(
+            not args.disable_balanced_record_sampling
+            and bool(train_feature_record_index)
+        ),
+        "attribute_sampling_enabled": bool(not args.disable_balanced_attribute_masking),
+        "descriptor_sampling_enabled": bool(
+            not args.disable_balanced_descriptor_sampling and not args.disable_graph_descriptors
+        ),
+        "patience": int(args.mask_balance_patience),
+        "max_forced_per_batch": int(args.mask_balance_max_forced_per_batch),
+        "descriptor_min_record_count": int(args.descriptor_min_record_count),
+        "descriptor_summary": descriptor_sampling_summary,
+        "train_record_counts": feature_record_index_counts(train_feature_record_index),
+    }
 
     config_record = {
         "args": vars(args),
@@ -502,10 +984,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         "descriptor_names": descriptor_names,
         "descriptor_mean": normalizer.mean.tolist(),
         "descriptor_std": normalizer.std.tolist(),
+        "ecfp_radius": int(args.ecfp_radius),
+        "ecfp_n_bits": int(args.ecfp_n_bits),
         "num_train_molecules": len(train_dataset),
         "num_val_molecules": len(val_dataset),
         "smiles_split_summary": smiles_split_summary,
         "feature_target_summary": feature_target_summary,
+        "preprocessing_cache": preprocessing_cache_summary,
+        "balanced_record_sampling": balanced_record_sampling_summary,
     }
     with open(output_dir / "pretraining_config.json", "w", encoding="utf-8") as f:
         json.dump(config_record, f, indent=2)
@@ -519,6 +1005,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 config=config,
                 train_dataset=train_dataset,
                 val_dataset=val_dataset,
+                train_feature_record_index=train_feature_record_index,
                 device=device,
                 output_dir=output_dir,
             )
@@ -542,6 +1029,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     save_selected_checkpoint(selected_row, output_dir)
     write_summary_table(all_rows, output_dir / "mol_encoder_pretraining_summary.csv")
+    write_summary_table(all_rows, output_dir / "mol_encoder_pretraining_summary.tsv", delimiter="	")
     with open(output_dir / "mol_encoder_pretraining_summary.json", "w", encoding="utf-8") as f:
         json.dump(all_rows, f, indent=2)
     return 0

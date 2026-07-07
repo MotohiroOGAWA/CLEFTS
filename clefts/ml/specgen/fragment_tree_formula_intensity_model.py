@@ -75,7 +75,7 @@ class FragmentTreeFormulaIntensityPredictor(nn.Module):
             self.formula_node_head = None
         else:
             self.formula_dim = int(feature_model.formula_tensorizer.dim)
-            self.fragment_dim = int(feature_model.tree_encoder.dim)
+            self.fragment_dim = int(feature_model.tree_encoder.hidden_dim)
             self.hidden_dim = int(hidden_dim or self.fragment_dim)
             self.formula_node_input = nn.Sequential(
                 nn.Linear(

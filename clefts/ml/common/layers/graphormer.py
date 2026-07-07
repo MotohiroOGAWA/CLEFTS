@@ -811,6 +811,7 @@ class GraphormerMHA(nn.Module):
         node_mask: torch.Tensor,                   # [B, N] bool (True = valid node, False = padding)
         dist_bias: Optional[torch.Tensor] = None,  # [..., H, N, N]
         edge_bias: Optional[torch.Tensor] = None,  # [..., H, N, N]
+        attention_mask: Optional[torch.Tensor] = None,  # [B, N, N] bool (True = allowed)
         build_pairwise_mask: bool = False,
     ) -> torch.Tensor:
         # -------------------------
@@ -880,14 +881,15 @@ class GraphormerMHA(nn.Module):
         # Optional pairwise additive mask
         # -------------------------
         additive_mask = None
-        if build_pairwise_mask:
-            # Allow attention only between valid nodes
-            pair = node_mask[:, :, None] & node_mask[:, None, :]  # [B, N, N]
-            neg_inf = torch.finfo(dtype).min
-            additive_mask = torch.zeros((B, N, N), device=device, dtype=dtype)
-            additive_mask = additive_mask.masked_fill(~pair, neg_inf)
-            # Expand per head to match [B*H, N, N]
-            additive_mask = additive_mask.repeat_interleave(self.num_heads, dim=0)
+        if attention_mask is not None or build_pairwise_mask:
+            additive_mask = node_mask[:, :, None] & node_mask[:, None, :]  # [B, N, N]
+            if attention_mask is not None:
+                if attention_mask.shape != (B, N, N):
+                    raise ValueError(
+                        f"attention_mask must have shape {(B, N, N)}, "
+                        f"got {tuple(attention_mask.shape)}."
+                    )
+                additive_mask = additive_mask & attention_mask.to(torch.bool)
 
         # -------------------------
         # Self-attention
@@ -944,6 +946,7 @@ class GraphormerBlock(nn.Module):
         dist_bias: Optional[torch.Tensor] = None,   # [B, H, num_tokens, num_tokens]
         edge_bias: Optional[torch.Tensor] = None,   # [B, H, num_tokens, num_tokens]
         node_mask: Optional[torch.Tensor] = None,   # [B, num_tokens] bool
+        attention_mask: Optional[torch.Tensor] = None,  # [B, num_tokens, num_tokens] bool
     ) -> torch.Tensor:
 
         if self.freeze_token_count < 0:
@@ -963,7 +966,13 @@ class GraphormerBlock(nn.Module):
             frozen_tokens = None
 
         h = self.norm1(x)
-        h = self.mha(h, node_mask=node_mask, dist_bias=dist_bias, edge_bias=edge_bias)
+        h = self.mha(
+            h,
+            node_mask=node_mask,
+            dist_bias=dist_bias,
+            edge_bias=edge_bias,
+            attention_mask=attention_mask,
+        )
         x = x + self.drop1(h)
 
         h = self.norm2(x)
@@ -977,99 +986,149 @@ class GraphormerBlock(nn.Module):
 
 
 class GraphormerEncoder(nn.Module):
+    """Generic Graphormer encoder for graph-structured node tokens.
+
+    Token layout inside attention is:
+        [condition tokens, graph tokens, node tokens]
+
+    ``node_dim`` is the input node feature width. ``hidden_dim`` is the shared
+    token width used by node, graph, and condition tokens. A graph
+    representation is always returned: graph tokens are used when
+    ``graph_token_count > 0``; otherwise masked mean pooling over node tokens is
+    used. Condition tokens are fixed context tokens for sample-level inputs such
+    as collision energy or adduct type.
+    """
+
     def __init__(
         self,
-        in_dim: int,
-        dim: int,
-        edge_dim: int,
-        num_heads: int,
-        num_layers: int,
-        max_degree: int,
-        max_spatial_dist: int,
-        max_edge_dist: int,
-        num_graph_tokens: int = 1,
+        node_dim: int,
+        hidden_dim: int,
+        edge_dim: int = 0,
+        num_heads: int = 8,
+        num_layers: int = 2,
+        max_degree: int = 8,
+        max_spatial_dist: int = 4,
+        max_edge_dist: int = 4,
+        *,
+        graph_token_count: int = 0,
+        condition_dim: Optional[int] = None,
+        condition_token_count: int = 0,
         dropout: float = 0.0,
-        add_virtual_node: bool = False,
+        graph_to_node: bool = True,
+        condition_to_node: bool = True,
+        condition_to_graph: bool = True,
         undirected_for_spd: bool = True,
         undirected_for_path: bool = True,
-        freeze_vnode: bool = False,
         start_cap: int = 64,
         cap_growth: float = 2.0,
     ):
         super().__init__()
-        assert dim % num_heads == 0
 
-        if num_graph_tokens <= 0:
-            raise ValueError("num_graph_tokens must be positive")
+        node_dim = int(node_dim)
+        hidden_dim = int(hidden_dim)
+        graph_token_count = int(graph_token_count)
 
-        if freeze_vnode and not add_virtual_node:
-            raise ValueError(
-                "freeze_vnode=True requires add_virtual_node=True."
-            )
+        if node_dim <= 0:
+            raise ValueError("node_dim must be positive.")
+        if hidden_dim <= 0:
+            raise ValueError("hidden_dim must be positive.")
+        if hidden_dim % int(num_heads) != 0:
+            raise ValueError("hidden_dim must be divisible by num_heads.")
+        if graph_token_count < 0:
+            raise ValueError("graph_token_count must be non-negative.")
 
-        self.dim = dim
-        self.num_graph_tokens = int(num_graph_tokens)
-        self.graph_repr_dim = dim * self.num_graph_tokens
+        if condition_dim is not None and int(condition_dim) > 0 and condition_token_count <= 0:
+            condition_token_count = 1
+        condition_token_count = int(condition_token_count)
+        if condition_token_count < 0:
+            raise ValueError("condition_token_count must be non-negative.")
 
-        self.num_heads = num_heads
-        self.num_layers = num_layers
-        self.max_spatial_dist = max_spatial_dist
-        self.max_edge_dist = max_edge_dist
-        self.max_degree = max_degree
-        self.edge_dim = edge_dim
-        self.add_virtual_node = add_virtual_node
+        self.node_dim = node_dim
+        self.hidden_dim = hidden_dim
+        self.num_heads = int(num_heads)
+        self.num_layers = int(num_layers)
+        self.max_spatial_dist = int(max_spatial_dist)
+        self.max_edge_dist = int(max_edge_dist)
+        self.max_degree = int(max_degree)
+        self.edge_dim = int(edge_dim)
+        self.graph_token_count = graph_token_count
+        self.condition_token_count = condition_token_count
+        self.graph_repr_dim = self.hidden_dim * max(1, self.graph_token_count)
+        self.condition_repr_dim = self.hidden_dim * self.condition_token_count
+        self.graph_to_node = bool(graph_to_node)
+        self.condition_to_node = bool(condition_to_node)
+        self.condition_to_graph = bool(condition_to_graph)
         self.undirected_for_spd = undirected_for_spd
         self.undirected_for_path = undirected_for_path
-        self.freeze_vnode = freeze_vnode
-        self.freeze_token_count = (
-            self.num_graph_tokens
-            if self.add_virtual_node and self.freeze_vnode
-            else 0
+        self.start_cap = int(start_cap)
+        self.cap_growth = float(cap_growth)
+
+        self.node_proj = (
+            nn.Identity()
+            if self.node_dim == self.hidden_dim
+            else nn.Linear(self.node_dim, self.hidden_dim, bias=False)
         )
-
-        self.start_cap = start_cap
-        self.cap_growth = cap_growth
-
-        self.in_proj = nn.Identity() if in_dim == dim else nn.Linear(in_dim, dim, bias=False)
-
-        self.centrality = CentralityEncoding(dim=dim, max_degree=max_degree)
-        self.spatial = SpatialEncoding(num_heads=num_heads, max_dist=max_spatial_dist)
+        self.centrality = CentralityEncoding(dim=self.hidden_dim, max_degree=self.max_degree)
+        self.spatial = SpatialEncoding(num_heads=self.num_heads, max_dist=self.max_spatial_dist)
 
         self.edge_enc = (
             EdgeEncoding(
-                edge_dim=edge_dim,
-                num_heads=num_heads,
-                max_dist=max_edge_dist,
+                edge_dim=self.edge_dim,
+                num_heads=self.num_heads,
+                max_dist=self.max_edge_dist,
                 undirected=undirected_for_path,
             )
-            if edge_dim > 0
+            if self.edge_dim > 0
             else None
         )
 
         self.blocks = nn.ModuleList([
-            GraphormerBlock(dim=dim, num_heads=num_heads, dropout=dropout, freeze_token_count=self.freeze_token_count)
-            for _ in range(num_layers)
+            GraphormerBlock(
+                dim=self.hidden_dim,
+                num_heads=self.num_heads,
+                dropout=dropout,
+                freeze_token_count=self.condition_token_count,
+            )
+            for _ in range(self.num_layers)
         ])
 
-        if add_virtual_node:
-            self.graph_tokens = nn.Parameter(
-                torch.empty(self.num_graph_tokens, dim)
-            )
+        if self.graph_token_count > 0:
+            self.graph_tokens = nn.Parameter(torch.empty(self.graph_token_count, self.hidden_dim))
             nn.init.normal_(self.graph_tokens, mean=0.0, std=0.02)
         else:
             self.graph_tokens = None
 
+        if self.condition_token_count > 0:
+            condition_dim = int(condition_dim or self.condition_repr_dim)
+            self.condition_dim = condition_dim
+            self.condition_proj = (
+                nn.Identity()
+                if condition_dim == self.condition_repr_dim
+                else nn.Linear(condition_dim, self.condition_repr_dim, bias=False)
+            )
+        else:
+            self.condition_dim = 0
+            self.condition_proj = None
+
     def forward(
         self,
         data: Data | Batch,
-        graph_repr: Optional[torch.Tensor] = None,
+        condition_repr: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         assert isinstance(data, (Data, Batch)), "data must be a Data or Batch instance"
         assert data.x is not None, "data.x (node features) must be provided"
 
-        if graph_repr is not None:
-            assert graph_repr.size(0) == data.num_graphs, "graph_repr batch size mismatch"
-            assert graph_repr.size(1) == self.graph_repr_dim, "graph_repr feature size mismatch"
+        num_graphs = self._num_graphs(data)
+        if condition_repr is not None:
+            if self.condition_token_count <= 0:
+                raise ValueError("condition_repr was provided but condition_token_count is 0.")
+            if condition_repr.size(0) != num_graphs:
+                raise ValueError("condition_repr batch size mismatch.")
+            if condition_repr.size(1) != self.condition_dim:
+                raise ValueError(
+                    f"condition_repr feature size mismatch: expected {self.condition_dim}, "
+                    f"got {condition_repr.size(1)}."
+                )
 
         bucket_list, ids_list = PaddedGraphBatch.bucketize_to_padded_graph_batches(
             data,
@@ -1078,47 +1137,26 @@ class GraphormerEncoder(nn.Module):
         )
 
         device = data.x.device
-
-        # 1) node outputs
-        out_h = data.x.new_zeros((data.num_nodes, self.dim))  # [N_total, dim]
-
-        # 2) graph outputs
-        num_graphs = (
-            int(data.num_graphs)
-            if hasattr(data, "num_graphs") and data.num_graphs is not None
-            else int(data.batch.max().item() + 1)
-        )
-        out_graph_repr = data.x.new_zeros(
-            (num_graphs, self.graph_repr_dim)
-        )  # [G, graph_repr_dim]
+        out_h = data.x.new_zeros((data.num_nodes, self.hidden_dim))
+        out_graph_repr = data.x.new_zeros((num_graphs, self.graph_repr_dim))
 
         for bucket, ids in zip(bucket_list, ids_list):
             ids = ids.to(device)
-
-            # [B, cap, dim]
             h = self._project_and_centrality_bucket(bucket)
-
-            # [B, H, cap, cap]
             dist_bias, edge_bias = self._compute_dist_and_edge_biases(bucket)
+            node_mask = bucket.node_mask
 
-            node_mask = bucket.node_mask  # [B, cap]
+            local_condition = None
+            if condition_repr is not None:
+                local_condition = self._condition_repr_to_tokens(condition_repr[ids])
 
-            if self.add_virtual_node:
-                if graph_repr is not None:
-                    graph_token_input = self._graph_repr_to_graph_tokens(
-                        graph_repr[ids]
-                    )  # [B, K, dim]
-                else:
-                    graph_token_input = None
-
-                h, node_mask, dist_bias, edge_bias = self._add_graph_tokens(
-                    h=h,
-                    node_mask=node_mask,
-                    num_heads=self.num_heads,
-                    dist_bias=dist_bias,
-                    edge_bias=edge_bias,
-                    graph_tokens=graph_token_input,
-                )
+            h, node_mask, dist_bias, edge_bias, attention_mask = self._add_context_tokens(
+                h=h,
+                node_mask=node_mask,
+                dist_bias=dist_bias,
+                edge_bias=edge_bias,
+                condition_tokens=local_condition,
+            )
 
             for blk in self.blocks:
                 h = blk(
@@ -1126,73 +1164,50 @@ class GraphormerEncoder(nn.Module):
                     node_mask=node_mask,
                     dist_bias=dist_bias,
                     edge_bias=edge_bias,
+                    attention_mask=attention_mask,
                 )
 
-            node_h, node_mask_wo_graph_tokens, local_graph_repr = (
-                self._remove_graph_tokens_and_readout(
-                    h=h,
-                    node_mask=node_mask,
-                )
+            node_h, node_mask_wo_context, local_graph_repr = self._remove_context_tokens_and_readout(
+                h=h,
+                node_mask=node_mask,
             )
-
             out_graph_repr[ids] = local_graph_repr
 
             node_ids = bucket.node_ids.to(device)
-            valid = node_mask_wo_graph_tokens.to(torch.bool)
+            valid = node_mask_wo_context.to(torch.bool)
             out_h[node_ids[valid]] = node_h[valid]
 
         return out_h, out_graph_repr
 
-    def _project_and_centrality_bucket(
-        self,
-        bb: PaddedGraphBatch,
-    ) -> torch.Tensor:
-        """
-        bb.x: [B, cap, Fin]  ->  h: [B, cap, dim]
-        """
+    @staticmethod
+    def _num_graphs(data: Data | Batch) -> int:
+        if hasattr(data, "num_graphs") and data.num_graphs is not None:
+            return int(data.num_graphs)
+        if hasattr(data, "batch") and data.batch is not None and data.batch.numel() > 0:
+            return int(data.batch.max().item() + 1)
+        return 1
+
+    def _project_and_centrality_bucket(self, bb: PaddedGraphBatch) -> torch.Tensor:
         x = bb.x
         if x is None:
             raise ValueError("bb.x is required")
-
-        # [B, cap, dim]
-        h = self.in_proj(x)
-
-        # [B, cap, dim]
-        h = self.centrality(
+        h = self.node_proj(x)
+        return self.centrality(
             h,
             edge_index=bb.edge_index,
             edge_mask=bb.edge_mask,
             node_mask=bb.node_mask,
         )
 
-        return h
-
-    def _compute_dist_and_edge_biases(
-        self,
-        bb: PaddedGraphBatch,
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """
-        bb: PaddedGraphBatch
-
-        Returns:
-        dist_bias: [B, H, cap, cap]
-        edge_bias: [B, H, cap, cap] or None
-        """
-        cap = bb.cap
-
-        # adjacency
-        adj = bb.build_adj(undirected=self.undirected_for_spd, add_self_loops=False)  # [B,cap,cap] bool
-
-        # SPD up to max_dist
+    def _compute_dist_and_edge_biases(self, bb: PaddedGraphBatch) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        adj = bb.build_adj(undirected=self.undirected_for_spd, add_self_loops=False)
         spatial_pos = SpatialEncoding.compute_spatial_pos(
             adj=adj,
             node_mask=bb.node_mask,
             max_dist=self.max_spatial_dist,
             add_self_loops=False,
-        )  # [B,cap,cap] long
-
-        dist_bias = self.spatial(spatial_pos)  # [B,H,cap,cap]
-
+        )
+        dist_bias = self.spatial(spatial_pos)
         edge_bias = torch.zeros_like(dist_bias) if self.edge_enc is not None else None
         if self.edge_enc is not None and bb.edge_attr is not None and bb.edge_attr.numel() > 0:
             edge_bias = self.edge_enc(
@@ -1200,139 +1215,118 @@ class GraphormerEncoder(nn.Module):
                 edge_attr=bb.edge_attr,
                 spatial_pos=spatial_pos,
                 edge_mask=bb.edge_mask,
-            )  # [B,H,cap,cap]
-
+            )
         return dist_bias, edge_bias
 
-    def _graph_repr_to_graph_tokens(
+    def _condition_repr_to_tokens(self, condition_repr: torch.Tensor) -> torch.Tensor:
+        if self.condition_proj is None:
+            raise ValueError("condition tokens are disabled.")
+        condition_tokens = self.condition_proj(condition_repr)
+        return condition_tokens.view(condition_repr.size(0), self.condition_token_count, self.hidden_dim)
+
+    def _add_context_tokens(
         self,
-        graph_repr: torch.Tensor,  # [B, K * dim]
-    ) -> torch.Tensor:
-        """
-        Convert previous graph representation into graph tokens.
-
-        Returns:
-            graph_tokens: [B, K, dim]
-        """
-        B = graph_repr.size(0)
-
-        if graph_repr.size(1) != self.graph_repr_dim:
-            raise ValueError(
-                f"graph_repr feature size mismatch: "
-                f"expected {self.graph_repr_dim}, got {graph_repr.size(1)}"
-            )
-
-        return graph_repr.view(B, self.num_graph_tokens, self.dim)
-
-
-    def _add_graph_tokens(
-        self,
-        h: torch.Tensor,                      # [B, N, dim]
-        node_mask: torch.Tensor,              # [B, N]
-        num_heads: int,
-        dist_bias: Optional[torch.Tensor] = None,  # [B, H, N, N]
-        edge_bias: Optional[torch.Tensor] = None,  # [B, H, N, N]
-        graph_tokens: Optional[torch.Tensor] = None,  # [B, K, dim]
-    ) -> tuple[
-        torch.Tensor,
-        torch.Tensor,
-        Optional[torch.Tensor],
-        Optional[torch.Tensor],
-    ]:
-        """
-        Prepend multiple graph tokens to node features and related masks/biases.
-
-        Returns:
-            h_new:
-                [B, K + N, dim]
-
-            node_mask_new:
-                [B, K + N]
-
-            dist_bias:
-                [B, H, K + N, K + N] or None
-
-            edge_bias:
-                [B, H, K + N, K + N] or None
-        """
+        *,
+        h: torch.Tensor,
+        node_mask: torch.Tensor,
+        dist_bias: Optional[torch.Tensor],
+        edge_bias: Optional[torch.Tensor],
+        condition_tokens: Optional[torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], torch.Tensor]:
         device = h.device
-        B, N, dim = h.shape
-        H = num_heads
-        K = self.num_graph_tokens
+        B, N, hidden_dim = h.shape
+        C = self.condition_token_count
+        G = self.graph_token_count
+        prefix_parts = []
 
-        if graph_tokens is not None:
-            if graph_tokens.shape != (B, K, dim):
+        if C > 0:
+            if condition_tokens is None:
+                raise ValueError("condition_repr is required when condition_token_count > 0.")
+            if condition_tokens.shape != (B, C, hidden_dim):
                 raise ValueError(
-                    f"graph_tokens must have shape {(B, K, dim)}, "
-                    f"got {tuple(graph_tokens.shape)}"
+                    f"condition_tokens must have shape {(B, C, hidden_dim)}, "
+                    f"got {tuple(condition_tokens.shape)}."
                 )
-            graph_token_feat = graph_tokens
-        else:
+            prefix_parts.append(condition_tokens)
+
+        if G > 0:
             if self.graph_tokens is None:
-                raise ValueError("self.graph_tokens is None")
-            graph_token_feat = self.graph_tokens.view(1, K, dim).expand(B, K, dim)
+                raise ValueError("graph tokens are not initialized.")
+            prefix_parts.append(self.graph_tokens.view(1, G, hidden_dim).expand(B, G, hidden_dim))
 
-        h_new = torch.cat([graph_token_feat, h], dim=1)  # [B, K + N, dim]
+        if prefix_parts:
+            prefix = torch.cat(prefix_parts, dim=1)
+            h = torch.cat([prefix, h], dim=1)
+            prefix_mask = torch.ones((B, C + G), dtype=torch.bool, device=device)
+            node_mask = torch.cat([prefix_mask, node_mask.to(torch.bool)], dim=1)
+            dist_bias = self._prepend_zero_bias(dist_bias, C + G)
+            edge_bias = self._prepend_zero_bias(edge_bias, C + G)
 
-        graph_token_mask = torch.ones((B, K), dtype=torch.bool, device=device)
-        node_mask_new = torch.cat(
-            [graph_token_mask, node_mask.to(torch.bool)],
-            dim=1,
-        )  # [B, K + N]
+        attention_mask = self._build_attention_mask(
+            batch_size=B,
+            num_nodes=N,
+            device=device,
+        )
+        return h, node_mask, dist_bias, edge_bias, attention_mask
 
-        if dist_bias is not None:
-            new_dist_bias = dist_bias.new_zeros((B, H, K + N, K + N))
-            new_dist_bias[:, :, K:, K:] = dist_bias
-            dist_bias = new_dist_bias
-
-        if edge_bias is not None:
-            new_edge_bias = edge_bias.new_zeros((B, H, K + N, K + N))
-            new_edge_bias[:, :, K:, K:] = edge_bias
-            edge_bias = new_edge_bias
-
-        return h_new, node_mask_new, dist_bias, edge_bias
-
-
-    def _remove_graph_tokens_and_readout(
+    def _prepend_zero_bias(
         self,
-        h: torch.Tensor,          # [B, K + cap, dim]
-        node_mask: torch.Tensor,  # [B, K + cap]
+        bias: Optional[torch.Tensor],
+        prefix_count: int,
+    ) -> Optional[torch.Tensor]:
+        if bias is None or prefix_count <= 0:
+            return bias
+        B, H, N, _ = bias.shape
+        out = bias.new_zeros((B, H, prefix_count + N, prefix_count + N))
+        out[:, :, prefix_count:, prefix_count:] = bias
+        return out
+
+    def _build_attention_mask(
+        self,
+        *,
+        batch_size: int,
+        num_nodes: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        C = self.condition_token_count
+        G = self.graph_token_count
+        total = C + G + num_nodes
+        mask = torch.ones((batch_size, total, total), dtype=torch.bool, device=device)
+
+        node_start = C + G
+        graph_start = C
+        graph_end = C + G
+
+        if C > 0 and not self.condition_to_node:
+            mask[:, node_start:, :C] = False
+        if C > 0 and G > 0 and not self.condition_to_graph:
+            mask[:, graph_start:graph_end, :C] = False
+        if G > 0 and not self.graph_to_node:
+            mask[:, node_start:, graph_start:graph_end] = False
+
+        return mask
+
+    def _remove_context_tokens_and_readout(
+        self,
+        *,
+        h: torch.Tensor,
+        node_mask: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Returns:
-            node_h:
-                [B, cap, dim]
+        C = self.condition_token_count
+        G = self.graph_token_count
+        node_start = C + G
+        node_h = h[:, node_start:, :]
+        node_mask = node_mask[:, node_start:]
 
-            node_mask:
-                [B, cap]
-
-            graph_repr:
-                [B, K * dim]
-        """
-        if self.add_virtual_node:
-            K = self.num_graph_tokens
-
-            graph_token_h = h[:, :K, :]       # [B, K, dim]
-            node_h = h[:, K:, :]              # [B, cap, dim]
-            node_mask = node_mask[:, K:]      # [B, cap]
-
-            B = graph_token_h.size(0)
-            graph_repr = graph_token_h.reshape(B, K * self.dim)  # [B, graph_repr_dim]
-
+        if G > 0:
+            graph_token_h = h[:, C: C + G, :]
+            graph_repr = graph_token_h.reshape(h.size(0), G * self.hidden_dim)
             return node_h, node_mask, graph_repr
 
-        # fallback when add_virtual_node=False
         mask = node_mask.to(h.dtype)
         denom = mask.sum(dim=1, keepdim=True).clamp_min(1.0)
-        pooled = (h * mask.unsqueeze(-1)).sum(dim=1) / denom  # [B, dim]
-
-        if self.num_graph_tokens == 1:
-            graph_repr = pooled
-        else:
-            # fallback: repeat pooled vector to match graph_repr_dim
-            graph_repr = pooled.repeat(1, self.num_graph_tokens)
-
-        return h, node_mask, graph_repr
+        graph_repr = (node_h * mask.unsqueeze(-1)).sum(dim=1) / denom
+        return node_h, node_mask, graph_repr
 
 if __name__ == "__main__":
     torch.manual_seed(0)
@@ -1466,15 +1460,15 @@ if __name__ == "__main__":
 
     # Test both execution modes
     enc = GraphormerEncoder(
-        in_dim=Fin,
-        dim=dim,
+        node_dim=Fin,
+        hidden_dim=dim,
         num_heads=num_heads,
         num_layers=num_layers,
         max_spatial_dist=6,
         max_edge_dist=6,
         edge_dim=edge_dim,
         max_degree=3,
-        add_virtual_node=True,
+        graph_token_count=1,
         dropout=0.0,
         undirected_for_spd=True,
         undirected_for_path=True,
@@ -1483,15 +1477,15 @@ if __name__ == "__main__":
         cap_growth=2.0,
     )
     enc2 = GraphormerEncoder(
-        in_dim=dim,
-        dim=dim,
+        node_dim=dim,
+        hidden_dim=dim,
         num_heads=num_heads,
         num_layers=num_layers,
         max_spatial_dist=6,
         max_edge_dist=6,
         edge_dim=edge_dim,
         max_degree=3,
-        add_virtual_node=True,
+        graph_token_count=1,
         dropout=0.0,
         undirected_for_spd=True,
         undirected_for_path=True,
@@ -1502,7 +1496,7 @@ if __name__ == "__main__":
 
     out, graph_repr = enc(batch)
     batch.x = out  # feed first encoder output as input to second encoder
-    out, graph_repr = enc2(batch, graph_repr=graph_repr)
+    out, graph_repr = enc2(batch)
     loss = out.mean() + (graph_repr.mean() if graph_repr is not None else 0.0)
     loss.backward()
 

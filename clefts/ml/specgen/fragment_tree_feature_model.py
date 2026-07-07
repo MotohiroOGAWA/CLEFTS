@@ -91,22 +91,19 @@ class FragmentTreeFeatureModel(nn.Module):
         self.cleavage_edge_fnet = CleavageEdgeFeatureNet(**cleavage_edge_fnet_params)
 
         tree_encoder_params = tree_encoder_params.copy()
-        tree_encoder_params["in_dim"] = self.mol_encoder.graph_dim + 3
+        tree_encoder_params["node_dim"] = self.mol_encoder.graph_dim + 3
         tree_encoder_params["edge_dim"] = self.cleavage_edge_fnet.feature_dim
         tree_encoder_params["max_spatial_dist"] = self.fragmenter.tree_max_depth + 1
         tree_encoder_params["max_edge_dist"] = self.fragmenter.tree_max_depth + 1
         tree_encoder_params["dropout"] = dropout
-        tree_encoder_params["add_virtual_node"] = True
+        tree_encoder_params["condition_dim"] = self._condition_encoder.feature_dim
+        tree_encoder_params.setdefault("condition_token_count", 1)
+        tree_encoder_params.setdefault("condition_to_node", True)
+        tree_encoder_params.setdefault("condition_to_graph", True)
+        tree_encoder_params.setdefault("graph_to_node", False)
         tree_encoder_params["undirected_for_spd"] = False
         tree_encoder_params["undirected_for_path"] = False
-        tree_encoder_params["freeze_vnode"] = True
         self.tree_encoder = GraphormerEncoder(**tree_encoder_params)
-
-        self.ms2_condition_to_tree_proj = nn.Sequential(
-            nn.Linear(self._condition_encoder.feature_dim, self.tree_encoder.dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-        )
 
         self.main_adduct_types = bidict(
             {idx: adduct for idx, adduct in enumerate(self._fragmenter.adduct_types)}
@@ -766,7 +763,7 @@ class FragmentTreeFeatureModel(nn.Module):
 
         tree_node_emb, tree_graph_repr = self.tree_encoder(
             sample_tree_batch,
-            graph_repr=condition_tree_repr,
+            condition_repr=condition_tree_repr,
         )
 
         # Store encoded features in the batch itself.
@@ -941,18 +938,13 @@ class FragmentTreeFeatureModel(nn.Module):
         # [E]
 
         # -------------------------
-        # Sample condition -> tree graph representation
+        # Sample-level fixed condition tokens
         # -------------------------
-        sample_condition_features = self._condition_encoder(
+        sample_condition_tree_repr = self._condition_encoder(
             structure.sample_adduct_type_index.to(device).long(),
             structure.sample_ce_value.to(device),
         )
         # [S, condition_dim]
-
-        sample_condition_tree_repr = self.ms2_condition_to_tree_proj(
-            sample_condition_features
-        )
-        # [S, tree_graph_repr_dim]
 
         if sample_condition_tree_repr.size(0) != num_samples:
             raise ValueError(
@@ -961,11 +953,11 @@ class FragmentTreeFeatureModel(nn.Module):
                 f"expected {num_samples}."
             )
 
-        if sample_condition_tree_repr.size(1) != self.tree_encoder.graph_repr_dim:
+        if sample_condition_tree_repr.size(1) != self.tree_encoder.condition_dim:
             raise ValueError(
-                "ms2_condition_to_tree_proj output has invalid feature dimension: "
+                "MS2ConditionEncoder output has invalid feature dimension: "
                 f"got {sample_condition_tree_repr.size(1)}, "
-                f"expected {self.tree_encoder.graph_repr_dim}."
+                f"expected {self.tree_encoder.condition_dim}."
             )
 
         sample_data_list: List[Data] = []
@@ -1462,7 +1454,7 @@ class FragmentTreeFeatureModel(nn.Module):
         condition_tree_repr = sample_condition_tree_repr[
             kept_sample_ids_tensor
         ]
-        # [G, tree_graph_repr_dim]
+        # [G, condition_dim]
 
         # -------------------------
         # Concatenate precursor pathway sequences and target candidate indexes
