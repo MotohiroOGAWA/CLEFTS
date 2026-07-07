@@ -32,6 +32,7 @@ if __package__ in {None, ""}:
         MolPretrainingDataset,
         load_smiles_file,
     )
+    from clefts.ml.training.mol_training.descriptor_coverage import DEFAULT_DESCRIPTOR_BIN_SPECS, build_descriptor_record_index
     from clefts.ml.training.mol_training.feature_schema import atom_feature_groups, bond_feature_groups
     from clefts.ml.training.mol_training.pretraining_model import MolPretrainingModel
     from clefts.ml.training.mol_training.trainer import make_loader, train_epochs
@@ -50,6 +51,7 @@ else:
         MolPretrainingDataset,
         load_smiles_file,
     )
+    from .descriptor_coverage import DEFAULT_DESCRIPTOR_BIN_SPECS, build_descriptor_record_index
     from .feature_schema import atom_feature_groups, bond_feature_groups
     from .pretraining_model import MolPretrainingModel
     from .trainer import make_loader, train_epochs
@@ -421,8 +423,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--edge-mask-ratio", type=float, default=0.25, help="Random edge masking ratio for edge attribute prediction.")
     parser.add_argument("--disable-balanced-attribute-masking", action="store_true", help="Disable class-balancing when selecting node and edge attributes to mask.")
     parser.add_argument("--disable-balanced-record-sampling", action="store_true", help="Disable forced molecule sampling for rare node and edge attribute classes.")
+    parser.add_argument("--disable-balanced-descriptor-sampling", action="store_true", help="Disable forced molecule sampling for descriptor target bins.")
     parser.add_argument("--mask-balance-patience", type=int, default=20, help="Number of batches a class may be absent before balanced masking or sampling forces it.")
     parser.add_argument("--mask-balance-max-forced-per-batch", type=int, default=8, help="Maximum forced rare classes added per batch by balanced masking or sampling.")
+    parser.add_argument("--descriptor-min-record-count", type=int, default=10, help="Ignore descriptor bins with fewer than this many molecules when forcing balanced sampling.")
     parser.add_argument("--disable-balanced-validation-masks", action="store_true", help="Disable validation-time forced coverage for node and edge attribute classes present in a batch.")
     parser.add_argument("--min-validation-target-count", type=int, default=1, help="Warn when validation has fewer targets than this for any node or edge attribute class.")
 
@@ -755,6 +759,35 @@ def build_feature_record_index(
     }
 
 
+def build_descriptor_sampling_index(
+    dataset: MolPretrainingDataset,
+    *,
+    min_record_count: int,
+) -> Tuple[Dict[str, Dict[str, Dict[str, List[int]]]], Dict[str, Dict[str, object]]]:
+    descriptor_rows = [data.descriptors.detach().cpu().tolist() for data in dataset.items]
+    descriptor_index, descriptor_summary = build_descriptor_record_index(
+        descriptor_rows,
+        dataset.descriptor_names,
+        min_record_count=min_record_count,
+        specs_by_name={spec.name: spec for spec in DEFAULT_DESCRIPTOR_BIN_SPECS},
+    )
+    return {"descriptor": descriptor_index}, descriptor_summary
+
+
+def merge_record_indexes(
+    *indexes: Dict[str, Dict[str, Dict[str, List[int]]]] | None,
+) -> Dict[str, Dict[str, Dict[str, List[int]]]]:
+    merged: Dict[str, Dict[str, Dict[str, List[int]]]] = {}
+    for index in indexes:
+        if not index:
+            continue
+        for level, groups in index.items():
+            merged.setdefault(level, {})
+            for group_name, labels in groups.items():
+                merged[level][group_name] = {label: list(records) for label, records in labels.items()}
+    return merged
+
+
 def feature_record_index_counts(
     index: Dict[str, Dict[str, Dict[str, List[int]]]],
 ) -> Dict[str, Dict[str, Dict[str, int]]]:
@@ -824,7 +857,7 @@ def run_pretraining_stage(
     output_dir: Path,
 ) -> Dict[str, object]:
     balanced_feature_record_index = None
-    if not args.disable_balanced_attribute_masking and not args.disable_balanced_record_sampling:
+    if not args.disable_balanced_record_sampling and train_feature_record_index:
         balanced_feature_record_index = train_feature_record_index
     train_loader = make_loader(
         train_dataset,
@@ -915,14 +948,32 @@ def main(argv: Sequence[str] | None = None) -> int:
         output_dir=output_dir,
         min_validation_target_count=args.min_validation_target_count,
     )
-    train_feature_record_index = build_feature_record_index(train_dataset, symbols=symbols)
+    attribute_record_index = build_feature_record_index(train_dataset, symbols=symbols)
+    descriptor_record_sampling_index, descriptor_sampling_summary = build_descriptor_sampling_index(
+        train_dataset,
+        min_record_count=args.descriptor_min_record_count,
+    )
+    train_feature_record_index = merge_record_indexes(
+        attribute_record_index
+        if not args.disable_balanced_attribute_masking
+        else None,
+        descriptor_record_sampling_index
+        if not args.disable_balanced_descriptor_sampling and not args.disable_graph_descriptors
+        else None,
+    )
     balanced_record_sampling_summary = {
         "enabled": bool(
-            not args.disable_balanced_attribute_masking
-            and not args.disable_balanced_record_sampling
+            not args.disable_balanced_record_sampling
+            and bool(train_feature_record_index)
+        ),
+        "attribute_sampling_enabled": bool(not args.disable_balanced_attribute_masking),
+        "descriptor_sampling_enabled": bool(
+            not args.disable_balanced_descriptor_sampling and not args.disable_graph_descriptors
         ),
         "patience": int(args.mask_balance_patience),
         "max_forced_per_batch": int(args.mask_balance_max_forced_per_batch),
+        "descriptor_min_record_count": int(args.descriptor_min_record_count),
+        "descriptor_summary": descriptor_sampling_summary,
         "train_record_counts": feature_record_index_counts(train_feature_record_index),
     }
 

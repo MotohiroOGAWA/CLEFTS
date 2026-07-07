@@ -13,6 +13,7 @@ from tqdm import tqdm
 
 from ....libs.mmkit.mmkit import Compound
 from ...mol.graph_builder import MolGraphBuilder
+from .descriptor_coverage import DEFAULT_DESCRIPTOR_BIN_SPECS, build_descriptor_record_index
 
 
 DEFAULT_DESCRIPTOR_NAMES = (
@@ -206,6 +207,21 @@ class MolPretrainingDataset(Dataset):
                 for class_idx, label in enumerate(group.labels):
                     if class_idx in present:
                         index[group.name][label].append(item_index)
+        return index
+
+    def descriptor_record_index(
+        self,
+        *,
+        min_record_count: int = 10,
+        descriptor_bin_specs=DEFAULT_DESCRIPTOR_BIN_SPECS,
+    ) -> Dict[str, Dict[str, List[int]]]:
+        descriptor_rows = [data.descriptors.detach().cpu().tolist() for data in self.items]
+        index, _ = build_descriptor_record_index(
+            descriptor_rows,
+            self.descriptor_names,
+            min_record_count=min_record_count,
+            specs_by_name={spec.name: spec for spec in descriptor_bin_specs},
+        )
         return index
 
 
