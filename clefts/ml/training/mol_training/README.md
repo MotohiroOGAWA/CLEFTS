@@ -1,7 +1,8 @@
 # mol_training Workflow Documentation
 
-This document summarizes the overall molecular encoder pretraining workflow implemented in `/workspaces/CLEFTS/mnt/app/clefts/ml/training/mol_training` in a slide-friendly format.
-It is intended to be loaded into tools such as ChatGPT to create slides explaining workflow diagrams, processing flows, training tasks, and output artifacts.
+This document summarizes the molecular encoder pretraining workflow implemented in this package. It describes the code, data flow, training tasks, metrics, and output artifacts in repository-relative terms.
+
+Unless otherwise noted, file names in this document are relative to `clefts/ml/training/mol_training/`, and output paths are relative to the user-provided `--output-dir`. Avoid relying on machine-specific absolute paths when copying examples or documenting runs.
 
 Target code:
 
@@ -409,8 +410,9 @@ Representative examples:
 
 TensorBoard grouping:
 
-- accuracy metrics: `node_acc/...`
-- loss/count metrics: `node/...`
+- `node_attr_acc`: overall feature accuracies and per-class accuracies
+- `node_attr_loss`: total node attribute loss and per-feature losses
+- `node_attr_count`: per-feature and per-class counts
 
 ---
 
@@ -565,8 +567,9 @@ Representative examples:
 
 TensorBoard grouping:
 
-- accuracy metrics: `edge_acc/...`
-- loss/count metrics: `edge/...`
+- `edge_attr_acc`: overall feature accuracies and per-class accuracies
+- `edge_attr_loss`: total edge attribute loss and per-feature losses
+- `edge_attr_count`: per-feature and per-class counts
 
 ---
 
@@ -644,8 +647,8 @@ Meaning of R2:
 
 TensorBoard:
 
-- `descriptor/loss_by_target`
-- `descriptor/r2_by_target`
+- `descriptor_loss`: total descriptor loss and per-target losses
+- `descriptor/r2_by_target`: per-target R2
 
 ---
 
@@ -811,21 +814,26 @@ Examples:
 - `descriptor_loss`
 - `ecfp_loss`
 
-### 19.2 Node/edge acc grouping
+### 19.2 Attribute grouping
 
-Attribute accuracies are separated from loss/count in TensorBoard.
+Node and edge attribute metrics are grouped by metric kind instead of feature group.
 
-- node accuracy: `node_acc/...`
-- edge accuracy: `edge_acc/...`
-- node loss/count: `node/...`
-- edge loss/count: `edge/...`
+- `node_attr_acc`, `node_attr_loss`, `node_attr_count`
+- `edge_attr_acc`, `edge_attr_loss`, `edge_attr_count`
 
-This makes important accuracy metrics easier to inspect.
+Each chart contains train/val series for the total metric, feature-level metrics, and class-level metrics where applicable.
 
-### 19.3 Descriptor grouping
+### 19.3 Node context and ECFP grouping
 
-- `descriptor/loss_by_target`
-- `descriptor/r2_by_target`
+Positive and negative breakdowns are kept in the same chart as the total metric.
+
+- `node_context_acc`, `node_context_loss`, `node_context_count`
+- `ecfp_acc`, `ecfp_loss`, `ecfp_count`
+
+### 19.4 Descriptor grouping
+
+- `descriptor_loss`: total descriptor loss and per-target losses
+- `descriptor/r2_by_target`: per-target R2
 
 ---
 
@@ -1022,7 +1030,7 @@ If this Markdown is converted into slides, the following structure is natural.
 - ECFP loss also uses balanced BCE so that positive/negative bits each contribute half
 - Descriptors report R2 instead of accuracy
 - Rare attribute classes are supported in two stages: dataset-level sampling and mask-level coverage
-- TensorBoard separates accuracy into `node_acc` and `edge_acc` for readability
+- TensorBoard groups sparse metrics into `node_attr_*`, `edge_attr_*`, `node_context_*`, `ecfp_*`, and descriptor charts
 
 ---
 

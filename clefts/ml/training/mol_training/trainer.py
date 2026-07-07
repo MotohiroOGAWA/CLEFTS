@@ -178,48 +178,71 @@ FEATURE_DISPLAY_NAMES = {
 
 
 def tensorboard_metric_tag(name: str) -> str:
+    if name.startswith("node_context_"):
+        if name.endswith("_acc"):
+            return "node_context_acc"
+        if name.endswith("_loss"):
+            return "node_context_loss"
+        if name.endswith("_count"):
+            return "node_context_count"
+    if name.startswith("ecfp_"):
+        if name.endswith("_acc"):
+            return "ecfp_acc"
+        if name.endswith("_loss"):
+            return "ecfp_loss"
+        if name.endswith("_count"):
+            return "ecfp_count"
+    class_match = CLASS_METRIC_RE.match(name)
+    if class_match:
+        prefix, _, _, metric_name = class_match.groups()
+        return f"{prefix}_attr_{metric_name}"
     match = GROUP_METRIC_RE.match(name)
     if not match:
         return name
-    prefix, group_name, metric_name = match.groups()
+    prefix, _, metric_name = match.groups()
+    return f"{prefix}_attr_{metric_name}"
+
+
+def tensorboard_metric_series_name(name: str) -> str:
+    if name == "descriptor_loss":
+        return "total"
+    if name in {"node_attr_loss", "edge_attr_loss", "node_context_loss", "ecfp_loss"}:
+        return "total"
+    for prefix in ("node_context", "ecfp"):
+        if not name.startswith(f"{prefix}_"):
+            continue
+        suffix = name[len(prefix) + 1 :]
+        for metric_name in ("acc", "loss", "count"):
+            if suffix == metric_name:
+                return "total"
+            if suffix.endswith(f"_{metric_name}"):
+                return suffix[: -(len(metric_name) + 1)]
+    match = GROUP_METRIC_RE.match(name)
+    if not match:
+        return "total"
+    _, group_name, metric_name = match.groups()
     display_name = FEATURE_DISPLAY_NAMES.get(group_name, group_name)
-    if metric_name == "acc":
-        return f"{prefix}_acc/{display_name}"
-    return f"{prefix}/{display_name}_{metric_name}"
+    for suffix in ("_acc", "_count"):
+        if metric_name.endswith(suffix):
+            class_label = metric_name[: -len(suffix)]
+            return f"{display_name}/{class_label}"
+    if metric_name in {"acc", "loss", "count"}:
+        return display_name
+    return f"{display_name}/{metric_name}"
 
 
 def should_skip_metric_pair(name: str) -> bool:
+    if name == "descriptor_loss":
+        return True
     descriptor_loss_match = DESCRIPTOR_ITEM_LOSS_RE.match(name)
-    if descriptor_loss_match and descriptor_loss_match.group(1) != "":
-        return name != "descriptor_loss"
+    if descriptor_loss_match:
+        return True
     if DESCRIPTOR_ITEM_R2_RE.match(name):
         return True
     if DESCRIPTOR_R2_ACCUM_RE.match(name):
         return True
-    return CLASS_METRIC_RE.match(name) is not None
+    return False
 
-
-def write_tensorboard_grouped_class_metrics(
-    writer: SummaryWriter,
-    *,
-    train_metrics: Dict[str, float],
-    val_metrics: Dict[str, float],
-    epoch: int,
-) -> None:
-    grouped: Dict[str, Dict[str, float]] = {}
-    for split, metrics in (("train", train_metrics), ("val", val_metrics)):
-        for name, value in metrics.items():
-            match = CLASS_METRIC_RE.match(name)
-            if not match:
-                continue
-            prefix, group_name, label, metric_name = match.groups()
-            display_name = FEATURE_DISPLAY_NAMES.get(group_name, group_name)
-            tag_prefix = f"{prefix}_acc" if metric_name == "acc" else prefix
-            tag = f"{tag_prefix}/{display_name}_{metric_name}_by_class"
-            grouped.setdefault(tag, {})[f"{split}/{label}"] = float(value)
-    for tag, values in grouped.items():
-        if values:
-            writer.add_scalars(tag, values, epoch)
 
 
 def write_tensorboard_grouped_descriptor_losses(
@@ -233,15 +256,19 @@ def write_tensorboard_grouped_descriptor_losses(
     r2_values = {}
     for split, metrics in (("train", train_metrics), ("val", val_metrics)):
         for name, value in metrics.items():
+            if name == "descriptor_loss":
+                loss_values[f"{split}/total"] = float(value)
+                continue
             loss_match = DESCRIPTOR_ITEM_LOSS_RE.match(name)
-            if loss_match and name != "descriptor_loss":
-                loss_values[f"{split}/{loss_match.group(1)}"] = float(value)
+            if loss_match:
+                loss_name = loss_match.group(1)
+                loss_values[f"{split}/{loss_name}"] = float(value)
                 continue
             r2_match = DESCRIPTOR_ITEM_R2_RE.match(name)
             if r2_match:
                 r2_values[f"{split}/{r2_match.group(1)}"] = float(value)
     if loss_values:
-        writer.add_scalars("descriptor/loss_by_target", loss_values, epoch)
+        writer.add_scalars("descriptor_loss", loss_values, epoch)
     if r2_values:
         writer.add_scalars("descriptor/r2_by_target", r2_values, epoch)
 
@@ -253,15 +280,20 @@ def write_tensorboard_metric_pairs(
     val_metrics: Dict[str, float],
     epoch: int,
 ) -> None:
+    grouped: Dict[str, Dict[str, float]] = {}
     for name in sorted(set(train_metrics) | set(val_metrics)):
         if should_skip_metric_pair(name):
             continue
-        values = {}
+        tag = tensorboard_metric_tag(name)
+        series_name = tensorboard_metric_series_name(name)
+        values = grouped.setdefault(tag, {})
         if name in train_metrics:
-            values["train"] = float(train_metrics[name])
+            values[f"train/{series_name}"] = float(train_metrics[name])
         if name in val_metrics:
-            values["val"] = float(val_metrics[name])
-        writer.add_scalars(tensorboard_metric_tag(name), values, epoch)
+            values[f"val/{series_name}"] = float(val_metrics[name])
+    for tag, values in grouped.items():
+        if values:
+            writer.add_scalars(tag, values, epoch)
 
 
 def write_tensorboard_command(log_dir: Path) -> None:
@@ -379,12 +411,6 @@ def train_epochs(
         csv_writer.writerows(metric_records)
         csv_file.flush()
         write_tensorboard_metric_pairs(
-            tb_writer,
-            train_metrics=train_metrics,
-            val_metrics=val_metrics,
-            epoch=epoch,
-        )
-        write_tensorboard_grouped_class_metrics(
             tb_writer,
             train_metrics=train_metrics,
             val_metrics=val_metrics,
