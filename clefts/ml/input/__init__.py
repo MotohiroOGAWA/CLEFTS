@@ -6,7 +6,6 @@ __all__ = [
     "FragmentTreeStructure",
     "FragmentTreeFeatures",
     "TrainingFragmentTreeStructure",
-    "SupervisedFragmentTreeStructureBuilder",
     "FragmentTreeStructureFileDataset",
     "FragmentTreeStructureFileItem",
     "build_fragment_tree_structure_files",
@@ -16,13 +15,6 @@ __all__ = [
 
 
 def __getattr__(name: str):
-    if name == "SupervisedFragmentTreeStructureBuilder":
-        from .supervised_fragment_tree_structure_builder import (
-            SupervisedFragmentTreeStructureBuilder,
-        )
-
-        return SupervisedFragmentTreeStructureBuilder
-
     if name in {
         "FragmentTreeStructureFileDataset",
         "FragmentTreeStructureFileItem",

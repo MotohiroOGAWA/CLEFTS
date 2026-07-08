@@ -724,7 +724,7 @@ class FragmentTreeIntensityTrainingLoss(nn.Module):
         if not target_mask.any():
             return target_weight
 
-        target_formula = target.target_formula.to(device).float()[target_mask]
+        target_formula = target.target_assignment_formula.to(device).float()[target_mask]
         target_intensity = target.target_intensity.to(device).float()[target_mask]
         for pred_index, formula in enumerate(predicted_formula):
             formula_mask = torch.all(target_formula == formula, dim=1)

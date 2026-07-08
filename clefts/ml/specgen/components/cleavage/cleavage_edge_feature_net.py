@@ -7,23 +7,21 @@ import torch.nn as nn
 
 from clefts.domain.fragment.cleavage import CleavagePatternSet
 from .cleavage_fnet import CleavageFNetInput, CleavageFNet
-from ....common.layers.set_transformer import SetTransformer
 from ....input.fragment_tree_features import FragmentTreeFeatures
 from ....input.fragment_tree_structure import FragmentTreeStructure
 
 
 class CleavageEdgeFeatureNet(nn.Module):
     """
-    Encode fragment-tree edge features from cleavage events.
+    Encode cleavage-event features for fragment-tree edges.
 
-    This module:
-        1. Groups cleavage events by
-           (cleavage_pattern_id, reaction_id, product_molecule_id).
-        2. Encodes each event group using the corresponding CleavageFNet.
-        3. Aggregates event-level features into edge-level features.
-
-    Output:
-        edge_attr: [E, feature_dim]
+    This module groups cleavage events by
+    (cleavage_pattern_id, reaction_id, product_molecule_id) and encodes each
+    event with the corresponding CleavageFNet. ``encode_events`` returns one
+    row per cleavage event so callers can distinguish multiple events on the
+    same source-target fragment-tree edge. ``forward`` keeps a legacy
+    edge-level view by deterministic mean pooling, but no learnable aggregation
+    model is used.
     """
 
     def __init__(
@@ -33,14 +31,17 @@ class CleavageEdgeFeatureNet(nn.Module):
         mol_dim: int,
         atom_dim: int,
         fc_dims: Tuple[int, ...],
-        aggregation_model_params: Dict,
-        dropout: float,
+        dropout: float = 0.0,
+        aggregation_model_params: Dict | None = None,
     ) -> None:
         super().__init__()
 
         self._feature_dim = int(feature_dim)
         self._mol_dim = int(mol_dim)
         self._atom_dim = int(atom_dim)
+        self._fc_dims = tuple(int(v) for v in fc_dims)
+        self._dropout = float(dropout)
+        self._cleavage_pattern_set_params = dict(cleavage_pattern_set_params)
 
         cleavage_pattern_set = CleavagePatternSet.from_dict(
             cleavage_pattern_set_params
@@ -137,11 +138,6 @@ class CleavageEdgeFeatureNet(nn.Module):
             product_tuple_length_by_event_type
         )
 
-        self.aggregation_model = self._build_aggregation_model(
-            aggregation_model_params=aggregation_model_params,
-            feature_dim=feature_dim,
-            dropout=dropout,
-        )
 
     @staticmethod
     def _make_cleavage_fnet_key(
@@ -159,29 +155,6 @@ class CleavageEdgeFeatureNet(nn.Module):
             f"p{int(cleavage_pattern_id)}"
             f"__r{int(reaction_id)}"
             f"__m{int(product_molecule_id)}"
-        )
-
-    @staticmethod
-    def _build_aggregation_model(
-        *,
-        aggregation_model_params: Dict,
-        feature_dim: int,
-        dropout: float,
-    ) -> nn.Module:
-        """Build event-to-edge aggregation model."""
-        aggregation_model_params = dict(aggregation_model_params)
-
-        aggregation_model_name = aggregation_model_params.pop("name")
-
-        if aggregation_model_name == "set_transformer":
-            aggregation_model_params["in_dim"] = feature_dim
-            aggregation_model_params["out_dim"] = feature_dim
-            aggregation_model_params["dropout"] = dropout
-
-            return SetTransformer(**aggregation_model_params)
-
-        raise ValueError(
-            f"Unsupported aggregation model: {aggregation_model_name}."
         )
 
     @property
@@ -210,30 +183,50 @@ class CleavageEdgeFeatureNet(nn.Module):
         return self._atom_dim
 
     @property
+    def fc_dims(self) -> Tuple[int, ...]:
+        return self._fc_dims
+
+    @property
+    def dropout(self) -> float:
+        return self._dropout
+
+    def config_dict(self) -> Dict:
+        return {
+            "cleavage_pattern_set_params": dict(self._cleavage_pattern_set_params),
+            "feature_dim": self.feature_dim,
+            "mol_dim": self.mol_dim,
+            "atom_dim": self.atom_dim,
+            "fc_dims": tuple(self.fc_dims),
+            "dropout": self.dropout,
+        }
+
+    @property
     def event_types(self) -> Tuple[Tuple[int, int, int], ...]:
         return tuple(self.module_key_by_event_type.keys())
 
-    def forward(self, ft_features: FragmentTreeFeatures) -> torch.Tensor:
-        """
-        Encode edge features.
-
-        Parameters
-        ----------
-        ft_features:
-            FragmentTreeFeatures for a batch of fragment trees.
+    def encode_events(
+        self,
+        ft_features: FragmentTreeFeatures,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Encode cleavage events without merging events on the same edge.
 
         Returns
         -------
-        edge_attr:
-            [E, feature_dim]
+        event_row_id:
+            [M] row indexes into ``structure.cleavage_event``.
+
+        event_edge_id:
+            [M] fragment-tree edge index for each event.
+
+        event_attr:
+            [M, feature_dim] event-level cleavage embeddings.
         """
         structure = ft_features.structure
-        num_edges = int(structure.edge_index.size(1))
-
+        all_event_row_ids = []
         all_event_edge_ids = []
         all_event_feats = []
 
-        for event_edge_id, event_type, cleavage_fnet_input in (
+        for event_row_id, event_edge_id, event_type, cleavage_fnet_input in (
             self._iter_cleavage_fnet_batches(ft_features)
         ):
             if event_edge_id.size(0) != cleavage_fnet_input.batch_size:
@@ -248,47 +241,65 @@ class CleavageEdgeFeatureNet(nn.Module):
                 continue
 
             module_key = self._get_cleavage_fnet_key(event_type)
-
             event_feat = self.cleavage_fnet_dict[module_key](
                 cleavage_fnet_input
             )
             # [M_g, feature_dim]
 
-            all_event_edge_ids.append(event_edge_id)
+            all_event_row_ids.append(event_row_id.long())
+            all_event_edge_ids.append(event_edge_id.long())
             all_event_feats.append(event_feat)
 
         if len(all_event_feats) == 0:
+            empty_ids = torch.empty(
+                (0,),
+                dtype=torch.long,
+                device=structure.edge_index.device,
+            )
+            empty_attr = torch.empty(
+                (0, self.feature_dim),
+                dtype=ft_features.mol_x.dtype,
+                device=structure.edge_index.device,
+            )
+            return empty_ids, empty_ids, empty_attr
+
+        event_row_id = torch.cat(all_event_row_ids, dim=0).long()
+        event_edge_id = torch.cat(all_event_edge_ids, dim=0).long()
+        event_attr = torch.cat(all_event_feats, dim=0)
+
+        order = torch.argsort(event_row_id)
+        event_row_id = event_row_id[order]
+        event_edge_id = event_edge_id[order]
+        event_attr = event_attr[order]
+
+        self._validate_event_edge_id(
+            event_edge_id=event_edge_id,
+            num_edges=int(structure.edge_index.size(1)),
+        )
+        return event_row_id, event_edge_id, event_attr
+
+    def forward(self, ft_features: FragmentTreeFeatures) -> torch.Tensor:
+        """Return a legacy edge-level view by mean-pooling event features.
+
+        New event-aware training code should call ``encode_events`` directly.
+        This method exists so current spectrum-generation code can continue to
+        consume one feature row per fragment-tree edge while the learnable
+        aggregation model is removed.
+        """
+        structure = ft_features.structure
+        num_edges = int(structure.edge_index.size(1))
+        _, event_edge_id, event_attr = self.encode_events(ft_features)
+        if event_attr.size(0) == 0:
             return self._empty_edge_attr(
                 num_edges=num_edges,
                 device=structure.edge_index.device,
                 dtype=ft_features.mol_x.dtype,
             )
-
-        event_feat = torch.cat(all_event_feats, dim=0)
-        # [M, feature_dim]
-
-        event_edge_id = torch.cat(all_event_edge_ids, dim=0).long()
-        # [M]
-
-        self._validate_event_edge_id(
+        return self._mean_events_to_edges(
+            event_attr=event_attr,
             event_edge_id=event_edge_id,
             num_edges=num_edges,
         )
-
-        edge_attr = self._aggregate_events_to_edges(
-            event_feat=event_feat,
-            event_edge_id=event_edge_id,
-            num_edges=num_edges,
-        )
-        # [E, feature_dim]
-
-        if edge_attr.size(0) != num_edges:
-            raise ValueError(
-                "Aggregated edge features have invalid edge dimension: "
-                f"got {edge_attr.size(0)}, expected {num_edges}."
-            )
-
-        return edge_attr
 
     def _get_cleavage_fnet_key(
         self,
@@ -356,7 +367,7 @@ class CleavageEdgeFeatureNet(nn.Module):
     def _iter_cleavage_fnet_batches(
         self,
         ft_features: FragmentTreeFeatures,
-    ) -> Iterable[Tuple[torch.Tensor, Tuple[int, int, int], CleavageFNetInput]]:
+    ) -> Iterable[Tuple[torch.Tensor, torch.Tensor, Tuple[int, int, int], CleavageFNetInput]]:
         """
         Iterate over CleavageFNet mini-batches grouped by event type.
 
@@ -365,6 +376,9 @@ class CleavageEdgeFeatureNet(nn.Module):
 
         Yields
         ------
+        event_row_id:
+            [M_g] Row indices into structure.cleavage_event.
+
         event_edge_id:
             [M_g] Edge indices corresponding to cleavage events in this group.
 
@@ -488,6 +502,7 @@ class CleavageEdgeFeatureNet(nn.Module):
             )
 
             yield (
+                event_idx,
                 event_edge_id,
                 event_type,
                 cleavage_fnet_input,
@@ -753,57 +768,31 @@ class CleavageEdgeFeatureNet(nn.Module):
                 f"max={max_atom}, num_atoms={num_atoms}."
             )
 
-    def _aggregate_events_to_edges(
+    def _mean_events_to_edges(
         self,
         *,
-        event_feat: torch.Tensor,
+        event_attr: torch.Tensor,
         event_edge_id: torch.Tensor,
         num_edges: int,
     ) -> torch.Tensor:
-        """
-        Aggregate event-level features into edge-level features.
-
-        Parameters
-        ----------
-        event_feat:
-            [M, feature_dim]
-
-        event_edge_id:
-            [M]
-
-        num_edges:
-            E
-
-        Returns
-        -------
-        edge_attr:
-            [E, feature_dim]
-        """
-        num_edges = int(num_edges)
-
-        packed = SetTransformer.pack_sets_by_group(
-            feats=event_feat,
-            group_id=event_edge_id.long(),
-            num_groups=num_edges,
-        )
-
-        nonempty = packed.counts > 0
-        # [E]
-
+        """Deterministically mean-pool event features for legacy edge users."""
         edge_attr = torch.zeros(
-            (num_edges, self.feature_dim),
-            dtype=packed.X.dtype,
-            device=packed.X.device,
+            (int(num_edges), self.feature_dim),
+            dtype=event_attr.dtype,
+            device=event_attr.device,
         )
-        # [E, feature_dim]
-
-        if nonempty.any():
-            edge_attr_nonempty = self.aggregation_model(
-                packed.X[nonempty],
-                key_padding_mask=packed.key_padding_mask[nonempty],
-            )
-            # [E_nonempty, feature_dim]
-
-            edge_attr[nonempty] = edge_attr_nonempty
-
-        return edge_attr
+        counts = torch.zeros(
+            (int(num_edges), 1),
+            dtype=event_attr.dtype,
+            device=event_attr.device,
+        )
+        if event_attr.numel() == 0:
+            return edge_attr
+        edge_attr.index_add_(0, event_edge_id.long(), event_attr)
+        ones = torch.ones(
+            (event_attr.size(0), 1),
+            dtype=event_attr.dtype,
+            device=event_attr.device,
+        )
+        counts.index_add_(0, event_edge_id.long(), ones)
+        return edge_attr / counts.clamp_min(1.0)

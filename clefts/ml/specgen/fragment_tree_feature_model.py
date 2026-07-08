@@ -65,7 +65,7 @@ class FragmentTreeFeatureModel(nn.Module):
         cleavage_edge_fnet_params: Dict,
         tree_encoder_params: Dict,
         fragmenter_params: Dict,
-        dropout: float,
+        dropout: float = 0.0,
     ) -> None:
         super(FragmentTreeFeatureModel, self).__init__()
 
@@ -73,6 +73,7 @@ class FragmentTreeFeatureModel(nn.Module):
         mol_encoder_params["dropout"] = dropout
         self._mol_encoder = MolEncoder(**mol_encoder_params)
         self._freeze_mol_encoder = False
+        self._freeze_cleavage_edge_fnet = False
         self._fragmenter = Fragmenter.from_dict(fragmenter_params)
 
         condition_encoder_params = condition_encoder_params.copy()
@@ -91,6 +92,8 @@ class FragmentTreeFeatureModel(nn.Module):
         self.cleavage_edge_fnet = CleavageEdgeFeatureNet(**cleavage_edge_fnet_params)
 
         tree_encoder_params = tree_encoder_params.copy()
+        if "hidden_dim" not in tree_encoder_params and "dim" in tree_encoder_params:
+            tree_encoder_params["hidden_dim"] = tree_encoder_params.pop("dim")
         tree_encoder_params["node_dim"] = self.mol_encoder.graph_dim + 3
         tree_encoder_params["edge_dim"] = self.cleavage_edge_fnet.feature_dim
         tree_encoder_params["max_spatial_dist"] = self.fragmenter.tree_max_depth + 1
@@ -261,10 +264,48 @@ class FragmentTreeFeatureModel(nn.Module):
         for param in self._mol_encoder.parameters():
             param.requires_grad = False
 
+    def set_cleavage_edge_fnet_state_dict(self, state_dict: Dict, *, strict: bool = True) -> None:
+        missing_keys, unexpected_keys = self.cleavage_edge_fnet.load_state_dict(
+            state_dict,
+            strict=strict,
+        )
+        if missing_keys or unexpected_keys:
+            raise RuntimeError(
+                "Failed to load CleavageEdgeFeatureNet state_dict cleanly: "
+                f"missing_keys={missing_keys}, unexpected_keys={unexpected_keys}"
+            )
+
+    def load_cleavage_edge_fnet_checkpoint(self, checkpoint: Dict | str | Path, *, strict: bool = True) -> None:
+        if isinstance(checkpoint, (str, Path)):
+            checkpoint = torch.load(checkpoint, map_location="cpu")
+        checkpoint_params = checkpoint.get("cleavage_edge_fnet_params")
+        if checkpoint_params is not None:
+            expected = self.cleavage_edge_fnet.config_dict()
+            for key in ("feature_dim", "mol_dim", "atom_dim", "fc_dims"):
+                expected_value = expected.get(key)
+                actual_value = checkpoint_params.get(key)
+                if key == "fc_dims" and actual_value is not None:
+                    actual_value = tuple(actual_value)
+                if expected_value != actual_value:
+                    raise ValueError(
+                        "CleavageEdgeFeatureNet params do not match current model: "
+                        f"{key}: expected {expected_value}, got {actual_value}"
+                    )
+        state_dict = checkpoint.get("cleavage_edge_fnet_state_dict", checkpoint)
+        self.set_cleavage_edge_fnet_state_dict(state_dict, strict=strict)
+
+    def freeze_cleavage_edge_fnet(self) -> None:
+        self._freeze_cleavage_edge_fnet = True
+        self.cleavage_edge_fnet.eval()
+        for param in self.cleavage_edge_fnet.parameters():
+            param.requires_grad = False
+
     def train(self, mode: bool = True):
         super().train(mode)
         if getattr(self, "_freeze_mol_encoder", False):
             self._mol_encoder.eval()
+        if getattr(self, "_freeze_cleavage_edge_fnet", False):
+            self.cleavage_edge_fnet.eval()
         return self
 
 

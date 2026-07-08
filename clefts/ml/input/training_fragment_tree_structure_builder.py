@@ -31,6 +31,7 @@ class TrainingFormulaTarget:
     radical_index: int
     formula_tensor: Tensor
     intensity: float
+    expand_node_indexes: Tuple[int, ...] = ()
 
 
 @dataclass
@@ -242,54 +243,51 @@ class TrainingFragmentTreeStructureBuilder(SingleFragmentTreeStructureBuilder):
             for new_sample_index, old_sample_index in enumerate(sample_indexes)
         }
 
-        target_node_keep = torch.zeros(
-            (structure.num_nodes,),
-            dtype=torch.float32,
-            device=structure.device,
-        )
-        target_node_expand = torch.zeros_like(target_node_keep)
-        target_node_indexes: List[int] = []
-        target_formula_rows: List[Tensor] = []
-        target_intensities: List[float] = []
-        target_ion_indexes: List[int] = []
-        target_unsaturation_indexes: List[int] = []
-        target_radical_indexes: List[int] = []
-        target_sample_indexes: List[int] = []
-        target_peak_indexes: List[int] = []
-        target_formula_group_indexes: List[int] = []
-        target_edge_pairs: List[Tuple[int, int]] = []
-        target_edge_group_indexes: List[int] = []
+        sample_peak_mz_values: List[float] = []
+        sample_peak_intensity_values: List[float] = []
+        sample_peak_ptr_values: List[int] = [0]
+
+        formula_rows: List[Tensor] = []
+        peak_formula_ptr_counts = [0 for _ in range(1)]
+        formula_key_to_index: Dict[Tuple[int, Tuple[float, ...]], int] = {}
+        assignments_by_formula: List[List[TrainingFormulaTarget]] = []
 
         for old_sample_index in sample_indexes:
-            new_sample_index = sample_index_remap[old_sample_index]
             sample = self.samples[old_sample_index]
             if not isinstance(sample, TrainingFragmentTreeSample):
+                sample_peak_ptr_values.append(len(sample_peak_mz_values))
                 continue
 
-            for node_index in sample.target_node_keep_indexes:
-                target_node_keep[int(node_index)] = 1.0
-            for node_index in sample.target_node_expand_indexes:
-                target_node_expand[int(node_index)] = 1.0
-            for target_edge in sample.target_edge_rows:
-                target_edge_pairs.append(
-                    (int(new_sample_index), int(target_edge.edge_index))
-                )
-                target_edge_group_indexes.append(int(target_edge.group_index))
+            peak_start = len(sample_peak_mz_values)
+            sample_peak_mz_values.extend(float(value) for value in sample.peak_mz)
+            sample_peak_intensity_values.extend(float(value) for value in sample.peak_intensity)
+            sample_peak_ptr_values.append(len(sample_peak_mz_values))
+
+            while len(peak_formula_ptr_counts) < len(sample_peak_mz_values) + 1:
+                peak_formula_ptr_counts.append(0)
 
             for target in sample.target_formula_rows:
-                target_node_indexes.append(int(target.node_index))
-                target_formula_rows.append(target.formula_tensor.to(structure.device))
-                target_intensities.append(float(target.intensity))
-                target_ion_indexes.append(int(target.ion_index))
-                target_unsaturation_indexes.append(int(target.unsaturation_index))
-                target_radical_indexes.append(int(target.radical_index))
-                target_formula_group_indexes.append(int(target.group_index))
-                target_sample_indexes.append(int(new_sample_index))
-                target_peak_indexes.append(int(target.peak_index))
+                peak_index = int(target.peak_index)
+                if peak_index < 0 or peak_index >= len(sample.peak_mz):
+                    continue
+                global_peak_index = peak_start + peak_index
+                formula_tuple = tuple(float(v) for v in target.formula_tensor.detach().cpu().view(-1).tolist())
+                formula_key = (int(global_peak_index), formula_tuple)
+                formula_index = formula_key_to_index.get(formula_key)
+                if formula_index is None:
+                    formula_index = len(formula_rows)
+                    formula_key_to_index[formula_key] = formula_index
+                    formula_rows.append(target.formula_tensor.to(structure.device))
+                    assignments_by_formula.append([])
+                    peak_formula_ptr_counts[global_peak_index + 1] += 1
+                assignments_by_formula[formula_index].append(target)
+
+        for index in range(1, len(peak_formula_ptr_counts)):
+            peak_formula_ptr_counts[index] += peak_formula_ptr_counts[index - 1]
 
         formula_dim = int(structure.node_formula.size(1))
-        if target_formula_rows:
-            target_formula = torch.stack(target_formula_rows, dim=0).to(
+        if formula_rows:
+            target_formula = torch.stack(formula_rows, dim=0).to(
                 dtype=torch.float32,
                 device=structure.device,
             )
@@ -300,18 +298,29 @@ class TrainingFragmentTreeStructureBuilder(SingleFragmentTreeStructureBuilder):
                 device=structure.device,
             )
 
-        if target_edge_pairs:
-            target_edge_index = torch.tensor(
-                target_edge_pairs,
-                dtype=torch.long,
-                device=structure.device,
-            ).t().contiguous()
-        else:
-            target_edge_index = torch.empty(
-                (2, 0),
-                dtype=torch.long,
-                device=structure.device,
-            )
+        target_terminal_node_indexes: List[int] = []
+        target_ion_indexes: List[int] = []
+        target_unsaturation_indexes: List[int] = []
+        target_radical_indexes: List[int] = []
+        formula_assignment_ptr_values: List[int] = [0]
+        target_expand_node_indexes: List[int] = []
+        terminal_expand_ptr_values: List[int] = [0]
+
+        for assignments in assignments_by_formula:
+            for target in assignments:
+                target_terminal_node_indexes.append(int(target.node_index))
+                target_ion_indexes.append(int(target.ion_index))
+                target_unsaturation_indexes.append(int(target.unsaturation_index))
+                target_radical_indexes.append(int(target.radical_index))
+                seen_expand_nodes: Set[int] = set()
+                for node_index in target.expand_node_indexes:
+                    node_index = int(node_index)
+                    if node_index in seen_expand_nodes:
+                        continue
+                    seen_expand_nodes.add(node_index)
+                    target_expand_node_indexes.append(node_index)
+                terminal_expand_ptr_values.append(len(target_expand_node_indexes))
+            formula_assignment_ptr_values.append(len(target_terminal_node_indexes))
 
         return TrainingFragmentTreeStructure(
             node_smiles=structure.node_smiles,
@@ -335,8 +344,32 @@ class TrainingFragmentTreeStructureBuilder(SingleFragmentTreeStructureBuilder):
             precursor_unsaturation_index=structure.precursor_unsaturation_index,
             precursor_radical_index=structure.precursor_radical_index,
             precursor_sample_index=structure.precursor_sample_index,
-            target_node_keep=target_node_keep,
-            target_node_expand=target_node_expand,
+            sample_peak_mz=torch.tensor(
+                sample_peak_mz_values,
+                dtype=torch.float32,
+                device=structure.device,
+            ),
+            sample_peak_intensity=torch.tensor(
+                sample_peak_intensity_values,
+                dtype=torch.float32,
+                device=structure.device,
+            ),
+            sample_peak_ptr=torch.tensor(
+                sample_peak_ptr_values,
+                dtype=torch.long,
+                device=structure.device,
+            ),
+            target_formula=target_formula,
+            peak_formula_ptr=torch.tensor(
+                peak_formula_ptr_counts,
+                dtype=torch.long,
+                device=structure.device,
+            ),
+            target_terminal_node_index=torch.tensor(
+                target_terminal_node_indexes,
+                dtype=torch.long,
+                device=structure.device,
+            ),
             target_ion_index=torch.tensor(
                 target_ion_indexes,
                 dtype=torch.long,
@@ -352,35 +385,18 @@ class TrainingFragmentTreeStructureBuilder(SingleFragmentTreeStructureBuilder):
                 dtype=torch.long,
                 device=structure.device,
             ),
-            target_node_index=torch.tensor(
-                target_node_indexes,
+            formula_assignment_ptr=torch.tensor(
+                formula_assignment_ptr_values,
                 dtype=torch.long,
                 device=structure.device,
             ),
-            target_formula=target_formula,
-            target_intensity=torch.tensor(
-                target_intensities,
-                dtype=torch.float32,
-                device=structure.device,
-            ),
-            target_formula_group_index=torch.tensor(
-                target_formula_group_indexes,
+            target_expand_node_index=torch.tensor(
+                target_expand_node_indexes,
                 dtype=torch.long,
                 device=structure.device,
             ),
-            target_sample_index=torch.tensor(
-                target_sample_indexes,
-                dtype=torch.long,
-                device=structure.device,
-            ),
-            target_peak_index=torch.tensor(
-                target_peak_indexes,
-                dtype=torch.long,
-                device=structure.device,
-            ),
-            target_edge_index=target_edge_index,
-            target_edge_group_index=torch.tensor(
-                target_edge_group_indexes,
+            terminal_expand_ptr=torch.tensor(
+                terminal_expand_ptr_values,
                 dtype=torch.long,
                 device=structure.device,
             ),
@@ -486,6 +502,7 @@ class TrainingFragmentTreeStructureBuilder(SingleFragmentTreeStructureBuilder):
 
             for fragment_pathway in fragment_pathways:
                 formula = fragment_pathway.formula.normalized
+                expand_node_indexes_for_terminal: List[int] = []
                 group_key = (int(peak_index), str(formula))
                 if group_key not in group_index_by_peak_formula:
                     group_index_by_peak_formula[group_key] = len(group_index_by_peak_formula)
@@ -507,6 +524,7 @@ class TrainingFragmentTreeStructureBuilder(SingleFragmentTreeStructureBuilder):
                     src_smiles = fragment_pathway.get_node(node_index).smiles
                     dst_smiles = fragment_pathway.get_node(node_index + 1).smiles
                     src_node_index = self._get_node_index(src_smiles)
+                    expand_node_indexes_for_terminal.append(int(src_node_index))
                     sample.edge_indexes.update(
                         self._get_outgoing_edge_indexes_from_fragment_ion_tree(
                             fragment_ion_tree=fragment_ion_tree,
@@ -551,6 +569,7 @@ class TrainingFragmentTreeStructureBuilder(SingleFragmentTreeStructureBuilder):
                             dtype=torch.float32,
                         ),
                         intensity=peak_intensity,
+                        expand_node_indexes=tuple(expand_node_indexes_for_terminal),
                     ),
                     main_adduct_type=self._model.fragmenter.adduct_types[
                         int(sample.adduct_type_index)

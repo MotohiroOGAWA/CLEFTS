@@ -11,46 +11,81 @@ from .fragment_tree_structure import FragmentTreeStructure
 
 @dataclass(frozen=True)
 class TrainingFragmentTreeStructure(FragmentTreeStructure):
-    """FragmentTreeStructure with supervised targets for generation training."""
+    """FragmentTreeStructure with supervised spectrum targets.
 
-    target_node_keep: Tensor
-    # [N] 1 when the fragment node should remain as an emitted candidate.
+    The target hierarchy is:
 
-    target_node_expand: Tensor
-    # [N] 1 when the node should be expanded in the next cleavage step.
+        sample -> peak -> formula -> terminal node/state -> expand nodes
 
-    target_ion_index: Tensor
-    # [T] Flat ion target indexes aligned with target_node_index.
+    Pointer tensors follow the usual CSR convention: values for item ``i`` are
+    in ``data[ptr[i]:ptr[i + 1]]``. Empty ranges are valid and represent an
+    observed peak/formula with no assigned downstream target.
+    """
 
-    target_unsaturation_index: Tensor
-    # [T] Flat unsaturation target indexes aligned with target_node_index.
+    sample_peak_mz: Tensor
+    # [K] Observed peak m/z values flattened over all samples.
 
-    target_radical_index: Tensor
-    # [T] Flat radical target indexes aligned with target_node_index.
+    sample_peak_intensity: Tensor
+    # [K] Observed peak intensities aligned with sample_peak_mz.
 
-    target_node_index: Tensor
-    # [T] Node indexes for ion/unsaturation/radical targets.
+    sample_peak_ptr: Tensor
+    # [S + 1] Peak pointer per sample. Peaks for sample s are
+    # sample_peak_mz[sample_peak_ptr[s]:sample_peak_ptr[s + 1]].
 
     target_formula: Tensor
-    # [T, F] Target formula tensors used for formula-group coverage losses.
+    # [G, F] Target formula tensors assigned to observed peaks.
 
-    target_intensity: Tensor
-    # [T] Target intensity per target formula row.
+    peak_formula_ptr: Tensor
+    # [K + 1] Formula pointer per flattened observed peak. Formulas for peak k
+    # are target_formula[peak_formula_ptr[k]:peak_formula_ptr[k + 1]].
 
-    target_formula_group_index: Tensor
-    # [T] Formula group id. Rows with the same sample, peak, and group are alternatives.
+    target_terminal_node_index: Tensor
+    # [A] Terminal fragment node indexes aligned with target ion/state tensors.
 
-    target_sample_index: Tensor
-    # [T] Sample index aligned with target_formula.
+    target_ion_index: Tensor
+    # [A] Flat ion target indexes aligned with target_terminal_node_index.
 
-    target_peak_index: Tensor
-    # [T] Peak index aligned with target_formula.
+    target_unsaturation_index: Tensor
+    # [A] Flat unsaturation target indexes aligned with target_terminal_node_index.
 
-    target_edge_index: Tensor
-    # [2, U] Target traversal edges: row 0 is sample index, row 1 is edge index.
+    target_radical_index: Tensor
+    # [A] Flat radical target indexes aligned with target_terminal_node_index.
 
-    target_edge_group_index: Tensor
-    # [U] Formula group id aligned with target_edge_index columns.
+    formula_assignment_ptr: Tensor
+    # [G + 1] Terminal node/state assignment pointer per target formula.
+
+    target_expand_node_index: Tensor
+    # [X] Intermediate/source fragment nodes that should be expanded to reach a
+    # terminal assignment.
+
+    terminal_expand_ptr: Tensor
+    # [A + 1] Expand-node pointer per terminal node/state assignment.
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if self.sample_peak_mz.dim() != 1:
+            raise ValueError("sample_peak_mz must be 1D.")
+        if self.sample_peak_intensity.dim() != 1:
+            raise ValueError("sample_peak_intensity must be 1D.")
+        if self.sample_peak_mz.numel() != self.sample_peak_intensity.numel():
+            raise ValueError("sample_peak_mz and sample_peak_intensity must have the same length.")
+        if self.sample_peak_ptr.dim() != 1 or self.sample_peak_ptr.numel() != self.num_samples + 1:
+            raise ValueError("sample_peak_ptr must have shape [num_samples + 1].")
+        if self.target_formula.dim() != 2:
+            raise ValueError("target_formula must be 2D.")
+        if self.target_formula.size(1) != self.node_formula.size(1):
+            raise ValueError("target_formula width must match node_formula width.")
+        if self.peak_formula_ptr.dim() != 1 or self.peak_formula_ptr.numel() != self.sample_peak_mz.numel() + 1:
+            raise ValueError("peak_formula_ptr must have shape [num_peaks + 1].")
+        assignment_count = int(self.target_terminal_node_index.numel())
+        for name in ("target_ion_index", "target_unsaturation_index", "target_radical_index"):
+            value = getattr(self, name)
+            if value.dim() != 1 or value.numel() != assignment_count:
+                raise ValueError(f"{name} must be 1D and aligned with target_terminal_node_index.")
+        if self.formula_assignment_ptr.dim() != 1 or self.formula_assignment_ptr.numel() != self.target_formula.size(0) + 1:
+            raise ValueError("formula_assignment_ptr must have shape [num_target_formulas + 1].")
+        if self.terminal_expand_ptr.dim() != 1 or self.terminal_expand_ptr.numel() != assignment_count + 1:
+            raise ValueError("terminal_expand_ptr must have shape [num_terminal_assignments + 1].")
 
     def to(self, device: torch.device | str) -> "TrainingFragmentTreeStructure":
         base = super().to(device)
@@ -76,20 +111,139 @@ class TrainingFragmentTreeStructure(FragmentTreeStructure):
             precursor_unsaturation_index=base.precursor_unsaturation_index,
             precursor_radical_index=base.precursor_radical_index,
             precursor_sample_index=base.precursor_sample_index,
-            target_node_keep=self.target_node_keep.to(device),
-            target_node_expand=self.target_node_expand.to(device),
+            sample_peak_mz=self.sample_peak_mz.to(device),
+            sample_peak_intensity=self.sample_peak_intensity.to(device),
+            sample_peak_ptr=self.sample_peak_ptr.to(device),
+            target_formula=self.target_formula.to(device),
+            peak_formula_ptr=self.peak_formula_ptr.to(device),
+            target_terminal_node_index=self.target_terminal_node_index.to(device),
             target_ion_index=self.target_ion_index.to(device),
             target_unsaturation_index=self.target_unsaturation_index.to(device),
             target_radical_index=self.target_radical_index.to(device),
-            target_node_index=self.target_node_index.to(device),
-            target_formula=self.target_formula.to(device),
-            target_intensity=self.target_intensity.to(device),
-            target_formula_group_index=self.target_formula_group_index.to(device),
-            target_sample_index=self.target_sample_index.to(device),
-            target_peak_index=self.target_peak_index.to(device),
-            target_edge_index=self.target_edge_index.to(device),
-            target_edge_group_index=self.target_edge_group_index.to(device),
+            formula_assignment_ptr=self.formula_assignment_ptr.to(device),
+            target_expand_node_index=self.target_expand_node_index.to(device),
+            terminal_expand_ptr=self.terminal_expand_ptr.to(device),
         )
+
+    @property
+    def target_node_index(self) -> Tensor:
+        """Backward-compatible alias for terminal node assignments."""
+        return self.target_terminal_node_index
+
+    @property
+    def target_assignment_formula(self) -> Tensor:
+        """[A, F] Formula tensor expanded to terminal assignment rows."""
+        formula_index = self.assignment_formula_index
+        if formula_index.numel() == 0:
+            return self.target_formula.new_empty((0, self.target_formula.size(1)))
+        return self.target_formula[formula_index]
+
+    @property
+    def target_sample_index(self) -> Tensor:
+        """[A] Sample index expanded to terminal assignment rows."""
+        peak_index = self.assignment_peak_index
+        peak_sample_index = self.peak_sample_index
+        if peak_index.numel() == 0:
+            return peak_index
+        return peak_sample_index[peak_index]
+
+    @property
+    def target_peak_index(self) -> Tensor:
+        """[A] Local peak index within each sample for terminal assignments."""
+        peak_index = self.assignment_peak_index
+        peak_sample_index = self.peak_sample_index
+        if peak_index.numel() == 0:
+            return peak_index
+        sample_starts = self.sample_peak_ptr[peak_sample_index[peak_index]]
+        return peak_index - sample_starts
+
+    @property
+    def target_intensity(self) -> Tensor:
+        """[A] Peak intensity expanded to terminal assignment rows."""
+        peak_index = self.assignment_peak_index
+        if peak_index.numel() == 0:
+            return self.sample_peak_intensity.new_empty((0,))
+        return self.sample_peak_intensity[peak_index]
+
+    @property
+    def target_formula_group_index(self) -> Tensor:
+        """[A] Formula row index used as a compatibility group id."""
+        return self.assignment_formula_index
+
+    @property
+    def target_node_expand(self) -> Tensor:
+        """[N] Compatibility binary mask of nodes that appear in expand paths."""
+        out = torch.zeros((self.num_nodes,), dtype=torch.float32, device=self.edge_index.device)
+        if self.target_expand_node_index.numel() > 0:
+            valid = self.target_expand_node_index.long()
+            valid = valid[(valid >= 0) & (valid < self.num_nodes)]
+            if valid.numel() > 0:
+                out[valid.unique()] = 1.0
+        return out
+
+    @property
+    def target_node_keep(self) -> Tensor:
+        """[N] Compatibility binary mask of terminal target nodes."""
+        out = torch.zeros((self.num_nodes,), dtype=torch.float32, device=self.edge_index.device)
+        if self.target_terminal_node_index.numel() > 0:
+            valid = self.target_terminal_node_index.long()
+            valid = valid[(valid >= 0) & (valid < self.num_nodes)]
+            if valid.numel() > 0:
+                out[valid.unique()] = 1.0
+        return out
+
+    @property
+    def target_edge_index(self) -> Tensor:
+        """[2, 0] Edge targets are no longer stored in this terminal schema."""
+        return torch.empty((2, 0), dtype=torch.long, device=self.edge_index.device)
+
+    @property
+    def target_edge_group_index(self) -> Tensor:
+        """[0] Edge target groups are no longer stored in this terminal schema."""
+        return torch.empty((0,), dtype=torch.long, device=self.edge_index.device)
+
+    @property
+    def peak_sample_index(self) -> Tensor:
+        """[K] Sample index for each flattened observed peak."""
+        counts = self.sample_peak_ptr[1:] - self.sample_peak_ptr[:-1]
+        if counts.numel() == 0:
+            return torch.empty((0,), dtype=torch.long, device=self.sample_peak_ptr.device)
+        return torch.repeat_interleave(
+            torch.arange(counts.numel(), dtype=torch.long, device=self.sample_peak_ptr.device),
+            counts.long(),
+        )
+
+    @property
+    def formula_peak_index(self) -> Tensor:
+        """[G] Flattened observed peak index for each target formula."""
+        counts = self.peak_formula_ptr[1:] - self.peak_formula_ptr[:-1]
+        if counts.numel() == 0:
+            return torch.empty((0,), dtype=torch.long, device=self.peak_formula_ptr.device)
+        return torch.repeat_interleave(
+            torch.arange(counts.numel(), dtype=torch.long, device=self.peak_formula_ptr.device),
+            counts.long(),
+        )
+
+    @property
+    def assignment_formula_index(self) -> Tensor:
+        """[A] Target formula row index for each terminal assignment."""
+        counts = self.formula_assignment_ptr[1:] - self.formula_assignment_ptr[:-1]
+        if counts.numel() == 0:
+            return torch.empty((0,), dtype=torch.long, device=self.formula_assignment_ptr.device)
+        return torch.repeat_interleave(
+            torch.arange(counts.numel(), dtype=torch.long, device=self.formula_assignment_ptr.device),
+            counts.long(),
+        )
+
+    @property
+    def assignment_peak_index(self) -> Tensor:
+        """[A] Flattened observed peak index for each terminal assignment."""
+        formula_index = self.assignment_formula_index
+        formula_peak_index = self.formula_peak_index
+        if formula_index.numel() == 0:
+            return formula_index
+        return formula_peak_index[formula_index]
+
     @classmethod
     def from_structures(
         cls,
@@ -106,49 +260,100 @@ class TrainingFragmentTreeStructure(FragmentTreeStructure):
         target_device = base.device
 
         node_offsets = []
-        edge_offsets = []
-        sample_offsets = []
         node_offset = 0
-        edge_offset = 0
-        sample_offset = 0
         for structure in training_structures:
             node_offsets.append(node_offset)
-            edge_offsets.append(edge_offset)
-            sample_offsets.append(sample_offset)
             node_offset += int(structure.num_nodes)
-            edge_offset += int(structure.num_edges)
-            sample_offset += int(structure.num_samples)
 
-        target_node_keep = torch.cat(
-            [structure.target_node_keep.to(target_device) for structure in training_structures],
+        sample_peak_mz = torch.cat(
+            [structure.sample_peak_mz.to(target_device) for structure in training_structures],
             dim=0,
         )
-        target_node_expand = torch.cat(
-            [structure.target_node_expand.to(target_device) for structure in training_structures],
+        sample_peak_intensity = torch.cat(
+            [structure.sample_peak_intensity.to(target_device) for structure in training_structures],
             dim=0,
         )
 
-        target_node_index_parts = []
-        target_edge_index_parts = []
-        target_sample_index_parts = []
-        for structure, node_off, edge_off, sample_off in zip(
-            training_structures, node_offsets, edge_offsets, sample_offsets
-        ):
-            target_node_index_parts.append(
-                structure.target_node_index.to(target_device) + int(node_off)
-            )
-            edge_index = structure.target_edge_index.to(target_device).clone()
-            if edge_index.numel() > 0:
-                edge_index[0, :] += int(sample_off)
-                edge_index[1, :] += int(edge_off)
-            target_edge_index_parts.append(edge_index)
-            target_sample_index_parts.append(
-                structure.target_sample_index.to(target_device) + int(sample_off)
-            )
+        sample_peak_ptr_parts = []
+        peak_offset = 0
+        for structure in training_structures:
+            ptr = structure.sample_peak_ptr.to(target_device).long()
+            sample_peak_ptr_parts.append(ptr[:-1] + peak_offset)
+            peak_offset += int(ptr[-1].item())
+        sample_peak_ptr = torch.cat(
+            sample_peak_ptr_parts
+            + [torch.tensor([peak_offset], dtype=torch.long, device=target_device)],
+            dim=0,
+        )
 
-        target_node_index = torch.cat(target_node_index_parts, dim=0)
-        target_sample_index = torch.cat(target_sample_index_parts, dim=0)
-        target_edge_index = torch.cat(target_edge_index_parts, dim=1)
+        target_formula = torch.cat(
+            [structure.target_formula.to(target_device) for structure in training_structures],
+            dim=0,
+        )
+
+        peak_formula_ptr_parts = []
+        formula_offset = 0
+        for structure in training_structures:
+            ptr = structure.peak_formula_ptr.to(target_device).long()
+            peak_formula_ptr_parts.append(ptr[:-1] + formula_offset)
+            formula_offset += int(ptr[-1].item())
+        peak_formula_ptr = torch.cat(
+            peak_formula_ptr_parts
+            + [torch.tensor([formula_offset], dtype=torch.long, device=target_device)],
+            dim=0,
+        )
+
+        target_terminal_node_index = torch.cat(
+            [
+                structure.target_terminal_node_index.to(target_device).long() + int(node_off)
+                for structure, node_off in zip(training_structures, node_offsets)
+            ],
+            dim=0,
+        )
+        target_ion_index = torch.cat(
+            [structure.target_ion_index.to(target_device) for structure in training_structures],
+            dim=0,
+        )
+        target_unsaturation_index = torch.cat(
+            [structure.target_unsaturation_index.to(target_device) for structure in training_structures],
+            dim=0,
+        )
+        target_radical_index = torch.cat(
+            [structure.target_radical_index.to(target_device) for structure in training_structures],
+            dim=0,
+        )
+
+        formula_assignment_ptr_parts = []
+        assignment_offset = 0
+        for structure in training_structures:
+            ptr = structure.formula_assignment_ptr.to(target_device).long()
+            formula_assignment_ptr_parts.append(ptr[:-1] + assignment_offset)
+            assignment_offset += int(ptr[-1].item())
+        formula_assignment_ptr = torch.cat(
+            formula_assignment_ptr_parts
+            + [torch.tensor([assignment_offset], dtype=torch.long, device=target_device)],
+            dim=0,
+        )
+
+        target_expand_node_index = torch.cat(
+            [
+                structure.target_expand_node_index.to(target_device).long() + int(node_off)
+                for structure, node_off in zip(training_structures, node_offsets)
+            ],
+            dim=0,
+        )
+
+        terminal_expand_ptr_parts = []
+        expand_offset = 0
+        for structure in training_structures:
+            ptr = structure.terminal_expand_ptr.to(target_device).long()
+            terminal_expand_ptr_parts.append(ptr[:-1] + expand_offset)
+            expand_offset += int(ptr[-1].item())
+        terminal_expand_ptr = torch.cat(
+            terminal_expand_ptr_parts
+            + [torch.tensor([expand_offset], dtype=torch.long, device=target_device)],
+            dim=0,
+        )
 
         return cls(
             node_smiles=base.node_smiles,
@@ -172,42 +377,16 @@ class TrainingFragmentTreeStructure(FragmentTreeStructure):
             precursor_unsaturation_index=base.precursor_unsaturation_index,
             precursor_radical_index=base.precursor_radical_index,
             precursor_sample_index=base.precursor_sample_index,
-            target_node_keep=target_node_keep,
-            target_node_expand=target_node_expand,
-            target_ion_index=torch.cat(
-                [structure.target_ion_index.to(target_device) for structure in training_structures],
-                dim=0,
-            ),
-            target_unsaturation_index=torch.cat(
-                [structure.target_unsaturation_index.to(target_device) for structure in training_structures],
-                dim=0,
-            ),
-            target_radical_index=torch.cat(
-                [structure.target_radical_index.to(target_device) for structure in training_structures],
-                dim=0,
-            ),
-            target_node_index=target_node_index,
-            target_formula=torch.cat(
-                [structure.target_formula.to(target_device) for structure in training_structures],
-                dim=0,
-            ),
-            target_intensity=torch.cat(
-                [structure.target_intensity.to(target_device) for structure in training_structures],
-                dim=0,
-            ),
-            target_formula_group_index=torch.cat(
-                [structure.target_formula_group_index.to(target_device) for structure in training_structures],
-                dim=0,
-            ),
-            target_sample_index=target_sample_index,
-            target_peak_index=torch.cat(
-                [structure.target_peak_index.to(target_device) for structure in training_structures],
-                dim=0,
-            ),
-            target_edge_index=target_edge_index,
-            target_edge_group_index=torch.cat(
-                [structure.target_edge_group_index.to(target_device) for structure in training_structures],
-                dim=0,
-            ),
+            sample_peak_mz=sample_peak_mz,
+            sample_peak_intensity=sample_peak_intensity,
+            sample_peak_ptr=sample_peak_ptr,
+            target_formula=target_formula,
+            peak_formula_ptr=peak_formula_ptr,
+            target_terminal_node_index=target_terminal_node_index,
+            target_ion_index=target_ion_index,
+            target_unsaturation_index=target_unsaturation_index,
+            target_radical_index=target_radical_index,
+            formula_assignment_ptr=formula_assignment_ptr,
+            target_expand_node_index=target_expand_node_index,
+            terminal_expand_ptr=terminal_expand_ptr,
         )
-
