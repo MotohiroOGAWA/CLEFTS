@@ -97,7 +97,7 @@ This is passed to `MolGraphBuilder` and `AtomFeatureLayer`, and determines dimen
 Example:
 
 ```bash
---symbols C,N,O,S,F,Cl,Br,I,P,B,Si
+--symbols C,N,O,S,P,F,Cl,Br,I
 ```
 
 ---
@@ -816,24 +816,44 @@ Examples:
 
 ### 19.2 Attribute grouping
 
-Node and edge attribute metrics are grouped by metric kind instead of feature group.
+Node and edge attribute metrics are grouped first by metric kind, then by feature chart.
+Feature-level charts contain `train` and `val` series.
+Class-level charts contain one train/val pair per class label.
 
-- `node_attr_acc`, `node_attr_loss`, `node_attr_count`
-- `edge_attr_acc`, `edge_attr_loss`, `edge_attr_count`
+Examples:
 
-Each chart contains train/val series for the total metric, feature-level metrics, and class-level metrics where applicable.
+- `node_attr_acc/element`
+- `node_attr_acc/element_by_class`
+- `node_attr_acc/charge`
+- `node_attr_acc/charge_by_class`
+- `node_attr_loss/node_attr`
+- `node_attr_loss/element`
+- `node_attr_count/element_by_class`
+- `edge_attr_loss/edge_attr`
+- `edge_attr_acc/bond_type`
+- `edge_attr_acc/bond_type_by_class`
 
 ### 19.3 Node context and ECFP grouping
 
-Positive and negative breakdowns are kept in the same chart as the total metric.
+Total metrics and positive/negative breakdowns are written as separate charts.
 
-- `node_context_acc`, `node_context_loss`, `node_context_count`
-- `ecfp_acc`, `ecfp_loss`, `ecfp_count`
+Examples:
+
+- `node_context_acc/node_context`
+- `node_context_acc/pos_neg`
+- `node_context_loss/node_context`
+- `node_context_loss/pos_neg`
+- `ecfp_acc/ecfp`
+- `ecfp_acc/pos_neg`
+- `ecfp_loss/ecfp`
+- `ecfp_loss/pos_neg`
 
 ### 19.4 Descriptor grouping
 
-- `descriptor_loss`: total descriptor loss and per-target losses
-- `descriptor/r2_by_target`: per-target R2
+Descriptor metrics are intentionally kept to two charts.
+
+- `descriptor_loss/descriptor_loss`: total descriptor loss and per-target losses
+- `descriptor_r2/descriptor_r2`: per-target R2
 
 ---
 
@@ -1030,7 +1050,7 @@ If this Markdown is converted into slides, the following structure is natural.
 - ECFP loss also uses balanced BCE so that positive/negative bits each contribute half
 - Descriptors report R2 instead of accuracy
 - Rare attribute classes are supported in two stages: dataset-level sampling and mask-level coverage
-- TensorBoard groups sparse metrics into `node_attr_*`, `edge_attr_*`, `node_context_*`, `ecfp_*`, and descriptor charts
+- TensorBoard groups sparse metrics into feature-level attribute charts, positive/negative task charts, and two descriptor charts
 
 ---
 

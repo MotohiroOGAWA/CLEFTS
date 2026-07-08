@@ -178,29 +178,33 @@ FEATURE_DISPLAY_NAMES = {
 
 
 def tensorboard_metric_tag(name: str) -> str:
+    if name == "node_attr_loss":
+        return "node_attr_loss/node_attr"
+    if name == "edge_attr_loss":
+        return "edge_attr_loss/edge_attr"
     if name.startswith("node_context_"):
-        if name.endswith("_acc"):
-            return "node_context_acc"
-        if name.endswith("_loss"):
-            return "node_context_loss"
-        if name.endswith("_count"):
-            return "node_context_count"
+        metric_name = name.rsplit("_", 1)[-1]
+        if metric_name in {"acc", "loss", "count"}:
+            series_name = name[len("node_context_") : -(len(metric_name) + 1)]
+            chart_name = "node_context" if not series_name else "pos_neg"
+            return f"node_context_{metric_name}/{chart_name}"
     if name.startswith("ecfp_"):
-        if name.endswith("_acc"):
-            return "ecfp_acc"
-        if name.endswith("_loss"):
-            return "ecfp_loss"
-        if name.endswith("_count"):
-            return "ecfp_count"
+        metric_name = name.rsplit("_", 1)[-1]
+        if metric_name in {"acc", "loss", "count"}:
+            series_name = name[len("ecfp_") : -(len(metric_name) + 1)]
+            chart_name = "ecfp" if not series_name else "pos_neg"
+            return f"ecfp_{metric_name}/{chart_name}"
     class_match = CLASS_METRIC_RE.match(name)
     if class_match:
-        prefix, _, _, metric_name = class_match.groups()
-        return f"{prefix}_attr_{metric_name}"
+        prefix, group_name, _, metric_name = class_match.groups()
+        display_name = FEATURE_DISPLAY_NAMES.get(group_name, group_name)
+        return f"{prefix}_attr_{metric_name}/{display_name}_by_class"
     match = GROUP_METRIC_RE.match(name)
     if not match:
         return name
-    prefix, _, metric_name = match.groups()
-    return f"{prefix}_attr_{metric_name}"
+    prefix, group_name, metric_name = match.groups()
+    display_name = FEATURE_DISPLAY_NAMES.get(group_name, group_name)
+    return f"{prefix}_attr_{metric_name}/{display_name}"
 
 
 def tensorboard_metric_series_name(name: str) -> str:
@@ -214,7 +218,7 @@ def tensorboard_metric_series_name(name: str) -> str:
         suffix = name[len(prefix) + 1 :]
         for metric_name in ("acc", "loss", "count"):
             if suffix == metric_name:
-                return "total"
+                return "total" if metric_name == "loss" else prefix
             if suffix.endswith(f"_{metric_name}"):
                 return suffix[: -(len(metric_name) + 1)]
     match = GROUP_METRIC_RE.match(name)
@@ -224,10 +228,9 @@ def tensorboard_metric_series_name(name: str) -> str:
     display_name = FEATURE_DISPLAY_NAMES.get(group_name, group_name)
     for suffix in ("_acc", "_count"):
         if metric_name.endswith(suffix):
-            class_label = metric_name[: -len(suffix)]
-            return f"{display_name}/{class_label}"
+            return metric_name[: -len(suffix)]
     if metric_name in {"acc", "loss", "count"}:
-        return display_name
+        return "total" if metric_name == "loss" else display_name
     return f"{display_name}/{metric_name}"
 
 
@@ -268,9 +271,9 @@ def write_tensorboard_grouped_descriptor_losses(
             if r2_match:
                 r2_values[f"{split}/{r2_match.group(1)}"] = float(value)
     if loss_values:
-        writer.add_scalars("descriptor_loss", loss_values, epoch)
+        writer.add_scalars("descriptor_loss/descriptor_loss", loss_values, epoch)
     if r2_values:
-        writer.add_scalars("descriptor/r2_by_target", r2_values, epoch)
+        writer.add_scalars("descriptor_r2/descriptor_r2", r2_values, epoch)
 
 
 def write_tensorboard_metric_pairs(
