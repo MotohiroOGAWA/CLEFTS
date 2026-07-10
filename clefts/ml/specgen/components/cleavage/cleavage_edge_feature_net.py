@@ -32,7 +32,6 @@ class CleavageEdgeFeatureNet(nn.Module):
         atom_dim: int,
         fc_dims: Tuple[int, ...],
         dropout: float = 0.0,
-        aggregation_model_params: Dict | None = None,
     ) -> None:
         super().__init__()
 
@@ -189,6 +188,10 @@ class CleavageEdgeFeatureNet(nn.Module):
     @property
     def dropout(self) -> float:
         return self._dropout
+
+    @property
+    def cleavage_pattern_set_params(self) -> Dict:
+        return dict(self._cleavage_pattern_set_params)
 
     def config_dict(self) -> Dict:
         return {
