@@ -9,19 +9,28 @@ from typing import Optional
 
 import numpy as np
 import pandas as pd
-import torch
 from tqdm import tqdm
 
+from clefts.domain.fragment.cleavage import CleavagePatternSet
+from clefts.libs.mmkit.mmkit import Compound
 from clefts.libs.msentity.msentity import MSDataset
 from clefts.utils.parallel_subprocess import run_parallel_subprocesses
 
 ORIGINAL_INDEX_COLUMN = "__fragment_tree_original_index"
 STRUCTURE_DATA_DIR_NAME = "data"
 DEFAULT_PROJECT_MODEL_CONFIG_NAME = "model_config.json"
+DEFAULT_GENERATOR_CONFIG = (
+    Path(__file__).resolve().parents[2]
+    / "presets"
+    / "spectrum_generator_params"
+    / "single_bond_pos_model_config.json"
+)
+DEFAULT_TRAIN_INPUT = "data/raw/NIST/NIST23/MSMS-Pos-NIST23_v20_mini.msds"
 
 try:
     from .fragment_tree_training_data import (
         build_fragment_tree_structure_files,
+        build_fragment_tree_structure_files_from_existing,
         group_record_indexes_by_smiles,
         load_fragment_tree_structure_file,
     )
@@ -29,6 +38,7 @@ try:
 except ImportError:
     from clefts.ml.input.fragment_tree_training_data import (
         build_fragment_tree_structure_files,
+        build_fragment_tree_structure_files_from_existing,
         group_record_indexes_by_smiles,
         load_fragment_tree_structure_file,
     )
@@ -44,13 +54,33 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--train-input",
-        default="data/raw/NIST/NIST23/MSMS-Pos-NIST23_v20_mini.msds",
+        default=DEFAULT_TRAIN_INPUT,
         help="Training input MSDataset path.",
     )
     parser.add_argument(
         "--validation-input",
         default=None,
         help="Optional validation input MSDataset path.",
+    )
+    parser.add_argument(
+        "--train-structures-input-dir",
+        default=None,
+        help="Optional existing training structure directory. Mutually exclusive with an explicit --train-input.",
+    )
+    parser.add_argument(
+        "--validation-structures-input-dir",
+        default=None,
+        help="Optional existing validation structure directory. Mutually exclusive with --validation-input.",
+    )
+    parser.add_argument(
+        "--structure-rebuild-policy",
+        choices=("all-fragments", "root", "always"),
+        default="all-fragments",
+        help=(
+            "When using an existing structure directory, rebuild always, rebuild only "
+            "when added cleavage patterns match the root compound, or rebuild when "
+            "they match any saved fragment."
+        ),
     )
     parser.add_argument(
         "--output-dir",
@@ -84,11 +114,6 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--adduct-type-column", default="AdductType")
     parser.add_argument("--collision-energy-column", default="CollisionEnergy")
     parser.add_argument("--instrument-column", default=None)
-    parser.add_argument(
-        "--device",
-        default="cpu",
-        help="Torch device for model construction while building structures.",
-    )
     parser.add_argument(
         "--max-node",
         type=int,
@@ -188,12 +213,118 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def load_generator(params_path: str, device: torch.device) -> FragmentSpectrumGenerator:
-    with open(params_path, "r", encoding="utf-8") as f:
+def load_generator_params(params_path: str | Path) -> dict:
+    with Path(params_path).open("r", encoding="utf-8") as f:
         params = json.load(f)
-    generator = FragmentSpectrumGenerator(**params).to(device)
+
+    if "fragment_ion_tree_builder" not in params:
+        return params
+
+    with DEFAULT_GENERATOR_CONFIG.open("r", encoding="utf-8") as f:
+        generator_params = json.load(f)
+    generator_params["probability_model_params"]["fragmenter_params"] = params
+    return generator_params
+
+
+def load_generator(params_path: str | Path) -> FragmentSpectrumGenerator:
+    generator = FragmentSpectrumGenerator(**load_generator_params(params_path))
     generator.eval()
     return generator
+
+
+def _cleavage_pattern_set_from_params_dict(data: dict) -> CleavagePatternSet | None:
+    params = data.get("probability_model_params", data)
+    fragmenter_params = params.get("fragmenter_params", {})
+    builder_params = fragmenter_params.get("fragment_ion_tree_builder", fragmenter_params)
+    pattern_set_params = builder_params.get("cleavage_pattern_set")
+    if pattern_set_params is None:
+        return None
+    return CleavagePatternSet.from_dict(pattern_set_params)
+
+
+def load_cleavage_pattern_set_from_params(path: str | Path) -> CleavagePatternSet | None:
+    with Path(path).open("r", encoding="utf-8") as f:
+        return _cleavage_pattern_set_from_params_dict(json.load(f))
+
+
+def resolve_structure_input_data_dir(path: str | Path) -> Path:
+    input_dir = Path(path)
+    if any(input_dir.glob("*.pt")):
+        return input_dir
+    data_dir = input_dir / STRUCTURE_DATA_DIR_NAME
+    if any(data_dir.glob("*.pt")):
+        return data_dir
+    return input_dir
+
+
+def find_previous_model_config(structure_input_dir: str | Path) -> Path | None:
+    data_dir = resolve_structure_input_data_dir(structure_input_dir)
+    candidates = [
+        data_dir.parent.parent / "config" / DEFAULT_PROJECT_MODEL_CONFIG_NAME,
+        data_dir.parent / "config" / DEFAULT_PROJECT_MODEL_CONFIG_NAME,
+        data_dir / "config" / DEFAULT_PROJECT_MODEL_CONFIG_NAME,
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _pattern_matches_smiles(pattern, smiles: str) -> bool:
+    try:
+        result = pattern.fragment(Compound.from_smiles(smiles))
+    except Exception:
+        return False
+    return result is not None and len(result.products) > 0
+
+
+def make_structure_rebuild_decider(
+    *,
+    policy: str,
+    current_pattern_set: CleavagePatternSet,
+    previous_pattern_set: CleavagePatternSet | None,
+):
+    if policy == "always":
+        return lambda item: True
+
+    if previous_pattern_set is not None:
+        previous_id_by_key = {pattern.key: pattern.pattern_id for pattern in previous_pattern_set.patterns}
+        for pattern in current_pattern_set.patterns:
+            previous_id = previous_id_by_key.get(pattern.key)
+            if previous_id is not None and int(previous_id) != int(pattern.pattern_id):
+                print(
+                    "[WARN] Existing cleavage pattern IDs changed in the current PatternSet; "
+                    "all existing structures will be rebuilt.",
+                    file=sys.stderr,
+                )
+                return lambda item: True
+
+    previous_keys = set(previous_pattern_set.identity()) if previous_pattern_set is not None else set()
+    added_patterns = [
+        pattern
+        for pattern in current_pattern_set.patterns
+        if pattern.key not in previous_keys
+    ]
+    if not added_patterns:
+        return lambda item: False
+
+    def should_rebuild(item) -> bool:
+        metadata = dict(item.metadata)
+        root_smiles = str(metadata.get("smiles") or item.structure.node_smiles[0])
+        if policy == "root":
+            smiles_values = [root_smiles]
+        elif policy == "all-fragments":
+            smiles_values = [str(smiles) for smiles in item.structure.node_smiles.tolist()]
+        else:
+            raise ValueError(f"Unknown structure rebuild policy: {policy}")
+
+        for smiles in dict.fromkeys(smiles_values):
+            for pattern in added_patterns:
+                if _pattern_matches_smiles(pattern, smiles):
+                    return True
+        return False
+
+    return should_rebuild
 
 
 def default_model_config_output(output_root: str | Path) -> Path:
@@ -206,7 +337,6 @@ def copy_model_config_after_model_creation(
     output_file: str | Path,
     overwrite: bool = False,
 ) -> None:
-    source_path = Path(source_file)
     output_path = Path(output_file)
 
     if output_path.exists() and not overwrite:
@@ -216,8 +346,10 @@ def copy_model_config_after_model_creation(
             return
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy(source_path, output_path)
-    print(f"copied model config: {source_path} -> {output_path}")
+    with output_path.open("w", encoding="utf-8") as f:
+        json.dump(load_generator_params(source_file), f, indent=2)
+        f.write("\n")
+    print(f"wrote model config: {source_file} -> {output_path}")
 
 
 def structure_data_dir(structure_dir: str | Path) -> Path:
@@ -400,6 +532,54 @@ def build_structure_files_for_input(
     return saved_files
 
 
+def build_structure_files_for_existing_input(
+    *,
+    structures_input_dir: str | Path,
+    output_dir: str | Path,
+    args: argparse.Namespace,
+    generator: FragmentSpectrumGenerator,
+    manifest_file: str | Path | None = None,
+) -> list[Path]:
+    input_data_dir = resolve_structure_input_data_dir(structures_input_dir)
+    previous_config = find_previous_model_config(input_data_dir)
+    previous_pattern_set = None
+    if previous_config is not None:
+        previous_pattern_set = load_cleavage_pattern_set_from_params(previous_config)
+        print(f"previous model config: {previous_config}")
+    else:
+        print(
+            "[WARN] Previous model config was not found near the structure input. "
+            "All current cleavage patterns will be treated as added patterns.",
+            file=sys.stderr,
+        )
+
+    current_pattern_set = generator.feature_model.fragmenter.cleavage_pattern_set
+    should_rebuild = make_structure_rebuild_decider(
+        policy=args.structure_rebuild_policy,
+        current_pattern_set=current_pattern_set,
+        previous_pattern_set=previous_pattern_set,
+    )
+    print(f"structures input: {input_data_dir}")
+    print(f"output_dir: {output_dir}")
+    print(f"structure_rebuild_policy: {args.structure_rebuild_policy}")
+
+    saved_files = build_fragment_tree_structure_files_from_existing(
+        input_dir=input_data_dir,
+        feature_model=generator.feature_model,
+        output_dir=output_dir,
+        should_rebuild=should_rebuild,
+        max_node=args.max_node,
+        max_edge=args.max_edge,
+        overwrite=args.overwrite,
+        manifest_file=manifest_file,
+    )
+
+    print(f"saved structure files: {len(saved_files)}")
+    for path in saved_files[:5]:
+        print(f"  {path}")
+    return saved_files
+
+
 def make_smiles_chunks(
     dataset: MSDataset,
     *,
@@ -504,8 +684,6 @@ def run_parallel_for_input(
             str(args.adduct_type_column),
             "--collision-energy-column",
             str(args.collision_energy_column),
-            "--device",
-            str(args.device),
             "--max-node",
             str(args.max_node),
             "--max-edge",
@@ -583,12 +761,20 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
     if args is None:
         args = parse_args()
 
-    device = torch.device(args.device)
     generator = None
     output_root = Path(args.output_dir)
 
+    train_uses_structures = args.train_structures_input_dir is not None
+    validation_uses_structures = args.validation_structures_input_dir is not None
+    if train_uses_structures and args.train_input != DEFAULT_TRAIN_INPUT:
+        raise ValueError("--train-input and --train-structures-input-dir are mutually exclusive.")
+    if args.validation_input is not None and validation_uses_structures:
+        raise ValueError("--validation-input and --validation-structures-input-dir are mutually exclusive.")
+    if train_uses_structures and args.save_train_valid_records:
+        raise ValueError("--save-train-valid-records requires --train-input, not --train-structures-input-dir.")
+
     if args.structure_output_dir is not None:
-        generator = load_generator(args.params, device=device)
+        generator = load_generator(args.params)
         build_structure_files_for_input(
             input_path=args.train_input,
             output_dir=Path(args.structure_output_dir),
@@ -634,13 +820,13 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
     if args.overwrite:
         structure_dirs = [train_structure_dir]
         parallel_temp_dirs = [parallel_temp_dir(args, output_root, "train")]
-        if args.validation_input is not None:
+        if args.validation_input is not None or validation_uses_structures:
             structure_dirs.append(validation_structure_dir)
             parallel_temp_dirs.append(parallel_temp_dir(args, output_root, "validation"))
         remove_existing_dirs(structure_dirs, description="structure")
         remove_existing_dirs(parallel_temp_dirs, description="parallel temp")
 
-    generator = load_generator(args.params, device=device)
+    generator = load_generator(args.params)
     model_config_output = (
         Path(args.model_config_output)
         if args.model_config_output is not None
@@ -651,6 +837,53 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
         output_file=model_config_output,
         overwrite=bool(args.overwrite_model_config),
     )
+
+    if train_uses_structures or validation_uses_structures:
+        if args.num_workers > 1:
+            print(
+                "[WARN] --num-workers is ignored when a structures input directory is used.",
+                file=sys.stderr,
+            )
+        if train_uses_structures:
+            build_structure_files_for_existing_input(
+                structures_input_dir=args.train_structures_input_dir,
+                output_dir=train_structure_data_dir,
+                args=args,
+                generator=generator,
+                manifest_file=train_manifest_file,
+            )
+        else:
+            build_structure_files_for_input(
+                input_path=args.train_input,
+                output_dir=train_structure_data_dir,
+                args=args,
+                generator=generator,
+                manifest_file=train_manifest_file,
+                save_valid=bool(args.save_train_valid_records),
+                valid_records_output=train_valid_output,
+                assignment_score_output=train_assignment_score_output,
+            )
+
+        if validation_uses_structures:
+            build_structure_files_for_existing_input(
+                structures_input_dir=args.validation_structures_input_dir,
+                output_dir=validation_structure_data_dir,
+                args=args,
+                generator=generator,
+                manifest_file=validation_structure_dir / "manifest.tsv",
+            )
+        elif args.validation_input is not None:
+            build_structure_files_for_input(
+                input_path=args.validation_input,
+                output_dir=validation_structure_data_dir,
+                args=args,
+                generator=generator,
+                manifest_file=validation_structure_dir / "manifest.tsv",
+                save_valid=bool(args.save_validation_valid_records),
+                valid_records_output=validation_valid_output,
+                assignment_score_output=validation_assignment_score_output,
+            )
+        return
 
     if args.num_workers > 1:
         run_parallel_for_input(

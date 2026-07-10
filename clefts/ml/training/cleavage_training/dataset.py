@@ -94,8 +94,9 @@ def make_cleavage_structure_dataloader(
     map_location: str | torch.device = "cpu",
     device: Optional[str | torch.device] = None,
 ) -> DataLoader:
+    data_dir = resolve_structure_data_dir(root_dir)
     dataset = FragmentTreeStructureFileDataset(
-        root_dir,
+        data_dir,
         pattern=pattern,
         map_location=map_location,
         device=device,
@@ -107,6 +108,20 @@ def make_cleavage_structure_dataloader(
         num_workers=num_workers,
         collate_fn=collate_fragment_tree_structure_items,
     )
+
+
+def resolve_structure_data_dir(root_dir: str | Path) -> Path:
+    """Resolve a TrainingFragmentTreeStructure split dir to its data directory."""
+
+    path = Path(root_dir)
+    if path.name == "data":
+        return path
+    data_dir = path / "data"
+    if data_dir.exists() or path.name in {"train_structures", "validation_structures"}:
+        return data_dir
+    if path.exists() and any(path.glob("*.pt")):
+        return path
+    return data_dir
 
 
 def count_event_classes(structures: Sequence[FragmentTreeStructure]) -> Dict[str, int]:

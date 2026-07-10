@@ -87,7 +87,7 @@ def mean_metrics(rows: Iterable[Dict[str, float]]) -> Dict[str, float]:
 def tensorboard_tag(name: str) -> str:
     if name == "loss":
         return "loss"
-    for prefix in ("observed_edge", "pattern", "reaction", "product_molecule", "atom_location"):
+    for prefix in ("observed_edge", "pattern", "reaction", "product_molecule", "compound_identity", "atom_location"):
         if name.startswith(prefix + "_"):
             metric = name.rsplit("_", 1)[-1]
             if metric in {"loss", "acc", "count"}:
@@ -100,7 +100,7 @@ def tensorboard_series(name: str) -> str:
     for suffix in ("_loss", "_acc", "_count"):
         if name.endswith(suffix):
             rest = name[: -len(suffix)]
-            for prefix in ("observed_edge", "pattern", "reaction", "product_molecule", "atom_location"):
+            for prefix in ("observed_edge", "pattern", "reaction", "product_molecule", "compound_identity", "atom_location"):
                 if rest == prefix:
                     return "total"
                 if rest.startswith(prefix + "_"):

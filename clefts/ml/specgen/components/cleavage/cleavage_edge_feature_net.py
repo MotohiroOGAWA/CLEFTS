@@ -40,9 +40,7 @@ class CleavageEdgeFeatureNet(nn.Module):
         self._atom_dim = int(atom_dim)
         self._fc_dims = tuple(int(v) for v in fc_dims)
         self._dropout = float(dropout)
-        self._cleavage_pattern_set_params = dict(cleavage_pattern_set_params)
-
-        cleavage_pattern_set = CleavagePatternSet.from_dict(
+        self._cleavage_pattern_set = CleavagePatternSet.from_dict(
             cleavage_pattern_set_params
         )
 
@@ -54,7 +52,7 @@ class CleavageEdgeFeatureNet(nn.Module):
         reactant_tuple_length_by_event_type: Dict[Tuple[int, int], int] = {}
         product_tuple_length_by_event_type: Dict[Tuple[int, int, int], int] = {}
 
-        for pattern in cleavage_pattern_set.patterns:
+        for pattern in self._cleavage_pattern_set.patterns:
             pattern_id = int(pattern.pattern_id)
 
             for reaction in pattern.cleavage_reactions:
@@ -190,12 +188,16 @@ class CleavageEdgeFeatureNet(nn.Module):
         return self._dropout
 
     @property
+    def cleavage_pattern_set(self) -> CleavagePatternSet:
+        return self._cleavage_pattern_set.copy()
+
+    @property
     def cleavage_pattern_set_params(self) -> Dict:
-        return dict(self._cleavage_pattern_set_params)
+        return self._cleavage_pattern_set.to_dict()
 
     def config_dict(self) -> Dict:
         return {
-            "cleavage_pattern_set_params": dict(self._cleavage_pattern_set_params),
+            "cleavage_pattern_set_params": self.cleavage_pattern_set_params,
             "feature_dim": self.feature_dim,
             "mol_dim": self.mol_dim,
             "atom_dim": self.atom_dim,

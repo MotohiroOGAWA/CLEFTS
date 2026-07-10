@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import shutil
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -325,6 +326,84 @@ def build_fragment_tree_structure_files(
                     "message": str(exc),
                 }
             )
+
+    manifest = pd.DataFrame(manifest_rows)
+    manifest_path = Path(manifest_file) if manifest_file is not None else output_path / "manifest.tsv"
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest.to_csv(manifest_path, sep="\t", index=False)
+
+    return saved_files
+
+
+def build_fragment_tree_structure_files_from_existing(
+    *,
+    input_dir: str | Path,
+    feature_model,
+    output_dir: str | Path,
+    should_rebuild,
+    max_node: int = -1,
+    max_edge: int = -1,
+    overwrite: bool = False,
+    manifest_file: Optional[str | Path] = None,
+) -> List[Path]:
+    """Build/copy structure files from an existing structure directory."""
+
+    input_path = Path(input_dir)
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    source_files = sorted(input_path.glob("*.pt"))
+    if len(source_files) == 0:
+        raise FileNotFoundError(f"No structure .pt files found in {input_path}.")
+
+    manifest_rows: List[Dict[str, object]] = []
+    saved_files: List[Path] = []
+    builder = TrainingFragmentTreeStructureBuilder(feature_model)
+
+    for source_file in tqdm(source_files, desc="Building from existing structures", mininterval=1.0):
+        target_file = output_path / source_file.name
+        if target_file.exists() and not overwrite:
+            item = load_fragment_tree_structure_file(target_file, map_location="cpu")
+            metadata = dict(item.metadata)
+            saved_files.append(target_file)
+            manifest_rows.append({"file": target_file.name, "smiles": metadata.get("smiles", ""), "num_input_records": metadata.get("num_input_records", ""), "num_valid_samples": metadata.get("num_valid_samples", item.structure.num_samples), "num_nodes": item.structure.num_nodes, "num_edges": item.structure.num_edges, "status": "skipped_exists"})
+            continue
+
+        try:
+            item = load_fragment_tree_structure_file(source_file, map_location="cpu")
+            metadata = dict(item.metadata)
+            smiles = str(metadata.get("smiles") or item.structure.node_smiles[0])
+            rebuild = bool(should_rebuild(item))
+
+            if not rebuild:
+                if source_file.resolve() != target_file.resolve():
+                    shutil.copy2(source_file, target_file)
+                saved_files.append(target_file)
+                manifest_rows.append({"file": target_file.name, "smiles": smiles, "num_input_records": metadata.get("num_input_records", item.structure.num_samples), "num_valid_samples": metadata.get("num_valid_samples", item.structure.num_samples), "num_nodes": item.structure.num_nodes, "num_edges": item.structure.num_edges, "status": "reused_no_new_pattern_match"})
+                continue
+
+            builder.reset()
+            sample_indexes = builder.add_training_samples_from_structure(item.structure, smiles=smiles, max_node=max_node, max_edge=max_edge)
+            valid_sample_count = int((sample_indexes >= 0).sum())
+            if valid_sample_count <= 0:
+                manifest_rows.append({"file": target_file.name, "smiles": smiles, "num_input_records": item.structure.num_samples, "status": "no_valid_samples"})
+                continue
+
+            record_indexes = metadata.get("record_indexes", [])
+            old_sample_indexes = metadata.get("sample_indexes", [])
+            if record_indexes and old_sample_indexes:
+                valid_record_indexes = [int(record_index) for record_index, old_sample_index in zip(record_indexes, old_sample_indexes) if int(old_sample_index) >= 0]
+            else:
+                valid_record_indexes = list(range(item.structure.num_samples))
+
+            structure = builder.to_structure()
+            new_metadata = {**metadata, "smiles": smiles, "record_indexes": valid_record_indexes, "sample_indexes": [int(index) for index in sample_indexes.tolist()], "num_input_records": int(len(valid_record_indexes)), "num_valid_samples": int(structure.num_samples), "num_nodes": int(structure.num_nodes), "num_edges": int(structure.num_edges), "max_node": int(max_node), "max_edge": int(max_edge), "source_structure_file": str(source_file)}
+            save_fragment_tree_structure(structure=structure, output_file=target_file, metadata=new_metadata)
+            saved_files.append(target_file)
+            manifest_rows.append({"file": target_file.name, "status": "rebuilt", **new_metadata})
+        except Exception as exc:
+            print(f"[WARN] Failed to build structure from {source_file}: {exc}", file=sys.stderr)
+            manifest_rows.append({"file": target_file.name, "status": "error", "message": str(exc)})
 
     manifest = pd.DataFrame(manifest_rows)
     manifest_path = Path(manifest_file) if manifest_file is not None else output_path / "manifest.tsv"

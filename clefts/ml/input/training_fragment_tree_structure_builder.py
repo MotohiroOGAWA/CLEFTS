@@ -66,6 +66,15 @@ class TrainingFragmentTreeSample(FragmentTreeSample):
     # Peak/formula/intensity targets aligned with terminal fragments.
 
 
+@dataclass(frozen=True)
+class TrainingSampleInputRow:
+    adduct_type_index: int
+    ce_value: float
+    peak_mz: Tuple[float, ...]
+    peak_intensity: Tuple[float, ...]
+    source_label: str
+
+
 @dataclass
 class TrainingFragmentTreeStructureBuilder(SingleFragmentTreeStructureBuilder):
     def add_training_sample(
@@ -81,14 +90,7 @@ class TrainingFragmentTreeStructureBuilder(SingleFragmentTreeStructureBuilder):
         max_edge: int = -1,
         max_depth: Optional[int] = None,
     ) -> np.ndarray:
-        """Add same-SMILES MSDataset records as training samples.
-
-        The shared fragment tree is built once up to ``max_depth`` and all of
-        its cleavage edges are registered before per-record target pathways are
-        assigned. For every correct pathway step, all child edges from the same
-        source node are added as candidates, while the actual traversal edge is
-        stored separately as a target.
-        """
+        """Add same-SMILES MSDataset records as training samples."""
         if len(dataset) == 0:
             raise ValueError("dataset must not be empty.")
 
@@ -100,6 +102,111 @@ class TrainingFragmentTreeStructureBuilder(SingleFragmentTreeStructureBuilder):
             )
 
         smiles = str(smiles_values[0])
+        fragment_ion_tree, fragment_compound_by_smiles = (
+            self._build_and_register_fragment_ion_tree(
+                smiles=smiles,
+                max_node=max_node,
+                max_edge=max_edge,
+                max_depth=max_depth,
+            )
+        )
+
+        sample_rows: List[Optional[TrainingSampleInputRow]] = []
+        peak_sets: List[Tuple[Adduct, Tuple[float, ...]]] = []
+
+        for record_index in range(len(dataset)):
+            record = dataset[record_index]
+            try:
+                parsed = self._parse_record_info(
+                    record,
+                    precursor_mz_column=precursor_mz_column,
+                    adduct_type_column=adduct_type_column,
+                    collision_energy_column=collision_energy_column,
+                    smiles_column=smiles_column,
+                    instrument_column=instrument_column,
+                )
+                record_smiles, _, precursor_type, adduct_type_index, ce_value, _ = parsed
+                if record_smiles != smiles:
+                    raise ValueError(
+                        f"Record SMILES {record_smiles!r} does not match "
+                        f"dataset SMILES {smiles!r}."
+                    )
+            except Exception:
+                sample_rows.append(None)
+                continue
+
+            peak_mz = tuple(float(peak.mz) for peak in record.peaks)
+            sample_rows.append(
+                TrainingSampleInputRow(
+                    adduct_type_index=int(adduct_type_index),
+                    ce_value=float(ce_value),
+                    peak_mz=peak_mz,
+                    peak_intensity=tuple(float(peak.intensity) for peak in record.peaks),
+                    source_label=f"record_index={record_index}",
+                )
+            )
+            peak_sets.append((precursor_type, peak_mz))
+
+        assignments = self._model.fragmenter.assign_fragment_pathways_to_peak_sets(
+            fragment_ion_tree=fragment_ion_tree,
+            peak_sets=peak_sets,
+        )
+
+        return self._add_assigned_training_sample_rows(
+            sample_rows=sample_rows,
+            assignments=assignments,
+            smiles=smiles,
+            fragment_ion_tree=fragment_ion_tree,
+            fragment_compound_by_smiles=fragment_compound_by_smiles,
+            desc="Adding training samples",
+        )
+
+    def add_training_samples_from_structure(
+        self,
+        structure: TrainingFragmentTreeStructure,
+        *,
+        smiles: str,
+        max_node: int = -1,
+        max_edge: int = -1,
+        max_depth: Optional[int] = None,
+    ) -> np.ndarray:
+        """Rebuild training samples from a saved structure and current model."""
+        fragment_ion_tree, fragment_compound_by_smiles = (
+            self._build_and_register_fragment_ion_tree(
+                smiles=smiles,
+                max_node=max_node,
+                max_edge=max_edge,
+                max_depth=max_depth,
+            )
+        )
+        sample_rows = self._sample_rows_from_structure(structure)
+        peak_sets = [
+            (self._model.fragmenter.adduct_types[row.adduct_type_index], row.peak_mz)
+            for row in sample_rows
+            if row is not None
+        ]
+        assignments = self._model.fragmenter.assign_fragment_pathways_to_peak_sets(
+            fragment_ion_tree=fragment_ion_tree,
+            peak_sets=peak_sets,
+        )
+
+        return self._add_assigned_training_sample_rows(
+            sample_rows=sample_rows,
+            assignments=assignments,
+            smiles=smiles,
+            fragment_ion_tree=fragment_ion_tree,
+            fragment_compound_by_smiles=fragment_compound_by_smiles,
+            desc="Rebuilding training samples",
+        )
+
+    def _build_and_register_fragment_ion_tree(
+        self,
+        *,
+        smiles: str,
+        max_node: int,
+        max_edge: int,
+        max_depth: Optional[int],
+    ) -> Tuple[FragmentIonTree, Dict[str, Compound]]:
         compound = Compound.from_smiles(smiles)
         if max_depth is None:
             max_depth = self._model.tree_max_depth
@@ -118,122 +225,134 @@ class TrainingFragmentTreeStructureBuilder(SingleFragmentTreeStructureBuilder):
             fragment_ion_tree=fragment_ion_tree,
             fragment_compound_by_smiles=fragment_compound_by_smiles,
         )
+        return fragment_ion_tree, fragment_compound_by_smiles
 
-        parsed_records: List[
-            Optional[Tuple[str, float, Adduct, int, float, Optional[str]]]
-        ] = []
-        peak_sets: List[Tuple[Adduct, Tuple[float, ...]]] = []
-
-        for record_index in range(len(dataset)):
-            record = dataset[record_index]
-            try:
-                parsed = self._parse_record_info(
-                    record,
-                    precursor_mz_column=precursor_mz_column,
-                    adduct_type_column=adduct_type_column,
-                    collision_energy_column=collision_energy_column,
-                    smiles_column=smiles_column,
-                    instrument_column=instrument_column,
+    def _sample_rows_from_structure(
+        self,
+        structure: TrainingFragmentTreeStructure,
+    ) -> List[TrainingSampleInputRow]:
+        sample_rows: List[TrainingSampleInputRow] = []
+        for sample_index in range(structure.num_samples):
+            adduct_type_index = int(structure.sample_adduct_type_index[sample_index].item())
+            if adduct_type_index < 0 or adduct_type_index >= len(self._model.fragmenter.adduct_types):
+                raise ValueError(
+                    "Saved sample adduct index is not supported by the current model: "
+                    f"{adduct_type_index}"
                 )
-                record_smiles, _, precursor_type, _, _, _ = parsed
-                if record_smiles != smiles:
-                    raise ValueError(
-                        f"Record SMILES {record_smiles!r} does not match "
-                        f"dataset SMILES {smiles!r}."
-                    )
-            except Exception:
-                parsed_records.append(None)
-                continue
-
-            parsed_records.append(parsed)
-            peak_sets.append(
-                (
-                    precursor_type,
-                    tuple(float(peak.mz) for peak in record.peaks),
+            start = int(structure.sample_peak_ptr[sample_index].item())
+            end = int(structure.sample_peak_ptr[sample_index + 1].item())
+            sample_rows.append(
+                TrainingSampleInputRow(
+                    adduct_type_index=adduct_type_index,
+                    ce_value=float(structure.sample_ce_value[sample_index].item()),
+                    peak_mz=tuple(
+                        float(value)
+                        for value in structure.sample_peak_mz[start:end].detach().cpu().tolist()
+                    ),
+                    peak_intensity=tuple(
+                        float(value)
+                        for value in structure.sample_peak_intensity[start:end].detach().cpu().tolist()
+                    ),
+                    source_label=f"sample_index={sample_index}",
                 )
             )
+        return sample_rows
 
-        assignments = self._model.fragmenter.assign_fragment_pathways_to_peak_sets(
-            fragment_ion_tree=fragment_ion_tree,
-            peak_sets=peak_sets,
-        )
-
+    def _add_assigned_training_sample_rows(
+        self,
+        *,
+        sample_rows: Sequence[Optional[TrainingSampleInputRow]],
+        assignments: Sequence[Tuple[FragmentPathwayGroup, Sequence[FragmentPathwayGroup]]],
+        smiles: str,
+        fragment_ion_tree: FragmentIonTree,
+        fragment_compound_by_smiles: Dict[str, Compound],
+        desc: str,
+    ) -> np.ndarray:
         sample_indexes: List[int] = []
         assignment_index = 0
 
-        for record_index, parsed in enumerate(
-            tqdm(
-                parsed_records,
-                desc="Adding training samples",
-                mininterval=1.0,
-            )
-        ):
-            if parsed is None:
+        for row in tqdm(sample_rows, desc=desc, mininterval=1.0):
+            if row is None:
                 sample_indexes.append(-1)
                 continue
 
-            record = dataset[record_index]
-            _, _, _, adduct_type_index, ce_value, _ = parsed
             (
                 precursor_fragment_pathways,
                 fragment_pathways_by_peaks,
             ) = assignments[assignment_index]
             assignment_index += 1
 
-            if len(precursor_fragment_pathways) == 0:
-                sample_indexes.append(-1)
-                continue
-
-            sample_index = len(self.samples)
-            sample = TrainingFragmentTreeSample(
-                adduct_type_index=int(adduct_type_index),
-                ce_value=float(ce_value),
-                peak_mz=[float(peak.mz) for peak in record.peaks],
-                peak_intensity=[float(peak.intensity) for peak in record.peaks],
+            sample_index = self._add_assigned_training_sample(
+                row=row,
+                precursor_fragment_pathways=precursor_fragment_pathways,
+                fragment_pathways_by_peaks=fragment_pathways_by_peaks,
+                smiles=smiles,
+                fragment_ion_tree=fragment_ion_tree,
+                fragment_compound_by_smiles=fragment_compound_by_smiles,
             )
-
-            try:
-                self._add_precursor_pathways_to_sample(
-                    sample=sample,
-                    precursor_fragment_pathways=precursor_fragment_pathways,
-                    adduct_type_index=int(adduct_type_index),
-                    fragment_compound_by_smiles=fragment_compound_by_smiles,
-                )
-                self._add_peak_pathways_to_sample(
-                    sample=sample,
-                    fragment_ion_tree=fragment_ion_tree,
-                    fragment_pathways_by_peaks=fragment_pathways_by_peaks,
-                    fragment_compound_by_smiles=fragment_compound_by_smiles,
-                )
-            except Exception as exc:
-                print(
-                    "[WARN] Failed to add training sample "
-                    f"record_index={record_index}, smiles={smiles!r}, "
-                    f"adduct_type={self._model.fragmenter.adduct_types[int(adduct_type_index)]}: {exc}",
-                    file=sys.stderr,
-                )
-                sample_indexes.append(-1)
-                continue
-
-            if not (
-                len(sample.precursor_edge_indexes)
-                == len(sample.precursor_unsaturation_indexes)
-                == len(sample.precursor_radical_indexes)
-            ):
-                raise ValueError(
-                    "Mismatch in lengths of precursor_edge_indexes, "
-                    "precursor_unsaturation_indexes, and "
-                    "precursor_radical_indexes."
-                )
-
-            if len(sample.precursor_edge_indexes) == 0:
-                sample_indexes.append(-1)
-                continue
-
-            self.samples[int(sample_index)] = sample
-            sample_indexes.append(int(sample_index))
+            sample_indexes.append(sample_index)
 
         return np.asarray(sample_indexes, dtype=int)
+
+    def _add_assigned_training_sample(
+        self,
+        *,
+        row: TrainingSampleInputRow,
+        precursor_fragment_pathways: FragmentPathwayGroup,
+        fragment_pathways_by_peaks: Sequence[FragmentPathwayGroup],
+        smiles: str,
+        fragment_ion_tree: FragmentIonTree,
+        fragment_compound_by_smiles: Dict[str, Compound],
+    ) -> int:
+        if len(precursor_fragment_pathways) == 0:
+            return -1
+
+        sample_index = len(self.samples)
+        sample = TrainingFragmentTreeSample(
+            adduct_type_index=int(row.adduct_type_index),
+            ce_value=float(row.ce_value),
+            peak_mz=list(row.peak_mz),
+            peak_intensity=list(row.peak_intensity),
+        )
+
+        try:
+            self._add_precursor_pathways_to_sample(
+                sample=sample,
+                precursor_fragment_pathways=precursor_fragment_pathways,
+                adduct_type_index=int(row.adduct_type_index),
+                fragment_compound_by_smiles=fragment_compound_by_smiles,
+            )
+            self._add_peak_pathways_to_sample(
+                sample=sample,
+                fragment_ion_tree=fragment_ion_tree,
+                fragment_pathways_by_peaks=fragment_pathways_by_peaks,
+                fragment_compound_by_smiles=fragment_compound_by_smiles,
+            )
+        except Exception as exc:
+            print(
+                "[WARN] Failed to add training sample "
+                f"{row.source_label}, smiles={smiles!r}, "
+                f"adduct_type={self._model.fragmenter.adduct_types[int(row.adduct_type_index)]}: {exc}",
+                file=sys.stderr,
+            )
+            return -1
+
+        if not (
+            len(sample.precursor_edge_indexes)
+            == len(sample.precursor_unsaturation_indexes)
+            == len(sample.precursor_radical_indexes)
+        ):
+            raise ValueError(
+                "Mismatch in lengths of precursor_edge_indexes, "
+                "precursor_unsaturation_indexes, and "
+                "precursor_radical_indexes."
+            )
+
+        if len(sample.precursor_edge_indexes) == 0:
+            return -1
+
+        self.samples[int(sample_index)] = sample
+        return int(sample_index)
 
     def to_structure(self) -> TrainingFragmentTreeStructure:
         structure = super().to_structure()

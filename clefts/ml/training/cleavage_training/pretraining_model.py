@@ -7,6 +7,7 @@ from typing import Dict, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from rdkit import Chem
 from torch import Tensor
 
 from ...input.fragment_tree_features import FragmentTreeFeatures
@@ -45,6 +46,8 @@ class CleavagePretrainingModel(nn.Module):
         pattern_loss_weight: float = 1.0,
         reaction_loss_weight: float = 1.0,
         product_loss_weight: float = 1.0,
+        compound_identity_loss_weight: float = 1.0,
+        compound_identity_temperature: float = 0.1,
         atom_location_loss_weight: float = 1.0,
         dropout: float = 0.1,
     ) -> None:
@@ -58,6 +61,8 @@ class CleavagePretrainingModel(nn.Module):
         self.pattern_loss_weight = float(pattern_loss_weight)
         self.reaction_loss_weight = float(reaction_loss_weight)
         self.product_loss_weight = float(product_loss_weight)
+        self.compound_identity_loss_weight = float(compound_identity_loss_weight)
+        self.compound_identity_temperature = float(compound_identity_temperature)
         self.atom_location_loss_weight = float(atom_location_loss_weight)
         self.hidden_dim = int(hidden_dim)
         self.dropout = float(dropout)
@@ -103,14 +108,20 @@ class CleavagePretrainingModel(nn.Module):
             "pattern_loss_weight": self.pattern_loss_weight,
             "reaction_loss_weight": self.reaction_loss_weight,
             "product_loss_weight": self.product_loss_weight,
+            "compound_identity_loss_weight": self.compound_identity_loss_weight,
+            "compound_identity_temperature": self.compound_identity_temperature,
             "atom_location_loss_weight": self.atom_location_loss_weight,
             "dropout": self.dropout,
         }
 
     def forward(self, structure: FragmentTreeStructure) -> CleavagePretrainingOutput:
-        targets = build_cleavage_edge_targets(structure)
         mol_graph = self.mol_encoder(structure.node_graph)
         ft_features = FragmentTreeFeatures.from_structure(structure, node_graphs=mol_graph)
+        return self.forward_features(ft_features)
+
+    def forward_features(self, ft_features: FragmentTreeFeatures) -> CleavagePretrainingOutput:
+        structure = ft_features.structure
+        targets = build_cleavage_edge_targets(structure)
         event_row_id, event_edge_id, event_attr = self.cleavage_edge_fnet.encode_events(ft_features)
         event_h = self.edge_body(self.edge_norm(event_attr))
 
@@ -137,9 +148,19 @@ class CleavagePretrainingModel(nn.Module):
                     losses.append(float(weight) * loss)
                     metrics.update(task_metrics)
 
+            identity_loss, identity_metrics = self._compound_identity_loss_and_metrics(
+                structure=structure,
+                event_h=event_h,
+                event_row_id=event_row_id,
+                event_edge_id=event_edge_id,
+            )
+            if identity_loss is not None:
+                losses.append(self.compound_identity_loss_weight * identity_loss)
+                metrics.update(identity_metrics)
+
             atom_loss, atom_metrics = self._atom_location_loss_and_metrics(
                 structure=structure,
-                atom_h=mol_graph.x,
+                atom_h=ft_features.node_graphs.x,
                 event_h=event_h,
                 event_row_id=event_row_id,
                 event_edge_id=event_edge_id,
@@ -196,6 +217,104 @@ class CleavagePretrainingModel(nn.Module):
             f"{prefix}_acc": float((pred == target).float().mean().detach().cpu()),
             f"{prefix}_count": float(target.numel()),
         }
+
+
+    def _compound_identity_loss_and_metrics(
+        self,
+        *,
+        structure: FragmentTreeStructure,
+        event_h: Tensor,
+        event_row_id: Tensor,
+        event_edge_id: Tensor,
+    ) -> Tuple[Optional[Tensor], Dict[str, float]]:
+        labels = self._compound_identity_labels_from_structure(
+            structure=structure,
+            event_row_id=event_row_id,
+            event_edge_id=event_edge_id,
+        )
+        valid = labels != IGNORE_INDEX
+        if not bool(valid.any()):
+            return None, {}
+
+        z = F.normalize(event_h[valid], dim=-1)
+        labels = labels[valid]
+        n_events = int(labels.numel())
+        if n_events < 2:
+            return None, {}
+
+        same = labels.view(-1, 1).eq(labels.view(1, -1))
+        eye = torch.eye(n_events, dtype=torch.bool, device=labels.device)
+        positive_mask = same & ~eye
+        anchor_mask = positive_mask.any(dim=1)
+        if not bool(anchor_mask.any()):
+            return None, {
+                "compound_identity_anchor_count": 0.0,
+                "compound_identity_pair_count": 0.0,
+            }
+
+        temperature = max(self.compound_identity_temperature, 1e-6)
+        logits = z @ z.t() / temperature
+        logits = logits.masked_fill(eye, torch.finfo(logits.dtype).min)
+        log_prob = logits - torch.logsumexp(logits, dim=1, keepdim=True)
+        positive_log_prob = (log_prob * positive_mask.float()).sum(dim=1)
+        positive_count = positive_mask.sum(dim=1).clamp_min(1)
+        loss = -(positive_log_prob / positive_count)[anchor_mask].mean()
+
+        with torch.no_grad():
+            nearest = (z @ z.t()).masked_fill(eye, -2.0).argmax(dim=1)
+            nearest_acc = (labels[nearest] == labels).float().mean()
+
+        return loss, {
+            "compound_identity_loss": float(loss.detach().cpu()),
+            "compound_identity_nearest_acc": float(nearest_acc.detach().cpu()),
+            "compound_identity_anchor_count": float(anchor_mask.sum().detach().cpu()),
+            "compound_identity_pair_count": float(positive_mask.sum().detach().cpu()),
+        }
+
+    def _compound_identity_labels_from_structure(
+        self,
+        *,
+        structure: FragmentTreeStructure,
+        event_row_id: Tensor,
+        event_edge_id: Tensor,
+    ) -> Tensor:
+        labels = torch.full(
+            (event_row_id.size(0),),
+            IGNORE_INDEX,
+            dtype=torch.long,
+            device=event_row_id.device,
+        )
+        identity_id_by_key: Dict[str, int] = {}
+
+        for row_pos in range(int(event_row_id.numel())):
+            event_idx = int(event_row_id[row_pos].item())
+            edge_idx = int(event_edge_id[row_pos].item())
+            dst_node = int(structure.edge_index[1, edge_idx].item())
+            event = structure.cleavage_event[event_idx]
+            pattern_id = int(event[0].item())
+            reaction_id = int(event[1].item())
+            product_molecule_id = int(event[2].item())
+            product_atoms = self._event_atom_tuple(
+                structure,
+                tuple_length=self._lookup_product_tuple_length(
+                    structure,
+                    pattern_id,
+                    reaction_id,
+                    product_molecule_id,
+                ),
+                row_index=int(event[4].item()),
+            )
+            key = canonical_fragment_smiles(
+                smiles=str(structure.node_smiles[dst_node]),
+                atom_indices=tuple(int(i) for i in product_atoms.detach().cpu().tolist()),
+            )
+            if key is None:
+                continue
+            if key not in identity_id_by_key:
+                identity_id_by_key[key] = len(identity_id_by_key)
+            labels[row_pos] = identity_id_by_key[key]
+
+        return labels
 
     def _atom_location_loss_and_metrics(
         self,
@@ -300,3 +419,29 @@ class CleavagePretrainingModel(nn.Module):
                 f"pattern={pattern_id}, reaction={reaction_id}, product_molecule={product_molecule_id}."
             )
         return int(table[mask][0, 3].item())
+
+
+def canonical_fragment_smiles(smiles: str, atom_indices: Tuple[int, ...]) -> Optional[str]:
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        return None
+    mol = Chem.Mol(mol)
+    for atom in mol.GetAtoms():
+        atom.SetAtomMapNum(0)
+
+    atoms = tuple(sorted({int(i) for i in atom_indices if int(i) >= 0}))
+    if not atoms or atoms[-1] >= mol.GetNumAtoms():
+        return None
+    atom_set = set(atoms)
+    bonds = [
+        bond.GetIdx()
+        for bond in mol.GetBonds()
+        if bond.GetBeginAtomIdx() in atom_set and bond.GetEndAtomIdx() in atom_set
+    ]
+    return Chem.MolFragmentToSmiles(
+        mol,
+        atomsToUse=list(atoms),
+        bondsToUse=bonds,
+        canonical=True,
+        isomericSmiles=True,
+    )
