@@ -19,17 +19,7 @@
     },
     "cleavage_edge_fnet_params": {
       "feature_dim": 64,
-      "fc_dims": [128, 256, 128],
-      "aggregation_model_params": {
-        "name": "set_transformer",
-        "hidden_dim": 128,
-        "num_layers": 2,
-        "num_heads": 16,
-        "block_type": "sab",
-        "num_inducing_points": 16,
-        "num_seeds": 1,
-        "ffn_mult": 2
-      }
+      "fc_dims": [128, 256, 128]
     },
     "tree_encoder_params": {
       "dim": 128,

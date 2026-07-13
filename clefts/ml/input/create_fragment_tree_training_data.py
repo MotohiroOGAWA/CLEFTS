@@ -12,6 +12,7 @@ import pandas as pd
 from tqdm import tqdm
 
 from clefts.domain.fragment.cleavage import CleavagePatternSet
+from clefts.ml.input.cleavage_pattern_statistics import write_cleavage_pattern_statistics
 from clefts.libs.mmkit.mmkit import Compound
 from clefts.libs.msentity.msentity import MSDataset
 from clefts.utils.parallel_subprocess import run_parallel_subprocesses
@@ -837,6 +838,24 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
         output_file=model_config_output,
         overwrite=bool(args.overwrite_model_config),
     )
+
+    pattern_set = generator.feature_model.fragmenter.cleavage_pattern_set
+    if not train_uses_structures:
+        write_cleavage_pattern_statistics(
+            dataset=MSDataset.load(args.train_input),
+            pattern_set=pattern_set,
+            output_dir=output_root,
+            split_name="train",
+            smiles_column=args.smiles_column,
+        )
+    if args.validation_input is not None and not validation_uses_structures:
+        write_cleavage_pattern_statistics(
+            dataset=MSDataset.load(args.validation_input),
+            pattern_set=pattern_set,
+            output_dir=output_root,
+            split_name="validation",
+            smiles_column=args.smiles_column,
+        )
 
     if train_uses_structures or validation_uses_structures:
         if args.num_workers > 1:
