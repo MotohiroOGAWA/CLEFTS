@@ -285,9 +285,23 @@ def build_fragment_tree_structure_files(
                 continue
 
             structure = builder.to_structure()
+            source_record_indexes = [
+                int(dataset.metadata.iloc[index].get("__fragment_tree_original_index", index))
+                for index in record_indexes
+            ]
+            spec_ids = (
+                [
+                    "" if pd.isna(dataset.metadata.iloc[index]["SpecID"])
+                    else str(dataset.metadata.iloc[index]["SpecID"])
+                    for index in record_indexes
+                ]
+                if "SpecID" in dataset.metadata.columns
+                else None
+            )
             metadata = {
                 "smiles": smiles,
                 "record_indexes": [int(index) for index in record_indexes],
+                "source_record_indexes": source_record_indexes,
                 "sample_indexes": [int(index) for index in sample_indexes.tolist()],
                 "num_input_records": int(len(record_indexes)),
                 "num_valid_samples": int(structure.num_samples),
@@ -296,6 +310,8 @@ def build_fragment_tree_structure_files(
                 "max_node": int(max_node),
                 "max_edge": int(max_edge),
             }
+            if spec_ids is not None:
+                metadata["spec_ids"] = spec_ids
             save_fragment_tree_structure(
                 structure=structure,
                 output_file=structure_file,

@@ -12,7 +12,9 @@ import pandas as pd
 from tqdm import tqdm
 
 from clefts.domain.fragment.cleavage import CleavagePatternSet
-from clefts.ml.input.cleavage_pattern_statistics import write_cleavage_pattern_statistics
+from clefts.ml.input.assigned_cleavage_event_statistics import (
+    write_assigned_cleavage_event_statistics,
+)
 from clefts.libs.mmkit.mmkit import Compound
 from clefts.libs.msentity.msentity import MSDataset
 from clefts.utils.parallel_subprocess import run_parallel_subprocesses
@@ -203,6 +205,11 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--assignment-score-output",
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--assigned-cleavage-event-output",
         default=None,
         help=argparse.SUPPRESS,
     )
@@ -487,6 +494,7 @@ def build_structure_files_for_input(
     save_valid: bool = False,
     valid_records_output: str | Path | None = None,
     assignment_score_output: str | Path | None = None,
+    assigned_cleavage_event_output: str | Path | None = None,
 ) -> list[Path]:
     dataset = MSDataset.load(input_path)
     print(f"input: {input_path}")
@@ -524,6 +532,14 @@ def build_structure_files_for_input(
             structure_files=saved_files,
             output_file=assignment_score_output,
             smiles_column=args.smiles_column,
+        )
+
+    if assigned_cleavage_event_output is not None:
+        write_assigned_cleavage_event_statistics(
+            structure_files=saved_files,
+            pattern_set=generator.feature_model.fragmenter.cleavage_pattern_set,
+            output_file=assigned_cleavage_event_output,
+            num_workers=1,
         )
 
     print(f"saved structure files: {len(saved_files)}")
@@ -606,6 +622,96 @@ def merge_tsv_files(input_files: list[Path], output_file: Path) -> None:
     pd.concat(frames, ignore_index=True).to_csv(output_file, sep="\t", index=False)
 
 
+def merge_assigned_cleavage_event_tsv_files(
+    input_files: list[Path],
+    output_file: Path,
+) -> None:
+    frames = [pd.read_csv(path, sep="\t") for path in input_files if path.exists()]
+    key_columns = [
+        "reactant_smarts",
+        "matched_substructure",
+        "pattern_id",
+    ]
+    value_columns = [
+        "assigned_cleavage_event_count",
+        "assigned_pathway_count",
+        "sample_count",
+    ]
+    if frames:
+        merged = pd.concat(frames, ignore_index=True)
+        merged = merged.groupby(key_columns, as_index=False, dropna=False)[value_columns].sum()
+        merged = merged.sort_values(
+            ["assigned_cleavage_event_count", "reactant_smarts", "matched_substructure"],
+            ascending=[False, True, True],
+            kind="stable",
+        )
+    else:
+        merged = pd.DataFrame(columns=[*key_columns, *value_columns])
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    output_columns = [
+        "reactant_smarts",
+        "matched_substructure",
+        "assigned_cleavage_event_count",
+        "assigned_pathway_count",
+        "sample_count",
+        "pattern_id",
+    ]
+    merged.to_csv(output_file, sep="\t", index=False, columns=output_columns)
+
+    sample_input_files = [
+        path.with_name(f"{path.stem}_by_sample{path.suffix}")
+        for path in input_files
+    ]
+    sample_output_file = output_file.with_name(
+        f"{output_file.stem}_by_sample{output_file.suffix}"
+    )
+    merge_tsv_files(sample_input_files, sample_output_file)
+
+    derived_tables = (
+        ("by_pattern", ["pattern_id", "reactant_smarts"]),
+        (
+            "by_pattern_reaction",
+            ["pattern_id", "reaction_id", "reactant_smarts"],
+        ),
+        (
+            "by_pattern_reaction_product",
+            [
+                "pattern_id", "reaction_id", "product_molecule_id",
+                "reactant_smarts",
+            ],
+        ),
+    )
+    for suffix, derived_key_columns in derived_tables:
+        derived_input_files = [
+            path.with_name(f"{path.stem}_{suffix}{path.suffix}")
+            for path in input_files
+        ]
+        derived_frames = [
+            pd.read_csv(path, sep="\t")
+            for path in derived_input_files
+            if path.exists()
+        ]
+        derived_output_file = output_file.with_name(
+            f"{output_file.stem}_{suffix}{output_file.suffix}"
+        )
+        if derived_frames:
+            derived = pd.concat(derived_frames, ignore_index=True)
+            derived = derived.groupby(
+                derived_key_columns, as_index=False, dropna=False
+            )[value_columns].sum()
+            derived = derived.sort_values(
+                ["assigned_cleavage_event_count", *derived_key_columns],
+                ascending=[False, *([True] * len(derived_key_columns))],
+                kind="stable",
+            )
+        else:
+            derived = pd.DataFrame(columns=[*derived_key_columns, *value_columns])
+        derived.to_csv(derived_output_file, sep="\t", index=False)
+
+    print(f"saved merged assigned cleavage events: {output_file}")
+    print(f"saved merged per-sample cleavage events: {sample_output_file}")
+
+
 def merge_msdatasets(input_files: list[Path], output_file: Path, *, empty_like: MSDataset) -> None:
     datasets = [MSDataset.load(str(path)) for path in input_files if path.exists()]
     datasets = [dataset for dataset in datasets if len(dataset) > 0]
@@ -652,6 +758,7 @@ def run_parallel_for_input(
     part_manifests: list[Path] = []
     part_valid_outputs: list[Path] = []
     part_score_outputs: list[Path] = []
+    part_event_outputs: list[Path] = []
     module_name = "clefts.ml.input.create_fragment_tree_training_data"
 
     for chunk_index, record_indexes in enumerate(
@@ -661,6 +768,7 @@ def run_parallel_for_input(
         temp_manifest = temp_root / f"part_{chunk_index:06d}_manifest.tsv"
         temp_valid = temp_root / f"part_{chunk_index:06d}_valid.msds"
         temp_score = temp_root / f"part_{chunk_index:06d}_assignment_scores.tsv"
+        temp_events = temp_root / f"part_{chunk_index:06d}_assigned_cleavage_events.tsv"
         chunk_dataset = dataset[record_indexes].copy()
         chunk_dataset[ORIGINAL_INDEX_COLUMN] = list(record_indexes)
         chunk_dataset.save(str(temp_input))
@@ -695,8 +803,11 @@ def run_parallel_for_input(
             "1",
             "--assignment-score-output",
             str(temp_score),
+            "--assigned-cleavage-event-output",
+            str(temp_events),
         ]
         part_score_outputs.append(temp_score)
+        part_event_outputs.append(temp_events)
         if args.instrument_column is not None:
             command.extend(["--instrument-column", str(args.instrument_column)])
         if save_valid:
@@ -720,6 +831,16 @@ def run_parallel_for_input(
     merge_tsv_files(part_manifests, manifest_file)
     merge_tsv_files(part_score_outputs, assignment_score_output)
     print(f"saved merged assignment scores: {assignment_score_output}")
+    statistics_dir = Path(args.output_dir) / "statistics"
+    for legacy_name in (
+        f"{split_name}_summary.json",
+        f"{split_name}_cleavage_pattern_coverage.tsv",
+        f"{split_name}_cleavage_pattern_by_class.tsv",
+        f"{split_name}_matched_pattern_count_distribution.tsv",
+    ):
+        (statistics_dir / legacy_name).unlink(missing_ok=True)
+    event_output = statistics_dir / f"{split_name}_assigned_cleavage_events.tsv"
+    merge_assigned_cleavage_event_tsv_files(part_event_outputs, event_output)
     if save_valid:
         if valid_records_output is None:
             raise ValueError("valid_records_output is required when save_valid=True.")
@@ -740,6 +861,35 @@ def default_valid_output(structure_dir: Path) -> Path:
 
 def default_assignment_score_output(structure_dir: Path) -> Path:
     return structure_dir / "assignment_scores.tsv"
+
+
+def write_split_cleavage_event_statistics(
+    *,
+    structure_data_directory: Path,
+    output_root: Path,
+    split_name: str,
+    pattern_set: CleavagePatternSet,
+    num_workers: int,
+) -> None:
+    statistics_dir = output_root / "statistics"
+    for legacy_name in (
+        f"{split_name}_summary.json",
+        f"{split_name}_cleavage_pattern_coverage.tsv",
+        f"{split_name}_cleavage_pattern_by_class.tsv",
+        f"{split_name}_matched_pattern_count_distribution.tsv",
+    ):
+        (statistics_dir / legacy_name).unlink(missing_ok=True)
+
+    write_assigned_cleavage_event_statistics(
+        structure_files=sorted(structure_data_directory.glob("*.pt")),
+        pattern_set=pattern_set,
+        output_file=(
+            output_root
+            / "statistics"
+            / f"{split_name}_assigned_cleavage_events.tsv"
+        ),
+        num_workers=num_workers,
+    )
 
 
 def parallel_temp_dir(args: argparse.Namespace, output_root: Path, split_name: str) -> Path:
@@ -785,6 +935,7 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
             save_valid=args.save_valid_records,
             valid_records_output=args.valid_records_output,
             assignment_score_output=args.assignment_score_output,
+            assigned_cleavage_event_output=args.assigned_cleavage_event_output,
         )
         return
 
@@ -840,22 +991,6 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
     )
 
     pattern_set = generator.feature_model.fragmenter.cleavage_pattern_set
-    if not train_uses_structures:
-        write_cleavage_pattern_statistics(
-            dataset=MSDataset.load(args.train_input),
-            pattern_set=pattern_set,
-            output_dir=output_root,
-            split_name="train",
-            smiles_column=args.smiles_column,
-        )
-    if args.validation_input is not None and not validation_uses_structures:
-        write_cleavage_pattern_statistics(
-            dataset=MSDataset.load(args.validation_input),
-            pattern_set=pattern_set,
-            output_dir=output_root,
-            split_name="validation",
-            smiles_column=args.smiles_column,
-        )
 
     if train_uses_structures or validation_uses_structures:
         if args.num_workers > 1:
@@ -901,6 +1036,21 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
                 save_valid=bool(args.save_validation_valid_records),
                 valid_records_output=validation_valid_output,
                 assignment_score_output=validation_assignment_score_output,
+            )
+        write_split_cleavage_event_statistics(
+            structure_data_directory=train_structure_data_dir,
+            output_root=output_root,
+            split_name="train",
+            pattern_set=pattern_set,
+            num_workers=max(1, int(args.num_workers)),
+        )
+        if args.validation_input is not None or validation_uses_structures:
+            write_split_cleavage_event_statistics(
+                structure_data_directory=validation_structure_data_dir,
+                output_root=output_root,
+                split_name="validation",
+                pattern_set=pattern_set,
+                num_workers=max(1, int(args.num_workers)),
             )
         return
 
@@ -949,6 +1099,23 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
             save_valid=bool(args.save_validation_valid_records),
             valid_records_output=validation_valid_output,
             assignment_score_output=validation_assignment_score_output,
+        )
+
+
+    write_split_cleavage_event_statistics(
+        structure_data_directory=train_structure_data_dir,
+        output_root=output_root,
+        split_name="train",
+        pattern_set=pattern_set,
+        num_workers=max(1, int(args.num_workers)),
+    )
+    if args.validation_input is not None:
+        write_split_cleavage_event_statistics(
+            structure_data_directory=validation_structure_data_dir,
+            output_root=output_root,
+            split_name="validation",
+            pattern_set=pattern_set,
+            num_workers=max(1, int(args.num_workers)),
         )
 
 

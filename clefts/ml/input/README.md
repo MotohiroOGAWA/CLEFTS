@@ -47,7 +47,7 @@ python -m clefts.ml.input.create_fragment_tree_training_data \
 - `all-fragments`: rebuild when an added pattern matches any saved fragment. This is the default.
 - `always`: always rebuild the structure.
 
-SMARTS coverage statistics cannot be generated when only an existing structure directory is supplied because the original `MSDataset` metadata is unavailable.
+Assigned cleavage-event statistics are also generated when existing structures are used as input, based on the target assignments saved in the rebuilt or copied structures.
 
 ## Main output files
 
@@ -55,10 +55,11 @@ SMARTS coverage statistics cannot be generated when only an existing structure d
 OUTPUT_DIR/
 ├── config/model_config.json
 ├── statistics/
-│   ├── train_summary.json
-│   ├── train_cleavage_pattern_coverage.tsv
-│   ├── train_cleavage_pattern_by_class.tsv
-│   └── train_matched_pattern_count_distribution.tsv
+│   ├── train_assigned_cleavage_events.tsv
+│   ├── train_assigned_cleavage_events_by_sample.tsv
+│   ├── train_assigned_cleavage_events_by_pattern.tsv
+│   ├── train_assigned_cleavage_events_by_pattern_reaction.tsv
+│   └── train_assigned_cleavage_events_by_pattern_reaction_product.tsv
 ├── train_structures/
 │   ├── data/*.pt
 │   ├── manifest.tsv
@@ -68,22 +69,41 @@ OUTPUT_DIR/
 
 When `--validation-input` is supplied, the corresponding `statistics/validation_*` files are also generated.
 
-## SMARTS statistics
+With `--num-workers 2` or greater, each worker writes
+`part_*_assigned_cleavage_events.tsv` and
+`part_*_assigned_cleavage_events_by_sample.tsv` under the split's parallel
+temporary directory immediately after building its chunk. The parent process
+only sums the chunk aggregates and concatenates the per-sample rows. It does
+not rescan every final `.pt` file after all structure workers finish. The part
+files are removed with the other parallel temporary files unless
+`--keep-parallel-temp` is specified.
 
-A compound is counted by its unique, non-empty SMILES rather than by its number of spectra. If one compound has spectra at several collision energies, it is still counted only once.
+## Assigned cleavage-event statistics
 
-- `*_cleavage_pattern_coverage.tsv`: One row per cleavage pattern, sorted by `matched_compound_count` in descending order. This makes common pattern types such as C-C or S-C easy to inspect. `compound_coverage` is a fraction from 0 to 1, and `substructure_match_count` is the total number of matching substructure positions across all compounds. Patterns with no matches are included.
-- `*_cleavage_pattern_by_class.tsv`: Match counts and coverage grouped by `Kingdom`, `Superclass`, `Class`, `Subclass`, and `DirectParent`. Only classification columns available in the input are used. Zero-match combinations are included, making it possible to check whether a specialized SMARTS, such as a flavonoid pattern, has high coverage only in the expected class.
-- `*_matched_pattern_count_distribution.tsv`: Distribution of the number of distinct reactant SMARTS types matched by each compound. Compounds matching zero types are included.
-- `*_summary.json`: Input record count, unique SMILES count, valid compound count, invalid SMILES count, cleavage pattern count, and the classification columns used.
+These statistics count cleavage events in `FragmentPathway` objects that were actually assigned to observed spectrum peaks. They do not count every SMARTS match in the root compound or every event available in the shared fragment-tree structure.
 
-Coverage is calculated as:
+A structure can contain many spectrum samples for the same SMILES. Each target assignment is traced separately through:
 
 ```text
-compound_coverage = matched_compound_count / total_compound_count
+sample -> observed peak -> assigned FragmentPathway -> pathway edges -> cleavage events
 ```
 
-Matching uses each cleavage pattern's `reactant_query`. It does not depend on successful product generation or on the fragment tree `--max-node` and `--max-edge` limits.
+This ensures that samples sharing one structure are counted separately. If the same pathway is assigned in multiple samples, its events contribute once for each assignment in each sample. Shared pathway prefixes are therefore counted according to their actual use by assigned pathways.
+
+- `*_assigned_cleavage_events.tsv`: Aggregate counts sorted by `assigned_cleavage_event_count` in descending order. `reactant_smarts` identifies the cleavage pattern, while `matched_substructure` describes the actual matched atoms, such as `C-C`, `C-N`, or `C-O`. `assigned_pathway_count` is the number of assigned pathways containing that type, and `sample_count` is the number of distinct samples in which it occurs.
+- `*_assigned_cleavage_events_by_sample.tsv`: Per-sample detail used to produce the aggregate table. It includes the source record index, `SpecID` when the input dataset provides it, structure filename, structure-local sample index, SMARTS, matched substructure, and event count.
+- `*_assigned_cleavage_events_by_pattern.tsv`: Counts grouped by `pattern_id`.
+- `*_assigned_cleavage_events_by_pattern_reaction.tsv`: Counts grouped by `(pattern_id, reaction_id)`.
+- `*_assigned_cleavage_events_by_pattern_reaction_product.tsv`: Counts grouped by `(pattern_id, reaction_id, product_molecule_id)`.
+
+For example:
+
+```text
+reactant_smarts       matched_substructure  assigned_cleavage_event_count
+[!#1:1]-[!#1:2]      C-O                   1000
+```
+
+The compact label uses the actual atom and bond types at the matched reactant atom indexes. Single, double, triple, and aromatic bonds are represented by `-`, `=`, `#`, and `:`, respectively.
 
 ## Common options
 
