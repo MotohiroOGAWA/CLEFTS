@@ -18,6 +18,11 @@ from .pretraining_model import (
     atom_neighborhood_indices,
     canonical_fragment_smiles,
 )
+from .preprocessing import (
+    BalancedCleavageBatchSampler,
+    load_or_build_preprocessing_cache,
+    write_preprocessing_reports,
+)
 
 
 DEFAULT_GRAD_CLIP_NORM = 1.0
@@ -65,7 +70,10 @@ def checkpoint_payload(
     return payload
 
 def move_structure_batch(batch: Dict[str, object], device: torch.device):
-    return batch["structure"].to(device)
+    return (
+        batch["structure"].to(device),
+        batch["selected_cleavage_event_rows"].to(device),
+    )
 
 
 def structure_target_counts(loader, *, surrounding_radius: int) -> Dict[str, object]:
@@ -74,7 +82,6 @@ def structure_target_counts(loader, *, surrounding_radius: int) -> Dict[str, obj
     product = Counter()
     joint = Counter()
     reactant_structure = Counter()
-    atom_location = Counter()
     surrounding_structure = Counter()
     structure_count = event_count = edge_count = 0
     all_stage_event_count = all_stage_edge_count = 0
@@ -98,7 +105,6 @@ def structure_target_counts(loader, *, surrounding_radius: int) -> Dict[str, obj
             product[product_id] += 1
             joint[(pattern_id, reaction_id, product_id)] += 1
             src_node = int(structure.edge_index[0, edge_idx].item())
-            dst_node = int(structure.edge_index[1, edge_idx].item())
 
             reactant_table = structure.reactant_tuple_length_table.long()
             reactant_mask = (
@@ -119,52 +125,15 @@ def structure_target_counts(loader, *, surrounding_radius: int) -> Dict[str, obj
             if structure_key is not None:
                 reactant_structure[structure_key] += 1
 
-            product_table = structure.product_tuple_length_table.long()
-            product_mask = (
-                (product_table[:, 0] == pattern_id)
-                & (product_table[:, 1] == reaction_id)
-                & (product_table[:, 2] == product_id)
-            )
-            if bool(product_mask.any()):
-                product_length = int(product_table[product_mask][0, 3].item())
-                product_atoms = structure.cleavage_atom_idxs[product_length][
-                    int(event[4])
-                ].long()
-                for node_idx, matched_atoms in (
-                    (src_node, reactant_atoms),
-                    (dst_node, product_atoms),
-                ):
-                    node_size = int(
-                        structure.node_graph_offset[node_idx + 1].item()
-                        - structure.node_graph_offset[node_idx].item()
-                    )
-                    positive = len(
-                        {
-                            int(value)
-                            for value in matched_atoms.tolist()
-                            if 0 <= int(value) < node_size
-                        }
-                    )
-                    atom_location["positive"] += positive
-                    atom_location["negative"] += max(node_size - positive, 0)
-
-            src_size = int(
-                structure.node_graph_offset[src_node + 1].item()
-                - structure.node_graph_offset[src_node].item()
-            )
             src_smiles = str(structure.node_smiles[src_node])
-            for center in reactant_atoms.tolist():
-                neighborhood = atom_neighborhood_indices(
-                    src_smiles,
-                    center_atom=int(center),
-                    radius=surrounding_radius,
+            neighborhoods = [
+                atom_neighborhood_indices(
+                    src_smiles, center_atom=int(center), radius=surrounding_radius
                 )
-                if neighborhood is None:
-                    continue
-                surrounding_structure["positive"] += len(neighborhood)
-                surrounding_structure["negative"] += max(
-                    src_size - len(neighborhood), 0
-                )
+                for center in reactant_atoms.tolist()
+            ]
+            if any(value is not None for value in neighborhoods):
+                surrounding_structure["local_graph"] += 1
     return {
         "structure_count": structure_count,
         "edge_count": edge_count,
@@ -179,7 +148,6 @@ def structure_target_counts(loader, *, surrounding_radius: int) -> Dict[str, obj
             "/".join(map(str, key)): value for key, value in sorted(joint.items())
         },
         "reactant_structure": dict(sorted(reactant_structure.items())),
-        "atom_location": dict(sorted(atom_location.items())),
         "surrounding_structure": dict(sorted(surrounding_structure.items())),
         "surrounding_structure_radius": int(surrounding_radius),
     }
@@ -217,7 +185,6 @@ def write_target_report(
                 "product_molecule",
                 "pattern_reaction_product",
                 "reactant_structure",
-                "atom_location",
                 "surrounding_structure",
             ):
                 for class_id, count in split_report[target].items():
@@ -267,7 +234,7 @@ def mean_metrics(rows: Iterable[Dict[str, float]]) -> Dict[str, float]:
 def tensorboard_tag(name: str) -> str:
     if name == "loss":
         return "loss"
-    for prefix in ("observed_edge", "pattern", "reaction", "product_molecule", "reactant_structure", "atom_location", "surrounding_structure"):
+    for prefix in ("pattern", "reaction", "product_molecule", "reactant_structure", "surrounding_structure"):
         if name.startswith(prefix + "_"):
             metric = name.rsplit("_", 1)[-1]
             if metric in {"loss", "acc", "count"}:
@@ -286,7 +253,7 @@ def tensorboard_series(name: str) -> str:
     for suffix in ("_loss", "_acc", "_count"):
         if name.endswith(suffix):
             rest = name[: -len(suffix)]
-            for prefix in ("observed_edge", "pattern", "reaction", "product_molecule", "reactant_structure", "atom_location", "surrounding_structure"):
+            for prefix in ("pattern", "reaction", "product_molecule", "reactant_structure", "surrounding_structure"):
                 if rest == prefix:
                     return "total"
                 if rest.startswith(prefix + "_"):
@@ -315,8 +282,10 @@ def run_epoch(model: CleavagePretrainingModel, loader, *, device: torch.device, 
     context = torch.enable_grad() if is_train else torch.no_grad()
     with context:
         for batch in tqdm(loader, desc="train" if is_train else "val", mininterval=1.0):
-            structure = move_structure_batch(batch, device)
-            output = model(structure)
+            structure, selected_event_rows = move_structure_batch(batch, device)
+            output = model(
+                structure, selected_event_rows=selected_event_rows
+            )
             if is_train:
                 optimizer.zero_grad(set_to_none=True)
                 output.loss.backward()
@@ -341,6 +310,11 @@ def train(
     early_stopping_patience: Optional[int] = None,
     early_stopping_window_size: int = 1,
     early_stopping_min_delta: float = DEFAULT_MIN_DELTA,
+    preprocessing_cache: Optional[str | Path] = None,
+    rebuild_preprocessing_cache: bool = False,
+    min_data_count: int = 1000,
+    mask_balance_patience: int = 20,
+    mask_balance_max_forced_per_batch: int = 8,
 ) -> Dict[str, object]:
     device = torch.device(device)
     model.to(device)
@@ -351,8 +325,50 @@ def train(
     writer = SummaryWriter(log_dir=str(tb_dir))
     (output_path / "tensorboard_command.txt").write_text(f"tensorboard --logdir {tb_dir} --port 6006 --host 0.0.0.0\n")
 
-    train_loader = make_cleavage_structure_dataloader(train_dir, batch_size=batch_size, shuffle=True, num_workers=num_workers)
-    val_loader = make_cleavage_structure_dataloader(val_dir, batch_size=batch_size, shuffle=False, num_workers=num_workers)
+    cache_path = (
+        Path(preprocessing_cache)
+        if preprocessing_cache not in {None, ""}
+        else output_path / "main_preprocessing_cache.pt"
+    )
+    preprocessing_payload, preprocessing_summary = load_or_build_preprocessing_cache(
+        train_dir=train_dir,
+        val_dir=val_dir,
+        cache_path=cache_path,
+        rebuild=rebuild_preprocessing_cache,
+        surrounding_radius=model.surrounding_structure_radius,
+    )
+    write_preprocessing_reports(preprocessing_payload, output_path)
+
+    train_probe = make_cleavage_structure_dataloader(
+        train_dir, batch_size=batch_size, shuffle=False, num_workers=num_workers
+    )
+    val_probe = make_cleavage_structure_dataloader(
+        val_dir, batch_size=batch_size, shuffle=False, num_workers=num_workers
+    )
+    train_sampler = BalancedCleavageBatchSampler(
+        dataset_size=len(train_probe.dataset),
+        batch_size=batch_size,
+        index=preprocessing_payload["train"],
+        min_data_count=min_data_count,
+        patience=mask_balance_patience,
+        max_forced_per_batch=mask_balance_max_forced_per_batch,
+        shuffle=True,
+    )
+    val_sampler = BalancedCleavageBatchSampler(
+        dataset_size=len(val_probe.dataset),
+        batch_size=batch_size,
+        index=preprocessing_payload["val"],
+        min_data_count=min_data_count,
+        patience=mask_balance_patience,
+        max_forced_per_batch=mask_balance_max_forced_per_batch,
+        shuffle=False,
+    )
+    train_loader = make_cleavage_structure_dataloader(
+        train_dir, num_workers=num_workers, batch_sampler=train_sampler
+    )
+    val_loader = make_cleavage_structure_dataloader(
+        val_dir, num_workers=num_workers, batch_sampler=val_sampler
+    )
     target_report = write_target_report(
         output_path,
         train_loader=train_loader,
@@ -481,6 +497,13 @@ def train(
         "final_train_metrics": final_train_metrics,
         "final_val_metrics": final_val_metrics,
         "target_report": target_report,
+        "preprocessing_cache": preprocessing_summary,
+        "balanced_sampling": {
+            "min_data_count": int(min_data_count),
+            "patience": int(mask_balance_patience),
+            "max_forced_per_batch": int(mask_balance_max_forced_per_batch),
+            "reactant_pos_neg_forced": True,
+        },
     }
     final_ckpt = checkpoint_payload(
         model,

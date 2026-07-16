@@ -10,6 +10,9 @@ from clefts.ml.training.cleavage_training.pretraining_model import (
     atom_neighborhood_indices,
     canonical_fragment_smiles,
 )
+from clefts.ml.training.cleavage_training.preprocessing import (
+    BalancedCleavageBatchSampler,
+)
 
 
 class TestCanonicalFragmentSmiles(unittest.TestCase):
@@ -67,6 +70,46 @@ class TestFirstStageEdgeMask(unittest.TestCase):
             first_stage_edge_mask(structure).tolist(),
             [True, False, True, False],
         )
+
+
+class TestBalancedCleavageBatchSampler(unittest.TestCase):
+    def test_every_batch_contains_positive_and_negative_reactant_identities(self) -> None:
+        index = {
+            "counts": {
+                "pattern:0": 2,
+                "reactant_structure:A": 1,
+                "reactant_structure:B": 1,
+            },
+            "files_by_target": {
+                "pattern:0": [0, 1],
+                "reactant_structure:A": [0],
+                "reactant_structure:B": [1],
+            },
+            "events_by_target": {
+                "pattern:0": [(0, 0), (1, 0)],
+                "reactant_structure:A": [(0, 0)],
+                "reactant_structure:B": [(1, 0)],
+            },
+            "identity_files": {"A": [0], "B": [1]},
+            "identity_events": {"A": [(0, 0)], "B": [(1, 0)]},
+        }
+        sampler = BalancedCleavageBatchSampler(
+            dataset_size=2,
+            batch_size=1,
+            index=index,
+            min_data_count=1000,
+            patience=20,
+            max_forced_per_batch=8,
+            shuffle=False,
+        )
+        identity_by_file = {0: "A", 1: "B"}
+        for batch in sampler:
+            identities = [
+                identity_by_file[index[0] if isinstance(index, tuple) else index]
+                for index in batch
+            ]
+            self.assertLess(len(set(identities)), len(identities))
+            self.assertGreaterEqual(len(set(identities)), 2)
 
 
 if __name__ == "__main__":

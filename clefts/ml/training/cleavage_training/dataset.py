@@ -7,14 +7,56 @@ from typing import Dict, Optional, Sequence
 import torch
 from torch import Tensor
 from torch.utils.data import DataLoader
+from torch.utils.data import Sampler
 
 from ...input.fragment_tree_structure import FragmentTreeStructure
 from ...input.fragment_tree_training_data import (
     FragmentTreeStructureFileDataset,
+    FragmentTreeStructureFileItem,
     collate_fragment_tree_structure_items,
 )
 
 IGNORE_INDEX = -100
+
+
+class SelectableCleavageStructureDataset(FragmentTreeStructureFileDataset):
+    """Accept either a file index or ``(file index, local event index)``."""
+
+    def __getitem__(
+        self, index: int | tuple[int, int]
+    ) -> FragmentTreeStructureFileItem:
+        selected_event = None
+        if isinstance(index, tuple):
+            index, selected_event = map(int, index)
+        item = super().__getitem__(int(index))
+        metadata = dict(item.metadata)
+        metadata["_selected_cleavage_event"] = selected_event
+        return FragmentTreeStructureFileItem(
+            path=item.path,
+            structure=item.structure,
+            metadata=metadata,
+        )
+
+
+def collate_selectable_cleavage_items(
+    items: Sequence[FragmentTreeStructureFileItem],
+) -> Dict[str, object]:
+    batch = collate_fragment_tree_structure_items(items)
+    selected_rows = []
+    event_offset = 0
+    for item in items:
+        selected = item.metadata.get("_selected_cleavage_event")
+        if selected is None:
+            selected_rows.extend(
+                range(event_offset, event_offset + int(item.structure.num_cleavage_events))
+            )
+        elif 0 <= int(selected) < int(item.structure.num_cleavage_events):
+            selected_rows.append(event_offset + int(selected))
+        event_offset += int(item.structure.num_cleavage_events)
+    batch["selected_cleavage_event_rows"] = torch.tensor(
+        selected_rows, dtype=torch.long
+    )
+    return batch
 
 
 @dataclass(frozen=True)
@@ -117,21 +159,23 @@ def make_cleavage_structure_dataloader(
     pattern: str = "*.pt",
     map_location: str | torch.device = "cpu",
     device: Optional[str | torch.device] = None,
+    batch_sampler: Optional[Sampler[Sequence[int]]] = None,
 ) -> DataLoader:
     data_dir = resolve_structure_data_dir(root_dir)
-    dataset = FragmentTreeStructureFileDataset(
+    dataset = SelectableCleavageStructureDataset(
         data_dir,
         pattern=pattern,
         map_location=map_location,
         device=device,
     )
-    return DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        num_workers=num_workers,
-        collate_fn=collate_fragment_tree_structure_items,
-    )
+    kwargs = {
+        "dataset": dataset,
+        "num_workers": num_workers,
+        "collate_fn": collate_selectable_cleavage_items,
+    }
+    if batch_sampler is not None:
+        return DataLoader(batch_sampler=batch_sampler, **kwargs)
+    return DataLoader(batch_size=batch_size, shuffle=shuffle, **kwargs)
 
 
 def resolve_structure_data_dir(root_dir: str | Path) -> Path:

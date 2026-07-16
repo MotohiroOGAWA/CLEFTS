@@ -36,13 +36,13 @@ FragmentTreeStructure.node_graph
 
 The heads predict:
 
-- observed traversal edge: whether the event's edge is used by assigned training pathways
 - cleavage pattern id per event
 - reaction id per event
 - product molecule id per event
 - reactant SMARTS match identity: every pair of matched reactant substructures is classified as the same (1) or different (0). The matched atoms and their internal bonds are canonicalized after clearing atom-map numbers, so broad SMARTS patterns still learn concrete differences such as C-C versus C-O.
-- reactant/product atom location masks per event inside source and target fragment molecules
-- surrounding structure masks: for every reactant SMARTS-matched atom, predict the atoms attached within a configurable bond radius (`--surrounding-structure-radius`, default 2).
+- surrounding local graph labels: from the cleavage feature and an unlabeled graph skeleton containing the reactant SMARTS atoms plus a configurable bond radius, predict every atom and bond label. Rooted positional features identify each reactant SMARTS slot and its graph distance without exposing source atom labels.
+
+`observed_event_edge` and `atom_location` are intentionally not trained.
 
 Source/target ECFP is intentionally not included here because the fragment-tree nodes already carry molecule-level information from the frozen pretrained MolEncoder.
 
@@ -66,7 +66,6 @@ Metrics are written to `<output-dir>/tensorboard`.
 
 Examples:
 
-- `observed_edge_acc/edge`
 - `pattern_acc/pattern`
 - `reaction_acc/reaction`
 - `product_molecule_acc/product_molecule`
@@ -74,18 +73,53 @@ Examples:
 - `reactant_structure_acc/reactant_structure`
 - `surrounding_structure_loss/surrounding_structure`
 - `surrounding_structure_acc/surrounding_structure`
-- `atom_location_acc/atom_location`
+
+Surrounding-structure evaluation also reports each reconstructed label group
+separately:
+
+- atom: `symbol`, `charge`, `ring_type`, `hybridization`,
+  `num_hydrogens`, and `valence_electrons`
+- bond: `bond_type` and `ring_type`
+
+For example, TensorBoard contains `train/atom_symbol`,
+`val/atom_symbol`, `train/bond_type`, and `val/bond_type` series under
+the surrounding-structure accuracy/count charts.
 
 ID classification metrics are also grouped by class, for example
 `pattern_acc/pattern_by_class`, `reaction_acc/reaction_by_class`, and
-`product_molecule_acc/product_molecule_by_class`. Binary mask tasks expose
-separate positive and negative series so that a high accuracy caused only by
-the majority class is visible.
+`product_molecule_acc/product_molecule_by_class`. Reactant-structure batches
+are expanded from the preprocessing index so positive and negative pairs are
+both present whenever the split contains at least two identities. The loss
+uses the same number of positive and negative pairs, preventing the quadratic
+number of pair combinations from letting either side dominate the gradient.
+Validation selects this balanced subset deterministically.
+
+## Preprocessing cache and balanced sampling
+
+Before training, every first-stage event is indexed by source file, edge,
+event row, ID targets, and canonical reactant identity. The reusable cache
+defaults to `<output-dir>/main_preprocessing_cache.pt`. If it exists and its
+input-file manifest matches, it is loaded without rescanning. `--overwrite`
+keeps this cache and removes only the other generated training outputs.
+Human-readable copies are written as
+`preprocessing_event_index.csv` and `preprocessing_summary.json`.
+
+- `--preprocessing-cache`: explicit cache path
+- `--rebuild-preprocessing-cache`: force a rescan
+- `--min-data-count`: targets whose total event count is at or below this value are treated as rare. For example, `1000` makes every target represented by at most 1000 cached events eligible for forced coverage.
+- `--mask-balance-patience`: number of consecutive batches in which a rare target may be absent. Once this reaches the configured value, one matching cached cleavage event is forced into the next batch. The default is 20.
+- `--mask-balance-max-forced-per-batch`: upper bound on the number of rare cleavage events added to one batch by the preceding rule. The default is 8; it prevents balancing from expanding a batch without limit.
+
+Forced entries are event-level, not file-level. The cache locates the source
+file, edge, and cleavage-event row, but only the selected cleavage event
+contributes to the next forward pass and loss. Other events in that file are
+not trained during that forced entry. Ordinary shuffled dataset entries still
+train all first-stage events in their file.
 
 ## Training reports
 
-Training uses the existing `.pt` structure files directly; no balanced-data
-preprocessing is required. The output directory contains:
+Training uses the existing `.pt` structure files through the cached event
+index. The output directory contains:
 
 - `target_class_report.json` and `target_class_report.csv`: train/validation
   counts for every pattern, reaction, product molecule, and joint ID
@@ -95,6 +129,8 @@ preprocessing is required. The output directory contains:
   metrics, and the target distribution report
 - `best.pt` and `last.pt`: best-validation and final checkpoints
 - `tensorboard_command.txt`: command for opening the generated TensorBoard log
+- `preprocessing_event_index.csv`: file/edge/event-to-target mapping
+- `preprocessing_summary.json`: cached target totals
 
 Optional early stopping follows the `mol_training` workflow and can be enabled
 with `--early-stopping-patience`.

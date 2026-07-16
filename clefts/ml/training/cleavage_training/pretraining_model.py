@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
@@ -12,12 +11,12 @@ from torch import Tensor
 
 from ...input.fragment_tree_features import FragmentTreeFeatures
 from ...input.fragment_tree_structure import FragmentTreeStructure
+from ...mol.atom_feature import AtomFeatureLayer
+from ...mol.bond_feature import BondFeatureLayer
 from ...mol.mol_encoder import MolEncoder
 from ...specgen.components.cleavage.cleavage_edge_feature_net import CleavageEdgeFeatureNet
 from .dataset import (
     IGNORE_INDEX,
-    CleavageEdgeTargets,
-    build_cleavage_edge_targets,
     first_stage_edge_mask,
 )
 
@@ -47,12 +46,10 @@ class CleavagePretrainingModel(nn.Module):
         num_reactions: int,
         num_product_molecules: int,
         hidden_dim: int = 256,
-        observed_edge_loss_weight: float = 1.0,
         pattern_loss_weight: float = 1.0,
         reaction_loss_weight: float = 1.0,
         product_loss_weight: float = 1.0,
         reactant_structure_loss_weight: float = 1.0,
-        atom_location_loss_weight: float = 1.0,
         surrounding_structure_loss_weight: float = 1.0,
         surrounding_structure_radius: int = 2,
         dropout: float = 0.1,
@@ -63,12 +60,10 @@ class CleavagePretrainingModel(nn.Module):
         self.num_patterns = int(num_patterns)
         self.num_reactions = int(num_reactions)
         self.num_product_molecules = int(num_product_molecules)
-        self.observed_edge_loss_weight = float(observed_edge_loss_weight)
         self.pattern_loss_weight = float(pattern_loss_weight)
         self.reaction_loss_weight = float(reaction_loss_weight)
         self.product_loss_weight = float(product_loss_weight)
         self.reactant_structure_loss_weight = float(reactant_structure_loss_weight)
-        self.atom_location_loss_weight = float(atom_location_loss_weight)
         self.surrounding_structure_loss_weight = float(surrounding_structure_loss_weight)
         self.surrounding_structure_radius = int(surrounding_structure_radius)
         if self.surrounding_structure_radius < 1:
@@ -78,7 +73,6 @@ class CleavagePretrainingModel(nn.Module):
         self._freeze_mol_encoder = False
 
         edge_dim = int(cleavage_edge_fnet.feature_dim)
-        atom_dim = int(mol_encoder.node_dim)
         self.edge_norm = nn.LayerNorm(edge_dim)
         self.edge_body = nn.Sequential(
             nn.Linear(edge_dim, hidden_dim),
@@ -87,14 +81,38 @@ class CleavagePretrainingModel(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
             nn.GELU(),
         )
-        self.observed_edge_head = nn.Linear(hidden_dim, 1)
         self.pattern_head = nn.Linear(hidden_dim, self.num_patterns) if self.num_patterns > 0 else None
         self.reaction_head = nn.Linear(hidden_dim, self.num_reactions) if self.num_reactions > 0 else None
         self.product_head = nn.Linear(hidden_dim, self.num_product_molecules) if self.num_product_molecules > 0 else None
         self.reactant_pair_head = nn.Linear(hidden_dim * 2, 1)
-        self.edge_atom_query = nn.Linear(hidden_dim, hidden_dim)
-        self.atom_key = nn.Linear(atom_dim, hidden_dim)
-        self.surrounding_center_query = nn.Linear(atom_dim, hidden_dim)
+        self.surrounding_position = nn.Sequential(
+            nn.Linear(4, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        self.surrounding_message = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        self.surrounding_bond_body = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.GELU(),
+        )
+        self.atom_feature_layer = AtomFeatureLayer(symbols=mol_encoder.symbols)
+        self.bond_feature_layer = BondFeatureLayer()
+        self.surrounding_atom_heads = nn.ModuleDict(
+            {
+                name: nn.Linear(hidden_dim, len(values))
+                for name, values in self.atom_feature_layer.feature_sets.items()
+            }
+        )
+        self.surrounding_bond_heads = nn.ModuleDict(
+            {
+                name: nn.Linear(hidden_dim, len(values))
+                for name, values in self.bond_feature_layer.feature_sets.items()
+            }
+        )
 
 
     def freeze_mol_encoder(self) -> None:
@@ -115,27 +133,41 @@ class CleavagePretrainingModel(nn.Module):
             "num_reactions": self.num_reactions,
             "num_product_molecules": self.num_product_molecules,
             "hidden_dim": self.hidden_dim,
-            "observed_edge_loss_weight": self.observed_edge_loss_weight,
             "pattern_loss_weight": self.pattern_loss_weight,
             "reaction_loss_weight": self.reaction_loss_weight,
             "product_loss_weight": self.product_loss_weight,
             "reactant_structure_loss_weight": self.reactant_structure_loss_weight,
-            "atom_location_loss_weight": self.atom_location_loss_weight,
             "surrounding_structure_loss_weight": self.surrounding_structure_loss_weight,
             "surrounding_structure_radius": self.surrounding_structure_radius,
             "dropout": self.dropout,
         }
 
-    def forward(self, structure: FragmentTreeStructure) -> CleavagePretrainingOutput:
+    def forward(
+        self,
+        structure: FragmentTreeStructure,
+        *,
+        selected_event_rows: Optional[Tensor] = None,
+    ) -> CleavagePretrainingOutput:
         mol_graph = self.mol_encoder(structure.node_graph)
         ft_features = FragmentTreeFeatures.from_structure(structure, node_graphs=mol_graph)
-        return self.forward_features(ft_features)
+        return self.forward_features(
+            ft_features, selected_event_rows=selected_event_rows
+        )
 
-    def forward_features(self, ft_features: FragmentTreeFeatures) -> CleavagePretrainingOutput:
+    def forward_features(
+        self,
+        ft_features: FragmentTreeFeatures,
+        *,
+        selected_event_rows: Optional[Tensor] = None,
+    ) -> CleavagePretrainingOutput:
         structure = ft_features.structure
-        targets = build_cleavage_edge_targets(structure)
         event_row_id, event_edge_id, event_attr = self.cleavage_edge_fnet.encode_events(ft_features)
         stage_mask = first_stage_edge_mask(structure)[event_edge_id.long()]
+        if selected_event_rows is not None:
+            selected_event_rows = selected_event_rows.to(
+                device=event_row_id.device, dtype=event_row_id.dtype
+            )
+            stage_mask &= torch.isin(event_row_id, selected_event_rows)
         event_row_id = event_row_id[stage_mask]
         event_edge_id = event_edge_id[stage_mask]
         event_attr = event_attr[stage_mask]
@@ -145,12 +177,6 @@ class CleavagePretrainingModel(nn.Module):
         metrics: Dict[str, float] = {}
 
         if event_attr.size(0) > 0:
-            observed_target = targets.observed_edge[event_edge_id]
-            observed_logits = self.observed_edge_head(event_h).squeeze(-1)
-            observed_loss = self._observed_edge_loss(observed_logits, observed_target)
-            losses.append(self.observed_edge_loss_weight * observed_loss)
-            metrics.update(self._binary_metrics("observed_event_edge", observed_logits, observed_target, observed_loss))
-
             event_labels = structure.cleavage_event[event_row_id.long()]
             for name, labels, head, weight in (
                 ("pattern", event_labels[:, 0].long(), self.pattern_head, self.pattern_loss_weight),
@@ -174,20 +200,8 @@ class CleavagePretrainingModel(nn.Module):
                 losses.append(self.reactant_structure_loss_weight * structure_loss)
                 metrics.update(structure_metrics)
 
-            atom_loss, atom_metrics = self._atom_location_loss_and_metrics(
-                structure=structure,
-                atom_h=ft_features.node_graphs.x,
-                event_h=event_h,
-                event_row_id=event_row_id,
-                event_edge_id=event_edge_id,
-            )
-            if atom_loss is not None:
-                losses.append(self.atom_location_loss_weight * atom_loss)
-                metrics.update(atom_metrics)
-
             surrounding_loss, surrounding_metrics = self._surrounding_structure_loss_and_metrics(
                 structure=structure,
-                atom_h=ft_features.node_graphs.x,
                 event_h=event_h,
                 event_row_id=event_row_id,
                 event_edge_id=event_edge_id,
@@ -278,9 +292,30 @@ class CleavagePretrainingModel(nn.Module):
         pair_features = torch.cat(
             (torch.abs(z[pair_i] - z[pair_j]), z[pair_i] * z[pair_j]), dim=-1
         )
-        logits = self.reactant_pair_head(pair_features).squeeze(-1)
-        target = labels[pair_i].eq(labels[pair_j]).to(logits.dtype)
-        loss = self._observed_edge_loss(logits, target)
+        target_bool = labels[pair_i].eq(labels[pair_j])
+        positive_pairs = target_bool.nonzero(as_tuple=False).flatten()
+        negative_pairs = (~target_bool).nonzero(as_tuple=False).flatten()
+        if positive_pairs.numel() == 0 or negative_pairs.numel() == 0:
+            return None, {}
+
+        # Equalize pair contributions. Merely placing both identities in a
+        # batch does not balance the O(N^2) pair combinations and previously
+        # allowed one side to dominate the gradient.
+        pair_count = min(positive_pairs.numel(), negative_pairs.numel())
+        if self.training:
+            positive_pairs = positive_pairs[
+                torch.randperm(positive_pairs.numel(), device=labels.device)[:pair_count]
+            ]
+            negative_pairs = negative_pairs[
+                torch.randperm(negative_pairs.numel(), device=labels.device)[:pair_count]
+            ]
+        else:
+            positive_pairs = positive_pairs[:pair_count]
+            negative_pairs = negative_pairs[:pair_count]
+        selected_pairs = torch.cat((positive_pairs, negative_pairs))
+        logits = self.reactant_pair_head(pair_features[selected_pairs]).squeeze(-1)
+        target = target_bool[selected_pairs].to(logits.dtype)
+        loss = F.binary_cross_entropy_with_logits(logits, target)
         return loss, self._binary_metrics("reactant_structure", logits, target, loss)
 
     def _reactant_structure_labels_from_structure(
@@ -319,84 +354,20 @@ class CleavagePretrainingModel(nn.Module):
             labels[row_pos] = identity_id_by_key[key]
         return labels
 
-    def _atom_location_loss_and_metrics(
-        self,
-        *,
-        structure: FragmentTreeStructure,
-        atom_h: Tensor,
-        event_h: Tensor,
-        event_row_id: Tensor,
-        event_edge_id: Tensor,
-    ) -> Tuple[Optional[Tensor], Dict[str, float]]:
-        losses = []
-        correct = count = 0.0
-        positive_correct = positive_count = 0.0
-        negative_correct = negative_count = 0.0
-        for row_pos in range(int(event_row_id.numel())):
-            event_idx = int(event_row_id[row_pos].item())
-            edge_idx = int(event_edge_id[row_pos].item())
-            src_node = int(structure.edge_index[0, edge_idx].item())
-            dst_node = int(structure.edge_index[1, edge_idx].item())
-            event = structure.cleavage_event[event_idx]
-            pattern_id = int(event[0].item())
-            reaction_id = int(event[1].item())
-            product_molecule_id = int(event[2].item())
-
-            reactant_atoms = self._event_atom_tuple(
-                structure,
-                tuple_length=self._lookup_reactant_tuple_length(structure, pattern_id, reaction_id),
-                row_index=int(event[3].item()),
-            )
-            product_atoms = self._event_atom_tuple(
-                structure,
-                tuple_length=self._lookup_product_tuple_length(structure, pattern_id, reaction_id, product_molecule_id),
-                row_index=int(event[4].item()),
-            )
-            for node_idx, local_atoms in ((src_node, reactant_atoms), (dst_node, product_atoms)):
-                node_loss, node_metrics = self._node_atom_location_loss(
-                    structure=structure,
-                    atom_h=atom_h,
-                    edge_h=event_h[row_pos],
-                    node_idx=node_idx,
-                    positive_local_atoms=local_atoms,
-                )
-                if node_loss is not None:
-                    losses.append(node_loss)
-                    correct += node_metrics["correct"]
-                    count += node_metrics["count"]
-                    positive_correct += node_metrics["positive_correct"]
-                    positive_count += node_metrics["positive_count"]
-                    negative_correct += node_metrics["negative_correct"]
-                    negative_count += node_metrics["negative_count"]
-        if not losses:
-            return None, {}
-        loss = torch.stack(losses).mean()
-        metrics = {
-            "atom_location_loss": float(loss.detach().cpu()),
-            "atom_location_acc": float(correct / max(count, 1.0)),
-            "atom_location_count": float(count),
-        }
-        if positive_count > 0:
-            metrics["atom_location_pos_acc"] = positive_correct / positive_count
-            metrics["atom_location_pos_count"] = positive_count
-        if negative_count > 0:
-            metrics["atom_location_neg_acc"] = negative_correct / negative_count
-            metrics["atom_location_neg_count"] = negative_count
-        return loss, metrics
-
     def _surrounding_structure_loss_and_metrics(
         self,
         *,
         structure: FragmentTreeStructure,
-        atom_h: Tensor,
         event_h: Tensor,
         event_row_id: Tensor,
         event_edge_id: Tensor,
     ) -> Tuple[Optional[Tensor], Dict[str, float]]:
         losses = []
-        correct = count = 0.0
-        positive_correct = positive_count = 0.0
-        negative_correct = negative_count = 0.0
+        graph_correct = graph_count = 0.0
+        atom_correct = atom_count = 0.0
+        bond_correct = bond_count = 0.0
+        group_correct: Dict[str, float] = {}
+        group_count: Dict[str, float] = {}
         for row_pos in range(int(event_row_id.numel())):
             event_idx = int(event_row_id[row_pos].item())
             edge_idx = int(event_edge_id[row_pos].item())
@@ -409,95 +380,209 @@ class CleavagePretrainingModel(nn.Module):
                 ),
                 row_index=int(event[3].item()),
             )
-            start = int(structure.node_graph_offset[src_node].item())
-            stop = int(structure.node_graph_offset[src_node + 1].item())
-            if stop <= start:
+            mol = Chem.MolFromSmiles(str(structure.node_smiles[src_node]))
+            if mol is None:
                 continue
-            node_atoms = atom_h[start:stop]
-            smiles = str(structure.node_smiles[src_node])
-            for center_value in reactant_atoms.tolist():
-                center = int(center_value)
-                if center < 0 or center >= node_atoms.size(0):
-                    continue
-                neighborhood = atom_neighborhood_indices(
-                    smiles, center_atom=center, radius=self.surrounding_structure_radius
-                )
-                if neighborhood is None:
-                    continue
-                query = (
-                    self.edge_atom_query(event_h[row_pos])
-                    + self.surrounding_center_query(node_atoms[center])
-                )
-                logits = (
-                    self.atom_key(node_atoms) * query.view(1, -1)
-                ).sum(dim=-1) / math.sqrt(max(query.numel(), 1))
-                target = torch.zeros_like(logits)
-                if neighborhood:
-                    target[torch.tensor(
-                        neighborhood, dtype=torch.long, device=target.device
-                    )] = 1.0
-                node_loss = self._observed_edge_loss(logits, target)
-                losses.append(node_loss)
-                pred = torch.sigmoid(logits) >= 0.5
-                target_bool = target.bool()
-                correct += float((pred == target_bool).float().sum().detach().cpu())
-                count += float(target.numel())
-                if bool(target_bool.any()):
-                    positive_correct += float(pred[target_bool].sum().detach().cpu())
-                    positive_count += float(target_bool.sum().detach().cpu())
-                negative_mask = ~target_bool
-                if bool(negative_mask.any()):
-                    negative_correct += float((~pred[negative_mask]).sum().detach().cpu())
-                    negative_count += float(negative_mask.sum().detach().cpu())
+            decoded = self._decode_local_skeleton(
+                mol=mol,
+                reactant_atoms=tuple(int(value) for value in reactant_atoms.tolist()),
+                event_h=event_h[row_pos],
+            )
+            if decoded is None:
+                continue
+            item_loss, item_metrics = decoded
+            losses.append(item_loss)
+            graph_correct += item_metrics["graph_correct"]
+            graph_count += 1.0
+            atom_correct += item_metrics["atom_correct"]
+            atom_count += item_metrics["atom_count"]
+            bond_correct += item_metrics["bond_correct"]
+            bond_count += item_metrics["bond_count"]
+            for key, value in item_metrics.items():
+                if key.endswith("_group_correct"):
+                    group_correct[key[:-len("_group_correct")]] = (
+                        group_correct.get(key[:-len("_group_correct")], 0.0) + value
+                    )
+                elif key.endswith("_group_count"):
+                    group_count[key[:-len("_group_count")]] = (
+                        group_count.get(key[:-len("_group_count")], 0.0) + value
+                    )
         if not losses:
             return None, {}
         loss = torch.stack(losses).mean()
         metrics = {
             "surrounding_structure_loss": float(loss.detach().cpu()),
-            "surrounding_structure_acc": correct / max(count, 1.0),
-            "surrounding_structure_count": count,
+            # Exact reconstruction: every atom and bond label group in the
+            # supplied unlabeled local skeleton must be correct.
+            "surrounding_structure_acc": graph_correct / max(graph_count, 1.0),
+            "surrounding_structure_count": graph_count,
+            "surrounding_structure_atom_acc": atom_correct / max(atom_count, 1.0),
+            "surrounding_structure_atom_count": atom_count,
+            "surrounding_structure_bond_acc": bond_correct / max(bond_count, 1.0),
+            "surrounding_structure_bond_count": bond_count,
         }
-        if positive_count > 0:
-            metrics["surrounding_structure_pos_acc"] = positive_correct / positive_count
-            metrics["surrounding_structure_pos_count"] = positive_count
-        if negative_count > 0:
-            metrics["surrounding_structure_neg_acc"] = negative_correct / negative_count
-            metrics["surrounding_structure_neg_count"] = negative_count
+        for key in sorted(group_count):
+            count = group_count[key]
+            metrics[f"surrounding_structure_{key}_acc"] = (
+                group_correct.get(key, 0.0) / max(count, 1.0)
+            )
+            metrics[f"surrounding_structure_{key}_count"] = count
         return loss, metrics
 
-    def _node_atom_location_loss(
+    def _decode_local_skeleton(
         self,
         *,
-        structure: FragmentTreeStructure,
-        atom_h: Tensor,
-        edge_h: Tensor,
-        node_idx: int,
-        positive_local_atoms: Tensor,
-    ) -> Tuple[Optional[Tensor], Dict[str, float]]:
-        start = int(structure.node_graph_offset[int(node_idx)].item())
-        stop = int(structure.node_graph_offset[int(node_idx) + 1].item())
-        if stop <= start:
-            return None, {}
-        node_atoms = atom_h[start:stop]
-        query = self.edge_atom_query(edge_h).view(1, -1)
-        keys = self.atom_key(node_atoms)
-        logits = (keys * query).sum(dim=-1) / math.sqrt(max(keys.size(-1), 1))
-        target = torch.zeros((stop - start,), dtype=logits.dtype, device=logits.device)
-        valid_atoms = positive_local_atoms[(positive_local_atoms >= 0) & (positive_local_atoms < target.numel())].long()
-        if valid_atoms.numel() == 0:
-            return None, {}
-        target[valid_atoms] = 1.0
-        loss = F.binary_cross_entropy_with_logits(logits, target)
-        pred = torch.sigmoid(logits) >= 0.5
-        target_bool = target.bool()
-        negative_mask = ~target_bool
-        return loss, {
-            "correct": float((pred == target_bool).float().sum().detach().cpu()),
-            "count": float(target.numel()),
-            "positive_correct": float(pred[target_bool].sum().detach().cpu()),
-            "positive_count": float(target_bool.sum().detach().cpu()),
-            "negative_correct": float((~pred[negative_mask]).sum().detach().cpu()),
-            "negative_count": float(negative_mask.sum().detach().cpu()),
+        mol: Chem.Mol,
+        reactant_atoms: Tuple[int, ...],
+        event_h: Tensor,
+    ) -> Optional[Tuple[Tensor, Dict[str, float]]]:
+        valid_reactant = tuple(
+            atom for atom in reactant_atoms if 0 <= atom < mol.GetNumAtoms()
+        )
+        if not valid_reactant:
+            return None
+        distance_matrix = Chem.GetDistanceMatrix(mol)
+        local_atoms = sorted(
+            atom.GetIdx()
+            for atom in mol.GetAtoms()
+            if min(float(distance_matrix[center, atom.GetIdx()]) for center in valid_reactant)
+            <= self.surrounding_structure_radius
+        )
+        if not local_atoms:
+            return None
+        local_set = set(local_atoms)
+        atom_to_local = {atom: index for index, atom in enumerate(local_atoms)}
+        local_bonds = [
+            bond for bond in mol.GetBonds()
+            if bond.GetBeginAtomIdx() in local_set and bond.GetEndAtomIdx() in local_set
+        ]
+
+        position_rows = []
+        reactant_slot = {atom: slot for slot, atom in enumerate(valid_reactant)}
+        slot_scale = max(len(valid_reactant) - 1, 1)
+        radius_scale = max(self.surrounding_structure_radius, 1)
+        for atom_index in local_atoms:
+            nearest_slot, nearest_distance = min(
+                (
+                    slot,
+                    float(distance_matrix[center, atom_index]),
+                )
+                for slot, center in enumerate(valid_reactant)
+            )
+            degree = sum(
+                1
+                for neighbor in mol.GetAtomWithIdx(atom_index).GetNeighbors()
+                if neighbor.GetIdx() in local_set
+            )
+            position_rows.append(
+                [
+                    1.0 if atom_index in reactant_slot else 0.0,
+                    float(reactant_slot.get(atom_index, nearest_slot)) / slot_scale,
+                    nearest_distance / radius_scale,
+                    float(degree) / 4.0,
+                ]
+            )
+        positions = torch.tensor(
+            position_rows, dtype=event_h.dtype, device=event_h.device
+        )
+        node_h = event_h.view(1, -1) + self.surrounding_position(positions)
+
+        if local_bonds:
+            undirected_edges = [
+                (
+                    atom_to_local[bond.GetBeginAtomIdx()],
+                    atom_to_local[bond.GetEndAtomIdx()],
+                )
+                for bond in local_bonds
+            ]
+            for _ in range(2):
+                source = torch.tensor(
+                    [edge[0] for edge in undirected_edges] + [edge[1] for edge in undirected_edges],
+                    dtype=torch.long,
+                    device=node_h.device,
+                )
+                target = torch.tensor(
+                    [edge[1] for edge in undirected_edges] + [edge[0] for edge in undirected_edges],
+                    dtype=torch.long,
+                    device=node_h.device,
+                )
+                aggregated = torch.zeros_like(node_h).index_add(0, target, node_h[source])
+                degree = torch.zeros(
+                    (node_h.size(0), 1), dtype=node_h.dtype, device=node_h.device
+                ).index_add(
+                    0,
+                    target,
+                    torch.ones((target.numel(), 1), dtype=node_h.dtype, device=node_h.device),
+                )
+                message = self.surrounding_message(
+                    torch.cat((node_h, aggregated / degree.clamp_min(1.0)), dim=-1)
+                )
+                node_h = node_h + message
+
+        losses = []
+        all_correct = True
+        atom_correct = atom_count = 0.0
+        group_metrics: Dict[str, float] = {}
+        atom_targets = torch.stack(
+            [self.atom_feature_layer.encode(mol.GetAtomWithIdx(index)) for index in local_atoms]
+        ).to(device=event_h.device)
+        offset = 0
+        for name, values in self.atom_feature_layer.feature_sets.items():
+            width = len(values)
+            target = atom_targets[:, offset : offset + width].argmax(dim=-1)
+            logits = self.surrounding_atom_heads[name](node_h)
+            losses.append(F.cross_entropy(logits, target))
+            correct = logits.argmax(dim=-1).eq(target)
+            atom_correct += float(correct.sum().detach().cpu())
+            atom_count += float(target.numel())
+            group_metrics[f"atom_{name}_group_correct"] = float(
+                correct.sum().detach().cpu()
+            )
+            group_metrics[f"atom_{name}_group_count"] = float(target.numel())
+            all_correct = all_correct and bool(correct.all())
+            offset += width
+
+        bond_correct = bond_count = 0.0
+        if local_bonds:
+            left = torch.tensor(
+                [atom_to_local[b.GetBeginAtomIdx()] for b in local_bonds],
+                dtype=torch.long,
+                device=event_h.device,
+            )
+            right = torch.tensor(
+                [atom_to_local[b.GetEndAtomIdx()] for b in local_bonds],
+                dtype=torch.long,
+                device=event_h.device,
+            )
+            bond_h = self.surrounding_bond_body(
+                torch.cat((torch.abs(node_h[left] - node_h[right]), node_h[left] * node_h[right]), dim=-1)
+            )
+            bond_targets = torch.stack(
+                [self.bond_feature_layer.encode(bond) for bond in local_bonds]
+            ).to(device=event_h.device)
+            offset = 0
+            for name, values in self.bond_feature_layer.feature_sets.items():
+                width = len(values)
+                target = bond_targets[:, offset : offset + width].argmax(dim=-1)
+                logits = self.surrounding_bond_heads[name](bond_h)
+                losses.append(F.cross_entropy(logits, target))
+                correct = logits.argmax(dim=-1).eq(target)
+                bond_correct += float(correct.sum().detach().cpu())
+                bond_count += float(target.numel())
+                group_metrics[f"bond_{name}_group_correct"] = float(
+                    correct.sum().detach().cpu()
+                )
+                group_metrics[f"bond_{name}_group_count"] = float(target.numel())
+                all_correct = all_correct and bool(correct.all())
+                offset += width
+
+        return torch.stack(losses).mean(), {
+            "graph_correct": float(all_correct),
+            "atom_correct": atom_correct,
+            "atom_count": atom_count,
+            "bond_correct": bond_correct,
+            "bond_count": bond_count,
+            **group_metrics,
         }
 
     @staticmethod
@@ -512,18 +597,6 @@ class CleavagePretrainingModel(nn.Module):
         if not bool(mask.any()):
             raise KeyError(f"Missing reactant tuple length for pattern={pattern_id}, reaction={reaction_id}.")
         return int(table[mask][0, 2].item())
-
-    @staticmethod
-    def _lookup_product_tuple_length(structure: FragmentTreeStructure, pattern_id: int, reaction_id: int, product_molecule_id: int) -> int:
-        table = structure.product_tuple_length_table.long()
-        mask = (table[:, 0] == int(pattern_id)) & (table[:, 1] == int(reaction_id)) & (table[:, 2] == int(product_molecule_id))
-        if not bool(mask.any()):
-            raise KeyError(
-                "Missing product tuple length for "
-                f"pattern={pattern_id}, reaction={reaction_id}, product_molecule={product_molecule_id}."
-            )
-        return int(table[mask][0, 3].item())
-
 
 def atom_neighborhood_indices(
     smiles: str, *, center_atom: int, radius: int

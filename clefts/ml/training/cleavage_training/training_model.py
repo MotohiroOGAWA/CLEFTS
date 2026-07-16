@@ -100,12 +100,10 @@ def build_model(args: argparse.Namespace) -> CleavagePretrainingModel:
         num_reactions=counts["num_reactions"],
         num_product_molecules=counts["num_product_molecules"],
         hidden_dim=args.hidden_dim,
-        observed_edge_loss_weight=args.observed_edge_loss_weight,
         pattern_loss_weight=args.pattern_loss_weight,
         reaction_loss_weight=args.reaction_loss_weight,
         product_loss_weight=args.product_loss_weight,
         reactant_structure_loss_weight=args.reactant_structure_loss_weight,
-        atom_location_loss_weight=args.atom_location_loss_weight,
         surrounding_structure_loss_weight=args.surrounding_structure_loss_weight,
         surrounding_structure_radius=args.surrounding_structure_radius,
         dropout=args.dropout,
@@ -115,7 +113,12 @@ def build_model(args: argparse.Namespace) -> CleavagePretrainingModel:
 
 
 
-def prepare_output_dir(path: str | Path, *, overwrite: bool = False) -> Path:
+def prepare_output_dir(
+    path: str | Path,
+    *,
+    overwrite: bool = False,
+    preserve: tuple[str | Path, ...] = (),
+) -> Path:
     output_path = Path(path)
     if output_path.exists() and any(output_path.iterdir()):
         if not overwrite:
@@ -127,7 +130,23 @@ def prepare_output_dir(path: str | Path, *, overwrite: bool = False) -> Path:
             answer = input(f"Output directory already exists: {output_path}. Overwrite? [y/N] ")
             if answer.strip().lower() not in {"y", "yes"}:
                 raise SystemExit("Aborted because output directory was not overwritten.")
-        shutil.rmtree(output_path)
+        preserved_paths = {
+            Path(value).resolve()
+            for value in preserve
+            if Path(value).resolve().is_relative_to(output_path.resolve())
+        }
+        for child in output_path.iterdir():
+            child_resolved = child.resolve()
+            if any(
+                preserved == child_resolved
+                or preserved.is_relative_to(child_resolved)
+                for preserved in preserved_paths
+            ):
+                continue
+            if child.is_dir():
+                shutil.rmtree(child)
+            else:
+                child.unlink()
     output_path.mkdir(parents=True, exist_ok=True)
     return output_path
 
@@ -142,14 +161,40 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--hidden-dim", type=int, default=256)
     parser.add_argument("--cleavage-fc-dims", default="256,256")
     parser.add_argument("--dropout", type=float, default=0.1)
-    parser.add_argument("--observed-edge-loss-weight", type=float, default=1.0)
     parser.add_argument("--pattern-loss-weight", type=float, default=1.0)
     parser.add_argument("--reaction-loss-weight", type=float, default=1.0)
     parser.add_argument("--product-loss-weight", type=float, default=1.0)
     parser.add_argument("--reactant-structure-loss-weight", type=float, default=1.0)
     parser.add_argument("--surrounding-structure-loss-weight", type=float, default=1.0)
     parser.add_argument("--surrounding-structure-radius", type=int, default=2, help="Maximum bond distance predicted around each reactant SMARTS-matched atom.")
-    parser.add_argument("--atom-location-loss-weight", type=float, default=1.0)
+    parser.add_argument(
+        "--preprocessing-cache",
+        default=None,
+        help="Reusable cleavage event/file index cache. Defaults beside output-dir.",
+    )
+    parser.add_argument(
+        "--rebuild-preprocessing-cache",
+        action="store_true",
+        help="Ignore and rebuild an existing preprocessing cache.",
+    )
+    parser.add_argument(
+        "--min-data-count",
+        type=int,
+        default=1000,
+        help="Targets with at most this many events are covered by forced sampling.",
+    )
+    parser.add_argument(
+        "--mask-balance-patience",
+        type=int,
+        default=32,
+        help="Number of batches a target may be absent before cached sampling forces it.",
+    )
+    parser.add_argument(
+        "--mask-balance-max-forced-per-batch",
+        type=int,
+        default=8,
+        help="Maximum cached rare-target files added per batch.",
+    )
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--lr", type=float, default=1e-4)
@@ -165,7 +210,18 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
-    output_dir = prepare_output_dir(args.output_dir, overwrite=args.overwrite)
+    output_path = Path(args.output_dir)
+    default_cache = output_path / "main_preprocessing_cache.pt"
+    cache_path = (
+        Path(args.preprocessing_cache)
+        if args.preprocessing_cache not in {None, ""}
+        else default_cache
+    )
+    output_dir = prepare_output_dir(
+        output_path,
+        overwrite=args.overwrite,
+        preserve=(cache_path,),
+    )
     model = build_model(args)
     with (output_dir / "cleavage_pretraining_config.json").open("w", encoding="utf-8") as f:
         json.dump(vars(args), f, indent=2)
@@ -183,6 +239,11 @@ def main() -> None:
         early_stopping_patience=args.early_stopping_patience,
         early_stopping_window_size=args.early_stopping_window_size,
         early_stopping_min_delta=args.early_stopping_min_delta,
+        preprocessing_cache=args.preprocessing_cache,
+        rebuild_preprocessing_cache=args.rebuild_preprocessing_cache,
+        min_data_count=args.min_data_count,
+        mask_balance_patience=args.mask_balance_patience,
+        mask_balance_max_forced_per_batch=args.mask_balance_max_forced_per_batch,
     )
 
 
