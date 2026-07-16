@@ -2,15 +2,26 @@ from __future__ import annotations
 
 import csv
 import json
+import time
+from collections import Counter
 from pathlib import Path
-from typing import Dict, Iterable, Optional
+from typing import Dict, Iterable, List, Optional
 
 import torch
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
-from .dataset import make_cleavage_structure_dataloader
-from .pretraining_model import CleavagePretrainingModel
+from ...common.torch_utils.early_stopping import EarlyStopping
+from .dataset import first_stage_edge_mask, make_cleavage_structure_dataloader
+from .pretraining_model import (
+    CleavagePretrainingModel,
+    atom_neighborhood_indices,
+    canonical_fragment_smiles,
+)
+
+
+DEFAULT_GRAD_CLIP_NORM = 1.0
+DEFAULT_MIN_DELTA = 1e-4
 
 
 
@@ -57,6 +68,175 @@ def move_structure_batch(batch: Dict[str, object], device: torch.device):
     return batch["structure"].to(device)
 
 
+def structure_target_counts(loader, *, surrounding_radius: int) -> Dict[str, object]:
+    pattern = Counter()
+    reaction = Counter()
+    product = Counter()
+    joint = Counter()
+    reactant_structure = Counter()
+    atom_location = Counter()
+    surrounding_structure = Counter()
+    structure_count = event_count = edge_count = 0
+    all_stage_event_count = all_stage_edge_count = 0
+    for item in tqdm(loader.dataset, desc="Scanning cleavage targets", leave=False):
+        structure = item.structure
+        structure_count += 1
+        all_stage_edge_count += int(structure.num_edges)
+        all_stage_event_count += int(structure.num_cleavage_events)
+        stage_edge_mask = first_stage_edge_mask(structure)
+        edge_count += int(stage_edge_mask.sum().item())
+        for event_idx, event in enumerate(structure.cleavage_event.tolist()):
+            edge_idx = int(structure.cleavage_event_edge_index[event_idx].item())
+            if edge_idx < 0 or edge_idx >= int(structure.num_edges):
+                continue
+            if not bool(stage_edge_mask[edge_idx]):
+                continue
+            event_count += 1
+            pattern_id, reaction_id, product_id = map(int, event[:3])
+            pattern[pattern_id] += 1
+            reaction[reaction_id] += 1
+            product[product_id] += 1
+            joint[(pattern_id, reaction_id, product_id)] += 1
+            src_node = int(structure.edge_index[0, edge_idx].item())
+            dst_node = int(structure.edge_index[1, edge_idx].item())
+
+            reactant_table = structure.reactant_tuple_length_table.long()
+            reactant_mask = (
+                (reactant_table[:, 0] == pattern_id)
+                & (reactant_table[:, 1] == reaction_id)
+            )
+            if not bool(reactant_mask.any()):
+                continue
+            reactant_length = int(reactant_table[reactant_mask][0, 2].item())
+            reactant_atoms = structure.cleavage_atom_idxs[reactant_length][
+                int(event[3])
+            ].long()
+
+            structure_key = canonical_fragment_smiles(
+                str(structure.node_smiles[src_node]),
+                tuple(int(value) for value in reactant_atoms.tolist()),
+            )
+            if structure_key is not None:
+                reactant_structure[structure_key] += 1
+
+            product_table = structure.product_tuple_length_table.long()
+            product_mask = (
+                (product_table[:, 0] == pattern_id)
+                & (product_table[:, 1] == reaction_id)
+                & (product_table[:, 2] == product_id)
+            )
+            if bool(product_mask.any()):
+                product_length = int(product_table[product_mask][0, 3].item())
+                product_atoms = structure.cleavage_atom_idxs[product_length][
+                    int(event[4])
+                ].long()
+                for node_idx, matched_atoms in (
+                    (src_node, reactant_atoms),
+                    (dst_node, product_atoms),
+                ):
+                    node_size = int(
+                        structure.node_graph_offset[node_idx + 1].item()
+                        - structure.node_graph_offset[node_idx].item()
+                    )
+                    positive = len(
+                        {
+                            int(value)
+                            for value in matched_atoms.tolist()
+                            if 0 <= int(value) < node_size
+                        }
+                    )
+                    atom_location["positive"] += positive
+                    atom_location["negative"] += max(node_size - positive, 0)
+
+            src_size = int(
+                structure.node_graph_offset[src_node + 1].item()
+                - structure.node_graph_offset[src_node].item()
+            )
+            src_smiles = str(structure.node_smiles[src_node])
+            for center in reactant_atoms.tolist():
+                neighborhood = atom_neighborhood_indices(
+                    src_smiles,
+                    center_atom=int(center),
+                    radius=surrounding_radius,
+                )
+                if neighborhood is None:
+                    continue
+                surrounding_structure["positive"] += len(neighborhood)
+                surrounding_structure["negative"] += max(
+                    src_size - len(neighborhood), 0
+                )
+    return {
+        "structure_count": structure_count,
+        "edge_count": edge_count,
+        "event_count": event_count,
+        "all_stage_edge_count": all_stage_edge_count,
+        "all_stage_event_count": all_stage_event_count,
+        "stage": 1,
+        "pattern": {str(key): value for key, value in sorted(pattern.items())},
+        "reaction": {str(key): value for key, value in sorted(reaction.items())},
+        "product_molecule": {str(key): value for key, value in sorted(product.items())},
+        "pattern_reaction_product": {
+            "/".join(map(str, key)): value for key, value in sorted(joint.items())
+        },
+        "reactant_structure": dict(sorted(reactant_structure.items())),
+        "atom_location": dict(sorted(atom_location.items())),
+        "surrounding_structure": dict(sorted(surrounding_structure.items())),
+        "surrounding_structure_radius": int(surrounding_radius),
+    }
+
+
+def write_target_report(
+    output_dir: Path,
+    *,
+    train_loader,
+    val_loader,
+    writer: SummaryWriter,
+    surrounding_radius: int,
+) -> Dict[str, object]:
+    report = {
+        "train": structure_target_counts(
+            train_loader, surrounding_radius=surrounding_radius
+        ),
+        "val": structure_target_counts(
+            val_loader, surrounding_radius=surrounding_radius
+        ),
+    }
+    with (output_dir / "target_class_report.json").open("w", encoding="utf-8") as f:
+        json.dump(report, f, indent=2)
+    with (output_dir / "target_class_report.csv").open(
+        "w", newline="", encoding="utf-8"
+    ) as f:
+        csv_writer = csv.DictWriter(
+            f, fieldnames=["split", "target", "class_id", "count"]
+        )
+        csv_writer.writeheader()
+        for split, split_report in report.items():
+            for target in (
+                "pattern",
+                "reaction",
+                "product_molecule",
+                "pattern_reaction_product",
+                "reactant_structure",
+                "atom_location",
+                "surrounding_structure",
+            ):
+                for class_id, count in split_report[target].items():
+                    csv_writer.writerow(
+                        {
+                            "split": split,
+                            "target": target,
+                            "class_id": class_id,
+                            "count": count,
+                        }
+                    )
+                    writer.add_scalar(
+                        f"target_count/{target}_by_class/{split}/{class_id}",
+                        float(count),
+                        0,
+                    )
+    return report
+
+
 def mean_metrics(rows: Iterable[Dict[str, float]]) -> Dict[str, float]:
     rows = list(rows)
     if not rows:
@@ -87,11 +267,17 @@ def mean_metrics(rows: Iterable[Dict[str, float]]) -> Dict[str, float]:
 def tensorboard_tag(name: str) -> str:
     if name == "loss":
         return "loss"
-    for prefix in ("observed_edge", "pattern", "reaction", "product_molecule", "compound_identity", "atom_location"):
+    for prefix in ("observed_edge", "pattern", "reaction", "product_molecule", "reactant_structure", "atom_location", "surrounding_structure"):
         if name.startswith(prefix + "_"):
             metric = name.rsplit("_", 1)[-1]
             if metric in {"loss", "acc", "count"}:
-                chart = prefix if prefix != "observed_edge" else "edge"
+                middle = name[len(prefix) + 1 : -(len(metric) + 1)]
+                if middle.startswith("class_"):
+                    chart = f"{prefix}_by_class"
+                elif middle in {"pos", "neg"}:
+                    chart = f"{prefix}_pos_neg"
+                else:
+                    chart = prefix if prefix != "observed_edge" else "edge"
                 return f"{prefix}_{metric}/{chart}"
     return name
 
@@ -100,7 +286,7 @@ def tensorboard_series(name: str) -> str:
     for suffix in ("_loss", "_acc", "_count"):
         if name.endswith(suffix):
             rest = name[: -len(suffix)]
-            for prefix in ("observed_edge", "pattern", "reaction", "product_molecule", "compound_identity", "atom_location"):
+            for prefix in ("observed_edge", "pattern", "reaction", "product_molecule", "reactant_structure", "atom_location", "surrounding_structure"):
                 if rest == prefix:
                     return "total"
                 if rest.startswith(prefix + "_"):
@@ -152,7 +338,10 @@ def train(
     weight_decay: float = 1e-2,
     device: str | torch.device = "cpu",
     num_workers: int = 0,
-) -> None:
+    early_stopping_patience: Optional[int] = None,
+    early_stopping_window_size: int = 1,
+    early_stopping_min_delta: float = DEFAULT_MIN_DELTA,
+) -> Dict[str, object]:
     device = torch.device(device)
     model.to(device)
     output_path = Path(output_dir)
@@ -164,36 +353,144 @@ def train(
 
     train_loader = make_cleavage_structure_dataloader(train_dir, batch_size=batch_size, shuffle=True, num_workers=num_workers)
     val_loader = make_cleavage_structure_dataloader(val_dir, batch_size=batch_size, shuffle=False, num_workers=num_workers)
+    target_report = write_target_report(
+        output_path,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        writer=writer,
+        surrounding_radius=model.surrounding_structure_radius,
+    )
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(lr), weight_decay=float(weight_decay))
+    early_stopping = EarlyStopping(
+        patience=early_stopping_patience,
+        window_size=early_stopping_window_size,
+        min_delta=early_stopping_min_delta,
+        mode="min",
+    )
 
     metrics_file = output_path / "metrics.csv"
     best_val = float("inf")
-    with metrics_file.open("w", newline="", encoding="utf-8") as f:
-        writer_csv = csv.DictWriter(f, fieldnames=["epoch", "train_loss", "val_loss", "lr"])
-        writer_csv.writeheader()
+    best_epoch = -1
+    stopped_epoch = int(epochs)
+    metric_records: List[Dict[str, float]] = []
+    metric_fieldnames = ["epoch", "lr", "validation_seconds"]
+
+    def write_epoch_record(
+        csv_file,
+        *,
+        epoch: int,
+        train_metrics: Dict[str, float],
+        val_metrics: Dict[str, float],
+        validation_seconds: float,
+    ) -> None:
+        record = {
+            "epoch": epoch,
+            "lr": optimizer.param_groups[0]["lr"],
+            "validation_seconds": validation_seconds,
+            **{f"train_{key}": value for key, value in train_metrics.items()},
+            **{f"val_{key}": value for key, value in val_metrics.items()},
+        }
+        metric_records.append(record)
+        for key in record:
+            if key not in metric_fieldnames:
+                metric_fieldnames.append(key)
+        csv_file.seek(0)
+        csv_file.truncate()
+        csv_writer = csv.DictWriter(csv_file, fieldnames=metric_fieldnames)
+        csv_writer.writeheader()
+        csv_writer.writerows(metric_records)
+        csv_file.flush()
+        write_tensorboard_pairs(writer, train_metrics, val_metrics, epoch)
+        writer.add_scalar("optimizer/lr", optimizer.param_groups[0]["lr"], epoch)
+        writer.add_scalar("time/validation_seconds", validation_seconds, epoch)
+        writer.flush()
+
+    final_epoch = 0
+    final_train_metrics: Dict[str, float] = {}
+    final_val_metrics: Dict[str, float] = {}
+    with metrics_file.open("w+", newline="", encoding="utf-8") as f:
+        epoch0_train = run_epoch(model, train_loader, device=device, optimizer=None)
+        start = time.perf_counter()
+        epoch0_val = run_epoch(model, val_loader, device=device, optimizer=None)
+        epoch0_seconds = time.perf_counter() - start
+        write_epoch_record(
+            f,
+            epoch=0,
+            train_metrics=epoch0_train,
+            val_metrics=epoch0_val,
+            validation_seconds=epoch0_seconds,
+        )
+        best_val = float(epoch0_val.get("loss", float("inf")))
+        best_epoch = 0
+        final_train_metrics = epoch0_train
+        final_val_metrics = epoch0_val
+        initial_ckpt = checkpoint_payload(
+            model,
+            epoch=0,
+            train_metrics=epoch0_train,
+            val_metrics=epoch0_val,
+            extra={"best_val_loss": best_val, "best_epoch": best_epoch},
+        )
+        torch.save(initial_ckpt, output_path / "best.pt")
+        early_stopping(best_val)
+
         for epoch in range(1, int(epochs) + 1):
             train_metrics = run_epoch(model, train_loader, device=device, optimizer=optimizer)
+            start = time.perf_counter()
             val_metrics = run_epoch(model, val_loader, device=device, optimizer=None)
-            write_tensorboard_pairs(writer, train_metrics, val_metrics, epoch)
-            row = {
-                "epoch": epoch,
-                "train_loss": train_metrics.get("loss", float("nan")),
-                "val_loss": val_metrics.get("loss", float("nan")),
-                "lr": optimizer.param_groups[0]["lr"],
-            }
-            writer_csv.writerow(row)
-            f.flush()
+            validation_seconds = time.perf_counter() - start
+            write_epoch_record(
+                f,
+                epoch=epoch,
+                train_metrics=train_metrics,
+                val_metrics=val_metrics,
+                validation_seconds=validation_seconds,
+            )
+            final_epoch = epoch
+            final_train_metrics = train_metrics
+            final_val_metrics = val_metrics
             ckpt = checkpoint_payload(
                 model,
                 epoch=epoch,
                 train_metrics=train_metrics,
                 val_metrics=val_metrics,
-                extra={"best_val_loss": best_val},
+                extra={"best_val_loss": best_val, "best_epoch": best_epoch},
             )
             torch.save(ckpt, output_path / "last.pt")
             val_loss = float(val_metrics.get("loss", float("inf")))
-            if val_loss < best_val:
+            if val_loss < best_val - float(early_stopping_min_delta):
                 best_val = val_loss
+                best_epoch = epoch
                 ckpt["extra"]["best_val_loss"] = best_val
+                ckpt["extra"]["best_epoch"] = best_epoch
                 torch.save(ckpt, output_path / "best.pt")
+            early_stopping(val_loss)
+            if early_stopping.early_stop:
+                stopped_epoch = epoch
+                break
+
+    summary: Dict[str, object] = {
+        "best_val_loss": best_val,
+        "best_epoch": best_epoch,
+        "final_epoch": final_epoch,
+        "stopped_epoch": stopped_epoch,
+        "early_stopping_enabled": bool(
+            early_stopping_patience is not None and early_stopping_patience > 0
+        ),
+        "early_stopping_counter": early_stopping.counter,
+        "final_train_metrics": final_train_metrics,
+        "final_val_metrics": final_val_metrics,
+        "target_report": target_report,
+    }
+    final_ckpt = checkpoint_payload(
+        model,
+        epoch=final_epoch,
+        train_metrics=final_train_metrics,
+        val_metrics=final_val_metrics,
+        extra=summary,
+    )
+    torch.save(final_ckpt, output_path / "last.pt")
+    with (output_path / "training_summary.json").open("w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
     writer.close()
+    return summary

@@ -104,9 +104,10 @@ def build_model(args: argparse.Namespace) -> CleavagePretrainingModel:
         pattern_loss_weight=args.pattern_loss_weight,
         reaction_loss_weight=args.reaction_loss_weight,
         product_loss_weight=args.product_loss_weight,
-        compound_identity_loss_weight=args.compound_identity_loss_weight,
-        compound_identity_temperature=args.compound_identity_temperature,
+        reactant_structure_loss_weight=args.reactant_structure_loss_weight,
         atom_location_loss_weight=args.atom_location_loss_weight,
+        surrounding_structure_loss_weight=args.surrounding_structure_loss_weight,
+        surrounding_structure_radius=args.surrounding_structure_radius,
         dropout=args.dropout,
     )
     model.freeze_mol_encoder()
@@ -145,8 +146,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--pattern-loss-weight", type=float, default=1.0)
     parser.add_argument("--reaction-loss-weight", type=float, default=1.0)
     parser.add_argument("--product-loss-weight", type=float, default=1.0)
-    parser.add_argument("--compound-identity-loss-weight", type=float, default=1.0)
-    parser.add_argument("--compound-identity-temperature", type=float, default=0.1)
+    parser.add_argument("--reactant-structure-loss-weight", type=float, default=1.0)
+    parser.add_argument("--surrounding-structure-loss-weight", type=float, default=1.0)
+    parser.add_argument("--surrounding-structure-radius", type=int, default=2, help="Maximum bond distance predicted around each reactant SMARTS-matched atom.")
     parser.add_argument("--atom-location-loss-weight", type=float, default=1.0)
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=1)
@@ -154,6 +156,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--weight-decay", type=float, default=1e-2)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--early-stopping-patience", type=int, default=None, help="Stop after this many non-improving validation epochs; disabled by default.")
+    parser.add_argument("--early-stopping-window-size", type=int, default=1)
+    parser.add_argument("--early-stopping-min-delta", type=float, default=1e-4)
     parser.add_argument("--overwrite", action="store_true", help="Overwrite output-dir if it already exists and is not empty.")
     return parser
 
@@ -175,6 +180,9 @@ def main() -> None:
         weight_decay=args.weight_decay,
         device=args.device,
         num_workers=args.num_workers,
+        early_stopping_patience=args.early_stopping_patience,
+        early_stopping_window_size=args.early_stopping_window_size,
+        early_stopping_min_delta=args.early_stopping_min_delta,
     )
 
 

@@ -6,6 +6,12 @@
 
 The training data is the saved `TrainingFragmentTreeStructure` produced by `clefts.ml.input`. This keeps edge pretraining aligned with the same fragment structures used by spectrum training.
 
+Only first-stage cleavage events are used for pretraining. In each batched
+structure, nodes with no incoming fragment edge are treated as root molecules,
+and only events on edges leaving those roots are passed to every prediction
+head. Deeper candidate-tree stages remain in the input files but do not
+contribute to the loss.
+
 Recommended layout:
 
 ```text
@@ -34,10 +40,9 @@ The heads predict:
 - cleavage pattern id per event
 - reaction id per event
 - product molecule id per event
-- product-substructure identity contrast: event embeddings are pulled together when the product-side atoms matched by the reaction SMARTS canonicalize to the same atom-map-independent fragment structure, and pushed apart otherwise
+- reactant SMARTS match identity: every pair of matched reactant substructures is classified as the same (1) or different (0). The matched atoms and their internal bonds are canonicalized after clearing atom-map numbers, so broad SMARTS patterns still learn concrete differences such as C-C versus C-O.
 - reactant/product atom location masks per event inside source and target fragment molecules
-
-The compound identity target is built from the actual product fragment node and the product atom tuple stored for each cleavage event. The selected atoms and their internal bonds are canonicalized with RDKit after clearing atom-map numbers, so atom-map renumbering does not create a new identity. Different atom symbols or bond types remain different identities, even when the cleavage pattern itself used a broad query such as `[!#1]`.
+- surrounding structure masks: for every reactant SMARTS-matched atom, predict the atoms attached within a configurable bond radius (`--surrounding-structure-radius`, default 2).
 
 Source/target ECFP is intentionally not included here because the fragment-tree nodes already carry molecule-level information from the frozen pretrained MolEncoder.
 
@@ -65,6 +70,31 @@ Examples:
 - `pattern_acc/pattern`
 - `reaction_acc/reaction`
 - `product_molecule_acc/product_molecule`
-- `compound_identity_loss/compound_identity`
-- `compound_identity_nearest_acc/compound_identity`
+- `reactant_structure_loss/reactant_structure`
+- `reactant_structure_acc/reactant_structure`
+- `surrounding_structure_loss/surrounding_structure`
+- `surrounding_structure_acc/surrounding_structure`
 - `atom_location_acc/atom_location`
+
+ID classification metrics are also grouped by class, for example
+`pattern_acc/pattern_by_class`, `reaction_acc/reaction_by_class`, and
+`product_molecule_acc/product_molecule_by_class`. Binary mask tasks expose
+separate positive and negative series so that a high accuracy caused only by
+the majority class is visible.
+
+## Training reports
+
+Training uses the existing `.pt` structure files directly; no balanced-data
+preprocessing is required. The output directory contains:
+
+- `target_class_report.json` and `target_class_report.csv`: train/validation
+  counts for every pattern, reaction, product molecule, and joint ID
+- `metrics.csv`: epoch 0 baseline and every train/validation metric, including
+  per-class accuracy and count
+- `training_summary.json`: best/final epoch, early-stopping state, final
+  metrics, and the target distribution report
+- `best.pt` and `last.pt`: best-validation and final checkpoints
+- `tensorboard_command.txt`: command for opening the generated TensorBoard log
+
+Optional early stopping follows the `mol_training` workflow and can be enabled
+with `--early-stopping-patience`.

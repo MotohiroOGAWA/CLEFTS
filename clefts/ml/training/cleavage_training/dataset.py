@@ -84,6 +84,30 @@ def build_cleavage_edge_targets(structure: FragmentTreeStructure) -> CleavageEdg
     )
 
 
+def first_stage_edge_mask(structure: FragmentTreeStructure) -> Tensor:
+    """Return edges whose source is a root node of its fragment graph."""
+
+    device = structure.edge_index.device
+    num_nodes = int(structure.num_nodes)
+    num_edges = int(structure.num_edges)
+    if num_edges == 0:
+        return torch.zeros((0,), dtype=torch.bool, device=device)
+
+    is_root = torch.ones((num_nodes,), dtype=torch.bool, device=device)
+    target_nodes = structure.edge_index[1].long()
+    valid_targets = target_nodes[
+        (target_nodes >= 0) & (target_nodes < num_nodes)
+    ]
+    if valid_targets.numel() > 0:
+        is_root[valid_targets.unique()] = False
+
+    source_nodes = structure.edge_index[0].long()
+    valid_sources = (source_nodes >= 0) & (source_nodes < num_nodes)
+    mask = torch.zeros((num_edges,), dtype=torch.bool, device=device)
+    mask[valid_sources] = is_root[source_nodes[valid_sources]]
+    return mask
+
+
 def make_cleavage_structure_dataloader(
     root_dir: str | Path,
     *,

@@ -14,7 +14,12 @@ from ...input.fragment_tree_features import FragmentTreeFeatures
 from ...input.fragment_tree_structure import FragmentTreeStructure
 from ...mol.mol_encoder import MolEncoder
 from ...specgen.components.cleavage.cleavage_edge_feature_net import CleavageEdgeFeatureNet
-from .dataset import IGNORE_INDEX, CleavageEdgeTargets, build_cleavage_edge_targets
+from .dataset import (
+    IGNORE_INDEX,
+    CleavageEdgeTargets,
+    build_cleavage_edge_targets,
+    first_stage_edge_mask,
+)
 
 
 @dataclass(frozen=True)
@@ -46,9 +51,10 @@ class CleavagePretrainingModel(nn.Module):
         pattern_loss_weight: float = 1.0,
         reaction_loss_weight: float = 1.0,
         product_loss_weight: float = 1.0,
-        compound_identity_loss_weight: float = 1.0,
-        compound_identity_temperature: float = 0.1,
+        reactant_structure_loss_weight: float = 1.0,
         atom_location_loss_weight: float = 1.0,
+        surrounding_structure_loss_weight: float = 1.0,
+        surrounding_structure_radius: int = 2,
         dropout: float = 0.1,
     ) -> None:
         super().__init__()
@@ -61,9 +67,12 @@ class CleavagePretrainingModel(nn.Module):
         self.pattern_loss_weight = float(pattern_loss_weight)
         self.reaction_loss_weight = float(reaction_loss_weight)
         self.product_loss_weight = float(product_loss_weight)
-        self.compound_identity_loss_weight = float(compound_identity_loss_weight)
-        self.compound_identity_temperature = float(compound_identity_temperature)
+        self.reactant_structure_loss_weight = float(reactant_structure_loss_weight)
         self.atom_location_loss_weight = float(atom_location_loss_weight)
+        self.surrounding_structure_loss_weight = float(surrounding_structure_loss_weight)
+        self.surrounding_structure_radius = int(surrounding_structure_radius)
+        if self.surrounding_structure_radius < 1:
+            raise ValueError("surrounding_structure_radius must be at least 1.")
         self.hidden_dim = int(hidden_dim)
         self.dropout = float(dropout)
         self._freeze_mol_encoder = False
@@ -82,8 +91,10 @@ class CleavagePretrainingModel(nn.Module):
         self.pattern_head = nn.Linear(hidden_dim, self.num_patterns) if self.num_patterns > 0 else None
         self.reaction_head = nn.Linear(hidden_dim, self.num_reactions) if self.num_reactions > 0 else None
         self.product_head = nn.Linear(hidden_dim, self.num_product_molecules) if self.num_product_molecules > 0 else None
+        self.reactant_pair_head = nn.Linear(hidden_dim * 2, 1)
         self.edge_atom_query = nn.Linear(hidden_dim, hidden_dim)
         self.atom_key = nn.Linear(atom_dim, hidden_dim)
+        self.surrounding_center_query = nn.Linear(atom_dim, hidden_dim)
 
 
     def freeze_mol_encoder(self) -> None:
@@ -108,9 +119,10 @@ class CleavagePretrainingModel(nn.Module):
             "pattern_loss_weight": self.pattern_loss_weight,
             "reaction_loss_weight": self.reaction_loss_weight,
             "product_loss_weight": self.product_loss_weight,
-            "compound_identity_loss_weight": self.compound_identity_loss_weight,
-            "compound_identity_temperature": self.compound_identity_temperature,
+            "reactant_structure_loss_weight": self.reactant_structure_loss_weight,
             "atom_location_loss_weight": self.atom_location_loss_weight,
+            "surrounding_structure_loss_weight": self.surrounding_structure_loss_weight,
+            "surrounding_structure_radius": self.surrounding_structure_radius,
             "dropout": self.dropout,
         }
 
@@ -123,6 +135,10 @@ class CleavagePretrainingModel(nn.Module):
         structure = ft_features.structure
         targets = build_cleavage_edge_targets(structure)
         event_row_id, event_edge_id, event_attr = self.cleavage_edge_fnet.encode_events(ft_features)
+        stage_mask = first_stage_edge_mask(structure)[event_edge_id.long()]
+        event_row_id = event_row_id[stage_mask]
+        event_edge_id = event_edge_id[stage_mask]
+        event_attr = event_attr[stage_mask]
         event_h = self.edge_body(self.edge_norm(event_attr))
 
         losses = []
@@ -148,15 +164,15 @@ class CleavagePretrainingModel(nn.Module):
                     losses.append(float(weight) * loss)
                     metrics.update(task_metrics)
 
-            identity_loss, identity_metrics = self._compound_identity_loss_and_metrics(
+            structure_loss, structure_metrics = self._reactant_structure_loss_and_metrics(
                 structure=structure,
                 event_h=event_h,
                 event_row_id=event_row_id,
                 event_edge_id=event_edge_id,
             )
-            if identity_loss is not None:
-                losses.append(self.compound_identity_loss_weight * identity_loss)
-                metrics.update(identity_metrics)
+            if structure_loss is not None:
+                losses.append(self.reactant_structure_loss_weight * structure_loss)
+                metrics.update(structure_metrics)
 
             atom_loss, atom_metrics = self._atom_location_loss_and_metrics(
                 structure=structure,
@@ -168,6 +184,17 @@ class CleavagePretrainingModel(nn.Module):
             if atom_loss is not None:
                 losses.append(self.atom_location_loss_weight * atom_loss)
                 metrics.update(atom_metrics)
+
+            surrounding_loss, surrounding_metrics = self._surrounding_structure_loss_and_metrics(
+                structure=structure,
+                atom_h=ft_features.node_graphs.x,
+                event_h=event_h,
+                event_row_id=event_row_id,
+                event_edge_id=event_edge_id,
+            )
+            if surrounding_loss is not None:
+                losses.append(self.surrounding_structure_loss_weight * surrounding_loss)
+                metrics.update(surrounding_metrics)
 
         if losses:
             loss = torch.stack([item if item.dim() == 0 else item.mean() for item in losses]).sum()
@@ -212,14 +239,23 @@ class CleavagePretrainingModel(nn.Module):
         loss = F.cross_entropy(logits[valid], labels[valid])
         pred = logits[valid].argmax(dim=-1)
         target = labels[valid]
-        return loss, {
+        metrics = {
             f"{prefix}_loss": float(loss.detach().cpu()),
             f"{prefix}_acc": float((pred == target).float().mean().detach().cpu()),
             f"{prefix}_count": float(target.numel()),
         }
+        for class_id in target.unique(sorted=True).tolist():
+            class_mask = target == int(class_id)
+            metrics[f"{prefix}_class_{int(class_id)}_acc"] = float(
+                (pred[class_mask] == target[class_mask]).float().mean().detach().cpu()
+            )
+            metrics[f"{prefix}_class_{int(class_id)}_count"] = float(
+                class_mask.sum().detach().cpu()
+            )
+        return loss, metrics
 
 
-    def _compound_identity_loss_and_metrics(
+    def _reactant_structure_loss_and_metrics(
         self,
         *,
         structure: FragmentTreeStructure,
@@ -227,51 +263,27 @@ class CleavagePretrainingModel(nn.Module):
         event_row_id: Tensor,
         event_edge_id: Tensor,
     ) -> Tuple[Optional[Tensor], Dict[str, float]]:
-        labels = self._compound_identity_labels_from_structure(
-            structure=structure,
-            event_row_id=event_row_id,
-            event_edge_id=event_edge_id,
+        labels = self._reactant_structure_labels_from_structure(
+            structure=structure, event_row_id=event_row_id, event_edge_id=event_edge_id
         )
         valid = labels != IGNORE_INDEX
-        if not bool(valid.any()):
+        if int(valid.sum().item()) < 2:
             return None, {}
 
-        z = F.normalize(event_h[valid], dim=-1)
+        z = event_h[valid]
         labels = labels[valid]
-        n_events = int(labels.numel())
-        if n_events < 2:
-            return None, {}
+        pair_i, pair_j = torch.triu_indices(
+            labels.numel(), labels.numel(), offset=1, device=labels.device
+        )
+        pair_features = torch.cat(
+            (torch.abs(z[pair_i] - z[pair_j]), z[pair_i] * z[pair_j]), dim=-1
+        )
+        logits = self.reactant_pair_head(pair_features).squeeze(-1)
+        target = labels[pair_i].eq(labels[pair_j]).to(logits.dtype)
+        loss = self._observed_edge_loss(logits, target)
+        return loss, self._binary_metrics("reactant_structure", logits, target, loss)
 
-        same = labels.view(-1, 1).eq(labels.view(1, -1))
-        eye = torch.eye(n_events, dtype=torch.bool, device=labels.device)
-        positive_mask = same & ~eye
-        anchor_mask = positive_mask.any(dim=1)
-        if not bool(anchor_mask.any()):
-            return None, {
-                "compound_identity_anchor_count": 0.0,
-                "compound_identity_pair_count": 0.0,
-            }
-
-        temperature = max(self.compound_identity_temperature, 1e-6)
-        logits = z @ z.t() / temperature
-        logits = logits.masked_fill(eye, torch.finfo(logits.dtype).min)
-        log_prob = logits - torch.logsumexp(logits, dim=1, keepdim=True)
-        positive_log_prob = (log_prob * positive_mask.float()).sum(dim=1)
-        positive_count = positive_mask.sum(dim=1).clamp_min(1)
-        loss = -(positive_log_prob / positive_count)[anchor_mask].mean()
-
-        with torch.no_grad():
-            nearest = (z @ z.t()).masked_fill(eye, -2.0).argmax(dim=1)
-            nearest_acc = (labels[nearest] == labels).float().mean()
-
-        return loss, {
-            "compound_identity_loss": float(loss.detach().cpu()),
-            "compound_identity_nearest_acc": float(nearest_acc.detach().cpu()),
-            "compound_identity_anchor_count": float(anchor_mask.sum().detach().cpu()),
-            "compound_identity_pair_count": float(positive_mask.sum().detach().cpu()),
-        }
-
-    def _compound_identity_labels_from_structure(
+    def _reactant_structure_labels_from_structure(
         self,
         *,
         structure: FragmentTreeStructure,
@@ -279,41 +291,32 @@ class CleavagePretrainingModel(nn.Module):
         event_edge_id: Tensor,
     ) -> Tensor:
         labels = torch.full(
-            (event_row_id.size(0),),
-            IGNORE_INDEX,
-            dtype=torch.long,
-            device=event_row_id.device,
+            (event_row_id.size(0),), IGNORE_INDEX, dtype=torch.long, device=event_row_id.device
         )
         identity_id_by_key: Dict[str, int] = {}
-
         for row_pos in range(int(event_row_id.numel())):
             event_idx = int(event_row_id[row_pos].item())
             edge_idx = int(event_edge_id[row_pos].item())
-            dst_node = int(structure.edge_index[1, edge_idx].item())
+            src_node = int(structure.edge_index[0, edge_idx].item())
             event = structure.cleavage_event[event_idx]
             pattern_id = int(event[0].item())
             reaction_id = int(event[1].item())
-            product_molecule_id = int(event[2].item())
-            product_atoms = self._event_atom_tuple(
+            reactant_atoms = self._event_atom_tuple(
                 structure,
-                tuple_length=self._lookup_product_tuple_length(
-                    structure,
-                    pattern_id,
-                    reaction_id,
-                    product_molecule_id,
+                tuple_length=self._lookup_reactant_tuple_length(
+                    structure, pattern_id, reaction_id
                 ),
-                row_index=int(event[4].item()),
+                row_index=int(event[3].item()),
             )
             key = canonical_fragment_smiles(
-                smiles=str(structure.node_smiles[dst_node]),
-                atom_indices=tuple(int(i) for i in product_atoms.detach().cpu().tolist()),
+                smiles=str(structure.node_smiles[src_node]),
+                atom_indices=tuple(int(i) for i in reactant_atoms.detach().cpu().tolist()),
             )
             if key is None:
                 continue
             if key not in identity_id_by_key:
                 identity_id_by_key[key] = len(identity_id_by_key)
             labels[row_pos] = identity_id_by_key[key]
-
         return labels
 
     def _atom_location_loss_and_metrics(
@@ -326,8 +329,9 @@ class CleavagePretrainingModel(nn.Module):
         event_edge_id: Tensor,
     ) -> Tuple[Optional[Tensor], Dict[str, float]]:
         losses = []
-        correct = 0.0
-        count = 0.0
+        correct = count = 0.0
+        positive_correct = positive_count = 0.0
+        negative_correct = negative_count = 0.0
         for row_pos in range(int(event_row_id.numel())):
             event_idx = int(event_row_id[row_pos].item())
             edge_idx = int(event_edge_id[row_pos].item())
@@ -349,7 +353,7 @@ class CleavagePretrainingModel(nn.Module):
                 row_index=int(event[4].item()),
             )
             for node_idx, local_atoms in ((src_node, reactant_atoms), (dst_node, product_atoms)):
-                node_loss, node_correct, node_count = self._node_atom_location_loss(
+                node_loss, node_metrics = self._node_atom_location_loss(
                     structure=structure,
                     atom_h=atom_h,
                     edge_h=event_h[row_pos],
@@ -358,16 +362,108 @@ class CleavagePretrainingModel(nn.Module):
                 )
                 if node_loss is not None:
                     losses.append(node_loss)
-                    correct += node_correct
-                    count += node_count
+                    correct += node_metrics["correct"]
+                    count += node_metrics["count"]
+                    positive_correct += node_metrics["positive_correct"]
+                    positive_count += node_metrics["positive_count"]
+                    negative_correct += node_metrics["negative_correct"]
+                    negative_count += node_metrics["negative_count"]
         if not losses:
             return None, {}
         loss = torch.stack(losses).mean()
-        return loss, {
+        metrics = {
             "atom_location_loss": float(loss.detach().cpu()),
             "atom_location_acc": float(correct / max(count, 1.0)),
             "atom_location_count": float(count),
         }
+        if positive_count > 0:
+            metrics["atom_location_pos_acc"] = positive_correct / positive_count
+            metrics["atom_location_pos_count"] = positive_count
+        if negative_count > 0:
+            metrics["atom_location_neg_acc"] = negative_correct / negative_count
+            metrics["atom_location_neg_count"] = negative_count
+        return loss, metrics
+
+    def _surrounding_structure_loss_and_metrics(
+        self,
+        *,
+        structure: FragmentTreeStructure,
+        atom_h: Tensor,
+        event_h: Tensor,
+        event_row_id: Tensor,
+        event_edge_id: Tensor,
+    ) -> Tuple[Optional[Tensor], Dict[str, float]]:
+        losses = []
+        correct = count = 0.0
+        positive_correct = positive_count = 0.0
+        negative_correct = negative_count = 0.0
+        for row_pos in range(int(event_row_id.numel())):
+            event_idx = int(event_row_id[row_pos].item())
+            edge_idx = int(event_edge_id[row_pos].item())
+            src_node = int(structure.edge_index[0, edge_idx].item())
+            event = structure.cleavage_event[event_idx]
+            reactant_atoms = self._event_atom_tuple(
+                structure,
+                tuple_length=self._lookup_reactant_tuple_length(
+                    structure, int(event[0].item()), int(event[1].item())
+                ),
+                row_index=int(event[3].item()),
+            )
+            start = int(structure.node_graph_offset[src_node].item())
+            stop = int(structure.node_graph_offset[src_node + 1].item())
+            if stop <= start:
+                continue
+            node_atoms = atom_h[start:stop]
+            smiles = str(structure.node_smiles[src_node])
+            for center_value in reactant_atoms.tolist():
+                center = int(center_value)
+                if center < 0 or center >= node_atoms.size(0):
+                    continue
+                neighborhood = atom_neighborhood_indices(
+                    smiles, center_atom=center, radius=self.surrounding_structure_radius
+                )
+                if neighborhood is None:
+                    continue
+                query = (
+                    self.edge_atom_query(event_h[row_pos])
+                    + self.surrounding_center_query(node_atoms[center])
+                )
+                logits = (
+                    self.atom_key(node_atoms) * query.view(1, -1)
+                ).sum(dim=-1) / math.sqrt(max(query.numel(), 1))
+                target = torch.zeros_like(logits)
+                if neighborhood:
+                    target[torch.tensor(
+                        neighborhood, dtype=torch.long, device=target.device
+                    )] = 1.0
+                node_loss = self._observed_edge_loss(logits, target)
+                losses.append(node_loss)
+                pred = torch.sigmoid(logits) >= 0.5
+                target_bool = target.bool()
+                correct += float((pred == target_bool).float().sum().detach().cpu())
+                count += float(target.numel())
+                if bool(target_bool.any()):
+                    positive_correct += float(pred[target_bool].sum().detach().cpu())
+                    positive_count += float(target_bool.sum().detach().cpu())
+                negative_mask = ~target_bool
+                if bool(negative_mask.any()):
+                    negative_correct += float((~pred[negative_mask]).sum().detach().cpu())
+                    negative_count += float(negative_mask.sum().detach().cpu())
+        if not losses:
+            return None, {}
+        loss = torch.stack(losses).mean()
+        metrics = {
+            "surrounding_structure_loss": float(loss.detach().cpu()),
+            "surrounding_structure_acc": correct / max(count, 1.0),
+            "surrounding_structure_count": count,
+        }
+        if positive_count > 0:
+            metrics["surrounding_structure_pos_acc"] = positive_correct / positive_count
+            metrics["surrounding_structure_pos_count"] = positive_count
+        if negative_count > 0:
+            metrics["surrounding_structure_neg_acc"] = negative_correct / negative_count
+            metrics["surrounding_structure_neg_count"] = negative_count
+        return loss, metrics
 
     def _node_atom_location_loss(
         self,
@@ -377,11 +473,11 @@ class CleavagePretrainingModel(nn.Module):
         edge_h: Tensor,
         node_idx: int,
         positive_local_atoms: Tensor,
-    ) -> Tuple[Optional[Tensor], float, float]:
+    ) -> Tuple[Optional[Tensor], Dict[str, float]]:
         start = int(structure.node_graph_offset[int(node_idx)].item())
         stop = int(structure.node_graph_offset[int(node_idx) + 1].item())
         if stop <= start:
-            return None, 0.0, 0.0
+            return None, {}
         node_atoms = atom_h[start:stop]
         query = self.edge_atom_query(edge_h).view(1, -1)
         keys = self.atom_key(node_atoms)
@@ -389,12 +485,20 @@ class CleavagePretrainingModel(nn.Module):
         target = torch.zeros((stop - start,), dtype=logits.dtype, device=logits.device)
         valid_atoms = positive_local_atoms[(positive_local_atoms >= 0) & (positive_local_atoms < target.numel())].long()
         if valid_atoms.numel() == 0:
-            return None, 0.0, 0.0
+            return None, {}
         target[valid_atoms] = 1.0
         loss = F.binary_cross_entropy_with_logits(logits, target)
         pred = torch.sigmoid(logits) >= 0.5
-        correct = float((pred == target.bool()).float().sum().detach().cpu())
-        return loss, correct, float(target.numel())
+        target_bool = target.bool()
+        negative_mask = ~target_bool
+        return loss, {
+            "correct": float((pred == target_bool).float().sum().detach().cpu()),
+            "count": float(target.numel()),
+            "positive_correct": float(pred[target_bool].sum().detach().cpu()),
+            "positive_count": float(target_bool.sum().detach().cpu()),
+            "negative_correct": float((~pred[negative_mask]).sum().detach().cpu()),
+            "negative_count": float(negative_mask.sum().detach().cpu()),
+        }
 
     @staticmethod
     def _event_atom_tuple(structure: FragmentTreeStructure, *, tuple_length: int, row_index: int) -> Tensor:
@@ -420,6 +524,19 @@ class CleavagePretrainingModel(nn.Module):
             )
         return int(table[mask][0, 3].item())
 
+
+def atom_neighborhood_indices(
+    smiles: str, *, center_atom: int, radius: int
+) -> Optional[Tuple[int, ...]]:
+    """Return atoms one to ``radius`` bonds from a local center atom."""
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None or center_atom < 0 or center_atom >= mol.GetNumAtoms() or radius < 1:
+        return None
+    distances = Chem.GetDistanceMatrix(mol)[int(center_atom)]
+    return tuple(
+        int(idx) for idx, distance in enumerate(distances)
+        if 0 < float(distance) <= int(radius)
+    )
 
 def canonical_fragment_smiles(smiles: str, atom_indices: Tuple[int, ...]) -> Optional[str]:
     mol = Chem.MolFromSmiles(smiles)
