@@ -24,15 +24,15 @@ from clefts.utils.parallel_subprocess import run_parallel_subprocesses
 
 ORIGINAL_INDEX_COLUMN = "__fragment_tree_original_index"
 STRUCTURE_DATA_DIR_NAME = "data"
-DEFAULT_PROJECT_MODEL_CONFIG_NAME = "model_config.json"
+DEFAULT_PREPROCESSING_CONFIG_NAME = "preprocessing_config.json"
 from clefts.ml.input.fragment_tree_training_data import (
     build_fragment_tree_structure_files,
     build_fragment_tree_structure_files_from_existing,
     group_record_indexes_by_smiles,
     load_fragment_tree_structure_file,
 )
-from clefts.ml.specgen.fragment_tree_spectrum_predictor import (
-    FragmentSpectrumGenerator,
+from clefts.ml.input.fragment_tree_preprocessing_context import (
+    FragmentTreePreprocessingContext,
 )
 
 
@@ -94,21 +94,21 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--params",
         required=True,
-        help=(
-            "Complete FragmentSpectrumGenerator model config JSON. Select a positive- "
-            "or negative-mode config explicitly."
-        ),
+        help="Fragmenter parameter JSON used for preprocessing.",
     )
+    parser.add_argument("--symbols", nargs="+", required=True)
     parser.add_argument(
-        "--model-config-output",
+        "--preprocessing-config-output", "--model-config-output",
+        dest="preprocessing_config_output",
         default=None,
         help=(
-            "Path to copy the model config after the model is constructed. "
-            "Defaults to OUTPUT_DIR/config/model_config.json."
+            "Path for immutable preprocessing settings. Defaults to "
+            "OUTPUT_DIR/config/preprocessing_config.json."
         ),
     )
     parser.add_argument(
-        "--overwrite-model-config",
+        "--overwrite-preprocessing-config", "--overwrite-model-config",
+        dest="overwrite_preprocessing_config",
         action="store_true",
         help="Overwrite an existing copied model config without prompting.",
     )
@@ -221,24 +221,22 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def load_generator_params(params_path: str | Path) -> dict:
+def load_fragmenter_params(params_path: str | Path) -> dict:
     with Path(params_path).open("r", encoding="utf-8") as f:
         params = json.load(f)
 
-    if "probability_model_params" not in params:
-        raise ValueError(
-            "--params must be a complete FragmentSpectrumGenerator model config "
-            "containing 'probability_model_params'. Pass "
-            "clefts/presets/spectrum_generator_params/single_bond_pos_model_config.json "
-            "or single_bond_neg_model_config.json, rather than a fragmenter-only config."
-        )
+    if "probability_model_params" in params:
+        return dict(params["probability_model_params"]["fragmenter_params"])
     return params
 
 
-def load_generator(params_path: str | Path) -> FragmentSpectrumGenerator:
-    generator = FragmentSpectrumGenerator(**load_generator_params(params_path))
-    generator.eval()
-    return generator
+def load_preprocessing_context(args: argparse.Namespace) -> FragmentTreePreprocessingContext:
+    return FragmentTreePreprocessingContext(
+        symbols=args.symbols,
+        fragmenter_params=load_fragmenter_params(args.params),
+        max_node=args.max_node,
+        max_edge=args.max_edge,
+    )
 
 
 def _cleavage_pattern_set_from_params_dict(data: dict) -> CleavagePatternSet | None:
@@ -266,12 +264,12 @@ def resolve_structure_input_data_dir(path: str | Path) -> Path:
     return input_dir
 
 
-def find_previous_model_config(structure_input_dir: str | Path) -> Path | None:
+def find_previous_preprocessing_config(structure_input_dir: str | Path) -> Path | None:
     data_dir = resolve_structure_input_data_dir(structure_input_dir)
     candidates = [
-        data_dir.parent.parent / "config" / DEFAULT_PROJECT_MODEL_CONFIG_NAME,
-        data_dir.parent / "config" / DEFAULT_PROJECT_MODEL_CONFIG_NAME,
-        data_dir / "config" / DEFAULT_PROJECT_MODEL_CONFIG_NAME,
+        data_dir.parent.parent / "config" / DEFAULT_PREPROCESSING_CONFIG_NAME,
+        data_dir.parent / "config" / DEFAULT_PREPROCESSING_CONFIG_NAME,
+        data_dir / "config" / DEFAULT_PREPROCESSING_CONFIG_NAME,
     ]
     for candidate in candidates:
         if candidate.exists():
@@ -336,13 +334,13 @@ def make_structure_rebuild_decider(
     return should_rebuild
 
 
-def default_model_config_output(output_root: str | Path) -> Path:
-    return Path(output_root) / "config" / DEFAULT_PROJECT_MODEL_CONFIG_NAME
+def default_preprocessing_config_output(output_root: str | Path) -> Path:
+    return Path(output_root) / "config" / DEFAULT_PREPROCESSING_CONFIG_NAME
 
 
-def copy_model_config_after_model_creation(
+def write_preprocessing_config(
     *,
-    source_file: str | Path,
+    context: FragmentTreePreprocessingContext,
     output_file: str | Path,
     overwrite: bool = False,
 ) -> None:
@@ -351,19 +349,21 @@ def copy_model_config_after_model_creation(
     if output_path.exists() and not overwrite:
         with output_path.open("r", encoding="utf-8") as f:
             existing_config = json.load(f)
-        if existing_config == load_generator_params(source_file):
-            print(f"kept identical existing model config: {output_path}")
+        if existing_config == context.to_dict():
+            print(f"kept identical existing preprocessing config: {output_path}")
             return
-        answer = input(f"Model config already exists: {output_path}. Overwrite? [y/N] ")
-        if answer.strip().lower() not in {"y", "yes"}:
-            print(f"kept existing model config: {output_path}")
-            return
+        raise ValueError(
+            "Preprocessing settings are immutable once structure data exists. "
+            f"The requested settings differ from {output_path}. Use a different "
+            "output directory, or rebuild all data with --overwrite and "
+            "--overwrite-preprocessing-config."
+        )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", encoding="utf-8") as f:
-        json.dump(load_generator_params(source_file), f, indent=2)
+        json.dump(context.to_dict(), f, indent=2)
         f.write("\n")
-    print(f"wrote model config: {source_file} -> {output_path}")
+    print(f"wrote preprocessing config: {output_path}")
 
 
 def structure_data_dir(structure_dir: str | Path) -> Path:
@@ -495,7 +495,7 @@ def build_structure_files_for_input(
     input_path: str,
     output_dir: str | Path,
     args: argparse.Namespace,
-    generator: FragmentSpectrumGenerator,
+    context: FragmentTreePreprocessingContext,
     manifest_file: str | Path | None = None,
     save_valid: bool = False,
     valid_records_output: str | Path | None = None,
@@ -509,7 +509,7 @@ def build_structure_files_for_input(
     valid_record_indexes: list[int] = []
     saved_files = build_fragment_tree_structure_files(
         dataset=dataset,
-        feature_model=generator.feature_model,
+        feature_model=context,
         output_dir=output_dir,
         smiles_column=args.smiles_column,
         precursor_mz_column=args.precursor_mz_column,
@@ -543,7 +543,7 @@ def build_structure_files_for_input(
     if assigned_cleavage_event_output is not None:
         write_assigned_cleavage_event_statistics(
             structure_files=saved_files,
-            pattern_set=generator.feature_model.fragmenter.cleavage_pattern_set,
+            pattern_set=context.fragmenter.cleavage_pattern_set,
             output_file=assigned_cleavage_event_output,
             num_workers=1,
         )
@@ -560,11 +560,11 @@ def build_structure_files_for_existing_input(
     structures_input_dir: str | Path,
     output_dir: str | Path,
     args: argparse.Namespace,
-    generator: FragmentSpectrumGenerator,
+    context: FragmentTreePreprocessingContext,
     manifest_file: str | Path | None = None,
 ) -> list[Path]:
     input_data_dir = resolve_structure_input_data_dir(structures_input_dir)
-    previous_config = find_previous_model_config(input_data_dir)
+    previous_config = find_previous_preprocessing_config(input_data_dir)
     previous_pattern_set = None
     if previous_config is not None:
         previous_pattern_set = load_cleavage_pattern_set_from_params(previous_config)
@@ -576,7 +576,7 @@ def build_structure_files_for_existing_input(
             file=sys.stderr,
         )
 
-    current_pattern_set = generator.feature_model.fragmenter.cleavage_pattern_set
+    current_pattern_set = context.fragmenter.cleavage_pattern_set
     should_rebuild = make_structure_rebuild_decider(
         policy=args.structure_rebuild_policy,
         current_pattern_set=current_pattern_set,
@@ -588,7 +588,7 @@ def build_structure_files_for_existing_input(
 
     saved_files = build_fragment_tree_structure_files_from_existing(
         input_dir=input_data_dir,
-        feature_model=generator.feature_model,
+        feature_model=context,
         output_dir=output_dir,
         should_rebuild=should_rebuild,
         max_node=args.max_node,
@@ -791,6 +791,8 @@ def run_parallel_for_input(
             str(structure_output_dir),
             "--params",
             str(args.params),
+            "--symbols",
+            *[str(symbol) for symbol in args.symbols],
             "--smiles-column",
             str(args.smiles_column),
             "--precursor-mz-column",
@@ -970,12 +972,12 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
         raise ValueError("--validation-input and --validation-structures-input-dir are mutually exclusive.")
 
     if args.structure_output_dir is not None:
-        generator = load_generator(args.params)
+        generator = load_preprocessing_context(args)
         build_structure_files_for_input(
             input_path=args.train_input,
             output_dir=Path(args.structure_output_dir),
             args=args,
-            generator=generator,
+            context=generator,
             manifest_file=args.manifest_file,
             save_valid=args.save_valid_records,
             valid_records_output=args.valid_records_output,
@@ -1023,19 +1025,29 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
         remove_existing_dirs(structure_dirs, description="structure")
         remove_existing_dirs(parallel_temp_dirs, description="parallel temp")
 
-    generator = load_generator(args.params)
-    model_config_output = (
-        Path(args.model_config_output)
-        if args.model_config_output is not None
-        else default_model_config_output(output_root)
+    generator = load_preprocessing_context(args)
+    preprocessing_config_output_path = (
+        Path(args.preprocessing_config_output)
+        if args.preprocessing_config_output is not None
+        else default_preprocessing_config_output(output_root)
     )
-    copy_model_config_after_model_creation(
-        source_file=args.params,
-        output_file=model_config_output,
-        overwrite=bool(args.overwrite_model_config),
+    if (
+        args.overwrite_preprocessing_config
+        and train_structure_data_dir.exists()
+        and any(train_structure_data_dir.glob("*.pt"))
+        and not args.overwrite
+    ):
+        raise ValueError(
+            "--overwrite-preprocessing-config cannot be used while retaining existing "
+            "training structures. Add --overwrite to rebuild them."
+        )
+    write_preprocessing_config(
+        context=generator,
+        output_file=preprocessing_config_output_path,
+        overwrite=bool(args.overwrite_preprocessing_config),
     )
 
-    pattern_set = generator.feature_model.fragmenter.cleavage_pattern_set
+    pattern_set = generator.fragmenter.cleavage_pattern_set
 
     if validation_uses_structures:
         if args.num_workers > 1:
@@ -1054,7 +1066,7 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
                 input_path=args.train_input,
                 output_dir=train_structure_data_dir,
                 args=args,
-                generator=generator,
+                context=generator,
                 manifest_file=train_manifest_file,
                 save_valid=bool(args.save_train_valid_records),
                 valid_records_output=train_valid_output,
@@ -1065,7 +1077,7 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
             structures_input_dir=args.validation_structures_input_dir,
             output_dir=validation_structure_data_dir,
             args=args,
-            generator=generator,
+            context=generator,
             manifest_file=validation_structure_dir / "manifest.tsv",
         )
         write_split_cleavage_event_statistics(
@@ -1117,7 +1129,7 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
         input_path=args.train_input,
         output_dir=train_structure_data_dir,
         args=args,
-        generator=generator,
+        context=generator,
         manifest_file=train_manifest_file,
         save_valid=bool(args.save_train_valid_records),
         valid_records_output=train_valid_output,
@@ -1134,7 +1146,7 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
             input_path=validation_input,
             output_dir=validation_structure_data_dir,
             args=args,
-            generator=generator,
+            context=generator,
             manifest_file=validation_structure_dir / "manifest.tsv",
             save_valid=bool(args.save_validation_valid_records),
             valid_records_output=validation_valid_output,

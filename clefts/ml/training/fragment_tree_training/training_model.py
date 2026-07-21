@@ -152,6 +152,38 @@ def load_generator(model_config: Dict[str, Any], device: torch.device) -> Fragme
     return generator
 
 
+def validate_preprocessing_compatibility(
+    *, project_dir: str | Path, model_config: Dict[str, Any]
+) -> None:
+    config_path = Path(project_dir) / "config" / "preprocessing_config.json"
+    if not config_path.exists():
+        raise FileNotFoundError(
+            f"Preprocessing config not found: {config_path}. Training requires the "
+            "immutable definitions used to create the structure data."
+        )
+    preprocessing = load_config(config_path)
+    params = model_config.get("params", model_config).get("probability_model_params", {})
+    model_symbols = tuple(params.get("mol_encoder_params", {}).get("symbols", ()))
+    expected_symbols = tuple(preprocessing.get("symbols", ()))
+    if model_symbols != expected_symbols:
+        raise ValueError(
+            "Model symbols do not match preprocessing data: "
+            f"expected={expected_symbols}, actual={model_symbols}."
+        )
+
+    from clefts.domain.fragment import Fragmenter
+
+    expected_fragmenter = Fragmenter.from_dict(
+        preprocessing["fragmenter_params"]
+    ).to_dict()
+    actual_fragmenter = Fragmenter.from_dict(params["fragmenter_params"]).to_dict()
+    if actual_fragmenter != expected_fragmenter:
+        raise ValueError(
+            "Model fragmenter_params do not match the immutable preprocessing "
+            f"configuration in {config_path}."
+        )
+
+
 def build_training_model(
     model_config: Dict[str, Any],
     device: torch.device,
@@ -1345,6 +1377,9 @@ def run_training_from_config(
     )
 
     model_config = load_config(model_config_resolved)
+    validate_preprocessing_compatibility(
+        project_dir=project_dir, model_config=model_config
+    )
     shutil.copy(model_config_resolved, run_dir / model_config_resolved.name)
 
     main(
@@ -1408,6 +1443,9 @@ def run_training(
     )
 
     model_config = load_config(model_config_resolved)
+    validate_preprocessing_compatibility(
+        project_dir=project_dir, model_config=model_config
+    )
     shutil.copy(model_config_resolved, run_dir / model_config_resolved.name)
 
     main(

@@ -147,7 +147,7 @@ class TrainingFragmentTreeStructureBuilder(SingleFragmentTreeStructureBuilder):
             )
             peak_sets.append((precursor_type, peak_mz))
 
-        assignments = self._model.fragmenter.assign_fragment_pathways_to_peak_sets(
+        assignments = self._context.fragmenter.assign_fragment_pathways_to_peak_sets(
             fragment_ion_tree=fragment_ion_tree,
             peak_sets=peak_sets,
         )
@@ -181,11 +181,11 @@ class TrainingFragmentTreeStructureBuilder(SingleFragmentTreeStructureBuilder):
         )
         sample_rows = self._sample_rows_from_structure(structure)
         peak_sets = [
-            (self._model.fragmenter.adduct_types[row.adduct_type_index], row.peak_mz)
+            (self._context.fragmenter.adduct_types[row.adduct_type_index], row.peak_mz)
             for row in sample_rows
             if row is not None
         ]
-        assignments = self._model.fragmenter.assign_fragment_pathways_to_peak_sets(
+        assignments = self._context.fragmenter.assign_fragment_pathways_to_peak_sets(
             fragment_ion_tree=fragment_ion_tree,
             peak_sets=peak_sets,
         )
@@ -209,9 +209,9 @@ class TrainingFragmentTreeStructureBuilder(SingleFragmentTreeStructureBuilder):
     ) -> Tuple[FragmentIonTree, Dict[str, Compound]]:
         compound = Compound.from_smiles(smiles)
         if max_depth is None:
-            max_depth = self._model.tree_max_depth
+            max_depth = self._context.tree_max_depth
 
-        fragment_ion_tree = self._model.fragmenter.build_fragment_ion_tree(
+        fragment_ion_tree = self._context.fragmenter.build_fragment_ion_tree(
             compound=compound,
             max_node=max_node,
             max_edge=max_edge,
@@ -234,7 +234,7 @@ class TrainingFragmentTreeStructureBuilder(SingleFragmentTreeStructureBuilder):
         sample_rows: List[TrainingSampleInputRow] = []
         for sample_index in range(structure.num_samples):
             adduct_type_index = int(structure.sample_adduct_type_index[sample_index].item())
-            if adduct_type_index < 0 or adduct_type_index >= len(self._model.fragmenter.adduct_types):
+            if adduct_type_index < 0 or adduct_type_index >= len(self._context.fragmenter.adduct_types):
                 raise ValueError(
                     "Saved sample adduct index is not supported by the current model: "
                     f"{adduct_type_index}"
@@ -332,7 +332,7 @@ class TrainingFragmentTreeStructureBuilder(SingleFragmentTreeStructureBuilder):
             print(
                 "[WARN] Failed to add training sample "
                 f"{row.source_label}, smiles={smiles!r}, "
-                f"adduct_type={self._model.fragmenter.adduct_types[int(row.adduct_type_index)]}: {exc}",
+                f"adduct_type={self._context.fragmenter.adduct_types[int(row.adduct_type_index)]}: {exc}",
                 file=sys.stderr,
             )
             return -1
@@ -569,12 +569,12 @@ class TrainingFragmentTreeStructureBuilder(SingleFragmentTreeStructureBuilder):
         adduct_type_index: int,
         fragment_compound_by_smiles: Dict[str, Compound],
     ) -> None:
-        main_adduct_type = self._model.fragmenter.adduct_types[adduct_type_index]
+        main_adduct_type = self._context.fragmenter.adduct_types[adduct_type_index]
 
         for precursor_pathway in precursor_fragment_pathways:
             precursor_edge_index_path = self._fragment_pathway_to_edge_index_path(
                 fragment_pathway=precursor_pathway,
-                padding_length=self._model.fragmenter.precursor_candidate_max_depth,
+                padding_length=self._context.fragmenter.precursor_candidate_max_depth,
                 fragment_compound_by_smiles=fragment_compound_by_smiles,
             )
             precursor_node = precursor_pathway.precursor_node
@@ -583,7 +583,7 @@ class TrainingFragmentTreeStructureBuilder(SingleFragmentTreeStructureBuilder):
 
             precursor_adduct = precursor_node.precursor_adduct_type
             precursor_delta_h_state = (
-                self._model.fragmenter.get_precursor_delta_h_state_by_adduct_type(
+                self._context.fragmenter.get_precursor_delta_h_state_by_adduct_type(
                     main_adduct_type=main_adduct_type,
                     adduct_type=precursor_adduct,
                 )
@@ -668,7 +668,7 @@ class TrainingFragmentTreeStructureBuilder(SingleFragmentTreeStructureBuilder):
                 ion_index, unsaturation_index, radical_index = (
                     self._resolve_fragment_state_target(
                         fragment_pathway=fragment_pathway,
-                        main_adduct_type=self._model.fragmenter.adduct_types[
+                        main_adduct_type=self._context.fragmenter.adduct_types[
                             int(sample.adduct_type_index)
                         ],
                     )
@@ -690,7 +690,7 @@ class TrainingFragmentTreeStructureBuilder(SingleFragmentTreeStructureBuilder):
                         intensity=peak_intensity,
                         expand_node_indexes=tuple(expand_node_indexes_for_terminal),
                     ),
-                    main_adduct_type=self._model.fragmenter.adduct_types[
+                    main_adduct_type=self._context.fragmenter.adduct_types[
                         int(sample.adduct_type_index)
                     ],
                 )
@@ -735,27 +735,27 @@ class TrainingFragmentTreeStructureBuilder(SingleFragmentTreeStructureBuilder):
         target_formula = fragment_pathway.formula.normalized
         terminal_formula = fragment_pathway.terminal_node.to_compound().formula
 
-        adduct_index = self._model.main_adduct_types.inverse[main_adduct_type]
+        adduct_index = self._context.main_adduct_types.inverse[main_adduct_type]
         role_index = 0 if fragment_pathway.terminal_node.is_precursor else 1
-        ion_mask = self._model.ion_candidate_valid_mask_by_role_adduct[
+        ion_mask = self._context.ion_candidate_valid_mask_by_role_adduct[
             role_index, int(adduct_index)
         ]
-        unsaturation_mask = self._model.unsaturation_candidate_valid_mask_by_role_adduct[
+        unsaturation_mask = self._context.unsaturation_candidate_valid_mask_by_role_adduct[
             role_index, int(adduct_index)
         ]
-        radical_mask = self._model.radical_candidate_valid_mask_by_role_adduct[
+        radical_mask = self._context.radical_candidate_valid_mask_by_role_adduct[
             role_index, int(adduct_index)
         ]
 
         matches: List[Tuple[Tuple[int, int, int, int, int], Tuple[int, int, int]]] = []
         for ion_index in ion_mask.nonzero(as_tuple=False).view(-1).tolist():
-            ion_adduct = self._model.ion_flat_candidates[int(ion_index), 1]
+            ion_adduct = self._context.ion_flat_candidates[int(ion_index), 1]
             for unsaturation_index in unsaturation_mask.nonzero(as_tuple=False).view(-1).tolist():
-                unsaturation_adduct = self._model.unsaturation_flat_candidates[
+                unsaturation_adduct = self._context.unsaturation_flat_candidates[
                     int(unsaturation_index), 1
                 ]
                 for radical_index in radical_mask.nonzero(as_tuple=False).view(-1).tolist():
-                    radical_adduct = self._model.radical_flat_candidates[
+                    radical_adduct = self._context.radical_flat_candidates[
                         int(radical_index), 1
                     ]
                     adduct = ion_adduct.add_prefer_self(unsaturation_adduct)
@@ -796,10 +796,10 @@ class TrainingFragmentTreeStructureBuilder(SingleFragmentTreeStructureBuilder):
         unsaturation_index: int,
         radical_index: int,
     ) -> Tuple[int, int, int, int, int]:
-        unsaturation_adduct = self._model.unsaturation_flat_candidates[
+        unsaturation_adduct = self._context.unsaturation_flat_candidates[
             int(unsaturation_index), 1
         ]
-        radical_adduct = self._model.radical_flat_candidates[int(radical_index), 1]
+        radical_adduct = self._context.radical_flat_candidates[int(radical_index), 1]
         return (
             self._adduct_distance_from_zero(unsaturation_adduct),
             self._adduct_distance_from_zero(radical_adduct),

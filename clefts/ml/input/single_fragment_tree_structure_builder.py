@@ -11,6 +11,7 @@ from ...libs.mmkit.mmkit import Compound, Adduct
 from ...libs.msentity.msentity import SpectrumRecord
 from ...domain.fragment.cleavage import CleavageResult
 from ...domain.fragment.ion_tree import FragmentIonTree
+from ...domain.mass import parse_ce_to_ev
 from ...domain.fragment.pathway import (
     FragmentPathway,
     FragmentPathwayGroup,
@@ -18,7 +19,7 @@ from ...domain.fragment.pathway import (
     FragmentPathwayEdge,
     CleavageStep,
 )
-from ..specgen.fragment_tree_feature_model import FragmentTreeFeatureModel
+from .fragment_tree_preprocessing_context import FragmentTreePreprocessingContext
 from ..mol.formula_encoder import FormulaTensorizer
 from .fragment_tree_structure import FragmentTreeStructure
 
@@ -64,8 +65,8 @@ class FragmentTreeSample:
 
 @dataclass
 class SingleFragmentTreeStructureBuilder:
-    _model: FragmentTreeFeatureModel = field(repr=False, compare=False)
-    # CleftsSpecGen model used to define model-derived IDs and settings.
+    _context: FragmentTreePreprocessingContext = field(repr=False, compare=False)
+    # Non-neural definitions used to build stable graph and categorical indexes.
     #
     # This builder depends on the model for:
     #     adduct type definitions
@@ -243,19 +244,17 @@ class SingleFragmentTreeStructureBuilder:
     def __post_init__(self) -> None:
         required_model_attrs = (
             "fragmenter",
-            "mol_encoder",
-            "cleavage_edge_fnet",
             "formula_tensorizer",
             "get_index_by_adduct_type",
         )
         missing_attrs = [
-            attr for attr in required_model_attrs if not hasattr(self._model, attr)
+            attr for attr in required_model_attrs if not hasattr(self._context, attr)
         ]
         if missing_attrs:
             raise TypeError(
-                "_model must provide the FragmentTree feature model interface. "
+                "_context must provide the fragment-tree preprocessing interface. "
                 f"Missing attrs: {missing_attrs}. "
-                f"Got {type(self._model).__name__}."
+                f"Got {type(self._context).__name__}."
             )
 
     def to_structure(self) -> FragmentTreeStructure:
@@ -277,15 +276,15 @@ class SingleFragmentTreeStructureBuilder:
         node_formula = torch.stack(self.node_formula, dim=0)
         formula_tensorizer = self._get_formula_tensorizer()
         ion_formula_delta = formula_tensorizer.adducts_to_delta_tensor(
-            [candidate for _, candidate in self._model.ion_flat_candidates],
+            [candidate for _, candidate in self._context.ion_flat_candidates],
             dtype=node_formula.dtype,
         )
         unsaturation_formula_delta = formula_tensorizer.adducts_to_delta_tensor(
-            [candidate for _, candidate in self._model.unsaturation_flat_candidates],
+            [candidate for _, candidate in self._context.unsaturation_flat_candidates],
             dtype=node_formula.dtype,
         )
         radical_formula_delta = formula_tensorizer.adducts_to_delta_tensor(
-            [candidate for _, candidate in self._model.radical_flat_candidates],
+            [candidate for _, candidate in self._context.radical_flat_candidates],
             dtype=node_formula.dtype,
         )
 
@@ -336,7 +335,7 @@ class SingleFragmentTreeStructureBuilder:
         # Tuple-length tables
         # -------------------------
         reactant_tuple_length_table = self._tuple_length_dict_to_tensor(
-            self._model.cleavage_edge_fnet.reactant_tuple_length_by_event_type,
+            self._get_cleavage_definitions().reactant_tuple_length_by_event_type,
             key_width=2,
         )
         # [R, 3]
@@ -346,7 +345,7 @@ class SingleFragmentTreeStructureBuilder:
         #   2: reactant_tuple_length
 
         product_tuple_length_table = self._tuple_length_dict_to_tensor(
-            self._model.cleavage_edge_fnet.product_tuple_length_by_event_type,
+            self._get_cleavage_definitions().product_tuple_length_by_event_type,
             key_width=3,
         )
         # [P, 4]
@@ -572,9 +571,9 @@ class SingleFragmentTreeStructureBuilder:
         # -------------------------
         # Build shared FragmentIonTree only once
         # -------------------------
-        fragment_ion_tree = self._model._fragmenter.build_fragment_ion_tree(
+        fragment_ion_tree = self._context._fragmenter.build_fragment_ion_tree(
             compound=compound,
-            max_depth=self._model.precursor_candidate_max_depth,
+            max_depth=self._context.precursor_candidate_max_depth,
             _include_fragment_compound_cache=True,
         )
 
@@ -620,7 +619,7 @@ class SingleFragmentTreeStructureBuilder:
             if cleavage_results is None:
                 compound = get_compound_by_smiles(smiles)
                 cleavage_results = (
-                    self._model.fragmenter.cleavage_pattern_set.fragment_all(
+                    self._context.fragmenter.cleavage_pattern_set.fragment_all(
                         compound
                     )
                 )
@@ -742,7 +741,7 @@ class SingleFragmentTreeStructureBuilder:
 
             if precursor_type not in precursor_fragment_pathways_by_adduct:
                 precursor_fragment_pathways, _ = (
-                    self._model.fragmenter.assign_fragment_pathways_to_peaks(
+                    self._context.fragmenter.assign_fragment_pathways_to_peaks(
                         fragment_ion_tree=fragment_ion_tree,
                         precursor_type=precursor_type,
                         peaks_mz=[],
@@ -754,7 +753,7 @@ class SingleFragmentTreeStructureBuilder:
             precursor_fragment_pathways = precursor_fragment_pathways_by_adduct[precursor_type]
 
             
-            main_adduct_type = self._model.fragmenter.adduct_types[adduct_type_index]
+            main_adduct_type = self._context.fragmenter.adduct_types[adduct_type_index]
 
             sample = FragmentTreeSample(
                 adduct_type_index=int(adduct_type_index),
@@ -764,7 +763,7 @@ class SingleFragmentTreeStructureBuilder:
             for precursor_pathway in precursor_fragment_pathways:
                 precursor_edge_index_path = self._fragment_pathway_to_edge_index_path(
                     fragment_pathway=precursor_pathway,
-                    padding_length=self._model.fragmenter.precursor_candidate_max_depth,
+                    padding_length=self._context.fragmenter.precursor_candidate_max_depth,
                     fragment_compound_by_smiles=fragment_compound_by_smiles,
                 )
                 if len(precursor_edge_index_path) == 0:
@@ -773,7 +772,7 @@ class SingleFragmentTreeStructureBuilder:
                 if precursor_node is None:
                     continue
                 precursor_adduct = precursor_node.precursor_adduct_type
-                precursor_delta_h_state = self._model.fragmenter.get_precursor_delta_h_state_by_adduct_type(
+                precursor_delta_h_state = self._context.fragmenter.get_precursor_delta_h_state_by_adduct_type(
                     main_adduct_type=main_adduct_type,
                     adduct_type=precursor_adduct,
                 )
@@ -822,7 +821,7 @@ class SingleFragmentTreeStructureBuilder:
 
         Notes
         -----
-        This method keeps self._model unchanged.
+        This method keeps self._context unchanged.
         """
 
         # -------------------------
@@ -867,20 +866,18 @@ class SingleFragmentTreeStructureBuilder:
     # internal helpers
     # -------------------------
     def _get_formula_tensorizer(self) -> FormulaTensorizer:
-        if not hasattr(self._model, "formula_tensorizer"):
+        if not hasattr(self._context, "formula_tensorizer"):
             raise ValueError("model must expose formula_tensorizer.")
-        return self._model.formula_tensorizer
+        return self._context.formula_tensorizer
 
     def _get_mol_graph(
         self,
         smiles: str,
         compound: Optional[Compound] = None,
     ) -> Data:
-        builder = (
-            self._model._mol_encoder.graph_builder
-            if self._model is not None
-            else None
-        )
+        builder = getattr(self._context, "mol_graph_builder", None)
+        if builder is None and hasattr(self._context, "_mol_encoder"):
+            builder = self._context._mol_encoder.graph_builder
 
         if builder is None:
             raise ValueError(
@@ -897,6 +894,14 @@ class SingleFragmentTreeStructureBuilder:
             raise TypeError("mol_graph_builder must return torch_geometric.data.Data")
 
         return graph
+
+    def _get_cleavage_definitions(self):
+        definitions = getattr(self._context, "cleavage_definitions", None)
+        if definitions is None:
+            definitions = getattr(self._context, "cleavage_edge_fnet", None)
+        if definitions is None:
+            raise ValueError("preprocessing context must expose cleavage definitions.")
+        return definitions
 
     def _get_node_index(
         self,
@@ -1421,9 +1426,9 @@ class SingleFragmentTreeStructureBuilder:
         if instrument_column is not None:
             instrument = record[instrument_column]
 
-        adduct_type_index = self._model.get_index_by_adduct_type(precursor_type)
+        adduct_type_index = self._context.get_index_by_adduct_type(precursor_type)
 
-        ce_value = FragmentTreeFeatureModel.parse_ce_to_ev(
+        ce_value = parse_ce_to_ev(
             ce_value_raw,
             precursor_mz=precursor_mz,
             instrument=instrument,

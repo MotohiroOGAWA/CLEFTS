@@ -9,7 +9,8 @@ Run the commands below from the repository's `mnt/app` directory.
 ```bash
 python -m clefts.ml.data_preparation.fragment_tree.create_fragment_tree_training_data \
   --train-input path/to/training_data.msds \
-  --params path/to/model_config.json \
+  --params path/to/fragmenter_params.json \
+  --symbols C N O P S F Cl Br I \
   --output-dir path/to/output_directory \
   --num-workers 1
 ```
@@ -21,7 +22,8 @@ python -m clefts.ml.data_preparation.fragment_tree.create_fragment_tree_training
   --train-input path/to/training_data.msds \
   --validation-input path/to/validation_candidates.msds \
   --validation-smiles-ratio 0.1 \
-  --params path/to/model_config.json \
+  --params path/to/fragmenter_params.json \
+  --symbols C N O P S F Cl Br I \
   --output-dir path/to/output_directory \
   --num-workers 4 \
   --chunk-size 32 \
@@ -30,18 +32,22 @@ python -m clefts.ml.data_preparation.fragment_tree.create_fragment_tree_training
   --overwrite-model-config
 ```
 
-For negative mode, use
-`--params clefts/presets/spectrum_generator_params/single_bond_neg_model_config.json`.
-The command requires a complete spectrum-generator model config so that ionization
-mode is never selected implicitly.
+Choose positive- or negative-mode fragmenter parameters explicitly. Neural-network
+dimensions, layer counts, and dropout are not preprocessing inputs.
 
 Both `--train-input` and `--output-dir` are required. Reusing the same output directory without `--overwrite` resumes training: existing SMILES structure files are skipped and missing ones are built. Validation sampling starts only after this training pass has completed, and its maximum Tanimoto values are calculated against the SMILES in the completed files under `train_structures/data`.
+
+The immutable preprocessing settings are saved in
+`config/preprocessing_config.json`. They contain `symbols`, normalized
+`fragmenter_params`, `max_node`, and `max_edge`; they do not contain neural-network
+dimensions, layer counts, or dropout. Training validates the model's symbols and
+fragmenter definitions against this file before constructing the model.
 
 ## Main output files
 
 ```text
 OUTPUT_DIR/
-├── config/model_config.json
+├── config/preprocessing_config.json
 ├── statistics/
 │   ├── train_assigned_cleavage_events.tsv
 │   ├── train_assigned_cleavage_events_by_sample.tsv
@@ -101,6 +107,7 @@ The compact label uses the actual atom and bond types at the matched reactant at
 - `--num-workers`: Use two or more subprocess workers to process SMILES groups in parallel. SMARTS statistics are calculated once per split by the parent process.
 - `--chunk-size`: Number of SMILES groups assigned to each parallel chunk.
 - `--smiles-column`: Name of the SMILES metadata column. The default is `SMILES`.
+- `--symbols`: Element symbols that define the atom-feature columns. This is required and immutable for generated data.
 - `--validation-smiles-ratio`: Target validation count divided by unique training SMILES count. The unit is SMILES, not spectrum records.
 - `--tanimoto-num-bins`: Number of intervals used to balance maximum Tanimoto similarity (default: 10).
 - `--save-train-valid-records`: Save training records for which structures were successfully generated as an `.msds` file.
