@@ -4,8 +4,8 @@ import argparse
 from pathlib import Path
 
 from ...base import CLICommand
-from clefts.ml.input.create_fragment_tree_training_data import main as create_main
-from clefts.ml.input.create_fragment_tree_training_data import parse_args as create_parse_args
+from clefts.ml.data_preparation.fragment_tree.create_fragment_tree_training_data import main as create_main
+from clefts.ml.data_preparation.fragment_tree.create_fragment_tree_training_data import parse_args as create_parse_args
 
 
 class CreateFragmentTreeDataCommand(CLICommand):
@@ -37,6 +37,16 @@ class CreateFragmentTreeDataCommand(CLICommand):
             default=None,
             help="Optional validation input MSDataset path.",
         )
+        parser.add_argument(
+            "--validation-smiles-ratio",
+            type=float,
+            default=0.1,
+            help="Validation SMILES count relative to training SMILES count (default: 0.1).",
+        )
+        parser.add_argument("--tanimoto-num-bins", type=int, default=10)
+        parser.add_argument("--tanimoto-radius", type=int, default=2)
+        parser.add_argument("--tanimoto-n-bits", type=int, default=2048)
+        parser.add_argument("--validation-sampling-seed", type=int, default=0)
         parser.add_argument("--smiles-column", default="SMILES")
         parser.add_argument("--precursor-mz-column", default="PrecursorMZ")
         parser.add_argument("--adduct-type-column", default="AdductType")
@@ -106,6 +116,14 @@ class CreateFragmentTreeDataCommand(CLICommand):
         ]
         if args.validation_input is not None:
             argv.extend(["--validation-input", str(args.validation_input)])
+        if args.validation_smiles_ratio is not None:
+            argv.extend(["--validation-smiles-ratio", str(args.validation_smiles_ratio)])
+        argv.extend([
+            "--tanimoto-num-bins", str(args.tanimoto_num_bins),
+            "--tanimoto-radius", str(args.tanimoto_radius),
+            "--tanimoto-n-bits", str(args.tanimoto_n_bits),
+            "--validation-sampling-seed", str(args.validation_sampling_seed),
+        ])
         if args.instrument_column is not None:
             argv.extend(["--instrument-column", str(args.instrument_column)])
         if args.overwrite:

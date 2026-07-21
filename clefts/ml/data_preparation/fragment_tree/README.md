@@ -1,29 +1,28 @@
 # Creating Fragment Tree Training Data
 
-`create_fragment_tree_training_data.py` groups an `MSDataset` by SMILES and creates one training `FragmentTreeStructure` (`.pt`) file for each SMILES group. It also reports how often each cleavage pattern's reactant SMARTS matches the input compounds.
+`create_fragment_tree_training_data.py` groups an `MSDataset` by SMILES and creates one training `FragmentTreeStructure` (`.pt`) file for each SMILES group. Executable dataset-building workflows and reporting helpers live in `clefts.ml.data_preparation`; reusable dataset and structure classes remain in `clefts.ml.input`.
 
 Run the commands below from the repository's `mnt/app` directory.
 
 ## Basic example
 
 ```bash
-cd /workspaces/CLEFTS/mnt/app
-
-python -m clefts.ml.input.create_fragment_tree_training_data \
-  --train-input data/minidata/MSMS-Pos-NIST23_cf_mini.msds \
-  --params clefts/domain/fragment/presets/fragmenter_pos.json \
-  --output-dir data/test/fragment_tree_training_structures \
+python -m clefts.ml.data_preparation.fragment_tree.create_fragment_tree_training_data \
+  --train-input path/to/training_data.msds \
+  --params path/to/model_config.json \
+  --output-dir path/to/output_directory \
   --num-workers 1
 ```
 
 Add `--overwrite --overwrite-model-config` to rebuild existing output:
 
 ```bash
-python -m clefts.ml.input.create_fragment_tree_training_data \
-  --train-input data/minidata/MSMS-Pos-NIST23_cf_mini.msds \
-  --validation-input data/minidata/MSMS-Pos-MoNA_cf_mini.msds \
-  --params clefts/domain/fragment/presets/fragmenter_pos.json \
-  --output-dir data/test/fragment_tree_training_structures \
+python -m clefts.ml.data_preparation.fragment_tree.create_fragment_tree_training_data \
+  --train-input path/to/training_data.msds \
+  --validation-input path/to/validation_candidates.msds \
+  --validation-smiles-ratio 0.1 \
+  --params path/to/model_config.json \
+  --output-dir path/to/output_directory \
   --num-workers 4 \
   --chunk-size 32 \
   --save-train-valid-records \
@@ -31,23 +30,12 @@ python -m clefts.ml.input.create_fragment_tree_training_data \
   --overwrite-model-config
 ```
 
-To update previously generated structures using a configuration containing new cleavage patterns:
+For negative mode, use
+`--params clefts/presets/spectrum_generator_params/single_bond_neg_model_config.json`.
+The command requires a complete spectrum-generator model config so that ionization
+mode is never selected implicitly.
 
-```bash
-python -m clefts.ml.input.create_fragment_tree_training_data \
-  --train-structures-input-dir data/old/fragment_tree_training_structures/train_structures \
-  --params path/to/new_model_config.json \
-  --output-dir data/new/fragment_tree_training_structures \
-  --structure-rebuild-policy all-fragments
-```
-
-`--structure-rebuild-policy` accepts:
-
-- `root`: rebuild when an added pattern matches the root compound.
-- `all-fragments`: rebuild when an added pattern matches any saved fragment. This is the default.
-- `always`: always rebuild the structure.
-
-Assigned cleavage-event statistics are also generated when existing structures are used as input, based on the target assignments saved in the rebuilt or copied structures.
+Both `--train-input` and `--output-dir` are required. Reusing the same output directory without `--overwrite` resumes training: existing SMILES structure files are skipped and missing ones are built. Validation sampling starts only after this training pass has completed, and its maximum Tanimoto values are calculated against the SMILES in the completed files under `train_structures/data`.
 
 ## Main output files
 
@@ -68,6 +56,8 @@ OUTPUT_DIR/
 ```
 
 When `--validation-input` is supplied, the corresponding `statistics/validation_*` files are also generated.
+
+By default, `--validation-smiles-ratio` is `0.1`: the number of selected validation SMILES is 10% of the number of unique training SMILES (rounded up and capped by the available validation SMILES). Candidates are divided into ten bins by their maximum Morgan-fingerprint Tanimoto similarity to training data, then selected round-robin across non-empty bins. Thus similarity 1.0 (also present in training) through structurally dissimilar candidates near 0.0 are represented as evenly as the candidate pool allows. The selection is deterministic by default; use `--validation-sampling-seed` to change it. `validation_structures/max_tanimoto_index.tsv` records the selected SMILES and similarities.
 
 With `--num-workers 2` or greater, each worker writes
 `part_*_assigned_cleavage_events.tsv` and
@@ -111,6 +101,8 @@ The compact label uses the actual atom and bond types at the matched reactant at
 - `--num-workers`: Use two or more subprocess workers to process SMILES groups in parallel. SMARTS statistics are calculated once per split by the parent process.
 - `--chunk-size`: Number of SMILES groups assigned to each parallel chunk.
 - `--smiles-column`: Name of the SMILES metadata column. The default is `SMILES`.
+- `--validation-smiles-ratio`: Target validation count divided by unique training SMILES count. The unit is SMILES, not spectrum records.
+- `--tanimoto-num-bins`: Number of intervals used to balance maximum Tanimoto similarity (default: 10).
 - `--save-train-valid-records`: Save training records for which structures were successfully generated as an `.msds` file.
 - `--no-save-validation-valid-records`: Disable saving valid validation records.
 - `--overwrite`: Remove and rebuild existing structure output.
@@ -118,5 +110,5 @@ The compact label uses the actual atom and bond types at the matched reactant at
 Display all available options with:
 
 ```bash
-python -m clefts.ml.input.create_fragment_tree_training_data --help
+python -m clefts.ml.data_preparation.fragment_tree.create_fragment_tree_training_data --help
 ```

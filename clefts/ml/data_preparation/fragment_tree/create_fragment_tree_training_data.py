@@ -12,8 +12,11 @@ import pandas as pd
 from tqdm import tqdm
 
 from clefts.domain.fragment.cleavage import CleavagePatternSet
-from clefts.ml.input.assigned_cleavage_event_statistics import (
+from clefts.ml.data_preparation.fragment_tree.assigned_cleavage_event_statistics import (
     write_assigned_cleavage_event_statistics,
+)
+from clefts.ml.data_preparation.fragment_tree.validation_sampling import (
+    sample_validation_dataset,
 )
 from clefts.libs.mmkit.mmkit import Compound
 from clefts.libs.msentity.msentity import MSDataset
@@ -22,30 +25,15 @@ from clefts.utils.parallel_subprocess import run_parallel_subprocesses
 ORIGINAL_INDEX_COLUMN = "__fragment_tree_original_index"
 STRUCTURE_DATA_DIR_NAME = "data"
 DEFAULT_PROJECT_MODEL_CONFIG_NAME = "model_config.json"
-DEFAULT_GENERATOR_CONFIG = (
-    Path(__file__).resolve().parents[2]
-    / "presets"
-    / "spectrum_generator_params"
-    / "single_bond_pos_model_config.json"
+from clefts.ml.input.fragment_tree_training_data import (
+    build_fragment_tree_structure_files,
+    build_fragment_tree_structure_files_from_existing,
+    group_record_indexes_by_smiles,
+    load_fragment_tree_structure_file,
 )
-DEFAULT_TRAIN_INPUT = "data/raw/NIST/NIST23/MSMS-Pos-NIST23_v20_mini.msds"
-
-try:
-    from .fragment_tree_training_data import (
-        build_fragment_tree_structure_files,
-        build_fragment_tree_structure_files_from_existing,
-        group_record_indexes_by_smiles,
-        load_fragment_tree_structure_file,
-    )
-    from ..specgen.fragment_tree_spectrum_predictor import FragmentSpectrumGenerator
-except ImportError:
-    from clefts.ml.input.fragment_tree_training_data import (
-        build_fragment_tree_structure_files,
-        build_fragment_tree_structure_files_from_existing,
-        group_record_indexes_by_smiles,
-        load_fragment_tree_structure_file,
-    )
-    from clefts.ml.specgen.fragment_tree_spectrum_predictor import FragmentSpectrumGenerator
+from clefts.ml.specgen.fragment_tree_spectrum_predictor import (
+    FragmentSpectrumGenerator,
+)
 
 
 def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
@@ -57,7 +45,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--train-input",
-        default=DEFAULT_TRAIN_INPUT,
+        required=True,
         help="Training input MSDataset path.",
     )
     parser.add_argument(
@@ -66,10 +54,19 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         help="Optional validation input MSDataset path.",
     )
     parser.add_argument(
-        "--train-structures-input-dir",
-        default=None,
-        help="Optional existing training structure directory. Mutually exclusive with an explicit --train-input.",
+        "--validation-smiles-ratio",
+        type=float,
+        default=0.1,
+        help=(
+            "Sample this many validation SMILES relative to the number of training "
+            "SMILES (for example, 0.1). Sampling is balanced over maximum Tanimoto "
+            "similarity to the training set. Default: 0.1."
+        ),
     )
+    parser.add_argument("--tanimoto-num-bins", type=int, default=10)
+    parser.add_argument("--tanimoto-radius", type=int, default=2)
+    parser.add_argument("--tanimoto-n-bits", type=int, default=2048)
+    parser.add_argument("--validation-sampling-seed", type=int, default=0)
     parser.add_argument(
         "--validation-structures-input-dir",
         default=None,
@@ -87,7 +84,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--output-dir",
-        default="data/test/fragment_tree_training_structures",
+        required=True,
         help=(
             "Output root directory. Structure .pt files are written under "
             "train_structures/data, and validation .pt files under "
@@ -96,8 +93,11 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--params",
-        default="clefts/ml/specgen/presets/fragment_spectrum_generator_param.json",
-        help="FragmentSpectrumGenerator parameter JSON used to construct the feature model.",
+        required=True,
+        help=(
+            "Complete FragmentSpectrumGenerator model config JSON. Select a positive- "
+            "or negative-mode config explicitly."
+        ),
     )
     parser.add_argument(
         "--model-config-output",
@@ -225,13 +225,14 @@ def load_generator_params(params_path: str | Path) -> dict:
     with Path(params_path).open("r", encoding="utf-8") as f:
         params = json.load(f)
 
-    if "fragment_ion_tree_builder" not in params:
-        return params
-
-    with DEFAULT_GENERATOR_CONFIG.open("r", encoding="utf-8") as f:
-        generator_params = json.load(f)
-    generator_params["probability_model_params"]["fragmenter_params"] = params
-    return generator_params
+    if "probability_model_params" not in params:
+        raise ValueError(
+            "--params must be a complete FragmentSpectrumGenerator model config "
+            "containing 'probability_model_params'. Pass "
+            "clefts/presets/spectrum_generator_params/single_bond_pos_model_config.json "
+            "or single_bond_neg_model_config.json, rather than a fragmenter-only config."
+        )
+    return params
 
 
 def load_generator(params_path: str | Path) -> FragmentSpectrumGenerator:
@@ -348,6 +349,11 @@ def copy_model_config_after_model_creation(
     output_path = Path(output_file)
 
     if output_path.exists() and not overwrite:
+        with output_path.open("r", encoding="utf-8") as f:
+            existing_config = json.load(f)
+        if existing_config == load_generator_params(source_file):
+            print(f"kept identical existing model config: {output_path}")
+            return
         answer = input(f"Model config already exists: {output_path}. Overwrite? [y/N] ")
         if answer.strip().lower() not in {"y", "yes"}:
             print(f"kept existing model config: {output_path}")
@@ -759,7 +765,7 @@ def run_parallel_for_input(
     part_valid_outputs: list[Path] = []
     part_score_outputs: list[Path] = []
     part_event_outputs: list[Path] = []
-    module_name = "clefts.ml.input.create_fragment_tree_training_data"
+    module_name = "clefts.ml.data_preparation.fragment_tree.create_fragment_tree_training_data"
 
     for chunk_index, record_indexes in enumerate(
         tqdm(chunks, desc=f"Preparing {split_name} chunks", mininterval=1.0)
@@ -908,6 +914,50 @@ def remove_existing_dirs(directories: list[Path], *, description: str) -> None:
         print(f"removed existing {description} directory: {directory}")
 
 
+def prepare_validation_input(
+    *,
+    args: argparse.Namespace,
+    train_structure_data_dir: Path,
+    validation_structure_dir: Path,
+) -> str | None:
+    if args.validation_input is None or args.validation_smiles_ratio is None:
+        return args.validation_input
+    train_smiles = []
+    for structure_file in sorted(train_structure_data_dir.glob("*.pt")):
+        item = load_fragment_tree_structure_file(structure_file, map_location="cpu")
+        smiles = item.metadata.get("smiles")
+        if smiles is None and len(item.structure.node_smiles) > 0:
+            smiles = item.structure.node_smiles[0]
+        if smiles is not None:
+            train_smiles.append(str(smiles))
+    if not train_smiles:
+        raise RuntimeError(
+            f"No completed training structures were found in {train_structure_data_dir}."
+        )
+
+    sampled_input = validation_structure_dir / "sampled_input.msds"
+    report_file = validation_structure_dir / "max_tanimoto_index.tsv"
+    output = sample_validation_dataset(
+        train_smiles=train_smiles,
+        validation_dataset=MSDataset.load(args.validation_input),
+        smiles_column=args.smiles_column,
+        ratio=args.validation_smiles_ratio,
+        num_bins=args.tanimoto_num_bins,
+        radius=args.tanimoto_radius,
+        n_bits=args.tanimoto_n_bits,
+        seed=args.validation_sampling_seed,
+        output_file=sampled_input,
+        report_file=report_file,
+    )
+    sampled_count = len(pd.read_csv(report_file, sep="\t"))
+    print(
+        f"sampled validation SMILES: {sampled_count} "
+        f"(ratio={args.validation_smiles_ratio}) -> {output}"
+    )
+    print(f"saved validation max Tanimoto indexes: {report_file}")
+    return str(output)
+
+
 def main(args: Optional[argparse.Namespace] = None) -> None:
     if args is None:
         args = parse_args()
@@ -915,14 +965,9 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
     generator = None
     output_root = Path(args.output_dir)
 
-    train_uses_structures = args.train_structures_input_dir is not None
     validation_uses_structures = args.validation_structures_input_dir is not None
-    if train_uses_structures and args.train_input != DEFAULT_TRAIN_INPUT:
-        raise ValueError("--train-input and --train-structures-input-dir are mutually exclusive.")
     if args.validation_input is not None and validation_uses_structures:
         raise ValueError("--validation-input and --validation-structures-input-dir are mutually exclusive.")
-    if train_uses_structures and args.save_train_valid_records:
-        raise ValueError("--save-train-valid-records requires --train-input, not --train-structures-input-dir.")
 
     if args.structure_output_dir is not None:
         generator = load_generator(args.params)
@@ -992,19 +1037,17 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
 
     pattern_set = generator.feature_model.fragmenter.cleavage_pattern_set
 
-    if train_uses_structures or validation_uses_structures:
+    if validation_uses_structures:
         if args.num_workers > 1:
-            print(
-                "[WARN] --num-workers is ignored when a structures input directory is used.",
-                file=sys.stderr,
-            )
-        if train_uses_structures:
-            build_structure_files_for_existing_input(
-                structures_input_dir=args.train_structures_input_dir,
-                output_dir=train_structure_data_dir,
+            run_parallel_for_input(
+                input_path=args.train_input,
+                structure_output_dir=train_structure_data_dir,
                 args=args,
-                generator=generator,
                 manifest_file=train_manifest_file,
+                save_valid=bool(args.save_train_valid_records),
+                valid_records_output=train_valid_output,
+                assignment_score_output=train_assignment_score_output,
+                split_name="train",
             )
         else:
             build_structure_files_for_input(
@@ -1018,25 +1061,13 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
                 assignment_score_output=train_assignment_score_output,
             )
 
-        if validation_uses_structures:
-            build_structure_files_for_existing_input(
-                structures_input_dir=args.validation_structures_input_dir,
-                output_dir=validation_structure_data_dir,
-                args=args,
-                generator=generator,
-                manifest_file=validation_structure_dir / "manifest.tsv",
-            )
-        elif args.validation_input is not None:
-            build_structure_files_for_input(
-                input_path=args.validation_input,
-                output_dir=validation_structure_data_dir,
-                args=args,
-                generator=generator,
-                manifest_file=validation_structure_dir / "manifest.tsv",
-                save_valid=bool(args.save_validation_valid_records),
-                valid_records_output=validation_valid_output,
-                assignment_score_output=validation_assignment_score_output,
-            )
+        build_structure_files_for_existing_input(
+            structures_input_dir=args.validation_structures_input_dir,
+            output_dir=validation_structure_data_dir,
+            args=args,
+            generator=generator,
+            manifest_file=validation_structure_dir / "manifest.tsv",
+        )
         write_split_cleavage_event_statistics(
             structure_data_directory=train_structure_data_dir,
             output_root=output_root,
@@ -1044,14 +1075,13 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
             pattern_set=pattern_set,
             num_workers=max(1, int(args.num_workers)),
         )
-        if args.validation_input is not None or validation_uses_structures:
-            write_split_cleavage_event_statistics(
-                structure_data_directory=validation_structure_data_dir,
-                output_root=output_root,
-                split_name="validation",
-                pattern_set=pattern_set,
-                num_workers=max(1, int(args.num_workers)),
-            )
+        write_split_cleavage_event_statistics(
+            structure_data_directory=validation_structure_data_dir,
+            output_root=output_root,
+            split_name="validation",
+            pattern_set=pattern_set,
+            num_workers=max(1, int(args.num_workers)),
+        )
         return
 
     if args.num_workers > 1:
@@ -1065,9 +1095,14 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
             assignment_score_output=train_assignment_score_output,
             split_name="train",
         )
-        if args.validation_input is not None:
+        validation_input = prepare_validation_input(
+            args=args,
+            train_structure_data_dir=train_structure_data_dir,
+            validation_structure_dir=validation_structure_dir,
+        )
+        if validation_input is not None:
             run_parallel_for_input(
-                input_path=args.validation_input,
+                input_path=validation_input,
                 structure_output_dir=validation_structure_data_dir,
                 args=args,
                 manifest_file=validation_structure_dir / "manifest.tsv",
@@ -1089,9 +1124,14 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
         assignment_score_output=train_assignment_score_output,
     )
 
-    if args.validation_input is not None:
+    validation_input = prepare_validation_input(
+        args=args,
+        train_structure_data_dir=train_structure_data_dir,
+        validation_structure_dir=validation_structure_dir,
+    )
+    if validation_input is not None:
         build_structure_files_for_input(
-            input_path=args.validation_input,
+            input_path=validation_input,
             output_dir=validation_structure_data_dir,
             args=args,
             generator=generator,

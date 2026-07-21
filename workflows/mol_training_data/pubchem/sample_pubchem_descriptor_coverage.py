@@ -34,7 +34,6 @@ from clefts.ml.training.mol_training.descriptor_coverage import (  # noqa: E402
 )
 from clefts.utils.parallel_subprocess import run_parallel_subprocesses  # noqa: E402
 
-DEFAULT_INPUT = Path("/workspaces/CLEFTS/raw_data/PubChem/pubchem_cid_smiles.parquet")
 DEFAULT_OUTPUT_DIR = Path("/workspaces/CLEFTS/mnt/app/data/processed/pubchem/descriptor_coverage_sample")
 DEFAULT_OUTPUT_NAME = "pubchem_descriptor_coverage_sample.parquet"
 DEFAULT_REPORT_NAME = "pubchem_descriptor_coverage_sample_report.json"
@@ -616,7 +615,7 @@ def confirm_output_dir_overwrite(output_dir: Path, *, assume_yes: bool) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Sample PubChem molecules for descriptor-bin coverage.")
-    parser.add_argument("--input", type=Path, default=DEFAULT_INPUT)
+    parser.add_argument("--input", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--output", type=Path, default=None)
     parser.add_argument("--smiles-output", type=Path, default=None)

@@ -43,7 +43,9 @@ def _collect_structure_statistics(
     structure_file_str: str,
 ) -> dict[str, Counter]:
     """Collect assigned-event counts for one structure; safe for subprocess use."""
-    from .fragment_tree_training_data import load_fragment_tree_structure_file
+    from clefts.ml.input.fragment_tree_training_data import (
+        load_fragment_tree_structure_file,
+    )
 
     structure_file = Path(structure_file_str)
     item = load_fragment_tree_structure_file(structure_file, map_location="cpu")
