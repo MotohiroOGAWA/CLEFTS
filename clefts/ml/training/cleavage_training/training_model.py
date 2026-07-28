@@ -151,6 +151,12 @@ def prepare_output_dir(
     return output_path
 
 def build_parser() -> argparse.ArgumentParser:
+    def positive_int(value: str) -> int:
+        parsed = int(value)
+        if parsed < 1:
+            raise argparse.ArgumentTypeError("must be at least 1")
+        return parsed
+
     parser = argparse.ArgumentParser(description="Pretrain cleavage-edge features from FragmentTreeStructure files.")
     parser.add_argument("--train-dir", required=True, help="Training structure split directory, usually <project>/train_structures.")
     parser.add_argument("--val-dir", required=True, help="Validation structure split directory, usually <project>/validation_structures.")
@@ -197,6 +203,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument(
+        "--max-cleavage-events",
+        type=positive_int,
+        default=None,
+        help=(
+            "Maximum cleavage events encoded per SMILES structure load. "
+            "Regular events are randomly resampled; forced rare-target events remain selected."
+        ),
+    )
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-2)
     parser.add_argument("--device", default="cpu")
@@ -244,6 +259,7 @@ def main() -> None:
         min_data_count=args.min_data_count,
         mask_balance_patience=args.mask_balance_patience,
         mask_balance_max_forced_per_batch=args.mask_balance_max_forced_per_batch,
+        max_cleavage_events=args.max_cleavage_events,
     )
 
 

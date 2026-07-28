@@ -5,7 +5,10 @@ from types import SimpleNamespace
 
 import torch
 
-from clefts.ml.training.cleavage_training.dataset import first_stage_edge_mask
+from clefts.ml.training.cleavage_training.dataset import (
+    first_stage_edge_mask,
+    sample_first_stage_event_rows,
+)
 from clefts.ml.training.cleavage_training.pretraining_model import (
     atom_neighborhood_indices,
     canonical_fragment_smiles,
@@ -69,6 +72,37 @@ class TestFirstStageEdgeMask(unittest.TestCase):
         self.assertEqual(
             first_stage_edge_mask(structure).tolist(),
             [True, False, True, False],
+        )
+
+    def test_event_limit_samples_only_first_stage_events(self) -> None:
+        structure = SimpleNamespace(
+            num_nodes=4,
+            num_edges=3,
+            num_cleavage_events=4,
+            edge_index=torch.tensor([[0, 1, 0], [1, 2, 3]], dtype=torch.long),
+            cleavage_event_edge_index=torch.tensor([0, 1, 2, 2]),
+        )
+        for _ in range(10):
+            selected = sample_first_stage_event_rows(structure, 2)
+            self.assertEqual(len(selected), 2)
+            self.assertTrue(set(selected).issubset({0, 2, 3}))
+
+    def test_event_limit_rejects_non_positive_values(self) -> None:
+        structure = SimpleNamespace(num_cleavage_events=0)
+        with self.assertRaisesRegex(ValueError, "at least 1"):
+            sample_first_stage_event_rows(structure, 0)
+
+    def test_validation_selection_is_deterministic(self) -> None:
+        structure = SimpleNamespace(
+            num_nodes=4,
+            num_edges=3,
+            num_cleavage_events=3,
+            edge_index=torch.tensor([[0, 0, 0], [1, 2, 3]], dtype=torch.long),
+            cleavage_event_edge_index=torch.tensor([0, 1, 2]),
+        )
+        self.assertEqual(
+            sample_first_stage_event_rows(structure, 2, randomize=False),
+            (0, 1),
         )
 
 

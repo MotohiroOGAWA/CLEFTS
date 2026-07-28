@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, Iterable, Tuple
+from typing import Dict, Iterable, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -212,6 +212,7 @@ class CleavageEdgeFeatureNet(nn.Module):
     def encode_events(
         self,
         ft_features: FragmentTreeFeatures,
+        selected_event_rows: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Encode cleavage events without merging events on the same edge.
 
@@ -232,7 +233,9 @@ class CleavageEdgeFeatureNet(nn.Module):
         all_event_feats = []
 
         for event_row_id, event_edge_id, event_type, cleavage_fnet_input in (
-            self._iter_cleavage_fnet_batches(ft_features)
+            self._iter_cleavage_fnet_batches(
+                ft_features, selected_event_rows=selected_event_rows
+            )
         ):
             if event_edge_id.size(0) != cleavage_fnet_input.batch_size:
                 raise ValueError(
@@ -372,6 +375,8 @@ class CleavageEdgeFeatureNet(nn.Module):
     def _iter_cleavage_fnet_batches(
         self,
         ft_features: FragmentTreeFeatures,
+        *,
+        selected_event_rows: Optional[torch.Tensor] = None,
     ) -> Iterable[Tuple[torch.Tensor, torch.Tensor, Tuple[int, int, int], CleavageFNetInput]]:
         """
         Iterate over CleavageFNet mini-batches grouped by event type.
@@ -435,6 +440,23 @@ class CleavageEdgeFeatureNet(nn.Module):
         )
         # [M]
 
+        selected_mask = None
+        if selected_event_rows is not None:
+            selected_event_rows = selected_event_rows.to(
+                device=event_edge_id_all.device, dtype=torch.long
+            )
+            selected_mask = torch.zeros(
+                (int(structure.num_cleavage_events),),
+                dtype=torch.bool,
+                device=event_edge_id_all.device,
+            )
+            valid_rows = selected_event_rows[
+                (selected_event_rows >= 0)
+                & (selected_event_rows < int(structure.num_cleavage_events))
+            ]
+            if valid_rows.numel() > 0:
+                selected_mask[valid_rows] = True
+
         for event_type in self.module_key_by_event_type.keys():
             cleavage_pattern_id, reaction_id, product_molecule_id = event_type
 
@@ -443,6 +465,8 @@ class CleavageEdgeFeatureNet(nn.Module):
                 & (event_reaction_id_all == reaction_id)
                 & (event_product_molecule_id_all == product_molecule_id)
             )
+            if selected_mask is not None:
+                mask &= selected_mask
             # [M]
 
             if not mask.any():

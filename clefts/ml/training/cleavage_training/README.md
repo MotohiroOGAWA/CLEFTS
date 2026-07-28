@@ -55,10 +55,30 @@ python -m clefts.ml.training.cleavage_training.training_model \
   --output-dir <project>/cleavage_pretraining \
   --cleavage-pattern-set-json clefts/domain/fragment/presets/fragmenter_pos.json \
   --mol-encoder-checkpoint <mol_training>/pretraining_best.pt \
+  --max-cleavage-events 128 \
   --device cuda
 ```
 
 `--cleavage-pattern-set-json` may point either to a raw `CleavagePatternSet` JSON or to a fragmenter preset containing `fragment_ion_tree_builder.cleavage_pattern_set`.
+
+### Limiting events per SMILES
+
+`--max-cleavage-events` limits how many eligible first-stage cleavage events
+from one SMILES structure are encoded in a regular dataset entry. This avoids
+running out of accelerator memory for large compounds with many candidate
+edges. The limit is applied before `CleavageFNet` constructs event features,
+so unselected events do not consume memory in the event encoder.
+
+Training randomly resamples the limited event subset whenever a SMILES
+structure is loaded. Different events can therefore be learned across epochs
+instead of permanently discarding events beyond the limit. Validation selects
+a deterministic subset so its metrics remain comparable between epochs.
+
+Rare-target and reactant positive/negative forced sampling remains active.
+An event explicitly added by the balanced sampler is always retained even when
+regular entries are limited. Omitting `--max-cleavage-events` preserves the
+previous behavior and encodes all eligible first-stage events. The value must
+be at least `1` when specified.
 
 ## TensorBoard
 
@@ -113,8 +133,9 @@ Human-readable copies are written as
 Forced entries are event-level, not file-level. The cache locates the source
 file, edge, and cleavage-event row, but only the selected cleavage event
 contributes to the next forward pass and loss. Other events in that file are
-not trained during that forced entry. Ordinary shuffled dataset entries still
-train all first-stage events in their file.
+not trained during that forced entry. Ordinary shuffled dataset entries train
+all first-stage events in their file unless `--max-cleavage-events` is set; if
+it is set, they use the randomly resampled subset described above.
 
 ## Training reports
 

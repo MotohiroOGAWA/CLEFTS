@@ -315,6 +315,7 @@ def train(
     min_data_count: int = 1000,
     mask_balance_patience: int = 20,
     mask_balance_max_forced_per_batch: int = 8,
+    max_cleavage_events: Optional[int] = None,
 ) -> Dict[str, object]:
     device = torch.device(device)
     model.to(device)
@@ -340,10 +341,14 @@ def train(
     write_preprocessing_reports(preprocessing_payload, output_path)
 
     train_probe = make_cleavage_structure_dataloader(
-        train_dir, batch_size=batch_size, shuffle=False, num_workers=num_workers
+        train_dir, batch_size=batch_size, shuffle=False, num_workers=num_workers,
+        max_cleavage_events=max_cleavage_events,
+        randomize_event_selection=True,
     )
     val_probe = make_cleavage_structure_dataloader(
-        val_dir, batch_size=batch_size, shuffle=False, num_workers=num_workers
+        val_dir, batch_size=batch_size, shuffle=False, num_workers=num_workers,
+        max_cleavage_events=max_cleavage_events,
+        randomize_event_selection=False,
     )
     train_sampler = BalancedCleavageBatchSampler(
         dataset_size=len(train_probe.dataset),
@@ -364,10 +369,14 @@ def train(
         shuffle=False,
     )
     train_loader = make_cleavage_structure_dataloader(
-        train_dir, num_workers=num_workers, batch_sampler=train_sampler
+        train_dir, num_workers=num_workers, batch_sampler=train_sampler,
+        max_cleavage_events=max_cleavage_events,
+        randomize_event_selection=True,
     )
     val_loader = make_cleavage_structure_dataloader(
-        val_dir, num_workers=num_workers, batch_sampler=val_sampler
+        val_dir, num_workers=num_workers, batch_sampler=val_sampler,
+        max_cleavage_events=max_cleavage_events,
+        randomize_event_selection=False,
     )
     target_report = write_target_report(
         output_path,
@@ -499,6 +508,9 @@ def train(
         "target_report": target_report,
         "preprocessing_cache": preprocessing_summary,
         "balanced_sampling": {
+            "max_cleavage_events_per_smiles": (
+                None if max_cleavage_events is None else int(max_cleavage_events)
+            ),
             "min_data_count": int(min_data_count),
             "patience": int(mask_balance_patience),
             "max_forced_per_batch": int(mask_balance_max_forced_per_batch),

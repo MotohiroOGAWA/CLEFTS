@@ -19,18 +19,67 @@ from ...input.fragment_tree_training_data import (
 IGNORE_INDEX = -100
 
 
+def sample_first_stage_event_rows(
+    structure: FragmentTreeStructure,
+    max_cleavage_events: int,
+    *,
+    randomize: bool = True,
+) -> tuple[int, ...]:
+    """Randomly sample trainable event rows up to a per-structure limit."""
+    if int(max_cleavage_events) < 1:
+        raise ValueError("max_cleavage_events must be at least 1.")
+    if int(structure.num_cleavage_events) == 0:
+        return ()
+    stage_edges = first_stage_edge_mask(structure)
+    event_edges = structure.cleavage_event_edge_index.long()
+    valid = (event_edges >= 0) & (event_edges < int(structure.num_edges))
+    candidate_rows = torch.nonzero(valid, as_tuple=False).flatten()
+    if candidate_rows.numel() > 0:
+        candidate_rows = candidate_rows[stage_edges[event_edges[candidate_rows]]]
+    if candidate_rows.numel() <= int(max_cleavage_events):
+        return tuple(int(value) for value in candidate_rows.tolist())
+    if randomize:
+        order = torch.randperm(candidate_rows.numel())[: int(max_cleavage_events)]
+        candidate_rows = candidate_rows[order]
+    else:
+        candidate_rows = candidate_rows[: int(max_cleavage_events)]
+    return tuple(int(value) for value in candidate_rows.tolist())
+
+
 class SelectableCleavageStructureDataset(FragmentTreeStructureFileDataset):
-    """Accept either a file index or ``(file index, local event index)``."""
+    """Select a bounded event subset, while accepting forced event indexes."""
+
+    def __init__(
+        self,
+        *args,
+        max_cleavage_events: Optional[int] = None,
+        randomize_event_selection: bool = True,
+        **kwargs,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        if max_cleavage_events is not None and int(max_cleavage_events) < 1:
+            raise ValueError("max_cleavage_events must be at least 1 or None.")
+        self.max_cleavage_events = (
+            None if max_cleavage_events is None else int(max_cleavage_events)
+        )
+        self.randomize_event_selection = bool(randomize_event_selection)
 
     def __getitem__(
         self, index: int | tuple[int, int]
     ) -> FragmentTreeStructureFileItem:
-        selected_event = None
+        selected_events = None
         if isinstance(index, tuple):
             index, selected_event = map(int, index)
+            selected_events = (selected_event,)
         item = super().__getitem__(int(index))
+        if selected_events is None and self.max_cleavage_events is not None:
+            selected_events = sample_first_stage_event_rows(
+                item.structure,
+                self.max_cleavage_events,
+                randomize=self.randomize_event_selection,
+            )
         metadata = dict(item.metadata)
-        metadata["_selected_cleavage_event"] = selected_event
+        metadata["_selected_cleavage_events"] = selected_events
         return FragmentTreeStructureFileItem(
             path=item.path,
             structure=item.structure,
@@ -45,13 +94,17 @@ def collate_selectable_cleavage_items(
     selected_rows = []
     event_offset = 0
     for item in items:
-        selected = item.metadata.get("_selected_cleavage_event")
+        selected = item.metadata.get("_selected_cleavage_events")
         if selected is None:
             selected_rows.extend(
                 range(event_offset, event_offset + int(item.structure.num_cleavage_events))
             )
-        elif 0 <= int(selected) < int(item.structure.num_cleavage_events):
-            selected_rows.append(event_offset + int(selected))
+        else:
+            selected_rows.extend(
+                event_offset + int(event_row)
+                for event_row in selected
+                if 0 <= int(event_row) < int(item.structure.num_cleavage_events)
+            )
         event_offset += int(item.structure.num_cleavage_events)
     batch["selected_cleavage_event_rows"] = torch.tensor(
         selected_rows, dtype=torch.long
@@ -160,6 +213,8 @@ def make_cleavage_structure_dataloader(
     map_location: str | torch.device = "cpu",
     device: Optional[str | torch.device] = None,
     batch_sampler: Optional[Sampler[Sequence[int]]] = None,
+    max_cleavage_events: Optional[int] = None,
+    randomize_event_selection: bool = True,
 ) -> DataLoader:
     data_dir = resolve_structure_data_dir(root_dir)
     dataset = SelectableCleavageStructureDataset(
@@ -167,6 +222,8 @@ def make_cleavage_structure_dataloader(
         pattern=pattern,
         map_location=map_location,
         device=device,
+        max_cleavage_events=max_cleavage_events,
+        randomize_event_selection=randomize_event_selection,
     )
     kwargs = {
         "dataset": dataset,
