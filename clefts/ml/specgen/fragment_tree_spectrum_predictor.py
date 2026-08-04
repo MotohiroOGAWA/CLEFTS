@@ -83,16 +83,30 @@ class FragmentTreeSpectrumPredictor(nn.Module):
         candidate_selector: FragmentTreeCandidateSelector,
         formula_intensity_predictor: FragmentTreeFormulaIntensityPredictor,
         *,
-        max_generation_steps: int = 3,
+        expand_cleavages: bool = True,
         normalize_intensity: bool = True,
         max_peaks_per_sample: Optional[int] = None,
+        max_edges_per_step: Optional[int] = 128,
+        max_retained_edges: Optional[int] = 30,
+        max_next_cleavage_candidates: int = 3,
+        mol_encoder_checkpoint: Optional[str] = None,
+        freeze_mol_encoder: bool = True,
+        cleavage_edge_fnet_checkpoint: Optional[str] = None,
+        freeze_cleavage_edge_fnet: bool = True,
     ) -> None:
         super().__init__()
         self.candidate_selector = candidate_selector
         self.formula_intensity_predictor = formula_intensity_predictor
-        self.max_generation_steps = int(max_generation_steps)
+        self.expand_cleavages = bool(expand_cleavages)
         self.normalize_intensity = bool(normalize_intensity)
         self.max_peaks_per_sample = max_peaks_per_sample
+        self.max_edges_per_step = max_edges_per_step
+        self.max_retained_edges = max_retained_edges
+        self.max_next_cleavage_candidates = int(max_next_cleavage_candidates)
+        self.mol_encoder_checkpoint = mol_encoder_checkpoint
+        self.freeze_mol_encoder = freeze_mol_encoder
+        self.cleavage_edge_fnet_checkpoint = cleavage_edge_fnet_checkpoint
+        self.freeze_cleavage_edge_fnet = freeze_cleavage_edge_fnet
 
     def forward(
         self,
@@ -101,7 +115,15 @@ class FragmentTreeSpectrumPredictor(nn.Module):
         include_formula_annotation: bool = False,
         include_fragment_ion_annotation: bool = False,
     ) -> FragmentSpectrumGeneratorOutput:
-        candidate_output = self.candidate_selector.generate_depth_limited_candidates(data, max_depth=self.max_generation_steps)
+        additional_depth = (
+            max(0, int(self.candidate_selector.fragmenter.tree_max_depth) - 1)
+            if self.expand_cleavages
+            else 0
+        )
+        candidate_output = self.candidate_selector.generate_depth_limited_candidates(
+            data,
+            max_depth=additional_depth,
+        )
         formula_intensity_output = self.formula_intensity_predictor.predict_from_candidate_output(candidate_output)
         peaks_by_sample: Dict[int, List[GeneratedSpectrumPeak]] = {}
         feature_model = self.candidate_selector.feature_model
@@ -214,7 +236,6 @@ class FragmentSpectrumGenerator(ModelBase):
         self,
         probability_model_params: Dict,
         *,
-        max_generation_steps: int = 3,
         min_peak_intensity: float = 1e-3,
         include_precursor_peaks: bool = True,
         include_fragment_peaks: bool = True,
@@ -223,14 +244,19 @@ class FragmentSpectrumGenerator(ModelBase):
         formula_mz_resolver: Optional[FormulaMzResolverFn] = None,
         normalize_intensity: bool = True,
         max_peaks_per_sample: Optional[int] = None,
+        max_edges_per_step: Optional[int] = 128,
+        max_retained_edges: Optional[int] = 30,
+        max_next_cleavage_candidates: int = 3,
+        mol_encoder_checkpoint: Optional[str] = None,
+        freeze_mol_encoder: bool = True,
+        cleavage_edge_fnet_checkpoint: Optional[str] = None,
+        freeze_cleavage_edge_fnet: bool = True,
     ) -> None:
         super(FragmentSpectrumGenerator, self).__init__(
             ignore_config_keys=["formula_mz_resolver"],
             **{k: v for k, v in locals().items() if k != "self"},
         )
 
-        if max_generation_steps < 0:
-            raise ValueError("max_generation_steps must be non-negative.")
         if min_peak_intensity < 0:
             raise ValueError("min_peak_intensity must be non-negative.")
         if min_fragment_ion_probability < 0:
@@ -239,12 +265,33 @@ class FragmentSpectrumGenerator(ModelBase):
             raise ValueError("max_fragment_ion_annotations_per_node must be positive or None.")
         if max_peaks_per_sample is not None and max_peaks_per_sample <= 0:
             raise ValueError("max_peaks_per_sample must be positive or None.")
+        if max_edges_per_step is not None and max_edges_per_step <= 0:
+            raise ValueError("max_edges_per_step must be positive or None.")
+        if max_retained_edges is not None and max_retained_edges <= 0:
+            raise ValueError("max_retained_edges must be positive or None.")
+        if max_next_cleavage_candidates <= 0:
+            raise ValueError("max_next_cleavage_candidates must be positive.")
 
         self.feature_model = FragmentTreeFeatureModel(**probability_model_params)
+        if mol_encoder_checkpoint:
+            self.feature_model.load_mol_encoder_checkpoint(mol_encoder_checkpoint)
+        if cleavage_edge_fnet_checkpoint:
+            self.feature_model.load_cleavage_edge_fnet_checkpoint(cleavage_edge_fnet_checkpoint)
+            if not mol_encoder_checkpoint:
+                try:
+                    self.feature_model.load_mol_encoder_checkpoint(cleavage_edge_fnet_checkpoint)
+                except KeyError:
+                    pass
+        if freeze_mol_encoder:
+            self.feature_model.freeze_mol_encoder()
+        if freeze_cleavage_edge_fnet:
+            self.feature_model.freeze_cleavage_edge_fnet()
         self.candidate_selector = FragmentTreeCandidateSelector(
             self.feature_model,
-            max_fragment_ion_candidates=(max_fragment_ion_annotations_per_node or 30),
-            max_next_cleavage_candidates=30,
+            max_fragment_ion_candidates=(max_fragment_ion_annotations_per_node or max_retained_edges or 30),
+            max_next_cleavage_candidates=max_next_cleavage_candidates,
+            max_edges_per_step=max_edges_per_step,
+            max_retained_edges=max_retained_edges,
         )
         self.formula_intensity_predictor = FragmentTreeFormulaIntensityPredictor(
             self.feature_model,
@@ -252,12 +299,13 @@ class FragmentSpectrumGenerator(ModelBase):
         self.spectrum_predictor = FragmentTreeSpectrumPredictor(
             self.candidate_selector,
             self.formula_intensity_predictor,
-            max_generation_steps=max_generation_steps,
             normalize_intensity=normalize_intensity,
             max_peaks_per_sample=max_peaks_per_sample,
+            max_edges_per_step=max_edges_per_step,
+            max_retained_edges=max_retained_edges,
+            max_next_cleavage_candidates=max_next_cleavage_candidates,
         )
 
-        self.max_generation_steps = max_generation_steps
         self.min_peak_intensity = min_peak_intensity
         self.include_precursor_peaks = include_precursor_peaks
         self.include_fragment_peaks = include_fragment_peaks
@@ -266,6 +314,13 @@ class FragmentSpectrumGenerator(ModelBase):
         self.formula_mz_resolver = formula_mz_resolver
         self.normalize_intensity = normalize_intensity
         self.max_peaks_per_sample = max_peaks_per_sample
+        self.max_edges_per_step = max_edges_per_step
+        self.max_retained_edges = max_retained_edges
+        self.max_next_cleavage_candidates = max_next_cleavage_candidates
+        self.mol_encoder_checkpoint = mol_encoder_checkpoint
+        self.freeze_mol_encoder = freeze_mol_encoder
+        self.cleavage_edge_fnet_checkpoint = cleavage_edge_fnet_checkpoint
+        self.freeze_cleavage_edge_fnet = freeze_cleavage_edge_fnet
 
     @property
     def probability_model(self) -> FragmentTreeFeatureModel:

@@ -93,8 +93,8 @@ class TestBuildSampleTreePygBatch(unittest.TestCase):
             condition_tree_repr,
             torch.tensor(
                 [
-                    [2.0, 10.0, 12.0, 1.0],
-                    [5.0, 20.0, 25.0, 1.0],
+                    [2.0, 10.0],
+                    [5.0, 20.0],
                 ],
                 dtype=torch.float32,
             ),
@@ -372,9 +372,10 @@ class TestBuildSampleTreePygBatch(unittest.TestCase):
         model._condition_encoder = DummyConditionEncoder()
         model.ms2_condition_to_tree_proj = DummyConditionToTreeProjection()
 
-        # _build_sample_tree_pyg_batch only needs graph_repr_dim here.
+        # _build_sample_tree_pyg_batch only needs these Graphormer-like attrs.
         model.tree_encoder = SimpleNamespace(
             dim=4,
+            condition_dim=2,
             graph_repr_dim=4,
         )
         model.main_adduct_types = {

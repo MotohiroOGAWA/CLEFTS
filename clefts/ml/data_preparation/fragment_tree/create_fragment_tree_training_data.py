@@ -9,30 +9,31 @@ from typing import Optional
 
 import numpy as np
 import pandas as pd
-import torch
 from tqdm import tqdm
 
+from clefts.domain.fragment.cleavage import CleavagePatternSet
+from clefts.ml.data_preparation.fragment_tree.assigned_cleavage_event_statistics import (
+    write_assigned_cleavage_event_statistics,
+)
+from clefts.ml.data_preparation.fragment_tree.validation_sampling import (
+    sample_validation_dataset,
+)
+from clefts.libs.mmkit.mmkit import Compound
 from clefts.libs.msentity.msentity import MSDataset
 from clefts.utils.parallel_subprocess import run_parallel_subprocesses
 
 ORIGINAL_INDEX_COLUMN = "__fragment_tree_original_index"
 STRUCTURE_DATA_DIR_NAME = "data"
-DEFAULT_PROJECT_MODEL_CONFIG_NAME = "model_config.json"
-
-try:
-    from .fragment_tree_training_data import (
-        build_fragment_tree_structure_files,
-        group_record_indexes_by_smiles,
-        load_fragment_tree_structure_file,
-    )
-    from ..specgen.fragment_tree_spectrum_predictor import FragmentSpectrumGenerator
-except ImportError:
-    from clefts.ml.input.fragment_tree_training_data import (
-        build_fragment_tree_structure_files,
-        group_record_indexes_by_smiles,
-        load_fragment_tree_structure_file,
-    )
-    from clefts.ml.specgen.fragment_tree_spectrum_predictor import FragmentSpectrumGenerator
+DEFAULT_PREPROCESSING_CONFIG_NAME = "preprocessing_config.json"
+from clefts.ml.input.fragment_tree_training_data import (
+    build_fragment_tree_structure_files,
+    build_fragment_tree_structure_files_from_existing,
+    group_record_indexes_by_smiles,
+    load_fragment_tree_structure_file,
+)
+from clefts.ml.input.fragment_tree_preprocessing_context import (
+    FragmentTreePreprocessingContext,
+)
 
 
 def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
@@ -44,7 +45,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--train-input",
-        default="data/raw/NIST/NIST23/MSMS-Pos-NIST23_v20_mini.msds",
+        required=True,
         help="Training input MSDataset path.",
     )
     parser.add_argument(
@@ -53,8 +54,37 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         help="Optional validation input MSDataset path.",
     )
     parser.add_argument(
+        "--validation-smiles-ratio",
+        type=float,
+        default=0.1,
+        help=(
+            "Sample this many validation SMILES relative to the number of training "
+            "SMILES (for example, 0.1). Sampling is balanced over maximum Tanimoto "
+            "similarity to the training set. Default: 0.1."
+        ),
+    )
+    parser.add_argument("--tanimoto-num-bins", type=int, default=10)
+    parser.add_argument("--tanimoto-radius", type=int, default=2)
+    parser.add_argument("--tanimoto-n-bits", type=int, default=2048)
+    parser.add_argument("--validation-sampling-seed", type=int, default=0)
+    parser.add_argument(
+        "--validation-structures-input-dir",
+        default=None,
+        help="Optional existing validation structure directory. Mutually exclusive with --validation-input.",
+    )
+    parser.add_argument(
+        "--structure-rebuild-policy",
+        choices=("all-fragments", "root", "always"),
+        default="all-fragments",
+        help=(
+            "When using an existing structure directory, rebuild always, rebuild only "
+            "when added cleavage patterns match the root compound, or rebuild when "
+            "they match any saved fragment."
+        ),
+    )
+    parser.add_argument(
         "--output-dir",
-        default="data/test/fragment_tree_training_structures",
+        required=True,
         help=(
             "Output root directory. Structure .pt files are written under "
             "train_structures/data, and validation .pt files under "
@@ -63,19 +93,22 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--params",
-        default="clefts/ml/specgen/presets/fragment_spectrum_generator_param.json",
-        help="FragmentSpectrumGenerator parameter JSON used to construct the feature model.",
+        required=True,
+        help="Fragmenter parameter JSON used for preprocessing.",
     )
+    parser.add_argument("--symbols", nargs="+", required=True)
     parser.add_argument(
-        "--model-config-output",
+        "--preprocessing-config-output", "--model-config-output",
+        dest="preprocessing_config_output",
         default=None,
         help=(
-            "Path to copy the model config after the model is constructed. "
-            "Defaults to OUTPUT_DIR/config/model_config.json."
+            "Path for immutable preprocessing settings. Defaults to "
+            "OUTPUT_DIR/config/preprocessing_config.json."
         ),
     )
     parser.add_argument(
-        "--overwrite-model-config",
+        "--overwrite-preprocessing-config", "--overwrite-model-config",
+        dest="overwrite_preprocessing_config",
         action="store_true",
         help="Overwrite an existing copied model config without prompting.",
     )
@@ -84,11 +117,6 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--adduct-type-column", default="AdductType")
     parser.add_argument("--collision-energy-column", default="CollisionEnergy")
     parser.add_argument("--instrument-column", default=None)
-    parser.add_argument(
-        "--device",
-        default="cpu",
-        help="Torch device for model construction while building structures.",
-    )
     parser.add_argument(
         "--max-node",
         type=int,
@@ -181,6 +209,11 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         help=argparse.SUPPRESS,
     )
     parser.add_argument(
+        "--assigned-cleavage-event-output",
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
         "--save-valid-records",
         action="store_true",
         help=argparse.SUPPRESS,
@@ -188,36 +221,149 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def load_generator(params_path: str, device: torch.device) -> FragmentSpectrumGenerator:
-    with open(params_path, "r", encoding="utf-8") as f:
+def load_fragmenter_params(params_path: str | Path) -> dict:
+    with Path(params_path).open("r", encoding="utf-8") as f:
         params = json.load(f)
-    generator = FragmentSpectrumGenerator(**params).to(device)
-    generator.eval()
-    return generator
+
+    if "probability_model_params" in params:
+        return dict(params["probability_model_params"]["fragmenter_params"])
+    return params
 
 
-def default_model_config_output(output_root: str | Path) -> Path:
-    return Path(output_root) / "config" / DEFAULT_PROJECT_MODEL_CONFIG_NAME
+def load_preprocessing_context(args: argparse.Namespace) -> FragmentTreePreprocessingContext:
+    return FragmentTreePreprocessingContext(
+        symbols=args.symbols,
+        fragmenter_params=load_fragmenter_params(args.params),
+        max_node=args.max_node,
+        max_edge=args.max_edge,
+    )
 
 
-def copy_model_config_after_model_creation(
+def _cleavage_pattern_set_from_params_dict(data: dict) -> CleavagePatternSet | None:
+    params = data.get("probability_model_params", data)
+    fragmenter_params = params.get("fragmenter_params", {})
+    builder_params = fragmenter_params.get("fragment_ion_tree_builder", fragmenter_params)
+    pattern_set_params = builder_params.get("cleavage_pattern_set")
+    if pattern_set_params is None:
+        return None
+    return CleavagePatternSet.from_dict(pattern_set_params)
+
+
+def load_cleavage_pattern_set_from_params(path: str | Path) -> CleavagePatternSet | None:
+    with Path(path).open("r", encoding="utf-8") as f:
+        return _cleavage_pattern_set_from_params_dict(json.load(f))
+
+
+def resolve_structure_input_data_dir(path: str | Path) -> Path:
+    input_dir = Path(path)
+    if any(input_dir.glob("*.pt")):
+        return input_dir
+    data_dir = input_dir / STRUCTURE_DATA_DIR_NAME
+    if any(data_dir.glob("*.pt")):
+        return data_dir
+    return input_dir
+
+
+def find_previous_preprocessing_config(structure_input_dir: str | Path) -> Path | None:
+    data_dir = resolve_structure_input_data_dir(structure_input_dir)
+    candidates = [
+        data_dir.parent.parent / "config" / DEFAULT_PREPROCESSING_CONFIG_NAME,
+        data_dir.parent / "config" / DEFAULT_PREPROCESSING_CONFIG_NAME,
+        data_dir / "config" / DEFAULT_PREPROCESSING_CONFIG_NAME,
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _pattern_matches_smiles(pattern, smiles: str) -> bool:
+    try:
+        result = pattern.fragment(Compound.from_smiles(smiles))
+    except Exception:
+        return False
+    return result is not None and len(result.products) > 0
+
+
+def make_structure_rebuild_decider(
     *,
-    source_file: str | Path,
+    policy: str,
+    current_pattern_set: CleavagePatternSet,
+    previous_pattern_set: CleavagePatternSet | None,
+):
+    if policy == "always":
+        return lambda item: True
+
+    if previous_pattern_set is not None:
+        previous_id_by_key = {pattern.key: pattern.pattern_id for pattern in previous_pattern_set.patterns}
+        for pattern in current_pattern_set.patterns:
+            previous_id = previous_id_by_key.get(pattern.key)
+            if previous_id is not None and int(previous_id) != int(pattern.pattern_id):
+                print(
+                    "[WARN] Existing cleavage pattern IDs changed in the current PatternSet; "
+                    "all existing structures will be rebuilt.",
+                    file=sys.stderr,
+                )
+                return lambda item: True
+
+    previous_keys = set(previous_pattern_set.identity()) if previous_pattern_set is not None else set()
+    added_patterns = [
+        pattern
+        for pattern in current_pattern_set.patterns
+        if pattern.key not in previous_keys
+    ]
+    if not added_patterns:
+        return lambda item: False
+
+    def should_rebuild(item) -> bool:
+        metadata = dict(item.metadata)
+        root_smiles = str(metadata.get("smiles") or item.structure.node_smiles[0])
+        if policy == "root":
+            smiles_values = [root_smiles]
+        elif policy == "all-fragments":
+            smiles_values = [str(smiles) for smiles in item.structure.node_smiles.tolist()]
+        else:
+            raise ValueError(f"Unknown structure rebuild policy: {policy}")
+
+        for smiles in dict.fromkeys(smiles_values):
+            for pattern in added_patterns:
+                if _pattern_matches_smiles(pattern, smiles):
+                    return True
+        return False
+
+    return should_rebuild
+
+
+def default_preprocessing_config_output(output_root: str | Path) -> Path:
+    return Path(output_root) / "config" / DEFAULT_PREPROCESSING_CONFIG_NAME
+
+
+def write_preprocessing_config(
+    *,
+    context: FragmentTreePreprocessingContext,
     output_file: str | Path,
     overwrite: bool = False,
 ) -> None:
-    source_path = Path(source_file)
     output_path = Path(output_file)
 
     if output_path.exists() and not overwrite:
-        answer = input(f"Model config already exists: {output_path}. Overwrite? [y/N] ")
-        if answer.strip().lower() not in {"y", "yes"}:
-            print(f"kept existing model config: {output_path}")
+        with output_path.open("r", encoding="utf-8") as f:
+            existing_config = json.load(f)
+        if existing_config == context.to_dict():
+            print(f"kept identical existing preprocessing config: {output_path}")
             return
+        raise ValueError(
+            "Preprocessing settings are immutable once structure data exists. "
+            f"The requested settings differ from {output_path}. Use a different "
+            "output directory, or rebuild all data with --overwrite and "
+            "--overwrite-preprocessing-config."
+        )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy(source_path, output_path)
-    print(f"copied model config: {source_path} -> {output_path}")
+    with output_path.open("w", encoding="utf-8") as f:
+        json.dump(context.to_dict(), f, indent=2)
+        f.write("\n")
+    print(f"wrote preprocessing config: {output_path}")
 
 
 def structure_data_dir(structure_dir: str | Path) -> Path:
@@ -349,11 +495,12 @@ def build_structure_files_for_input(
     input_path: str,
     output_dir: str | Path,
     args: argparse.Namespace,
-    generator: FragmentSpectrumGenerator,
+    context: FragmentTreePreprocessingContext,
     manifest_file: str | Path | None = None,
     save_valid: bool = False,
     valid_records_output: str | Path | None = None,
     assignment_score_output: str | Path | None = None,
+    assigned_cleavage_event_output: str | Path | None = None,
 ) -> list[Path]:
     dataset = MSDataset.load(input_path)
     print(f"input: {input_path}")
@@ -362,7 +509,7 @@ def build_structure_files_for_input(
     valid_record_indexes: list[int] = []
     saved_files = build_fragment_tree_structure_files(
         dataset=dataset,
-        feature_model=generator.feature_model,
+        feature_model=context,
         output_dir=output_dir,
         smiles_column=args.smiles_column,
         precursor_mz_column=args.precursor_mz_column,
@@ -393,10 +540,66 @@ def build_structure_files_for_input(
             smiles_column=args.smiles_column,
         )
 
+    if assigned_cleavage_event_output is not None:
+        write_assigned_cleavage_event_statistics(
+            structure_files=saved_files,
+            pattern_set=context.fragmenter.cleavage_pattern_set,
+            output_file=assigned_cleavage_event_output,
+            num_workers=1,
+        )
+
     print(f"saved structure files: {len(saved_files)}")
     for path in saved_files[:5]:
         print(f"  {path}")
 
+    return saved_files
+
+
+def build_structure_files_for_existing_input(
+    *,
+    structures_input_dir: str | Path,
+    output_dir: str | Path,
+    args: argparse.Namespace,
+    context: FragmentTreePreprocessingContext,
+    manifest_file: str | Path | None = None,
+) -> list[Path]:
+    input_data_dir = resolve_structure_input_data_dir(structures_input_dir)
+    previous_config = find_previous_preprocessing_config(input_data_dir)
+    previous_pattern_set = None
+    if previous_config is not None:
+        previous_pattern_set = load_cleavage_pattern_set_from_params(previous_config)
+        print(f"previous model config: {previous_config}")
+    else:
+        print(
+            "[WARN] Previous model config was not found near the structure input. "
+            "All current cleavage patterns will be treated as added patterns.",
+            file=sys.stderr,
+        )
+
+    current_pattern_set = context.fragmenter.cleavage_pattern_set
+    should_rebuild = make_structure_rebuild_decider(
+        policy=args.structure_rebuild_policy,
+        current_pattern_set=current_pattern_set,
+        previous_pattern_set=previous_pattern_set,
+    )
+    print(f"structures input: {input_data_dir}")
+    print(f"output_dir: {output_dir}")
+    print(f"structure_rebuild_policy: {args.structure_rebuild_policy}")
+
+    saved_files = build_fragment_tree_structure_files_from_existing(
+        input_dir=input_data_dir,
+        feature_model=context,
+        output_dir=output_dir,
+        should_rebuild=should_rebuild,
+        max_node=args.max_node,
+        max_edge=args.max_edge,
+        overwrite=args.overwrite,
+        manifest_file=manifest_file,
+    )
+
+    print(f"saved structure files: {len(saved_files)}")
+    for path in saved_files[:5]:
+        print(f"  {path}")
     return saved_files
 
 
@@ -423,6 +626,96 @@ def merge_tsv_files(input_files: list[Path], output_file: Path) -> None:
         return
     output_file.parent.mkdir(parents=True, exist_ok=True)
     pd.concat(frames, ignore_index=True).to_csv(output_file, sep="\t", index=False)
+
+
+def merge_assigned_cleavage_event_tsv_files(
+    input_files: list[Path],
+    output_file: Path,
+) -> None:
+    frames = [pd.read_csv(path, sep="\t") for path in input_files if path.exists()]
+    key_columns = [
+        "reactant_smarts",
+        "matched_substructure",
+        "pattern_id",
+    ]
+    value_columns = [
+        "assigned_cleavage_event_count",
+        "assigned_pathway_count",
+        "sample_count",
+    ]
+    if frames:
+        merged = pd.concat(frames, ignore_index=True)
+        merged = merged.groupby(key_columns, as_index=False, dropna=False)[value_columns].sum()
+        merged = merged.sort_values(
+            ["assigned_cleavage_event_count", "reactant_smarts", "matched_substructure"],
+            ascending=[False, True, True],
+            kind="stable",
+        )
+    else:
+        merged = pd.DataFrame(columns=[*key_columns, *value_columns])
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    output_columns = [
+        "reactant_smarts",
+        "matched_substructure",
+        "assigned_cleavage_event_count",
+        "assigned_pathway_count",
+        "sample_count",
+        "pattern_id",
+    ]
+    merged.to_csv(output_file, sep="\t", index=False, columns=output_columns)
+
+    sample_input_files = [
+        path.with_name(f"{path.stem}_by_sample{path.suffix}")
+        for path in input_files
+    ]
+    sample_output_file = output_file.with_name(
+        f"{output_file.stem}_by_sample{output_file.suffix}"
+    )
+    merge_tsv_files(sample_input_files, sample_output_file)
+
+    derived_tables = (
+        ("by_pattern", ["pattern_id", "reactant_smarts"]),
+        (
+            "by_pattern_reaction",
+            ["pattern_id", "reaction_id", "reactant_smarts"],
+        ),
+        (
+            "by_pattern_reaction_product",
+            [
+                "pattern_id", "reaction_id", "product_molecule_id",
+                "reactant_smarts",
+            ],
+        ),
+    )
+    for suffix, derived_key_columns in derived_tables:
+        derived_input_files = [
+            path.with_name(f"{path.stem}_{suffix}{path.suffix}")
+            for path in input_files
+        ]
+        derived_frames = [
+            pd.read_csv(path, sep="\t")
+            for path in derived_input_files
+            if path.exists()
+        ]
+        derived_output_file = output_file.with_name(
+            f"{output_file.stem}_{suffix}{output_file.suffix}"
+        )
+        if derived_frames:
+            derived = pd.concat(derived_frames, ignore_index=True)
+            derived = derived.groupby(
+                derived_key_columns, as_index=False, dropna=False
+            )[value_columns].sum()
+            derived = derived.sort_values(
+                ["assigned_cleavage_event_count", *derived_key_columns],
+                ascending=[False, *([True] * len(derived_key_columns))],
+                kind="stable",
+            )
+        else:
+            derived = pd.DataFrame(columns=[*derived_key_columns, *value_columns])
+        derived.to_csv(derived_output_file, sep="\t", index=False)
+
+    print(f"saved merged assigned cleavage events: {output_file}")
+    print(f"saved merged per-sample cleavage events: {sample_output_file}")
 
 
 def merge_msdatasets(input_files: list[Path], output_file: Path, *, empty_like: MSDataset) -> None:
@@ -471,7 +764,8 @@ def run_parallel_for_input(
     part_manifests: list[Path] = []
     part_valid_outputs: list[Path] = []
     part_score_outputs: list[Path] = []
-    module_name = "clefts.ml.input.create_fragment_tree_training_data"
+    part_event_outputs: list[Path] = []
+    module_name = "clefts.ml.data_preparation.fragment_tree.create_fragment_tree_training_data"
 
     for chunk_index, record_indexes in enumerate(
         tqdm(chunks, desc=f"Preparing {split_name} chunks", mininterval=1.0)
@@ -480,6 +774,7 @@ def run_parallel_for_input(
         temp_manifest = temp_root / f"part_{chunk_index:06d}_manifest.tsv"
         temp_valid = temp_root / f"part_{chunk_index:06d}_valid.msds"
         temp_score = temp_root / f"part_{chunk_index:06d}_assignment_scores.tsv"
+        temp_events = temp_root / f"part_{chunk_index:06d}_assigned_cleavage_events.tsv"
         chunk_dataset = dataset[record_indexes].copy()
         chunk_dataset[ORIGINAL_INDEX_COLUMN] = list(record_indexes)
         chunk_dataset.save(str(temp_input))
@@ -496,6 +791,8 @@ def run_parallel_for_input(
             str(structure_output_dir),
             "--params",
             str(args.params),
+            "--symbols",
+            *[str(symbol) for symbol in args.symbols],
             "--smiles-column",
             str(args.smiles_column),
             "--precursor-mz-column",
@@ -504,8 +801,6 @@ def run_parallel_for_input(
             str(args.adduct_type_column),
             "--collision-energy-column",
             str(args.collision_energy_column),
-            "--device",
-            str(args.device),
             "--max-node",
             str(args.max_node),
             "--max-edge",
@@ -516,8 +811,11 @@ def run_parallel_for_input(
             "1",
             "--assignment-score-output",
             str(temp_score),
+            "--assigned-cleavage-event-output",
+            str(temp_events),
         ]
         part_score_outputs.append(temp_score)
+        part_event_outputs.append(temp_events)
         if args.instrument_column is not None:
             command.extend(["--instrument-column", str(args.instrument_column)])
         if save_valid:
@@ -541,6 +839,16 @@ def run_parallel_for_input(
     merge_tsv_files(part_manifests, manifest_file)
     merge_tsv_files(part_score_outputs, assignment_score_output)
     print(f"saved merged assignment scores: {assignment_score_output}")
+    statistics_dir = Path(args.output_dir) / "statistics"
+    for legacy_name in (
+        f"{split_name}_summary.json",
+        f"{split_name}_cleavage_pattern_coverage.tsv",
+        f"{split_name}_cleavage_pattern_by_class.tsv",
+        f"{split_name}_matched_pattern_count_distribution.tsv",
+    ):
+        (statistics_dir / legacy_name).unlink(missing_ok=True)
+    event_output = statistics_dir / f"{split_name}_assigned_cleavage_events.tsv"
+    merge_assigned_cleavage_event_tsv_files(part_event_outputs, event_output)
     if save_valid:
         if valid_records_output is None:
             raise ValueError("valid_records_output is required when save_valid=True.")
@@ -563,6 +871,35 @@ def default_assignment_score_output(structure_dir: Path) -> Path:
     return structure_dir / "assignment_scores.tsv"
 
 
+def write_split_cleavage_event_statistics(
+    *,
+    structure_data_directory: Path,
+    output_root: Path,
+    split_name: str,
+    pattern_set: CleavagePatternSet,
+    num_workers: int,
+) -> None:
+    statistics_dir = output_root / "statistics"
+    for legacy_name in (
+        f"{split_name}_summary.json",
+        f"{split_name}_cleavage_pattern_coverage.tsv",
+        f"{split_name}_cleavage_pattern_by_class.tsv",
+        f"{split_name}_matched_pattern_count_distribution.tsv",
+    ):
+        (statistics_dir / legacy_name).unlink(missing_ok=True)
+
+    write_assigned_cleavage_event_statistics(
+        structure_files=sorted(structure_data_directory.glob("*.pt")),
+        pattern_set=pattern_set,
+        output_file=(
+            output_root
+            / "statistics"
+            / f"{split_name}_assigned_cleavage_events.tsv"
+        ),
+        num_workers=num_workers,
+    )
+
+
 def parallel_temp_dir(args: argparse.Namespace, output_root: Path, split_name: str) -> Path:
     if args.parallel_temp_dir is not None:
         return Path(args.parallel_temp_dir) / split_name
@@ -579,25 +916,73 @@ def remove_existing_dirs(directories: list[Path], *, description: str) -> None:
         print(f"removed existing {description} directory: {directory}")
 
 
+def prepare_validation_input(
+    *,
+    args: argparse.Namespace,
+    train_structure_data_dir: Path,
+    validation_structure_dir: Path,
+) -> str | None:
+    if args.validation_input is None or args.validation_smiles_ratio is None:
+        return args.validation_input
+    train_smiles = []
+    for structure_file in sorted(train_structure_data_dir.glob("*.pt")):
+        item = load_fragment_tree_structure_file(structure_file, map_location="cpu")
+        smiles = item.metadata.get("smiles")
+        if smiles is None and len(item.structure.node_smiles) > 0:
+            smiles = item.structure.node_smiles[0]
+        if smiles is not None:
+            train_smiles.append(str(smiles))
+    if not train_smiles:
+        raise RuntimeError(
+            f"No completed training structures were found in {train_structure_data_dir}."
+        )
+
+    sampled_input = validation_structure_dir / "sampled_input.msds"
+    report_file = validation_structure_dir / "max_tanimoto_index.tsv"
+    output = sample_validation_dataset(
+        train_smiles=train_smiles,
+        validation_dataset=MSDataset.load(args.validation_input),
+        smiles_column=args.smiles_column,
+        ratio=args.validation_smiles_ratio,
+        num_bins=args.tanimoto_num_bins,
+        radius=args.tanimoto_radius,
+        n_bits=args.tanimoto_n_bits,
+        seed=args.validation_sampling_seed,
+        output_file=sampled_input,
+        report_file=report_file,
+    )
+    sampled_count = len(pd.read_csv(report_file, sep="\t"))
+    print(
+        f"sampled validation SMILES: {sampled_count} "
+        f"(ratio={args.validation_smiles_ratio}) -> {output}"
+    )
+    print(f"saved validation max Tanimoto indexes: {report_file}")
+    return str(output)
+
+
 def main(args: Optional[argparse.Namespace] = None) -> None:
     if args is None:
         args = parse_args()
 
-    device = torch.device(args.device)
     generator = None
     output_root = Path(args.output_dir)
 
+    validation_uses_structures = args.validation_structures_input_dir is not None
+    if args.validation_input is not None and validation_uses_structures:
+        raise ValueError("--validation-input and --validation-structures-input-dir are mutually exclusive.")
+
     if args.structure_output_dir is not None:
-        generator = load_generator(args.params, device=device)
+        generator = load_preprocessing_context(args)
         build_structure_files_for_input(
             input_path=args.train_input,
             output_dir=Path(args.structure_output_dir),
             args=args,
-            generator=generator,
+            context=generator,
             manifest_file=args.manifest_file,
             save_valid=args.save_valid_records,
             valid_records_output=args.valid_records_output,
             assignment_score_output=args.assignment_score_output,
+            assigned_cleavage_event_output=args.assigned_cleavage_event_output,
         )
         return
 
@@ -634,23 +1019,82 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
     if args.overwrite:
         structure_dirs = [train_structure_dir]
         parallel_temp_dirs = [parallel_temp_dir(args, output_root, "train")]
-        if args.validation_input is not None:
+        if args.validation_input is not None or validation_uses_structures:
             structure_dirs.append(validation_structure_dir)
             parallel_temp_dirs.append(parallel_temp_dir(args, output_root, "validation"))
         remove_existing_dirs(structure_dirs, description="structure")
         remove_existing_dirs(parallel_temp_dirs, description="parallel temp")
 
-    generator = load_generator(args.params, device=device)
-    model_config_output = (
-        Path(args.model_config_output)
-        if args.model_config_output is not None
-        else default_model_config_output(output_root)
+    generator = load_preprocessing_context(args)
+    preprocessing_config_output_path = (
+        Path(args.preprocessing_config_output)
+        if args.preprocessing_config_output is not None
+        else default_preprocessing_config_output(output_root)
     )
-    copy_model_config_after_model_creation(
-        source_file=args.params,
-        output_file=model_config_output,
-        overwrite=bool(args.overwrite_model_config),
+    if (
+        args.overwrite_preprocessing_config
+        and train_structure_data_dir.exists()
+        and any(train_structure_data_dir.glob("*.pt"))
+        and not args.overwrite
+    ):
+        raise ValueError(
+            "--overwrite-preprocessing-config cannot be used while retaining existing "
+            "training structures. Add --overwrite to rebuild them."
+        )
+    write_preprocessing_config(
+        context=generator,
+        output_file=preprocessing_config_output_path,
+        overwrite=bool(args.overwrite_preprocessing_config),
     )
+
+    pattern_set = generator.fragmenter.cleavage_pattern_set
+
+    if validation_uses_structures:
+        if args.num_workers > 1:
+            run_parallel_for_input(
+                input_path=args.train_input,
+                structure_output_dir=train_structure_data_dir,
+                args=args,
+                manifest_file=train_manifest_file,
+                save_valid=bool(args.save_train_valid_records),
+                valid_records_output=train_valid_output,
+                assignment_score_output=train_assignment_score_output,
+                split_name="train",
+            )
+        else:
+            build_structure_files_for_input(
+                input_path=args.train_input,
+                output_dir=train_structure_data_dir,
+                args=args,
+                context=generator,
+                manifest_file=train_manifest_file,
+                save_valid=bool(args.save_train_valid_records),
+                valid_records_output=train_valid_output,
+                assignment_score_output=train_assignment_score_output,
+            )
+
+        build_structure_files_for_existing_input(
+            structures_input_dir=args.validation_structures_input_dir,
+            output_dir=validation_structure_data_dir,
+            args=args,
+            context=generator,
+            manifest_file=validation_structure_dir / "manifest.tsv",
+        )
+        write_split_cleavage_event_statistics(
+            structure_data_directory=train_structure_data_dir,
+            output_root=output_root,
+            split_name="train",
+            pattern_set=pattern_set,
+            num_workers=max(1, int(args.num_workers)),
+        )
+        write_split_cleavage_event_statistics(
+            structure_data_directory=validation_structure_data_dir,
+            output_root=output_root,
+            split_name="validation",
+            pattern_set=pattern_set,
+            num_workers=max(1, int(args.num_workers)),
+        )
+        return
 
     if args.num_workers > 1:
         run_parallel_for_input(
@@ -663,9 +1107,14 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
             assignment_score_output=train_assignment_score_output,
             split_name="train",
         )
-        if args.validation_input is not None:
+        validation_input = prepare_validation_input(
+            args=args,
+            train_structure_data_dir=train_structure_data_dir,
+            validation_structure_dir=validation_structure_dir,
+        )
+        if validation_input is not None:
             run_parallel_for_input(
-                input_path=args.validation_input,
+                input_path=validation_input,
                 structure_output_dir=validation_structure_data_dir,
                 args=args,
                 manifest_file=validation_structure_dir / "manifest.tsv",
@@ -680,23 +1129,45 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
         input_path=args.train_input,
         output_dir=train_structure_data_dir,
         args=args,
-        generator=generator,
+        context=generator,
         manifest_file=train_manifest_file,
         save_valid=bool(args.save_train_valid_records),
         valid_records_output=train_valid_output,
         assignment_score_output=train_assignment_score_output,
     )
 
-    if args.validation_input is not None:
+    validation_input = prepare_validation_input(
+        args=args,
+        train_structure_data_dir=train_structure_data_dir,
+        validation_structure_dir=validation_structure_dir,
+    )
+    if validation_input is not None:
         build_structure_files_for_input(
-            input_path=args.validation_input,
+            input_path=validation_input,
             output_dir=validation_structure_data_dir,
             args=args,
-            generator=generator,
+            context=generator,
             manifest_file=validation_structure_dir / "manifest.tsv",
             save_valid=bool(args.save_validation_valid_records),
             valid_records_output=validation_valid_output,
             assignment_score_output=validation_assignment_score_output,
+        )
+
+
+    write_split_cleavage_event_statistics(
+        structure_data_directory=train_structure_data_dir,
+        output_root=output_root,
+        split_name="train",
+        pattern_set=pattern_set,
+        num_workers=max(1, int(args.num_workers)),
+    )
+    if args.validation_input is not None:
+        write_split_cleavage_event_statistics(
+            structure_data_directory=validation_structure_data_dir,
+            output_root=output_root,
+            split_name="validation",
+            pattern_set=pattern_set,
+            num_workers=max(1, int(args.num_workers)),
         )
 
 

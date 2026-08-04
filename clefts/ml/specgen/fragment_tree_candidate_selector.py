@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import List, Optional, Tuple, Union
 
 import torch
@@ -66,6 +66,8 @@ class FragmentTreeCandidateSelector(nn.Module):
         *,
         max_fragment_ion_candidates: int = 30,
         max_next_cleavage_candidates: int = 3,
+        max_edges_per_step: Optional[int] = 128,
+        max_retained_edges: Optional[int] = 30,
         max_nodes_for_ion_candidates: Optional[int] = None,
         hidden_dim: Optional[int] = None,
     ) -> None:
@@ -74,6 +76,10 @@ class FragmentTreeCandidateSelector(nn.Module):
             raise ValueError("max_fragment_ion_candidates must be positive.")
         if max_next_cleavage_candidates <= 0:
             raise ValueError("max_next_cleavage_candidates must be positive.")
+        if max_edges_per_step is not None and max_edges_per_step <= 0:
+            raise ValueError("max_edges_per_step must be positive or None.")
+        if max_retained_edges is not None and max_retained_edges <= 0:
+            raise ValueError("max_retained_edges must be positive or None.")
         if max_nodes_for_ion_candidates is not None and max_nodes_for_ion_candidates <= 0:
             raise ValueError("max_nodes_for_ion_candidates must be positive or None.")
         self.feature_model = feature_model
@@ -82,6 +88,8 @@ class FragmentTreeCandidateSelector(nn.Module):
         self.cleavage_edge_fnet = feature_model.cleavage_edge_fnet
         self.max_fragment_ion_candidates = int(max_fragment_ion_candidates)
         self.max_next_cleavage_candidates = int(max_next_cleavage_candidates)
+        self.max_edges_per_step = max_edges_per_step
+        self.max_retained_edges = max_retained_edges
         self.max_nodes_for_ion_candidates = max_nodes_for_ion_candidates
         tree_dim = int(feature_model.tree_encoder.hidden_dim)
         hidden_dim = int(hidden_dim or tree_dim)
@@ -140,15 +148,127 @@ class FragmentTreeCandidateSelector(nn.Module):
     def generate_depth_limited_candidates(self, data: Union[FragmentTreeStructure, FragmentTreeFeatures], *, max_depth: int) -> FragmentTreeCandidateSelectionOutput:
         if max_depth < 0:
             raise ValueError("max_depth must be non-negative.")
-        output = self.forward(data)
+        # Molecular and cleavage-event encoders are evaluated once.  The much
+        # larger sample-tree encoder is then run on bounded edge windows.
+        features = self.feature_model.build_features(data)
+        output = self._forward_progressive(features)
         for _ in range(max_depth):
             if len(output.next_cleavage_candidates) == 0:
                 break
             next_features = self._expand_features_for_next_cleavage(output)
             if next_features is None:
                 break
-            output = self.forward(next_features)
+            output = self._forward_progressive(next_features)
         return output
+
+    def _forward_progressive(
+        self,
+        features: FragmentTreeFeatures,
+    ) -> FragmentTreeCandidateSelectionOutput:
+        """Rank arbitrary-size edge sets using ``new window + survivors``.
+
+        Training deliberately calls :meth:`forward` directly and therefore
+        remains a single teacher-forced pass.  This staged path is inference
+        only and bounds the tree-transformer input for each sample.
+        """
+        limit = self.max_edges_per_step
+        retain = self.max_retained_edges
+        pairs = features.structure.sample_edge_index.detach().cpu().t().tolist()
+        by_sample: dict[int, List[int]] = {}
+        for sample_id, edge_id in pairs:
+            if int(edge_id) >= 0:
+                by_sample.setdefault(int(sample_id), []).append(int(edge_id))
+        if limit is None or all(len(set(v)) <= limit for v in by_sample.values()):
+            return self.forward(features)
+
+        survivors: dict[int, List[int]] = {sample_id: [] for sample_id in by_sample}
+        offsets = {sample_id: 0 for sample_id in by_sample}
+        while any(offsets[sample_id] < len(set(edges)) for sample_id, edges in by_sample.items()):
+            window_pairs: List[Tuple[int, int]] = []
+            for sample_id, raw_edges in by_sample.items():
+                edges = sorted(set(raw_edges))
+                start = offsets[sample_id]
+                new_edges = edges[start : start + int(limit)]
+                offsets[sample_id] += len(new_edges)
+                for edge_id in sorted(set(survivors[sample_id] + new_edges)):
+                    window_pairs.append((sample_id, edge_id))
+
+            window_features = self._with_sample_edges(features, window_pairs)
+            window_output = self.forward(window_features)
+            survivors = self._rank_edges(
+                window_output,
+                window_pairs,
+                max_per_sample=retain,
+            )
+
+        final_pairs = [
+            (sample_id, edge_id)
+            for sample_id, edge_ids in sorted(survivors.items())
+            for edge_id in edge_ids
+        ]
+        return self.forward(self._with_sample_edges(features, final_pairs))
+
+    @staticmethod
+    def _with_sample_edges(
+        features: FragmentTreeFeatures,
+        pairs: List[Tuple[int, int]],
+    ) -> FragmentTreeFeatures:
+        device = features.structure.sample_edge_index.device
+        sample_edge_index = torch.tensor(
+            pairs, dtype=torch.long, device=device
+        ).t().contiguous()
+        if not pairs:
+            sample_edge_index = torch.empty((2, 0), dtype=torch.long, device=device)
+        structure = replace(
+            features.structure,
+            sample_edge_index=sample_edge_index,
+        )
+        return replace(features, structure=structure)
+
+    @staticmethod
+    def _rank_edges(
+        output: FragmentTreeCandidateSelectionOutput,
+        pairs: List[Tuple[int, int]],
+        *,
+        max_per_sample: Optional[int],
+    ) -> dict[int, List[int]]:
+        """Score an edge by its child keep score and edge cleavage score."""
+        structure = output.features.structure
+        batch = output.sample_tree_batch
+        node_score: dict[Tuple[int, int], float] = {}
+        kept_sample_ids = batch.kept_sample_ids.detach().cpu().long()
+        for batch_node in range(int(batch.x.size(0))):
+            graph_index = int(batch.batch[batch_node].detach().cpu().item())
+            sample_id = int(kept_sample_ids[graph_index].item())
+            global_node = int(batch.node_id_global[batch_node].detach().cpu().item())
+            node_score[(sample_id, global_node)] = float(
+                output.keep_logit[batch_node].detach().cpu().item()
+            )
+
+        edge_score: dict[Tuple[int, int], float] = {}
+        if hasattr(batch, "edge_id_global"):
+            for local_edge, global_edge in enumerate(
+                batch.edge_id_global.detach().cpu().long().tolist()
+            ):
+                graph_index = int(batch.batch[batch.edge_index[0, local_edge]].detach().cpu().item())
+                sample_id = int(kept_sample_ids[graph_index].item())
+                edge_score[(sample_id, int(global_edge))] = float(
+                    output.edge_cleave_logit[local_edge].detach().cpu().item()
+                )
+
+        ranked: dict[int, List[Tuple[float, int]]] = {}
+        edge_dst = structure.edge_index[1].detach().cpu().long()
+        for sample_id, edge_id in pairs:
+            dst = int(edge_dst[edge_id].item())
+            score = node_score.get((sample_id, dst), float("-inf"))
+            score += edge_score.get((sample_id, edge_id), 0.0)
+            ranked.setdefault(sample_id, []).append((score, edge_id))
+        result: dict[int, List[int]] = {}
+        for sample_id, rows in ranked.items():
+            rows.sort(key=lambda row: (-row[0], row[1]))
+            k = len(rows) if max_per_sample is None else min(max_per_sample, len(rows))
+            result[sample_id] = [edge_id for _, edge_id in rows[:k]]
+        return result
 
     def _expand_features_for_next_cleavage(
         self,

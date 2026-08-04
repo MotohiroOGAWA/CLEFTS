@@ -30,7 +30,6 @@ else:
     from .selector import SphereExclusionIndex
 
 
-DEFAULT_INPUT = Path("/workspaces/CLEFTS/raw_data/PubChem/pubchem_cid_smiles.parquet")
 DEFAULT_OUTPUT_DIR = Path("/workspaces/CLEFTS/mnt/app/data/processed/pubchem/sphere_exclusion")
 DEFAULT_OUTPUT = DEFAULT_OUTPUT_DIR / "pubchem_morgan2048_sphere_exclusion.parquet"
 DEFAULT_REPORT = DEFAULT_OUTPUT_DIR / "pubchem_morgan2048_sphere_exclusion_report.json"
@@ -588,7 +587,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Build a Morgan 2048-bit sphere-exclusion subset from PubChem CID/SMILES parquet."
     )
-    parser.add_argument("--input", type=Path, default=DEFAULT_INPUT)
+    parser.add_argument("--input", type=Path, required=True)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--smiles-output", type=Path, default=None, help="Newline-delimited SMILES output. Defaults to the output path with .smiles.txt suffix.")
     parser.add_argument("--report", type=Path, default=DEFAULT_REPORT)

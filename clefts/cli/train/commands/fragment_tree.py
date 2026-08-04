@@ -5,8 +5,9 @@ import argparse
 from ...base import CLICommand
 from clefts.ml.training.fragment_tree_training.training_model import (
     DEFAULT_EXPERIMENT_NAME,
+    build_model_config_from_pretrained,
     build_train_config,
-    run_training_from_config,
+    run_training,
 )
 
 
@@ -24,12 +25,22 @@ class FragmentTreeTrainCommand(CLICommand):
             metavar="PROJECT_DIR",
             help="Training project directory, e.g. data/training/project_single_bond_pos.",
         )
-        parser.add_argument(
-            "-m",
-            "--model-config",
-            default=None,
-            help="Model config path or name under PROJECT_DIR/config. Defaults to PROJECT_DIR/config/model_config.json.",
-        )
+        parser.add_argument("--mol-encoder-checkpoint", required=True)
+        parser.add_argument("--cleavage-edge-fnet-checkpoint", required=True)
+        parser.add_argument("--fragmenter-params", required=True)
+        parser.add_argument("--condition-adduct-embedding-dim", type=int, default=16)
+        parser.add_argument("--condition-ce-feature-dim", type=int, default=16)
+        parser.add_argument("--condition-ce-fc-dims", default="32")
+        parser.add_argument("--condition-feature-dim", type=int, default=64)
+        parser.add_argument("--condition-fc-dims", default="128,64")
+        parser.add_argument("--tree-hidden-dim", type=int, default=128)
+        parser.add_argument("--tree-num-layers", type=int, default=2)
+        parser.add_argument("--tree-num-heads", type=int, default=8)
+        parser.add_argument("--tree-max-degree", type=int, default=16)
+        parser.add_argument("--dropout", type=float, default=0.1)
+        parser.add_argument("--max-edges-per-step", type=int, default=128)
+        parser.add_argument("--max-retained-edges", type=int, default=30)
+        parser.add_argument("--max-next-cleavage-candidates", type=int, default=3)
         parser.add_argument(
             "--experiment-name",
             default=DEFAULT_EXPERIMENT_NAME,
@@ -42,6 +53,9 @@ class FragmentTreeTrainCommand(CLICommand):
         )
         parser.add_argument("--batch-size", type=int, default=1, help="default: %(default)s")
         parser.add_argument("--device", default="cpu", help="default: %(default)s")
+        parser.add_argument("--lr", type=float, default=1e-5)
+        parser.add_argument("--weight-decay", type=float, default=0.0)
+        parser.add_argument("--grad-clip-norm", type=float, default=1.0)
         parser.add_argument(
             "--epoch",
             "--epochs",
@@ -55,6 +69,11 @@ class FragmentTreeTrainCommand(CLICommand):
             type=int,
             default=100,
             help="Run validation every N successful training steps. Use 0 to disable.",
+        )
+        parser.add_argument(
+            "--validate-at-start",
+            action="store_true",
+            help="Run validation before the first training epoch.",
         )
         parser.add_argument(
             "--save-interval-epochs",
@@ -84,6 +103,33 @@ class FragmentTreeTrainCommand(CLICommand):
         )
 
     def run(self, args: argparse.Namespace) -> None:
+        csv_ints = lambda value: tuple(
+            int(part.strip()) for part in value.split(",") if part.strip()
+        )
+        model_config = build_model_config_from_pretrained(
+            mol_encoder_checkpoint=args.mol_encoder_checkpoint,
+            cleavage_edge_fnet_checkpoint=args.cleavage_edge_fnet_checkpoint,
+            fragmenter_params_path=args.fragmenter_params,
+            condition_encoder_params={
+                "adduct_embedding_dim": args.condition_adduct_embedding_dim,
+                "ce_feature_dim": args.condition_ce_feature_dim,
+                "ce_fc_dims": csv_ints(args.condition_ce_fc_dims),
+                "feature_dim": args.condition_feature_dim,
+                "fc_dims": csv_ints(args.condition_fc_dims),
+            },
+            tree_encoder_params={
+                "hidden_dim": args.tree_hidden_dim,
+                "num_layers": args.tree_num_layers,
+                "num_heads": args.tree_num_heads,
+                "max_degree": args.tree_max_degree,
+            },
+            dropout=args.dropout,
+            generator_params={
+                "max_edges_per_step": args.max_edges_per_step,
+                "max_retained_edges": args.max_retained_edges,
+                "max_next_cleavage_candidates": args.max_next_cleavage_candidates,
+            },
+        )
         train_config = build_train_config(
             project_dir=args.project_dir,
             experiment_name=args.experiment_name,
@@ -91,12 +137,16 @@ class FragmentTreeTrainCommand(CLICommand):
             batch_size=args.batch_size,
             device=args.device,
             epoch=args.epoch,
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+            grad_clip_norm=args.grad_clip_norm,
             validation_interval_steps=(
                 None
                 if args.validation_interval_steps is None
                 or args.validation_interval_steps <= 0
                 else args.validation_interval_steps
             ),
+            validate_at_start=args.validate_at_start,
             save_interval=args.save_interval_epochs,
             save_interval_steps=(
                 None
@@ -106,8 +156,8 @@ class FragmentTreeTrainCommand(CLICommand):
             training_structure_dir=args.training_structure_dir,
             validation_structure_dir=args.validation_structure_dir,
         )
-        run_training_from_config(
+        run_training(
             project_dir=args.project_dir,
-            model_config_path=args.model_config,
-            train_config=train_config,
+            model_config_inline=model_config,
+            train_config_inline=train_config,
         )
