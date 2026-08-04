@@ -5,11 +5,14 @@ import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+import numpy as np
 import pandas as pd
 import torch
 from torch import Tensor
 
+from clefts.libs.mmkit.mmkit import Adduct, Compound
 from clefts.libs.msentity.msentity import MSDataset
+from clefts.libs.msentity.msentity.core.PeakSeries import PeakSeries
 from clefts.ml.input.fragment_tree_structure import FragmentTreeStructure
 from clefts.ml.input.single_fragment_tree_structure_builder import (
     SingleFragmentTreeStructureBuilder,
@@ -18,6 +21,7 @@ from clefts.ml.specgen.fragment_tree_spectrum_predictor import (
     FragmentSpectrumGenerator,
     fragment_spectrum_output_to_msdataset,
 )
+from clefts.ml.specgen.fragment_tree_training_model import FragmentTreeTrainingModel
 
 
 def parse_args() -> argparse.Namespace:
@@ -27,8 +31,12 @@ def parse_args() -> argparse.Namespace:
             "the predictions as an MSDataset."
         )
     )
-    parser.add_argument("--input", required=True, help="Input MSDataset path.")
-    parser.add_argument("--output", required=True, help="Output MSDataset path.")
+    parser.add_argument("--input", help="Input MSDataset path.")
+    parser.add_argument(
+        "--output",
+        default="predicted.msds",
+        help="Output MSDataset path. Default: predicted.msds",
+    )
     parser.add_argument(
         "--model",
         required=True,
@@ -52,9 +60,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--instrument-column", default=None)
     parser.add_argument(
         "--smiles",
-        nargs="*",
+        nargs="+",
         default=None,
-        help="Optional SMILES values to predict. Defaults to all unique SMILES.",
+        help=(
+            "SMILES to predict. With --input, selects matching records; without "
+            "--input, creates one prediction sample per SMILES."
+        ),
+    )
+    parser.add_argument(
+        "--ce",
+        default=None,
+        help="Collision energy for direct prediction, normally an eV number (for example 20).",
+    )
+    parser.add_argument(
+        "--adduct-type",
+        "--adduct",
+        dest="adduct_type",
+        default=None,
+        help='AdductType for direct prediction (for example "[M+H]+").',
     )
     parser.add_argument(
         "--device",
@@ -76,7 +99,22 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Use strict state_dict loading.",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.input is None:
+        missing = [
+            name
+            for name, value in (
+                ("--smiles", args.smiles),
+                ("--ce", args.ce),
+                ("--adduct-type", args.adduct_type),
+            )
+            if value is None
+        ]
+        if missing:
+            parser.error(
+                "direct prediction without --input requires " + ", ".join(missing)
+            )
+    return args
 
 
 def load_json(path: str | Path) -> Dict[str, Any]:
@@ -133,10 +171,23 @@ def load_generator(
     generator = FragmentSpectrumGenerator(**params).to(device)
     state_dict = extract_state_dict(checkpoint)
 
-    missing_keys, unexpected_keys = generator.load_state_dict(
-        state_dict,
-        strict=strict,
+    # Fragment-tree training checkpoints contain the training wrapper, whose
+    # modules are shared with the generator.  Load through that wrapper so a
+    # checkpoint emitted by training is immediately usable for inference.
+    is_training_checkpoint = (
+        any(key.startswith("candidate_selector.") for key in state_dict)
+        and not any(key.startswith("feature_model.") for key in state_dict)
+        and not any(key.startswith("spectrum_predictor.") for key in state_dict)
     )
+    if is_training_checkpoint:
+        training_model = FragmentTreeTrainingModel(
+            generator.candidate_selector,
+            intensity_predictor=generator.formula_intensity_predictor,
+        ).to(device)
+        incompatible = training_model.load_state_dict(state_dict, strict=strict)
+    else:
+        incompatible = generator.load_state_dict(state_dict, strict=strict)
+    missing_keys, unexpected_keys = incompatible
     if missing_keys:
         print(f"missing keys while loading model: {len(missing_keys)}")
     if unexpected_keys:
@@ -144,6 +195,38 @@ def load_generator(
 
     generator.eval()
     return generator
+
+
+def direct_input_dataset(
+    *,
+    smiles_values: Sequence[str],
+    collision_energy: str,
+    adduct_type: str,
+) -> MSDataset:
+    """Create metadata-only samples for direct CLI prediction."""
+    adduct = Adduct.parse(adduct_type)
+    rows = []
+    for smiles in smiles_values:
+        compound = Compound.from_smiles(str(smiles))
+        rows.append(
+            {
+                "SMILES": str(smiles),
+                "PrecursorMZ": float(adduct.apply_to_mz(compound.exact_mass)),
+                "AdductType": adduct_type,
+                "CollisionEnergy": collision_energy,
+            }
+        )
+    metadata = pd.DataFrame(rows)
+    peaks = PeakSeries(
+        data=np.empty((0, 2), dtype=np.float64),
+        offsets=np.zeros(len(metadata) + 1, dtype=np.int64),
+    )
+    return MSDataset(
+        spectrum_metadata=metadata,
+        peak_series=peaks,
+        columns=metadata.columns.tolist(),
+        description="Direct spectrum prediction input",
+    )
 
 
 def select_smiles_values(
@@ -245,14 +328,22 @@ def main() -> None:
     args = parse_args()
     device = torch.device(args.device)
 
-    dataset = MSDataset.load(args.input)
+    dataset = (
+        MSDataset.load(args.input)
+        if args.input is not None
+        else direct_input_dataset(
+            smiles_values=args.smiles,
+            collision_energy=args.ce,
+            adduct_type=args.adduct_type,
+        )
+    )
     smiles_values = select_smiles_values(
         dataset,
         smiles_column=args.smiles_column,
         smiles_values=args.smiles,
     )
 
-    print(f"input: {args.input}")
+    print(f"input: {args.input or 'direct arguments'}")
     print(f"model: {args.model}")
     print(f"output: {args.output}")
     print(f"device: {device}")

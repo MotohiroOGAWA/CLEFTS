@@ -36,6 +36,8 @@ class FormulaIntensityOutput:
 class FormulaIntensityTrainingOutput:
     sample_index: Tensor
     formula_tensor: Tensor
+    # Sum of non-negative molecular-node -> formula-node edge scores.
+    # The historical field name is retained for checkpoint/API compatibility.
     logit: Tensor
     candidates: List[List[FragmentIonCandidate]]
 
@@ -154,32 +156,26 @@ class FragmentTreeFormulaIntensityPredictor(nn.Module):
         device = candidate_output.keep_logit.device
         sample_ids: List[int] = []
         formula_rows: List[Tensor] = []
-        group_reprs: List[Tensor] = []
+        group_intensities: List[Tensor] = []
         groups: List[List[FragmentIonCandidate]] = []
         for (sample_id, _), group in sorted(grouped.items(), key=lambda item: item[0]):
             candidate_repr = self._candidate_formula_node_repr(candidate_output, group)
-            score = torch.stack(
-                [
-                    candidate.score_tensor.to(device)
-                    if candidate.score_tensor is not None
-                    else candidate_output.keep_logit.new_tensor(float(candidate.score))
-                    for candidate in group
-                ],
-                dim=0,
+            # One formula node can be annotated by several molecular nodes.
+            # Each relation predicts a non-negative contribution; their sum
+            # is, by definition, the intensity of this formula node.
+            relation_score = F.softplus(
+                self.formula_node_head(candidate_repr).squeeze(-1)
             )
-            weight = torch.softmax(score.detach(), dim=0)
-            group_reprs.append((candidate_repr * weight[:, None]).sum(dim=0))
+            group_intensities.append(relation_score.sum())
             sample_ids.append(int(sample_id))
             formula_rows.append(group[0].formula_tensor.to(device).float())
             groups.append(group)
 
-        node_repr = torch.stack(group_reprs, dim=0)
         sample_index = torch.tensor(sample_ids, dtype=torch.long, device=device)
-        encoded = self._encode_formula_nodes_by_sample(node_repr, sample_index)
         return FormulaIntensityTrainingOutput(
             sample_index=sample_index,
             formula_tensor=torch.stack(formula_rows, dim=0),
-            logit=self.formula_node_head(encoded).squeeze(-1),
+            logit=torch.stack(group_intensities, dim=0),
             candidates=groups,
         )
 
@@ -234,7 +230,7 @@ class FragmentTreeFormulaIntensityPredictor(nn.Module):
         if training_output.logit.numel() == 0:
             return FormulaIntensityOutput(formula_predictions=[])
 
-        intensities = torch.sigmoid(training_output.logit)
+        intensities = training_output.logit
         predictions: List[FormulaIntensityPrediction] = []
         for index, group in enumerate(training_output.candidates):
             if len(group) == 0:

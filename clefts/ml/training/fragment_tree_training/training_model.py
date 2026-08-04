@@ -146,6 +146,123 @@ def save_config(config: Dict[str, Any], path: str | Path) -> None:
             json.dump(config, f, indent=2)
 
 
+def _checkpoint_dict(path: str | Path, *, label: str) -> Dict[str, Any]:
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    if not isinstance(checkpoint, dict):
+        raise TypeError(f"{label} checkpoint must contain a dictionary: {path}")
+    return checkpoint
+
+
+def _fragmenter_params_from_file(path: str | Path) -> Dict[str, Any]:
+    data = load_config(path)
+    if "probability_model_params" in data:
+        data = dict(data["probability_model_params"])
+    if "fragmenter_params" in data:
+        data = dict(data["fragmenter_params"])
+    if "fragment_ion_tree_builder" not in data:
+        raise KeyError(
+            "Fragmenter parameter file must contain fragment_ion_tree_builder "
+            f"(directly or below fragmenter_params): {path}"
+        )
+    return dict(data)
+
+
+def build_model_config_from_pretrained(
+    *,
+    mol_encoder_checkpoint: str | Path,
+    cleavage_edge_fnet_checkpoint: str | Path,
+    fragmenter_params_path: str | Path,
+    condition_encoder_params: Dict[str, Any],
+    tree_encoder_params: Dict[str, Any],
+    dropout: float,
+    generator_params: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Build spectrum-training config from the two pretrained checkpoints."""
+    mol_checkpoint = _checkpoint_dict(
+        mol_encoder_checkpoint, label="MolEncoder"
+    )
+    cleavage_checkpoint = _checkpoint_dict(
+        cleavage_edge_fnet_checkpoint, label="CleavageEdgeFNet"
+    )
+    mol_params = dict(mol_checkpoint.get("mol_encoder_params") or {})
+    if not mol_params:
+        raise KeyError(
+            "MolEncoder checkpoint is missing mol_encoder_params: "
+            f"{mol_encoder_checkpoint}"
+        )
+    cleavage_params_full = dict(
+        cleavage_checkpoint.get("cleavage_edge_fnet_params") or {}
+    )
+    if not cleavage_params_full:
+        raise KeyError(
+            "CleavageEdgeFNet checkpoint is missing cleavage_edge_fnet_params: "
+            f"{cleavage_edge_fnet_checkpoint}"
+        )
+    pattern_set = cleavage_params_full.get("cleavage_pattern_set_params")
+    if not isinstance(pattern_set, dict):
+        raise KeyError(
+            "CleavageEdgeFNet checkpoint is missing "
+            f"cleavage_pattern_set_params: {cleavage_edge_fnet_checkpoint}"
+        )
+    dimension_pairs = (
+        ("graph_dim", "mol_dim"),
+        ("node_dim", "atom_dim"),
+    )
+    incompatible_dimensions = {
+        f"mol_encoder_params.{mol_key} / cleavage_edge_fnet_params.{edge_key}": (
+            mol_params.get(mol_key),
+            cleavage_params_full.get(edge_key),
+        )
+        for mol_key, edge_key in dimension_pairs
+        if mol_params.get(mol_key) != cleavage_params_full.get(edge_key)
+    }
+    if incompatible_dimensions:
+        raise ValueError(
+            "The MolEncoder and CleavageEdgeFNet checkpoints were trained with "
+            "incompatible encoder dimensions: "
+            f"{incompatible_dimensions}. Select the MolEncoder checkpoint used "
+            "to pretrain the cleavage model."
+        )
+
+    fragmenter_params = _fragmenter_params_from_file(fragmenter_params_path)
+    tree_builder_params = dict(fragmenter_params["fragment_ion_tree_builder"])
+    # The cleavage checkpoint is authoritative for the pattern definitions
+    # used to construct both the pretrained edge network and this model.
+    tree_builder_params["cleavage_pattern_set"] = dict(pattern_set)
+    fragmenter_params["fragment_ion_tree_builder"] = tree_builder_params
+
+    cleavage_params = {
+        key: cleavage_params_full[key]
+        for key in ("feature_dim", "fc_dims")
+        if key in cleavage_params_full
+    }
+    missing_cleavage_params = {
+        "feature_dim", "fc_dims"
+    } - set(cleavage_params)
+    if missing_cleavage_params:
+        raise KeyError(
+            "CleavageEdgeFNet checkpoint is missing construction parameters: "
+            f"{sorted(missing_cleavage_params)}"
+        )
+
+    config: Dict[str, Any] = {
+        "probability_model_params": {
+            "mol_encoder_params": mol_params,
+            "condition_encoder_params": dict(condition_encoder_params),
+            "cleavage_edge_fnet_params": cleavage_params,
+            "tree_encoder_params": dict(tree_encoder_params),
+            "fragmenter_params": fragmenter_params,
+            "dropout": float(dropout),
+        },
+        "mol_encoder_checkpoint": str(mol_encoder_checkpoint),
+        "cleavage_edge_fnet_checkpoint": str(cleavage_edge_fnet_checkpoint),
+        "freeze_mol_encoder": True,
+        "freeze_cleavage_edge_fnet": True,
+    }
+    config.update(dict(generator_params or {}))
+    return config
+
+
 def load_generator(model_config: Dict[str, Any], device: torch.device) -> FragmentSpectrumGenerator:
     params = model_config.get("params", model_config)
     generator = FragmentSpectrumGenerator(**params).to(device)
@@ -153,9 +270,16 @@ def load_generator(model_config: Dict[str, Any], device: torch.device) -> Fragme
 
 
 def validate_preprocessing_compatibility(
-    *, project_dir: str | Path, model_config: Dict[str, Any]
+    *,
+    project_dir: str | Path,
+    model_config: Dict[str, Any],
+    preprocessing_config_path: Optional[str | Path] = None,
 ) -> None:
-    config_path = Path(project_dir) / "config" / "preprocessing_config.json"
+    config_path = (
+        Path(preprocessing_config_path)
+        if preprocessing_config_path is not None
+        else Path(project_dir) / "config" / "preprocessing_config.json"
+    )
     if not config_path.exists():
         raise FileNotFoundError(
             f"Preprocessing config not found: {config_path}. Training requires the "
@@ -163,8 +287,13 @@ def validate_preprocessing_compatibility(
         )
     preprocessing = load_config(config_path)
     params = model_config.get("params", model_config).get("probability_model_params", {})
-    model_symbols = tuple(params.get("mol_encoder_params", {}).get("symbols", ()))
-    expected_symbols = tuple(preprocessing.get("symbols", ()))
+    # AtomFeatureLayer canonicalizes symbols with sorted(set(symbols)).  Compare
+    # the effective feature-column order, not the user-facing input order saved
+    # by preprocessing.
+    model_symbols = tuple(
+        sorted(set(params.get("mol_encoder_params", {}).get("symbols", ())))
+    )
+    expected_symbols = tuple(sorted(set(preprocessing.get("symbols", ()))))
     if model_symbols != expected_symbols:
         raise ValueError(
             "Model symbols do not match preprocessing data: "
@@ -308,6 +437,7 @@ def normalize_train_config(
         )
     config["validation_valid_records_file"] = str(validation_valid_records_file)
     config["shuffle"] = bool(config.get("shuffle", True))
+    config["validate_at_start"] = bool(config.get("validate_at_start", False))
 
     return config
 
@@ -330,6 +460,7 @@ def build_train_config(
     training_structure_dir: Optional[str | Path] = None,
     validation_structure_dir: Optional[str | Path] = None,
     shuffle: bool = True,
+    validate_at_start: bool = False,
 ) -> Dict[str, Any]:
     optimizer_info: Dict[str, Any] = {
         "name": optimizer_name,
@@ -358,6 +489,7 @@ def build_train_config(
                 None if validation_structure_dir is None else str(validation_structure_dir)
             ),
             "shuffle": bool(shuffle),
+            "validate_at_start": bool(validate_at_start),
         },
     )
 
@@ -400,6 +532,7 @@ def prepare_train_from_config(
         "validation_valid_records_file": str(train_config["validation_valid_records_file"]),
         "shuffle": bool(train_config.get("shuffle", True)),
         "validation_interval_steps": validation_interval_steps,
+        "validate_at_start": bool(train_config.get("validate_at_start", False)),
         "pattern": "*.pt",
     }
 
@@ -789,7 +922,7 @@ def predict_validation_msdataset(
     predictor = FragmentTreeSpectrumPredictor(
         model.candidate_selector,
         model.intensity_predictor,
-        max_generation_steps=0,
+        expand_cleavages=False,
         normalize_intensity=True,
     ).to(device)
     predictor.eval()
@@ -825,14 +958,31 @@ def predict_validation_msdataset(
             if not valid_pairs:
                 continue
 
-            valid_pairs.sort(key=lambda pair: pair[1])
-            structure = FragmentTreeStructure.from_structures(
-                [builder.to_structure()],
-                device=device,
-            )
+            # A record can pass metadata parsing and receive a sample index
+            # while fragmentation produces no usable molecular nodes.  Such a
+            # sample cannot be represented as FragmentTreeStructure and must
+            # not abort validation for all remaining records.
+            if len(builder.node_graph) == 0:
+                print(
+                    "[WARN] validation prediction skipped "
+                    f"smiles={smiles!r}: fragmentation produced no nodes"
+                )
+                continue
 
-            with torch.no_grad():
-                output = predictor(structure)
+            valid_pairs.sort(key=lambda pair: pair[1])
+            try:
+                structure = FragmentTreeStructure.from_structures(
+                    [builder.to_structure()],
+                    device=device,
+                )
+                with torch.no_grad():
+                    output = predictor(structure)
+            except Exception as exc:
+                print(
+                    "[WARN] validation prediction skipped "
+                    f"smiles={smiles!r}: {type(exc).__name__}: {exc}"
+                )
+                continue
 
             batch_predicted_dataset = fragment_spectrum_output_to_msdataset(output)
             batch_peak_data = batch_predicted_dataset.peaks.data
@@ -930,6 +1080,7 @@ def main(
     run_dir: Path,
     extra_data: Dict[str, Any],
     validation_interval_steps: Optional[int] = None,
+    validate_at_start: bool = False,
 ) -> None:
     ckpt_manager = CheckPointManager(str(experiment_dir))
     ckpt_manager.set_run_dir(str(run_dir))
@@ -1090,20 +1241,24 @@ def main(
 
     for epoch_index in range(state.initial_epoch, max_epoch + 1):
         validation_epoch = epoch_index - 1
-        val_metrics, val_cosine = evaluate_current_validation(
-            desc=f"ValStart({validation_epoch})"
+        should_validate_at_epoch_start = (
+            epoch_index > state.initial_epoch or validate_at_start
         )
-        log_training_metrics(
-            event="epoch_start",
-            epoch_value=validation_epoch,
-            step_value=global_step,
-            train_metrics=last_train_metrics,
-            train_window_metrics=None,
-            val_metrics=val_metrics,
-            val_cosine=val_cosine,
-        )
+        if should_validate_at_epoch_start:
+            val_metrics, val_cosine = evaluate_current_validation(
+                desc=f"ValStart({validation_epoch})"
+            )
+            log_training_metrics(
+                event="epoch_start",
+                epoch_value=validation_epoch,
+                step_value=global_step,
+                train_metrics=last_train_metrics,
+                train_window_metrics=None,
+                val_metrics=val_metrics,
+                val_cosine=val_cosine,
+            )
 
-        if validation_epoch >= state.initial_epoch:
+        if validation_epoch >= state.initial_epoch and should_validate_at_epoch_start:
             val_loss = val_metrics.loss
             step_scheduler(scheduler, val_loss)
             improved = val_loss < best_val_loss - min_delta
@@ -1380,7 +1535,8 @@ def run_training_from_config(
     validate_preprocessing_compatibility(
         project_dir=project_dir, model_config=model_config
     )
-    shutil.copy(model_config_resolved, run_dir / model_config_resolved.name)
+    # Persist the effective configuration used by this run.
+    save_config(model_config, run_dir / model_config_resolved.name)
 
     main(
         model_config=model_config,
@@ -1398,6 +1554,7 @@ def run_training_from_config(
         run_dir=run_dir,
         extra_data=extra_data,
         validation_interval_steps=validation_interval_steps,
+        validate_at_start=bool(dataset_info.get("validate_at_start", False)),
     )
 
 def run_training(
@@ -1407,15 +1564,32 @@ def run_training(
     train_config_path: Optional[str | Path] = None,
     root_run_dir: Optional[str | Path] = None,
     num_workers: int = 0,
+    model_overrides: Optional[Dict[str, Any]] = None,
+    model_config_inline: Optional[Dict[str, Any]] = None,
+    train_config_inline: Optional[Dict[str, Any]] = None,
+    preprocessing_config_path: Optional[str | Path] = None,
 ) -> None:
-    train_config_resolved = resolve_train_config_path(
-        project_dir,
-        train_config_path,
+    model_config_resolved = (
+        None
+        if model_config_inline is not None
+        else resolve_model_config_path(project_dir, model_config_path)
     )
-    model_config_resolved = resolve_model_config_path(
-        project_dir,
-        model_config_path,
-    )
+    if train_config_inline is None:
+        train_config_resolved = resolve_train_config_path(
+            project_dir,
+            train_config_path,
+        )
+        prepared = prepare_train(
+            project_dir,
+            train_config_resolved,
+            root_run_dir=root_run_dir,
+        )
+    else:
+        prepared = prepare_train_from_config(
+            project_dir,
+            train_config_inline,
+            train_config_source=None,
+        )
 
     (
         experiment_dir,
@@ -1430,11 +1604,15 @@ def run_training(
         dataset_info,
         validation_interval_steps,
         run_dir,
-    ) = prepare_train(
-        project_dir,
-        train_config_resolved,
-        root_run_dir=root_run_dir,
-    )
+    ) = prepared
+    if root_run_dir is not None and train_config_inline is not None:
+        inline_run_dir = Path(root_run_dir) / run_dir.name
+        inline_run_dir.mkdir(parents=True, exist_ok=True)
+        run_dir = inline_run_dir
+        save_config(
+            normalize_train_config(project_dir, train_config_inline),
+            run_dir / DEFAULT_TRAIN_CONFIG_NAME,
+        )
 
     _, _, train_loader, val_loader, extra_data = setup_dataset(
         dataset_info,
@@ -1442,11 +1620,27 @@ def run_training(
         num_workers=num_workers,
     )
 
-    model_config = load_config(model_config_resolved)
-    validate_preprocessing_compatibility(
-        project_dir=project_dir, model_config=model_config
+    model_config = (
+        dict(model_config_inline)
+        if model_config_inline is not None
+        else load_config(model_config_resolved)
     )
-    shutil.copy(model_config_resolved, run_dir / model_config_resolved.name)
+    model_config.update(dict(model_overrides or {}))
+    validate_preprocessing_compatibility(
+        project_dir=project_dir,
+        model_config=model_config,
+        preprocessing_config_path=preprocessing_config_path,
+    )
+    # Persist the effective configuration, including command-line overrides.
+    save_config(
+        model_config,
+        run_dir
+        / (
+            DEFAULT_PROJECT_MODEL_CONFIG_NAME
+            if model_config_resolved is None
+            else model_config_resolved.name
+        ),
+    )
 
     main(
         model_config=model_config,
@@ -1464,51 +1658,154 @@ def run_training(
         run_dir=run_dir,
         extra_data=extra_data,
         validation_interval_steps=validation_interval_steps,
+        validate_at_start=bool(dataset_info.get("validate_at_start", False)),
     )
+
+def _csv_int_tuple(value: str) -> Tuple[int, ...]:
+    try:
+        parsed = tuple(int(part.strip()) for part in value.split(",") if part.strip())
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("expected comma-separated integers") from exc
+    if not parsed or any(item <= 0 for item in parsed):
+        raise argparse.ArgumentTypeError("values must be positive integers")
+    return parsed
+
+
+def _find_preprocessing_config(split_dir: str | Path) -> Path:
+    split_path = Path(split_dir).resolve()
+    for parent in (split_path, *split_path.parents):
+        candidate = parent / "config" / "preprocessing_config.json"
+        if candidate.is_file():
+            return candidate
+    raise FileNotFoundError(
+        "Could not find config/preprocessing_config.json in --train-dir or "
+        f"any of its parent directories: {split_dir}"
+    )
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train FragmentTreeTrainingModel.")
-    parser.add_argument(
-        "project_dir",
-        nargs="?",
-        default="data/training/fragment_tree_model",
-        help="Training project directory.",
-    )
-    parser.add_argument(
-        "-project",
-        "--project-dir",
-        dest="project_dir_option",
-        default=None,
-        help=argparse.SUPPRESS,
-    )
-    parser.add_argument(
-        "-m",
-        "-model",
-        "--model-config",
-        "--model-config-path",
-        default=None,
-        help="Model config path or name under PROJECT/config. Defaults to PROJECT/config/model_config.json.",
-    )
-    parser.add_argument(
-        "-t",
-        "-train",
-        "--train-config",
-        "--train-config-path",
-        default=None,
-        help="Train config path or name under PROJECT/config. Defaults to train_config.json.",
-    )
-    parser.add_argument("--root-run-dir", default=None)
+    parser.add_argument("--train-dir", required=True)
+    parser.add_argument("--val-dir", required=True)
+    parser.add_argument("--output-dir", required=True)
     parser.add_argument("--num-workers", type=int, default=0)
-    return parser.parse_args()
+    parser.add_argument("--mol-encoder-checkpoint", required=True)
+    parser.add_argument("--cleavage-edge-fnet-checkpoint", required=True)
+    parser.add_argument(
+        "--fragmenter-params",
+        required=True,
+        help=(
+            "Fragmenter JSON. Its cleavage_pattern_set is replaced by the one "
+            "stored in --cleavage-edge-fnet-checkpoint."
+        ),
+    )
+    parser.add_argument("--condition-adduct-embedding-dim", type=int, default=16)
+    parser.add_argument("--condition-ce-feature-dim", type=int, default=16)
+    parser.add_argument("--condition-ce-fc-dims", type=_csv_int_tuple, default=(32,))
+    parser.add_argument("--condition-feature-dim", type=int, default=64)
+    parser.add_argument("--condition-fc-dims", type=_csv_int_tuple, default=(128, 64))
+    parser.add_argument("--tree-hidden-dim", type=int, default=128)
+    parser.add_argument("--tree-num-layers", type=int, default=2)
+    parser.add_argument("--tree-num-heads", type=int, default=8)
+    parser.add_argument("--tree-max-degree", type=int, default=16)
+    parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--max-edges-per-step", type=int, default=128)
+    parser.add_argument("--max-retained-edges", type=int, default=30)
+    parser.add_argument("--max-next-cleavage-candidates", type=int, default=3)
+    parser.add_argument("--experiment-name", default=DEFAULT_EXPERIMENT_NAME)
+    parser.add_argument("--ckpt-id", default=None)
+    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--device", default="cpu")
+    parser.add_argument("--epochs", "--epoch", dest="epochs", type=int, default=10)
+    parser.add_argument("--validation-interval-steps", type=int, default=100)
+    parser.add_argument(
+        "--validate-at-start",
+        action="store_true",
+        help="Run ValStart before the first training epoch (disabled by default).",
+    )
+    parser.add_argument("--save-interval-epochs", type=int, default=1)
+    parser.add_argument("--save-interval-steps", type=int, default=100)
+    parser.add_argument("--optimizer", default="AdamW")
+    parser.add_argument("--lr", type=float, default=1e-5)
+    parser.add_argument("--weight-decay", type=float, default=0.0)
+    parser.add_argument("--grad-clip-norm", type=float, default=1.0)
+    parser.add_argument("--early-stopping-patience", type=int, default=None)
+    parser.add_argument(
+        "--shuffle", action=argparse.BooleanOptionalAction, default=True
+    )
+    args = parser.parse_args()
+    for option, value in (("--train-dir", args.train_dir), ("--val-dir", args.val_dir)):
+        if not Path(value).is_dir():
+            parser.error(f"{option} does not exist or is not a directory: {value}")
+    return args
 
 
 if __name__ == "__main__":
     args = parse_args()
-    project_dir = args.project_dir_option or args.project_dir
+    project_dir = args.output_dir
+    train_split_dir = Path(args.train_dir)
+    val_split_dir = Path(args.val_dir)
+    train_data_dir = train_split_dir / "data" if (train_split_dir / "data").is_dir() else train_split_dir
+    val_data_dir = val_split_dir / "data" if (val_split_dir / "data").is_dir() else val_split_dir
+    preprocessing_config_path = _find_preprocessing_config(train_split_dir)
+    model_config_inline = build_model_config_from_pretrained(
+        mol_encoder_checkpoint=args.mol_encoder_checkpoint,
+        cleavage_edge_fnet_checkpoint=args.cleavage_edge_fnet_checkpoint,
+        fragmenter_params_path=args.fragmenter_params,
+        condition_encoder_params={
+            "adduct_embedding_dim": args.condition_adduct_embedding_dim,
+            "ce_feature_dim": args.condition_ce_feature_dim,
+            "ce_fc_dims": args.condition_ce_fc_dims,
+            "feature_dim": args.condition_feature_dim,
+            "fc_dims": args.condition_fc_dims,
+        },
+        tree_encoder_params={
+            "hidden_dim": args.tree_hidden_dim,
+            "num_layers": args.tree_num_layers,
+            "num_heads": args.tree_num_heads,
+            "max_degree": args.tree_max_degree,
+        },
+        dropout=args.dropout,
+        generator_params={
+            "max_edges_per_step": args.max_edges_per_step,
+            "max_retained_edges": args.max_retained_edges,
+            "max_next_cleavage_candidates": args.max_next_cleavage_candidates,
+        },
+    )
+    train_config_inline = build_train_config(
+        project_dir=project_dir,
+        experiment_name=args.experiment_name,
+        ckpt_id=args.ckpt_id,
+        batch_size=args.batch_size,
+        device=args.device,
+        epoch=args.epochs,
+        validation_interval_steps=(
+            args.validation_interval_steps if args.validation_interval_steps > 0 else None
+        ),
+        save_interval=args.save_interval_epochs,
+        save_interval_steps=(
+            args.save_interval_steps if args.save_interval_steps > 0 else None
+        ),
+        optimizer_name=args.optimizer,
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+        grad_clip_norm=args.grad_clip_norm,
+        training_structure_dir=train_data_dir,
+        validation_structure_dir=val_data_dir,
+        shuffle=args.shuffle,
+        validate_at_start=args.validate_at_start,
+    )
+    train_config_inline["validation_valid_records_file"] = str(
+        val_split_dir / "valid_records.msds"
+    )
+    if args.early_stopping_patience is not None:
+        train_config_inline["early_stopping"] = {
+            "patience": args.early_stopping_patience
+        }
     run_training(
         project_dir=project_dir,
-        model_config_path=args.model_config,
-        train_config_path=args.train_config,
-        root_run_dir=args.root_run_dir,
         num_workers=args.num_workers,
+        model_config_inline=model_config_inline,
+        train_config_inline=train_config_inline,
+        preprocessing_config_path=preprocessing_config_path,
     )

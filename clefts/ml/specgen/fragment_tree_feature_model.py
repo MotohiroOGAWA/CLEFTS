@@ -420,6 +420,13 @@ class FragmentTreeFeatureModel(nn.Module):
             sample_tree_batch=sample_tree_batch,
         )
 
+    def build_features(
+        self,
+        data: Union[FragmentTreeStructure, FragmentTreeFeatures],
+    ) -> FragmentTreeFeatures:
+        """Encode molecules/cleavage events once for staged tree inference."""
+        return self._build_fragment_tree_features(data)
+
     def _build_flat_adduct_candidate_table(
         self,
         *,

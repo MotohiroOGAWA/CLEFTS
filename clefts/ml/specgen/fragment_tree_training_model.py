@@ -701,7 +701,7 @@ class FragmentTreeIntensityTrainingLoss(nn.Module):
             else:
                 target_intensity = target_weight
             losses.append(
-                F.binary_cross_entropy_with_logits(
+                F.smooth_l1_loss(
                     intensity_output.logit[pred_index],
                     target_intensity,
                 )
