@@ -55,13 +55,20 @@ OUTPUT_DIR/
 │   ├── train_assigned_cleavage_events_by_pattern_reaction.tsv
 │   └── train_assigned_cleavage_events_by_pattern_reaction_product.tsv
 ├── train_structures/
+│   ├── fragmenter.json
 │   ├── data/*.pt
 │   ├── manifest.tsv
 │   └── assignment_scores.tsv
-└── validation_structures/ ...
+└── validation_structures/
+    ├── fragmenter.json
+    └── ...
 ```
 
 When `--validation-input` is supplied, the corresponding `statistics/validation_*` files are also generated.
+Each generated structure split contains a `fragmenter.json` in the native
+`Fragmenter` format. It can be loaded directly with
+`Fragmenter.from_json(".../train_structures/fragmenter.json")` (or the validation
+equivalent) and used to reproduce fragmentation with the split's settings.
 
 By default, `--validation-smiles-ratio` is `0.1`: the number of selected validation SMILES is 10% of the number of unique training SMILES (rounded up and capped by the available validation SMILES). Candidates are divided into ten bins by their maximum Morgan-fingerprint Tanimoto similarity to training data, then selected round-robin across non-empty bins. Thus similarity 1.0 (also present in training) through structurally dissimilar candidates near 0.0 are represented as evenly as the candidate pool allows. The selection is deterministic by default; use `--validation-sampling-seed` to change it. `validation_structures/max_tanimoto_index.tsv` records the selected SMILES and similarities.
 
