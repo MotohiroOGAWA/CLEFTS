@@ -7,6 +7,7 @@ from clefts.ml.training.fragment_tree_training.training_model import (
     DEFAULT_EXPERIMENT_NAME,
     build_model_config_from_pretrained,
     build_train_config,
+    load_and_validate_split_preprocessing,
     run_training,
 )
 
@@ -27,7 +28,6 @@ class FragmentTreeTrainCommand(CLICommand):
         )
         parser.add_argument("--mol-encoder-checkpoint", required=True)
         parser.add_argument("--cleavage-edge-fnet-checkpoint", required=True)
-        parser.add_argument("--fragmenter-params", required=True)
         parser.add_argument("--condition-adduct-embedding-dim", type=int, default=16)
         parser.add_argument("--condition-ce-feature-dim", type=int, default=16)
         parser.add_argument("--condition-ce-fc-dims", default="32")
@@ -106,30 +106,6 @@ class FragmentTreeTrainCommand(CLICommand):
         csv_ints = lambda value: tuple(
             int(part.strip()) for part in value.split(",") if part.strip()
         )
-        model_config = build_model_config_from_pretrained(
-            mol_encoder_checkpoint=args.mol_encoder_checkpoint,
-            cleavage_edge_fnet_checkpoint=args.cleavage_edge_fnet_checkpoint,
-            fragmenter_params_path=args.fragmenter_params,
-            condition_encoder_params={
-                "adduct_embedding_dim": args.condition_adduct_embedding_dim,
-                "ce_feature_dim": args.condition_ce_feature_dim,
-                "ce_fc_dims": csv_ints(args.condition_ce_fc_dims),
-                "feature_dim": args.condition_feature_dim,
-                "fc_dims": csv_ints(args.condition_fc_dims),
-            },
-            tree_encoder_params={
-                "hidden_dim": args.tree_hidden_dim,
-                "num_layers": args.tree_num_layers,
-                "num_heads": args.tree_num_heads,
-                "max_degree": args.tree_max_degree,
-            },
-            dropout=args.dropout,
-            generator_params={
-                "max_edges_per_step": args.max_edges_per_step,
-                "max_retained_edges": args.max_retained_edges,
-                "max_next_cleavage_candidates": args.max_next_cleavage_candidates,
-            },
-        )
         train_config = build_train_config(
             project_dir=args.project_dir,
             experiment_name=args.experiment_name,
@@ -156,8 +132,37 @@ class FragmentTreeTrainCommand(CLICommand):
             training_structure_dir=args.training_structure_dir,
             validation_structure_dir=args.validation_structure_dir,
         )
+        preprocessing, preprocessing_config_path = load_and_validate_split_preprocessing(
+            train_config["training_structure_dir"],
+            train_config["validation_structure_dir"],
+        )
+        model_config = build_model_config_from_pretrained(
+            mol_encoder_checkpoint=args.mol_encoder_checkpoint,
+            cleavage_edge_fnet_checkpoint=args.cleavage_edge_fnet_checkpoint,
+            fragmenter_params=dict(preprocessing["fragmenter_params"]),
+            condition_encoder_params={
+                "adduct_embedding_dim": args.condition_adduct_embedding_dim,
+                "ce_feature_dim": args.condition_ce_feature_dim,
+                "ce_fc_dims": csv_ints(args.condition_ce_fc_dims),
+                "feature_dim": args.condition_feature_dim,
+                "fc_dims": csv_ints(args.condition_fc_dims),
+            },
+            tree_encoder_params={
+                "hidden_dim": args.tree_hidden_dim,
+                "num_layers": args.tree_num_layers,
+                "num_heads": args.tree_num_heads,
+                "max_degree": args.tree_max_degree,
+            },
+            dropout=args.dropout,
+            generator_params={
+                "max_edges_per_step": args.max_edges_per_step,
+                "max_retained_edges": args.max_retained_edges,
+                "max_next_cleavage_candidates": args.max_next_cleavage_candidates,
+            },
+        )
         run_training(
             project_dir=args.project_dir,
             model_config_inline=model_config,
             train_config_inline=train_config,
+            preprocessing_config_path=preprocessing_config_path,
         )

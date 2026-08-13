@@ -21,7 +21,7 @@ from clefts.ml.specgen.fragment_tree_spectrum_predictor import (
     FragmentSpectrumGenerator,
     fragment_spectrum_output_to_msdataset,
 )
-from clefts.ml.specgen.fragment_tree_training_model import FragmentTreeTrainingModel
+from clefts.ml.training.fragment_tree_training.model import FragmentTreeTrainingModel
 
 
 def parse_args() -> argparse.Namespace:

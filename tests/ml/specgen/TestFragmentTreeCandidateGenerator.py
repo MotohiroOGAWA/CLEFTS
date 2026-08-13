@@ -10,7 +10,7 @@ from clefts.libs.mmkit.mmkit import Formula
 from clefts.ml.specgen.fragment_tree_candidate_selector import FragmentIonCandidate
 from clefts.ml.specgen.fragment_tree_formula_intensity_model import FormulaIntensityPredictor
 from clefts.ml.specgen.fragment_tree_spectrum_predictor import fragment_spectrum_output_to_msdataset
-from clefts.ml.specgen.fragment_tree_training_model import FormulaGroupCoverageLoss
+from clefts.ml.training.fragment_tree_training.model import FormulaGroupCoverageLoss
 from clefts.ml.specgen.fragment_tree_spectrum_predictor import (
     GeneratedMassSpectrum,
     GeneratedSpectrumPeak,

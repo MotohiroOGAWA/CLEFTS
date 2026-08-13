@@ -16,11 +16,12 @@ molecular fragments may annotate that peak.
 
 ## Why training and inference differ
 
-Training uses one teacher-forced forward pass over the saved candidate tree.
-The target edge/node indexes in `TrainingFragmentTreeStructure` provide all
-depths at once.  Running the expensive sequential beam search for every
-optimizer step would multiply training time and would make hard top-k choices
-part of the gradient path.
+Training uses one teacher-forced forward pass.  For every sample it includes
+all positive edges needed by the target terminal/expand nodes, fills the rest
+of a `max_edges_per_step` window with randomly sampled negative edges, and
+selects at most `max_retained_edges` molecular candidates.  Selection and
+formula intensity losses are computed on every pass.  It does not run the
+expensive sequential beam search for every optimizer step.
 
 Inference uses staged pruning:
 
@@ -55,14 +56,12 @@ pretrained model files:
 - `--cleavage-edge-fnet-checkpoint`: supplies
   `cleavage_edge_fnet_params`, the pretrained edge-network weights, and its
   `cleavage_pattern_set_params`.
-- `--fragmenter-params`: supplies all other Fragmenter settings, including ion
-  adduct rules, depth, precursor-candidate depth, and mass tolerance.
+- `fragmenter.json` in each structure split supplies the Fragmenter settings,
+  including ion adduct rules, depth, precursor-candidate depth, and mass tolerance.
 
-The cleavage pattern set stored in the cleavage checkpoint is authoritative.
-If the file passed to `--fragmenter-params` also contains
-`fragment_ion_tree_builder.cleavage_pattern_set`, that value is replaced by
-the checkpoint value. This guarantees that the CleavageEdgeFNet is constructed
-with the same pattern/reaction/product definitions used during its pretraining.
+The train and validation copies of `fragmenter.json` must be identical, and
+their cleavage pattern set must match the cleavage checkpoint. The saved
+preprocessing symbols must also match the MolEncoder checkpoint.
 
 Both pretrained encoders are frozen. Checkpoint loading is strict and checks
 that the MolEncoder dimensions used by the cleavage checkpoint are compatible
@@ -95,8 +94,8 @@ how multiple fragment annotations for one formula peak are represented.
 
 ## Run
 
-From the application root, provide the two pretrained models and the
-Fragmenter JSON. All newly trained model and optimizer settings are ordinary
+From the application root, provide the two pretrained models. The Fragmenter
+configuration is loaded from the structure directories. Other model and optimizer settings are ordinary
 command-line arguments.
 
 ```bash
@@ -106,7 +105,6 @@ python -m clefts.ml.training.fragment_tree_training.training_model \
   --output-dir data/training/fragment_tree_projects/main \
   --mol-encoder-checkpoint data/training/mol_projects/main/runs/node16_gdim64_layers2_heads8_deg4_spd3_edged3_drop0p5/pretraining_last.pt \
   --cleavage-edge-fnet-checkpoint data/training/cleavage_projects/main/best.pt \
-  --fragmenter-params clefts/domain/fragment/presets/fragmenter_single_bond_pos.json \
   --condition-adduct-embedding-dim 16 \
   --condition-ce-feature-dim 16 \
   --condition-ce-fc-dims 32 \
@@ -153,11 +151,16 @@ the run remains reproducible without maintaining a handwritten model config.
 
 Training writes managed checkpoints, CSV metrics, TensorBoard events, and
 validation spectra below `<project>/experiments/<experiment_name>/`.
+The validation cosine is written both to the ordinary metrics and to
+`validation/validation_cosine.tsv`. TensorBoard also receives five measured
+vs generated mirror plots, sampled at evenly spaced ranks from the highest to
+the lowest validation cosine.
 
 ## Important limits
 
-- `max_edges_per_step` is an inference memory control, not a training-data
-  truncation option.
+- `max_edges_per_step` is both the inference new-edge window and the one-shot
+  training/validation candidate limit per sample. Required target-path edges
+  are never replaced by random negatives.
 - `max_retained_edges` is a maximum; the model does not pad to that number.
 - Set checkpoint paths before training starts.  Changing encoder definitions
   after structure creation is rejected by preprocessing compatibility checks.

@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import shutil
 import math
 import traceback
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -36,7 +37,7 @@ from ...specgen.fragment_tree_spectrum_predictor import (
     FragmentTreeSpectrumPredictor,
     fragment_spectrum_output_to_msdataset,
 )
-from ...specgen.fragment_tree_training_model import FragmentTreeTrainingModel
+from .model import FragmentTreeTrainingModel
 from ....libs.msentity.msentity import MSDataset
 from ....libs.msentity.msentity.processing.spectrum_similarity import cosine_similarity_pair
 
@@ -60,6 +61,7 @@ METRIC_COLUMNS = (
 
 DEFAULT_TRAIN_CONFIG_NAME = "train_config.json"
 DEFAULT_PROJECT_MODEL_CONFIG_NAME = "model_config.json"
+DEFAULT_PREPROCESSING_CONFIG_NAME = "preprocessing_config.json"
 DEFAULT_EXPERIMENT_NAME = "exp_main"
 DEFAULT_OPTIMIZER_INFO = {
     "name": "AdamW",
@@ -126,6 +128,69 @@ def nan_loss_metrics() -> EpochLossMetrics:
     )
 
 
+def sample_training_edges(
+    structure,
+    *,
+    max_edges_per_sample: Optional[int],
+):
+    """Teacher-force required edges and fill the window with random negatives.
+
+    This is deliberately a one-shot training/validation sampler.  Sequential
+    survivor windows are reserved for inference.
+    """
+    if max_edges_per_sample is None or structure.sample_edge_index.numel() == 0:
+        return structure
+    limit = int(max_edges_per_sample)
+    if limit <= 0:
+        raise ValueError("max_edges_per_sample must be positive or None.")
+
+    existing: Dict[int, List[int]] = {}
+    for sample_id, edge_id in structure.sample_edge_index.detach().cpu().t().tolist():
+        if int(edge_id) >= 0:
+            existing.setdefault(int(sample_id), []).append(int(edge_id))
+
+    required: Dict[int, set[int]] = {}
+    if structure.target_edge_index.numel() > 0:
+        for sample_id, edge_id in structure.target_edge_index.detach().cpu().t().tolist():
+            required.setdefault(int(sample_id), set()).add(int(edge_id))
+
+    # Intermediate molecular nodes on a target path must also remain reachable.
+    edge_dst = structure.edge_index[1].detach().cpu().long()
+    assignment_samples = structure.target_sample_index.detach().cpu().long()
+    expand_nodes = structure.target_expand_node_index.detach().cpu().long()
+    expand_ptr = structure.terminal_expand_ptr.detach().cpu().long()
+    for assignment_id, sample_id in enumerate(assignment_samples.tolist()):
+        start = int(expand_ptr[assignment_id].item())
+        end = int(expand_ptr[assignment_id + 1].item())
+        for node_id in expand_nodes[start:end].tolist():
+            incoming = (edge_dst == int(node_id)).nonzero(as_tuple=False).view(-1)
+            required.setdefault(int(sample_id), set()).update(
+                int(edge_id) for edge_id in incoming.tolist()
+            )
+
+    sampled_pairs: List[Tuple[int, int]] = []
+    for sample_id, raw_edges in sorted(existing.items()):
+        candidates = sorted(set(raw_edges))
+        must_keep = sorted(required.get(sample_id, set()).intersection(candidates))
+        if len(must_keep) > limit:
+            raise ValueError(
+                f"sample {sample_id} has {len(must_keep)} required edges, "
+                f"which exceeds max_edges_per_sample={limit}."
+            )
+        negatives = [edge_id for edge_id in candidates if edge_id not in set(must_keep)]
+        remaining = limit - len(must_keep)
+        if len(negatives) > remaining:
+            order = torch.randperm(len(negatives))[:remaining].tolist()
+            negatives = [negatives[index] for index in order]
+        sampled_pairs.extend((sample_id, edge_id) for edge_id in must_keep + negatives)
+
+    device = structure.sample_edge_index.device
+    sampled = torch.tensor(sampled_pairs, dtype=torch.long, device=device).t().contiguous()
+    if not sampled_pairs:
+        sampled = torch.empty((2, 0), dtype=torch.long, device=device)
+    return replace(structure, sample_edge_index=sampled)
+
+
 def load_config(path: str | Path) -> Dict[str, Any]:
     config_path = Path(path)
     with open(config_path, "r", encoding="utf-8") as f:
@@ -171,7 +236,7 @@ def build_model_config_from_pretrained(
     *,
     mol_encoder_checkpoint: str | Path,
     cleavage_edge_fnet_checkpoint: str | Path,
-    fragmenter_params_path: str | Path,
+    fragmenter_params: Dict[str, Any],
     condition_encoder_params: Dict[str, Any],
     tree_encoder_params: Dict[str, Any],
     dropout: float,
@@ -204,6 +269,19 @@ def build_model_config_from_pretrained(
             "CleavageEdgeFNet checkpoint is missing "
             f"cleavage_pattern_set_params: {cleavage_edge_fnet_checkpoint}"
         )
+    cleavage_mol_params = dict(cleavage_checkpoint.get("mol_encoder_params") or {})
+    if not cleavage_mol_params:
+        raise KeyError(
+            "CleavageEdgeFNet checkpoint is missing mol_encoder_params: "
+            f"{cleavage_edge_fnet_checkpoint}"
+        )
+    if mol_params != cleavage_mol_params:
+        raise ValueError(
+            "The MolEncoder checkpoint does not match the MolEncoder configuration "
+            "used to pretrain the CleavageEdgeFNet. Select the same MolEncoder "
+            "checkpoint/configuration."
+        )
+
     dimension_pairs = (
         ("graph_dim", "mol_dim"),
         ("node_dim", "atom_dim"),
@@ -224,12 +302,14 @@ def build_model_config_from_pretrained(
             "to pretrain the cleavage model."
         )
 
-    fragmenter_params = _fragmenter_params_from_file(fragmenter_params_path)
+    fragmenter_params = dict(fragmenter_params)
     tree_builder_params = dict(fragmenter_params["fragment_ion_tree_builder"])
-    # The cleavage checkpoint is authoritative for the pattern definitions
-    # used to construct both the pretrained edge network and this model.
-    tree_builder_params["cleavage_pattern_set"] = dict(pattern_set)
-    fragmenter_params["fragment_ion_tree_builder"] = tree_builder_params
+    data_pattern_set = tree_builder_params.get("cleavage_pattern_set")
+    if data_pattern_set != pattern_set:
+        raise ValueError(
+            "The fragmenter saved with the training data has a cleavage pattern "
+            "set that is incompatible with the CleavageEdgeFNet checkpoint."
+        )
 
     cleavage_params = {
         key: cleavage_params_full[key]
@@ -729,9 +809,12 @@ def run_epoch(
     on_step_end: Optional[
         Callable[[int, EpochLossMetrics, EpochLossMetrics], None]
     ] = None,
+    max_training_edges: Optional[int] = None,
 ) -> EpochLossMetrics:
     is_train = optimizer is not None
     model.train(is_train)
+    if max_training_edges is None:
+        max_training_edges = model.candidate_selector.max_edges_per_step
 
     total_loss = 0.0
     total_selection_loss = 0.0
@@ -751,6 +834,10 @@ def run_epoch(
     for batch in iterator:
         try:
             structure = batch["structure"].to(device)
+            structure = sample_training_edges(
+                structure,
+                max_edges_per_sample=max_training_edges,
+            )
             num_samples = int(structure.num_samples)
             sample_weight = max(num_samples, 1)
 
@@ -866,6 +953,9 @@ def evaluate_validation_cosine(
     model: FragmentTreeTrainingModel,
     dataset: MSDataset,
     batch_size: int = 128,
+    writer=None,
+    global_step: Optional[int] = None,
+    output_dir: Optional[Path] = None,
 ) -> float:
     if model.intensity_predictor is None:
         return float("nan")
@@ -895,10 +985,118 @@ def evaluate_validation_cosine(
         return float("nan")
 
     val_cosine = float(scores.mean())
+    if output_dir is not None:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        score_file = output_dir / "validation_cosine.tsv"
+        write_header = not score_file.exists()
+        with open(score_file, "a", encoding="utf-8", newline="") as f:
+            tsv = csv.writer(f, delimiter="\t")
+            if write_header:
+                tsv.writerow(["global_step", "spectrum_index", "cosine_similarity"])
+            for spectrum_index, score in enumerate(scores.tolist()):
+                tsv.writerow([global_step, spectrum_index, float(score)])
+    if writer is not None and global_step is not None:
+        log_validation_spectrum_quantiles(
+            writer=writer,
+            predicted_dataset=predicted_dataset,
+            target_dataset=target_dataset,
+            scores=scores,
+            global_step=int(global_step),
+        )
     with tqdm(total=1, desc="ValCosine", leave=True) as iterator:
         iterator.set_postfix(val_cosine=val_cosine)
         iterator.update(1)
     return val_cosine
+
+
+def find_split_config(split_dir: str | Path, filename: str) -> Path:
+    """Find a config saved in a structure split, accepting split/data paths."""
+    split_path = Path(split_dir).resolve()
+    candidates = []
+    for directory in (split_path, split_path.parent, *split_path.parents):
+        candidates.extend((directory / filename, directory / "config" / filename))
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    raise FileNotFoundError(
+        f"Could not find {filename} in the structure split: {split_dir}"
+    )
+
+
+def load_and_validate_split_preprocessing(
+    train_dir: str | Path,
+    val_dir: str | Path,
+) -> Tuple[Dict[str, Any], Path]:
+    """Load immutable preprocessing data and require identical train/val settings."""
+    train_preprocessing_path = find_split_config(
+        train_dir, DEFAULT_PREPROCESSING_CONFIG_NAME
+    )
+    val_preprocessing_path = find_split_config(
+        val_dir, DEFAULT_PREPROCESSING_CONFIG_NAME
+    )
+    train_preprocessing = load_config(train_preprocessing_path)
+    val_preprocessing = load_config(val_preprocessing_path)
+    if train_preprocessing != val_preprocessing:
+        raise ValueError(
+            "Training and validation structures were prepared with different "
+            "symbols or fragmenter settings."
+        )
+
+    train_fragmenter_path = find_split_config(train_dir, "fragmenter.json")
+    val_fragmenter_path = find_split_config(val_dir, "fragmenter.json")
+    train_fragmenter = _fragmenter_params_from_file(train_fragmenter_path)
+    val_fragmenter = _fragmenter_params_from_file(val_fragmenter_path)
+    if train_fragmenter != val_fragmenter:
+        raise ValueError(
+            "Training and validation structure directories contain different "
+            "fragmenter.json configurations."
+        )
+    if train_fragmenter != dict(train_preprocessing.get("fragmenter_params") or {}):
+        raise ValueError(
+            "fragmenter.json does not match preprocessing_config.json in the "
+            "training structure directory."
+        )
+    return train_preprocessing, train_preprocessing_path
+
+
+def log_validation_spectrum_quantiles(
+    *, writer, predicted_dataset: MSDataset, target_dataset: MSDataset,
+    scores: np.ndarray, global_step: int,
+) -> None:
+    """Show five representative mirror plots from high to low cosine."""
+    if scores.size == 0:
+        return
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("[WARN] matplotlib is unavailable; spectrum figures were skipped.")
+        return
+
+    ranked = np.argsort(scores)[::-1]
+    positions = np.linspace(0, len(ranked) - 1, num=min(5, len(ranked))).round().astype(int)
+    for level, position in enumerate(positions, start=1):
+        spectrum_index = int(ranked[int(position)])
+        target_start = int(target_dataset.peaks.offsets[spectrum_index])
+        target_end = int(target_dataset.peaks.offsets[spectrum_index + 1])
+        pred_start = int(predicted_dataset.peaks.offsets[spectrum_index])
+        pred_end = int(predicted_dataset.peaks.offsets[spectrum_index + 1])
+        target_peaks = target_dataset.peaks.data[target_start:target_end]
+        predicted_peaks = predicted_dataset.peaks.data[pred_start:pred_end]
+        figure, axis = plt.subplots(figsize=(10, 4))
+        if len(target_peaks):
+            axis.vlines(target_peaks[:, 0], 0, target_peaks[:, 1], color="black", label="measured")
+        if len(predicted_peaks):
+            axis.vlines(predicted_peaks[:, 0], 0, -predicted_peaks[:, 1], color="tab:red", label="generated")
+        axis.axhline(0, color="gray", linewidth=0.8)
+        axis.set(xlabel="m/z", ylabel="intensity", title=f"cosine={float(scores[spectrum_index]):.4f}")
+        axis.legend(loc="upper right")
+        figure.tight_layout()
+        writer.add_figure(
+            f"validation_spectra/level_{level}_high_to_low",
+            figure,
+            global_step=global_step,
+            close=True,
+        )
 
 
 def predict_validation_msdataset(
@@ -922,8 +1120,13 @@ def predict_validation_msdataset(
     predictor = FragmentTreeSpectrumPredictor(
         model.candidate_selector,
         model.intensity_predictor,
-        expand_cleavages=False,
+        expand_cleavages=True,
         normalize_intensity=True,
+        max_edges_per_step=model.candidate_selector.max_edges_per_step,
+        max_retained_edges=model.candidate_selector.max_retained_edges,
+        max_next_cleavage_candidates=(
+            model.candidate_selector.max_next_cleavage_candidates
+        ),
     ).to(device)
     predictor.eval()
 
@@ -1154,6 +1357,9 @@ def main(
                     model=model,
                     dataset=validation_dataset,
                     batch_size=batch_size,
+                    writer=writer,
+                    global_step=global_step,
+                    output_dir=run_dir / "validation",
                 )
                 if validation_dataset is not None
                 else float("nan")
@@ -1671,18 +1877,6 @@ def _csv_int_tuple(value: str) -> Tuple[int, ...]:
     return parsed
 
 
-def _find_preprocessing_config(split_dir: str | Path) -> Path:
-    split_path = Path(split_dir).resolve()
-    for parent in (split_path, *split_path.parents):
-        candidate = parent / "config" / "preprocessing_config.json"
-        if candidate.is_file():
-            return candidate
-    raise FileNotFoundError(
-        "Could not find config/preprocessing_config.json in --train-dir or "
-        f"any of its parent directories: {split_dir}"
-    )
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train FragmentTreeTrainingModel.")
     parser.add_argument("--train-dir", required=True)
@@ -1691,14 +1885,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--mol-encoder-checkpoint", required=True)
     parser.add_argument("--cleavage-edge-fnet-checkpoint", required=True)
-    parser.add_argument(
-        "--fragmenter-params",
-        required=True,
-        help=(
-            "Fragmenter JSON. Its cleavage_pattern_set is replaced by the one "
-            "stored in --cleavage-edge-fnet-checkpoint."
-        ),
-    )
     parser.add_argument("--condition-adduct-embedding-dim", type=int, default=16)
     parser.add_argument("--condition-ce-feature-dim", type=int, default=16)
     parser.add_argument("--condition-ce-fc-dims", type=_csv_int_tuple, default=(32,))
@@ -1747,11 +1933,13 @@ if __name__ == "__main__":
     val_split_dir = Path(args.val_dir)
     train_data_dir = train_split_dir / "data" if (train_split_dir / "data").is_dir() else train_split_dir
     val_data_dir = val_split_dir / "data" if (val_split_dir / "data").is_dir() else val_split_dir
-    preprocessing_config_path = _find_preprocessing_config(train_split_dir)
+    preprocessing, preprocessing_config_path = load_and_validate_split_preprocessing(
+        train_split_dir, val_split_dir
+    )
     model_config_inline = build_model_config_from_pretrained(
         mol_encoder_checkpoint=args.mol_encoder_checkpoint,
         cleavage_edge_fnet_checkpoint=args.cleavage_edge_fnet_checkpoint,
-        fragmenter_params_path=args.fragmenter_params,
+        fragmenter_params=dict(preprocessing["fragmenter_params"]),
         condition_encoder_params={
             "adduct_embedding_dim": args.condition_adduct_embedding_dim,
             "ce_feature_dim": args.condition_ce_feature_dim,

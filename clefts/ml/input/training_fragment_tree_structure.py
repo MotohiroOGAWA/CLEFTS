@@ -194,13 +194,40 @@ class TrainingFragmentTreeStructure(FragmentTreeStructure):
 
     @property
     def target_edge_index(self) -> Tensor:
-        """[2, 0] Edge targets are no longer stored in this terminal schema."""
-        return torch.empty((2, 0), dtype=torch.long, device=self.edge_index.device)
+        """[2, E] Candidate edges that can produce a target formula assignment.
+
+        Row 0 is the sample index and row 1 is the global fragmentation-edge
+        index.  More than one molecular node (and therefore edge) may be a
+        valid explanation for the same formula target.
+        """
+        if self.target_terminal_node_index.numel() == 0 or self.edge_index.numel() == 0:
+            return torch.empty((2, 0), dtype=torch.long, device=self.edge_index.device)
+        rows = []
+        edge_dst = self.edge_index[1].long()
+        for sample_id, node_id in zip(
+            self.target_sample_index.detach().cpu().tolist(),
+            self.target_terminal_node_index.detach().cpu().tolist(),
+        ):
+            for edge_id in (edge_dst == int(node_id)).nonzero(as_tuple=False).view(-1).tolist():
+                rows.append((int(sample_id), int(edge_id)))
+        if not rows:
+            return torch.empty((2, 0), dtype=torch.long, device=self.edge_index.device)
+        return torch.tensor(rows, dtype=torch.long, device=self.edge_index.device).t().contiguous()
 
     @property
     def target_edge_group_index(self) -> Tensor:
-        """[0] Edge target groups are no longer stored in this terminal schema."""
-        return torch.empty((0,), dtype=torch.long, device=self.edge_index.device)
+        """[E] Target-formula group aligned with :attr:`target_edge_index`."""
+        if self.target_terminal_node_index.numel() == 0 or self.edge_index.numel() == 0:
+            return torch.empty((0,), dtype=torch.long, device=self.edge_index.device)
+        groups = []
+        edge_dst = self.edge_index[1].long()
+        for formula_id, node_id in zip(
+            self.assignment_formula_index.detach().cpu().tolist(),
+            self.target_terminal_node_index.detach().cpu().tolist(),
+        ):
+            count = int((edge_dst == int(node_id)).sum().item())
+            groups.extend([int(formula_id)] * count)
+        return torch.tensor(groups, dtype=torch.long, device=self.edge_index.device)
 
     @property
     def peak_sample_index(self) -> Tensor:

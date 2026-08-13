@@ -1,5 +1,41 @@
 # Spectrum inference
 
+## Fragment-tree and spectrum representation
+
+The fragment tree is a bipartite-augmented graph with two kinds of nodes and
+two kinds of edges:
+
+- Molecular fragment nodes are encoded by the pretrained `MolEncoder`.
+- Molecular-node-to-molecular-node edges represent cleavages and are encoded
+  by the pretrained `CleavageEdgeFeatureNet` (cleavage fnet).
+- Every selected molecular node is connected to its corresponding formula
+  node. Several molecular nodes may connect to the same formula node.
+- The model predicts a non-negative score on every
+  molecular-node-to-formula-node edge. The intensity of a formula node is the
+  sum of all scores on its incident molecular edges; its formula mass and
+  charge determine m/z.
+
+Prediction first selects the necessary molecular nodes from the fragment-tree
+structure and then predicts these molecular-to-formula relation scores. The
+formula connections are present while molecular nodes are selected; formula
+coverage is therefore part of the selection objective rather than an
+after-the-fact annotation step.
+
+With `max_edges_per_step=128` and `max_retained_edges=30`, inference evaluates
+at most 128 new cleavage-edge candidates and retains at most 30. If there are
+129 or more candidates, later windows combine the preceding survivors with up
+to 128 new candidates and again retain the best 30. After all windows and
+cleavage depths are processed, formula nodes connected to the selected
+molecular nodes produce the final m/z and summed intensity.
+
+Training and validation avoid this sequential search: all required positive
+target-path edges are included once, random unnecessary edges fill the window
+to at most 128 (or the configured limit), and at most 30 molecular candidates
+are selected. Selection and intensity losses are evaluated together on each
+pass. Validation additionally performs real staged spectrum generation,
+records measured-vs-generated cosine similarity in TensorBoard/TSV, and logs
+five representative mirror plots ordered from high to low similarity.
+
 `predict_spectrum.py` loads a checkpoint produced by
 `fragment_tree_training` and predicts an MS/MS spectrum. A direct prediction
 needs four values: the trained model, SMILES, collision energy (CE), and

@@ -7,9 +7,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
-from ..input.training_fragment_tree_structure import TrainingFragmentTreeStructure
-from .fragment_tree_candidate_selector import FragmentTreeCandidateSelectionOutput
-from .fragment_tree_formula_intensity_model import FragmentTreeFormulaIntensityPredictor
+from ...input.training_fragment_tree_structure import TrainingFragmentTreeStructure
+from ...specgen.fragment_tree_candidate_selector import FragmentTreeCandidateSelectionOutput
+from ...specgen.fragment_tree_formula_intensity_model import FragmentTreeFormulaIntensityPredictor
 
 
 class FormulaGroupCoverageLoss(nn.Module):
@@ -720,12 +720,16 @@ class FragmentTreeIntensityTrainingLoss(nn.Module):
         device: torch.device,
     ) -> Tensor:
         target_weight = predicted_formula.new_zeros((predicted_formula.size(0),))
-        target_mask = target.target_sample_index.to(device).long() == int(sample_id)
+        formula_peak_index = target.formula_peak_index.to(device).long()
+        formula_sample_index = target.peak_sample_index.to(device).long()[formula_peak_index]
+        target_mask = formula_sample_index == int(sample_id)
         if not target_mask.any():
             return target_weight
 
-        target_formula = target.target_assignment_formula.to(device).float()[target_mask]
-        target_intensity = target.target_intensity.to(device).float()[target_mask]
+        target_formula = target.target_formula.to(device).float()[target_mask]
+        target_intensity = target.sample_peak_intensity.to(device).float()[
+            formula_peak_index[target_mask]
+        ]
         for pred_index, formula in enumerate(predicted_formula):
             formula_mask = torch.all(target_formula == formula, dim=1)
             if formula_mask.any():
