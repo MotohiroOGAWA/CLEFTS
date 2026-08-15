@@ -782,7 +782,8 @@ class CheckPointManager:
             url = CheckPointManager.get_tensorboard_url()
             print(f"Access TensorBoard at: {url}")
             
-            with open(os.path.join(log_dir, 'command.txt'), 'w') as f:
+            command_file = os.path.join(self._run_dir, 'tensorboard_command.txt')
+            with open(command_file, 'w') as f:
                 f.write(command+'\n')
                 f.write(f"Access TensorBoard at: {url}\n")
         return self._summary_writer

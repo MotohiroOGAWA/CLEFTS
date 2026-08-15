@@ -71,6 +71,12 @@ class FragmentTreeTrainCommand(CLICommand):
             help="Run validation every N successful training steps. Use 0 to disable.",
         )
         parser.add_argument(
+            "--train-log-interval-steps",
+            type=int,
+            default=100,
+            help="Log averaged training metrics every N successful steps. Use 0 to disable.",
+        )
+        parser.add_argument(
             "--validate-at-start",
             action="store_true",
             help="Run validation before the first training epoch.",
@@ -121,6 +127,12 @@ class FragmentTreeTrainCommand(CLICommand):
                 if args.validation_interval_steps is None
                 or args.validation_interval_steps <= 0
                 else args.validation_interval_steps
+            ),
+            train_log_interval_steps=(
+                None
+                if args.train_log_interval_steps is None
+                or args.train_log_interval_steps <= 0
+                else args.train_log_interval_steps
             ),
             validate_at_start=args.validate_at_start,
             save_interval=args.save_interval_epochs,

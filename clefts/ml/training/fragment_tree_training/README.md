@@ -122,6 +122,7 @@ python -m clefts.ml.training.fragment_tree_training.training_model \
   --batch-size 2 \
   --device cuda \
   --epochs 100 \
+  --train-log-interval-steps 100 \
   --validation-interval-steps 1000 \
   --save-interval-epochs 1 \
   --save-interval-steps 1000 \
@@ -143,6 +144,11 @@ The initial `ValStart(0)` pass is disabled by default so training starts
 without first generating all validation spectra. Add `--validate-at-start`
 when an untrained baseline validation measurement is required. Validation at
 configured step intervals and after training is unchanged.
+
+Training metrics are recorded every 100 successful optimizer steps by default.
+Use `--train-log-interval-steps` to change that interval. The log contains both
+the cumulative epoch averages and averages over the most recent logging window
+for total, selection, and intensity loss.
 
 Comma-separated dimension arguments such as `--condition-fc-dims` are written
 without spaces. The effective checkpoint-derived and command-line settings are

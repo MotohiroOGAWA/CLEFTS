@@ -471,6 +471,15 @@ def normalize_train_config(
         and config["validation_interval_steps"] <= 0
     ):
         raise ValueError("validation_interval_steps must be positive when specified.")
+    train_log_interval_steps = config.get("train_log_interval_steps", 100)
+    config["train_log_interval_steps"] = (
+        None if train_log_interval_steps in {None, ""} else int(train_log_interval_steps)
+    )
+    if (
+        config["train_log_interval_steps"] is not None
+        and config["train_log_interval_steps"] <= 0
+    ):
+        raise ValueError("train_log_interval_steps must be positive when specified.")
 
     config["save_interval"] = int(config.get("save_interval", 1))
     save_interval_steps = config.get(
@@ -531,6 +540,7 @@ def build_train_config(
     device: str = "cpu",
     epoch: int = 10,
     validation_interval_steps: Optional[int] = 100,
+    train_log_interval_steps: Optional[int] = 100,
     save_interval: int = 1,
     save_interval_steps: Optional[int] = 100,
     optimizer_name: str = "AdamW",
@@ -559,6 +569,7 @@ def build_train_config(
             "device": device,
             "epoch": int(epoch),
             "validation_interval_steps": validation_interval_steps,
+            "train_log_interval_steps": train_log_interval_steps,
             "save_interval": int(save_interval),
             "save_interval_steps": save_interval_steps,
             "optimizer": optimizer_info,
@@ -612,6 +623,7 @@ def prepare_train_from_config(
         "validation_valid_records_file": str(train_config["validation_valid_records_file"]),
         "shuffle": bool(train_config.get("shuffle", True)),
         "validation_interval_steps": validation_interval_steps,
+        "train_log_interval_steps": train_config.get("train_log_interval_steps"),
         "validate_at_start": bool(train_config.get("validate_at_start", False)),
         "pattern": "*.pt",
     }
@@ -733,6 +745,7 @@ def setup_dataset(
         "train_size": len(train_dataset),
         "val_size": len(val_dataset),
         "validation_interval_steps": dataset_info.get("validation_interval_steps"),
+        "train_log_interval_steps": dataset_info.get("train_log_interval_steps"),
     }
     return train_dataset, val_dataset, train_loader, val_loader, extra_data
 
@@ -804,6 +817,10 @@ def run_epoch(
     start_global_step: int = 0,
     validation_interval_steps: Optional[int] = None,
     on_validation_step: Optional[
+        Callable[[int, EpochLossMetrics, EpochLossMetrics], None]
+    ] = None,
+    train_log_interval_steps: Optional[int] = 100,
+    on_train_log_step: Optional[
         Callable[[int, EpochLossMetrics, EpochLossMetrics], None]
     ] = None,
     on_step_end: Optional[
@@ -908,15 +925,28 @@ def run_epoch(
             )
 
             global_step = int(start_global_step) + step_count
-            if (
+            validation_due = (
                 is_train
                 and validation_interval_steps is not None
                 and validation_interval_steps > 0
                 and on_validation_step is not None
                 and global_step % validation_interval_steps == 0
-            ):
+            )
+            if validation_due:
                 on_validation_step(global_step, cumulative_metrics, window_metrics)
                 model.train(is_train)
+
+            train_log_due = (
+                is_train
+                and train_log_interval_steps is not None
+                and train_log_interval_steps > 0
+                and on_train_log_step is not None
+                and global_step % train_log_interval_steps == 0
+            )
+            if train_log_due:
+                on_train_log_step(global_step, cumulative_metrics, window_metrics)
+
+            if validation_due or train_log_due:
                 window_loss = 0.0
                 window_selection_loss = 0.0
                 window_intensity_loss = 0.0
@@ -996,6 +1026,18 @@ def evaluate_validation_cosine(
             for spectrum_index, score in enumerate(scores.tolist()):
                 tsv.writerow([global_step, spectrum_index, float(score)])
     if writer is not None and global_step is not None:
+        cosine_summary = np.quantile(scores, [0.0, 0.25, 0.5, 0.75, 1.0])
+        writer.add_scalars(
+            "similarity/cosine_distribution",
+            {
+                "min": float(cosine_summary[0]),
+                "q1": float(cosine_summary[1]),
+                "median": float(cosine_summary[2]),
+                "q3": float(cosine_summary[3]),
+                "max": float(cosine_summary[4]),
+            },
+            int(global_step),
+        )
         log_validation_spectrum_quantiles(
             writer=writer,
             predicted_dataset=predicted_dataset,
@@ -1003,6 +1045,7 @@ def evaluate_validation_cosine(
             scores=scores,
             global_step=int(global_step),
         )
+        writer.flush()
     with tqdm(total=1, desc="ValCosine", leave=True) as iterator:
         iterator.set_postfix(val_cosine=val_cosine)
         iterator.update(1)
@@ -1312,7 +1355,12 @@ def main(
 
     max_epoch = state.initial_epoch + int(epoch) - 1
     writer = ckpt_manager.summary_writer
+    # Create a useful dashboard immediately. Without this, a new run contains
+    # only the event-file header until its first scheduled validation.
+    writer.add_scalar("optimizer/lr", float(optimizer.param_groups[0]["lr"]), global_step)
+    writer.flush()
     validation_valid_records_file = Path(extra_data["validation_valid_records_file"])
+    train_log_interval_steps = extra_data.get("train_log_interval_steps", 100)
     validation_dataset = (
         MSDataset.load(str(validation_valid_records_file))
         if validation_valid_records_file.exists()
@@ -1341,7 +1389,11 @@ def main(
         if finite_values:
             writer.add_scalars(main_tag, finite_values, step)
 
-    def evaluate_current_validation(desc: str) -> Tuple[EpochLossMetrics, float]:
+    def evaluate_current_validation(
+        desc: str,
+        *,
+        step_value: int,
+    ) -> Tuple[EpochLossMetrics, float]:
         if val_loader is None or len(val_loader) <= 0:
             return nan_loss_metrics(), float("nan")
         with torch.no_grad():
@@ -1358,7 +1410,7 @@ def main(
                     dataset=validation_dataset,
                     batch_size=batch_size,
                     writer=writer,
-                    global_step=global_step,
+                    global_step=step_value,
                     output_dir=run_dir / "validation",
                 )
                 if validation_dataset is not None
@@ -1426,6 +1478,7 @@ def main(
         add_scalars_if_finite("similarity/cosine", {"val": val_cosine}, step_value)
         add_scalar_if_finite("similarity/val_cosine", val_cosine, step_value)
         writer.add_scalar("optimizer/lr", lr, step_value)
+        writer.flush()
         print(
             f"event={event} epoch={epoch_value} step={step_value} "
             f"train_loss={train_metrics.loss:.6f} "
@@ -1452,7 +1505,8 @@ def main(
         )
         if should_validate_at_epoch_start:
             val_metrics, val_cosine = evaluate_current_validation(
-                desc=f"ValStart({validation_epoch})"
+                desc=f"ValStart({validation_epoch})",
+                step_value=global_step,
             )
             log_training_metrics(
                 event="epoch_start",
@@ -1500,7 +1554,8 @@ def main(
             train_window_metrics: EpochLossMetrics,
         ) -> None:
             step_val_metrics, step_val_cosine = evaluate_current_validation(
-                desc=f"ValStep({step_value})"
+                desc=f"ValStep({step_value})",
+                step_value=step_value,
             )
             log_training_metrics(
                 event="step",
@@ -1510,6 +1565,28 @@ def main(
                 train_window_metrics=train_window_metrics,
                 val_metrics=step_val_metrics,
                 val_cosine=step_val_cosine,
+            )
+
+        def on_train_log_step(
+            step_value: int,
+            train_epoch_metrics: EpochLossMetrics,
+            train_window_metrics: EpochLossMetrics,
+        ) -> None:
+            # Validation at the same step already includes all train metrics.
+            if (
+                validation_interval_steps is not None
+                and validation_interval_steps > 0
+                and step_value % validation_interval_steps == 0
+            ):
+                return
+            log_training_metrics(
+                event="train_step",
+                epoch_value=epoch_index,
+                step_value=step_value,
+                train_metrics=train_epoch_metrics,
+                train_window_metrics=train_window_metrics,
+                val_metrics=nan_loss_metrics(),
+                val_cosine=float("nan"),
             )
 
         def on_step_end(
@@ -1550,6 +1627,8 @@ def main(
             start_global_step=global_step,
             validation_interval_steps=validation_interval_steps,
             on_validation_step=on_validation_step,
+            train_log_interval_steps=train_log_interval_steps,
+            on_train_log_step=on_train_log_step,
             on_step_end=on_step_end,
         )
         global_step += train_metrics.steps
@@ -1573,7 +1652,8 @@ def main(
 
     if last_epoch_index >= state.initial_epoch:
         val_metrics, val_cosine = evaluate_current_validation(
-            desc=f"ValFinal({last_epoch_index})"
+            desc=f"ValFinal({last_epoch_index})",
+            step_value=global_step,
         )
         log_training_metrics(
             event="epoch_end",
@@ -1905,6 +1985,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", "--epoch", dest="epochs", type=int, default=10)
     parser.add_argument("--validation-interval-steps", type=int, default=100)
     parser.add_argument(
+        "--train-log-interval-steps",
+        type=int,
+        default=100,
+        help="Log averaged training metrics every N successful steps. Default: 100.",
+    )
+    parser.add_argument(
         "--validate-at-start",
         action="store_true",
         help="Run ValStart before the first training epoch (disabled by default).",
@@ -1969,6 +2055,9 @@ if __name__ == "__main__":
         epoch=args.epochs,
         validation_interval_steps=(
             args.validation_interval_steps if args.validation_interval_steps > 0 else None
+        ),
+        train_log_interval_steps=(
+            args.train_log_interval_steps if args.train_log_interval_steps > 0 else None
         ),
         save_interval=args.save_interval_epochs,
         save_interval_steps=(
