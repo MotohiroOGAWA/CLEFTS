@@ -55,7 +55,41 @@ METRIC_COLUMNS = (
     "val_selection_loss",
     "val_intensity_loss",
     "val_cosine",
+    "val_selection_precision",
+    "val_selection_recall",
+    "val_selection_f1",
+    "val_predicted_peak_count",
+    "val_target_peak_count",
+    "val_matched_peak_count",
+    "val_selected_intensity_fraction",
+    "val_top5_recall",
+    "val_top10_recall",
+    "val_top20_recall",
+    "val_matched_intensity_mae",
+    "val_matched_intensity_weighted_mae",
     "lr",
+)
+
+PEAK_SELECTION_TOP_K = (5, 10, 20)
+PEAK_SELECTION_MZ_TOLERANCE_DA = 0.01
+PEAK_SELECTION_METRIC_NAMES = (
+    "selection_precision",
+    "selection_recall",
+    "selection_f1",
+    "predicted_peak_count",
+    "target_peak_count",
+    "matched_peak_count",
+    "selected_intensity_fraction",
+    *(f"top{k}_recall" for k in PEAK_SELECTION_TOP_K),
+    "matched_intensity_mae",
+    "matched_intensity_weighted_mae",
+)
+PEAK_SELECTION_QUANTILES = (
+    ("min", 0.0),
+    ("q1", 0.25),
+    ("median", 0.5),
+    ("q3", 0.75),
+    ("max", 1.0),
 )
 
 
@@ -978,6 +1012,159 @@ def run_epoch(
     )
 
 
+def _match_peaks_one_to_one(
+    target_peaks: np.ndarray,
+    predicted_peaks: np.ndarray,
+    *,
+    mz_tolerance_da: float,
+) -> List[Tuple[int, int]]:
+    """Greedily make the closest one-to-one target/prediction peak matches."""
+    if mz_tolerance_da <= 0:
+        raise ValueError("mz_tolerance_da must be positive.")
+    if len(target_peaks) == 0 or len(predicted_peaks) == 0:
+        return []
+
+    candidates: List[Tuple[float, int, int]] = []
+    for target_index, target_mz in enumerate(target_peaks[:, 0]):
+        errors = np.abs(predicted_peaks[:, 0] - target_mz)
+        for predicted_index in np.flatnonzero(errors <= mz_tolerance_da).tolist():
+            candidates.append(
+                (float(errors[predicted_index]), int(target_index), int(predicted_index))
+            )
+    candidates.sort()
+
+    matched_targets: set[int] = set()
+    matched_predictions: set[int] = set()
+    matches: List[Tuple[int, int]] = []
+    for _, target_index, predicted_index in candidates:
+        if target_index in matched_targets or predicted_index in matched_predictions:
+            continue
+        matched_targets.add(target_index)
+        matched_predictions.add(predicted_index)
+        matches.append((target_index, predicted_index))
+    return matches
+
+
+def calculate_peak_selection_metrics(
+    predicted_dataset: MSDataset,
+    target_dataset: MSDataset,
+    *,
+    mz_tolerance_da: float = PEAK_SELECTION_MZ_TOLERANCE_DA,
+    top_k: Tuple[int, ...] = PEAK_SELECTION_TOP_K,
+) -> Dict[str, np.ndarray]:
+    """Calculate spectrum-wise selection and matched-intensity diagnostics."""
+    count = min(len(target_dataset), len(predicted_dataset))
+    values: Dict[str, List[float]] = {
+        "selection_precision": [],
+        "selection_recall": [],
+        "selection_f1": [],
+        "predicted_peak_count": [],
+        "target_peak_count": [],
+        "matched_peak_count": [],
+        "selected_intensity_fraction": [],
+        **{f"top{k}_recall": [] for k in top_k},
+        "matched_intensity_mae": [],
+        "matched_intensity_weighted_mae": [],
+    }
+    for spectrum_index in range(count):
+        target_start = int(target_dataset.peaks.offsets[spectrum_index])
+        target_end = int(target_dataset.peaks.offsets[spectrum_index + 1])
+        predicted_start = int(predicted_dataset.peaks.offsets[spectrum_index])
+        predicted_end = int(predicted_dataset.peaks.offsets[spectrum_index + 1])
+        target_peaks = np.asarray(
+            target_dataset.peaks.data[target_start:target_end], dtype=np.float64
+        )
+        predicted_peaks = np.asarray(
+            predicted_dataset.peaks.data[predicted_start:predicted_end], dtype=np.float64
+        )
+        matches = _match_peaks_one_to_one(
+            target_peaks, predicted_peaks, mz_tolerance_da=mz_tolerance_da
+        )
+        matched_target = np.asarray([pair[0] for pair in matches], dtype=np.int64)
+        matched_predicted = np.asarray([pair[1] for pair in matches], dtype=np.int64)
+        target_count = len(target_peaks)
+        predicted_count = len(predicted_peaks)
+
+        precision = len(matches) / predicted_count if predicted_count else 0.0
+        recall = len(matches) / target_count if target_count else float("nan")
+        values["selection_precision"].append(precision)
+        values["selection_recall"].append(recall)
+        values["selection_f1"].append(
+            2.0 * precision * recall / (precision + recall)
+            if target_count and precision + recall > 0
+            else (0.0 if target_count else float("nan"))
+        )
+        values["predicted_peak_count"].append(float(predicted_count))
+        values["target_peak_count"].append(float(target_count))
+        values["matched_peak_count"].append(float(len(matches)))
+        target_intensity = (
+            np.clip(target_peaks[:, 1], 0.0, None)
+            if target_count
+            else np.empty(0, dtype=np.float64)
+        )
+        total_intensity = float(target_intensity.sum())
+        selected_intensity = (
+            float(target_intensity[matched_target].sum()) if len(matches) else 0.0
+        )
+        values["selected_intensity_fraction"].append(
+            selected_intensity / total_intensity if total_intensity > 0 else float("nan")
+        )
+
+        intensity_rank = np.argsort(target_intensity, kind="stable")[::-1]
+        matched_target_set = set(matched_target.tolist())
+        for k in top_k:
+            denominator = min(int(k), target_count)
+            selected_top_k = sum(
+                int(index) in matched_target_set for index in intensity_rank[:denominator]
+            )
+            values[f"top{k}_recall"].append(
+                selected_top_k / denominator if denominator else float("nan")
+            )
+
+        if matches:
+            predicted_intensity = np.clip(predicted_peaks[:, 1], 0.0, None)
+            target_scale = max(float(target_intensity.max()), 1e-12)
+            predicted_scale = max(float(predicted_intensity.max()), 1e-12)
+            target_normalized = target_intensity[matched_target] / target_scale
+            predicted_normalized = predicted_intensity[matched_predicted] / predicted_scale
+            absolute_error = np.abs(target_normalized - predicted_normalized)
+            values["matched_intensity_mae"].append(float(absolute_error.mean()))
+            weight_sum = float(target_normalized.sum())
+            values["matched_intensity_weighted_mae"].append(
+                float(np.dot(absolute_error, target_normalized) / weight_sum)
+                if weight_sum > 0
+                else float("nan")
+            )
+        else:
+            values["matched_intensity_mae"].append(float("nan"))
+            values["matched_intensity_weighted_mae"].append(float("nan"))
+
+    return {
+        name: np.asarray(metric_values, dtype=np.float64)
+        for name, metric_values in values.items()
+    }
+
+
+def summarize_distribution(values: np.ndarray) -> Dict[str, float]:
+    finite = np.asarray(values, dtype=np.float64)
+    finite = finite[np.isfinite(finite)]
+    if finite.size == 0:
+        return {
+            "mean": float("nan"),
+            **{name: float("nan") for name, _ in PEAK_SELECTION_QUANTILES},
+        }
+    quantiles = np.quantile(
+        finite, [quantile for _, quantile in PEAK_SELECTION_QUANTILES]
+    )
+    return {
+        "mean": float(finite.mean()),
+        **{
+            name: float(quantiles[index])
+            for index, (name, _) in enumerate(PEAK_SELECTION_QUANTILES)
+        },
+    }
+
+
 def evaluate_validation_cosine(
     *,
     model: FragmentTreeTrainingModel,
@@ -986,6 +1173,7 @@ def evaluate_validation_cosine(
     writer=None,
     global_step: Optional[int] = None,
     output_dir: Optional[Path] = None,
+    selection_metric_means: Optional[Dict[str, float]] = None,
 ) -> float:
     if model.intensity_predictor is None:
         return float("nan")
@@ -1015,6 +1203,17 @@ def evaluate_validation_cosine(
         return float("nan")
 
     val_cosine = float(scores.mean())
+    selection_metrics = calculate_peak_selection_metrics(
+        predicted_dataset, target_dataset
+    )
+    selection_summaries = {
+        name: summarize_distribution(values)
+        for name, values in selection_metrics.items()
+    }
+    if selection_metric_means is not None:
+        selection_metric_means.update(
+            {name: summary["mean"] for name, summary in selection_summaries.items()}
+        )
     if output_dir is not None:
         output_dir.mkdir(parents=True, exist_ok=True)
         score_file = output_dir / "validation_cosine.tsv"
@@ -1025,6 +1224,35 @@ def evaluate_validation_cosine(
                 tsv.writerow(["global_step", "spectrum_index", "cosine_similarity"])
             for spectrum_index, score in enumerate(scores.tolist()):
                 tsv.writerow([global_step, spectrum_index, float(score)])
+        detail_file = output_dir / "validation_peak_selection.tsv"
+        write_header = not detail_file.exists()
+        with open(detail_file, "a", encoding="utf-8", newline="") as f:
+            tsv = csv.writer(f, delimiter="\t")
+            if write_header:
+                tsv.writerow(["global_step", "spectrum_index", *selection_metrics])
+            for spectrum_index in range(count):
+                tsv.writerow(
+                    [global_step, spectrum_index]
+                    + [selection_metrics[name][spectrum_index] for name in selection_metrics]
+                )
+        summary_file = output_dir / "validation_peak_selection_summary.tsv"
+        write_header = not summary_file.exists()
+        with open(summary_file, "a", encoding="utf-8", newline="") as f:
+            tsv = csv.writer(f, delimiter="\t")
+            if write_header:
+                tsv.writerow(
+                    [
+                        "global_step",
+                        "metric",
+                        "mean",
+                        *[name for name, _ in PEAK_SELECTION_QUANTILES],
+                    ]
+                )
+            for metric_name, summary in selection_summaries.items():
+                tsv.writerow(
+                    [global_step, metric_name, summary["mean"]]
+                    + [summary[name] for name, _ in PEAK_SELECTION_QUANTILES]
+                )
     if writer is not None and global_step is not None:
         cosine_summary = np.quantile(scores, [0.0, 0.25, 0.5, 0.75, 1.0])
         writer.add_scalars(
@@ -1038,6 +1266,24 @@ def evaluate_validation_cosine(
             },
             int(global_step),
         )
+        for metric_name, summary in selection_summaries.items():
+            finite_quantiles = {
+                name: summary[name]
+                for name, _ in PEAK_SELECTION_QUANTILES
+                if math.isfinite(summary[name])
+            }
+            if finite_quantiles:
+                writer.add_scalars(
+                    f"peak_selection/{metric_name}_distribution",
+                    finite_quantiles,
+                    int(global_step),
+                )
+            if math.isfinite(summary["mean"]):
+                writer.add_scalar(
+                    f"peak_selection/{metric_name}_mean",
+                    summary["mean"],
+                    int(global_step),
+                )
         log_validation_spectrum_quantiles(
             writer=writer,
             predicted_dataset=predicted_dataset,
@@ -1393,9 +1639,10 @@ def main(
         desc: str,
         *,
         step_value: int,
-    ) -> Tuple[EpochLossMetrics, float]:
+    ) -> Tuple[EpochLossMetrics, float, Dict[str, float]]:
         if val_loader is None or len(val_loader) <= 0:
-            return nan_loss_metrics(), float("nan")
+            return nan_loss_metrics(), float("nan"), {}
+        selection_metric_means: Dict[str, float] = {}
         with torch.no_grad():
             metrics = run_epoch(
                 model=model,
@@ -1412,11 +1659,12 @@ def main(
                     writer=writer,
                     global_step=step_value,
                     output_dir=run_dir / "validation",
+                    selection_metric_means=selection_metric_means,
                 )
                 if validation_dataset is not None
                 else float("nan")
             )
-        return metrics, cosine
+        return metrics, cosine, selection_metric_means
 
     def log_training_metrics(
         *,
@@ -1427,6 +1675,7 @@ def main(
         train_window_metrics: Optional[EpochLossMetrics],
         val_metrics: EpochLossMetrics,
         val_cosine: float,
+        val_peak_metrics: Optional[Dict[str, float]] = None,
     ) -> None:
         lr = float(optimizer.param_groups[0]["lr"])
         window_metrics = train_window_metrics or nan_loss_metrics()
@@ -1444,6 +1693,10 @@ def main(
             "val_selection_loss": val_metrics.selection_loss,
             "val_intensity_loss": val_metrics.intensity_loss,
             "val_cosine": val_cosine,
+            **{
+                f"val_{name}": (val_peak_metrics or {}).get(name, float("nan"))
+                for name in PEAK_SELECTION_METRIC_NAMES
+            },
             "lr": lr,
         }
         ckpt_manager.log_metrics(**metric_row)
@@ -1504,7 +1757,7 @@ def main(
             epoch_index > state.initial_epoch or validate_at_start
         )
         if should_validate_at_epoch_start:
-            val_metrics, val_cosine = evaluate_current_validation(
+            val_metrics, val_cosine, val_peak_metrics = evaluate_current_validation(
                 desc=f"ValStart({validation_epoch})",
                 step_value=global_step,
             )
@@ -1516,6 +1769,7 @@ def main(
                 train_window_metrics=None,
                 val_metrics=val_metrics,
                 val_cosine=val_cosine,
+                val_peak_metrics=val_peak_metrics,
             )
 
         if validation_epoch >= state.initial_epoch and should_validate_at_epoch_start:
@@ -1553,7 +1807,7 @@ def main(
             train_epoch_metrics: EpochLossMetrics,
             train_window_metrics: EpochLossMetrics,
         ) -> None:
-            step_val_metrics, step_val_cosine = evaluate_current_validation(
+            step_val_metrics, step_val_cosine, step_peak_metrics = evaluate_current_validation(
                 desc=f"ValStep({step_value})",
                 step_value=step_value,
             )
@@ -1565,6 +1819,7 @@ def main(
                 train_window_metrics=train_window_metrics,
                 val_metrics=step_val_metrics,
                 val_cosine=step_val_cosine,
+                val_peak_metrics=step_peak_metrics,
             )
 
         def on_train_log_step(
@@ -1651,7 +1906,7 @@ def main(
             )
 
     if last_epoch_index >= state.initial_epoch:
-        val_metrics, val_cosine = evaluate_current_validation(
+        val_metrics, val_cosine, val_peak_metrics = evaluate_current_validation(
             desc=f"ValFinal({last_epoch_index})",
             step_value=global_step,
         )
@@ -1663,6 +1918,7 @@ def main(
             train_window_metrics=None,
             val_metrics=val_metrics,
             val_cosine=val_cosine,
+            val_peak_metrics=val_peak_metrics,
         )
         val_loss = val_metrics.loss
         step_scheduler(scheduler, val_loss)

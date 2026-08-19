@@ -162,6 +162,21 @@ The validation cosine is written both to the ordinary metrics and to
 vs generated mirror plots, sampled at evenly spaced ranks from the highest to
 the lowest validation cosine.
 
+Validation also reports peak-selection diagnostics using one-to-one peak
+matching within 0.01 Da:
+
+- precision, recall, and F1 of generated peaks, plus predicted/target/matched counts;
+- the fraction of total measured intensity covered by selected peaks;
+- recall among the measured top 5, 10, and 20 peaks by intensity;
+- max-normalized intensity MAE, both unweighted and measured-intensity weighted,
+  among correctly selected peaks.
+
+The mean values are columns in `metrics.tsv`. Per-spectrum values are appended
+to `validation/validation_peak_selection.tsv`, while mean/min/Q1/median/Q3/max
+are appended to `validation/validation_peak_selection_summary.tsv`. TensorBoard
+shows each distribution statistic as a line over training steps under
+`peak_selection/`.
+
 ## Important limits
 
 - `max_edges_per_step` is both the inference new-edge window and the one-shot
