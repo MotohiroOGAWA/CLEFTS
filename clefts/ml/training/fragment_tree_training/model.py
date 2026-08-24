@@ -152,6 +152,15 @@ class FormulaGroupCoverageLoss(nn.Module):
 class FragmentTreeSelectionTrainingLoss(nn.Module):
     """Loss for peak-wise fragment coverage, state prediction, and cleavage."""
 
+    def __init__(self, intensity_alpha: float = 0.2, intensity_gamma: float = 0.5) -> None:
+        super().__init__()
+        if not 0.0 < intensity_alpha <= 1.0:
+            raise ValueError("intensity_alpha must be in (0, 1].")
+        if intensity_gamma <= 0.0:
+            raise ValueError("intensity_gamma must be positive.")
+        self.intensity_alpha = float(intensity_alpha)
+        self.intensity_gamma = float(intensity_gamma)
+
     def forward(
         self,
         output: FragmentTreeCandidateSelectionOutput,
@@ -221,6 +230,7 @@ class FragmentTreeSelectionTrainingLoss(nn.Module):
     ) -> Tensor:
         batch_node_by_sample_node = self._batch_node_by_sample_node(output, device=device)
         losses: List[Tensor] = []
+        weights: List[Tensor] = []
 
         for peak_key in self._target_peak_keys(target, device=device):
             row_index = self._target_peak_mask(target, peak_key=peak_key, device=device)
@@ -233,10 +243,20 @@ class FragmentTreeSelectionTrainingLoss(nn.Module):
                 continue
             peak_logit = output.keep_logit[batch_node_indexes]
             losses.append(F.softplus(-torch.logsumexp(peak_logit, dim=0)))
+            peak_intensity = target.target_intensity[row_index].to(device).float().max()
+            sample_mask = target.target_sample_index.to(device).long() == int(peak_key[0])
+            sample_max = target.target_intensity.to(device).float()[sample_mask].max().clamp_min(1e-12)
+            weights.append(self.intensity_weight(peak_intensity / sample_max))
 
         if len(losses) == 0:
             return output.keep_logit.sum() * 0.0
-        return torch.stack(losses).mean()
+        return self._weighted_mean(losses, weights, output.keep_logit)
+
+    def intensity_weight(self, normalized_intensity: Tensor) -> Tensor:
+        normalized_intensity = normalized_intensity.float().clamp(0.0, 1.0)
+        return self.intensity_alpha + (1.0 - self.intensity_alpha) * normalized_intensity.pow(
+            self.intensity_gamma
+        )
 
     def _keep_negative_loss(
         self,
@@ -670,7 +690,13 @@ class FragmentTreeSelectionTrainingLoss(nn.Module):
 
 
 class FragmentTreeIntensityTrainingLoss(nn.Module):
-    """Loss for per-formula intensities over selected formula nodes."""
+    """Formula-level Huber, spectrum cosine, and balanced presence losses."""
+
+    def __init__(self, huber_weight: float = 1.0, cosine_weight: float = 1.0, presence_weight: float = 1.0) -> None:
+        super().__init__()
+        self.huber_weight = float(huber_weight)
+        self.cosine_weight = float(cosine_weight)
+        self.presence_weight = float(presence_weight)
 
     def forward(
         self,
@@ -692,24 +718,41 @@ class FragmentTreeIntensityTrainingLoss(nn.Module):
                 sample_id=sample_id,
                 device=device,
             )
-            sample_target_mask = target.target_sample_index.to(device).long() == sample_id
-            if sample_target_mask.any():
-                max_target_intensity = target.target_intensity.to(device).float()[
-                    sample_target_mask
-                ].max().clamp_min(1e-12)
-                target_intensity = (target_weight / max_target_intensity).clamp(0.0, 1.0)
-            else:
-                target_intensity = target_weight
-            losses.append(
-                F.smooth_l1_loss(
-                    intensity_output.logit[pred_index],
-                    target_intensity,
+            target_intensity = target_weight / target_weight.sum().clamp_min(1e-12)
+            predicted_intensity = intensity_output.logit[pred_index]
+            huber_loss = F.smooth_l1_loss(predicted_intensity, target_intensity)
+            cosine_loss = self.cosine_loss(predicted_intensity, target_intensity)
+            sample_loss = self.huber_weight * huber_loss + self.cosine_weight * cosine_loss
+            presence_logit = getattr(intensity_output, "presence_logit", None)
+            if presence_logit is not None:
+                presence_target = (target_weight > 0).to(presence_logit.dtype)
+                sample_loss = sample_loss + self.presence_weight * self.balanced_presence_loss(
+                    presence_logit[pred_index], presence_target
                 )
-            )
+            losses.append(sample_loss)
 
         if len(losses) == 0:
             return intensity_output.logit.sum() * 0.0
         return torch.stack(losses).mean()
+
+    @staticmethod
+    def cosine_loss(predicted: Tensor, target: Tensor, eps: float = 1e-8) -> Tensor:
+        return 1.0 - F.cosine_similarity(
+            predicted.unsqueeze(0), target.unsqueeze(0), dim=1, eps=eps
+        ).squeeze(0)
+
+    @staticmethod
+    def balanced_presence_loss(logit: Tensor, target: Tensor) -> Tensor:
+        positive = target > 0.5
+        negative = ~positive
+        components: List[Tensor] = []
+        if positive.any():
+            components.append(F.binary_cross_entropy_with_logits(logit[positive], target[positive]))
+        if negative.any():
+            components.append(F.binary_cross_entropy_with_logits(logit[negative], target[negative]))
+        if not components:
+            return logit.sum() * 0.0
+        return torch.stack(components).mean()
 
     @staticmethod
     def _target_weight_for_predictions(

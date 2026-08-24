@@ -10,7 +10,11 @@ from clefts.libs.mmkit.mmkit import Formula
 from clefts.ml.specgen.fragment_tree_candidate_selector import FragmentIonCandidate
 from clefts.ml.specgen.fragment_tree_formula_intensity_model import FormulaIntensityPredictor
 from clefts.ml.specgen.fragment_tree_spectrum_predictor import fragment_spectrum_output_to_msdataset
-from clefts.ml.training.fragment_tree_training.model import FormulaGroupCoverageLoss
+from clefts.ml.training.fragment_tree_training.model import (
+    FormulaGroupCoverageLoss,
+    FragmentTreeIntensityTrainingLoss,
+    FragmentTreeSelectionTrainingLoss,
+)
 from clefts.ml.specgen.fragment_tree_spectrum_predictor import (
     GeneratedMassSpectrum,
     GeneratedSpectrumPeak,
@@ -146,6 +150,88 @@ class TestFragmentSpectrumOutputToMSDataset(unittest.TestCase):
         self.assertEqual(dataset[0].spectrum.mz.tolist(), [50.0, 101.0])
         self.assertEqual(dataset[0].spectrum.intensity.tolist(), [1.0, 0.5])
 
+
+if __name__ == "__main__":
+    unittest.main()
+
+class TestRelativeFormulaIntensity(unittest.TestCase):
+    def test_peak_intensity_weight_has_order_and_minimum(self) -> None:
+        loss = FragmentTreeSelectionTrainingLoss(intensity_alpha=0.2, intensity_gamma=0.5)
+        weights = loss.intensity_weight(torch.tensor([0.0, 0.01, 1.0]))
+        self.assertAlmostEqual(float(weights[0]), 0.2, places=6)
+        self.assertGreater(float(weights[2]), float(weights[1]))
+        self.assertGreater(float(weights[1]), float(weights[0]))
+
+    def test_relative_intensity_presence_normalization_and_competition(self) -> None:
+        sample_index = torch.tensor([0, 0, 1, 1])
+        presence = torch.tensor([8.0, -8.0, 0.0, 0.0])
+        abundance = torch.zeros(4)
+        intensity = FormulaIntensityPredictor.relative_intensity(presence, abundance, sample_index)
+        self.assertLess(float(intensity[1]), float(intensity[0]))
+        self.assertAlmostEqual(float(intensity[:2].sum()), 1.0, places=6)
+        self.assertAlmostEqual(float(intensity[2:].sum()), 1.0, places=6)
+        raised = FormulaIntensityPredictor.relative_intensity(torch.zeros(2), torch.tensor([2.0, 0.0]), torch.zeros(2, dtype=torch.long))
+        baseline = FormulaIntensityPredictor.relative_intensity(torch.zeros(2), torch.zeros(2), torch.zeros(2, dtype=torch.long))
+        self.assertGreater(float(raised[0]), float(baseline[0]))
+        self.assertLess(float(raised[1]), float(baseline[1]))
+
+    def test_cosine_and_balanced_presence_losses(self) -> None:
+        loss = FragmentTreeIntensityTrainingLoss()
+        target = torch.tensor([0.8, 0.2])
+        self.assertAlmostEqual(float(loss.cosine_loss(target, target)), 0.0, places=6)
+        self.assertGreater(float(loss.cosine_loss(torch.tensor([0.2, 0.8]), target)), 0.0)
+        labels = torch.tensor([1.0, 0.0])
+        good = loss.balanced_presence_loss(torch.tensor([5.0, -5.0]), labels)
+        bad = loss.balanced_presence_loss(torch.tensor([-5.0, 5.0]), labels)
+        self.assertLess(float(good), float(bad))
+
+    def test_formula_encoder_is_called_and_samples_are_isolated(self) -> None:
+        class RecordingEncoder(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.batch_sizes = []
+
+            def forward(self, value):
+                self.batch_sizes.append(int(value.size(1)))
+                return value + value.mean(dim=1, keepdim=True)
+
+        predictor = object.__new__(FormulaIntensityPredictor)
+        torch.nn.Module.__init__(predictor)
+        predictor.formula_node_encoder = RecordingEncoder()
+        rows = torch.tensor([[1.0, 0.0], [3.0, 0.0], [100.0, 0.0]])
+        samples = torch.tensor([0, 0, 1])
+        encoded = predictor._encode_formula_nodes_by_sample(rows, samples)
+        self.assertEqual(predictor.formula_node_encoder.batch_sizes, [2, 1])
+        self.assertTrue(torch.equal(encoded[2], torch.tensor([200.0, 0.0])))
+
+    def test_forward_candidate_output_uses_formula_encoder(self) -> None:
+        class RecordingEncoder(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.batch_sizes = []
+
+            def forward(self, value):
+                self.batch_sizes.append(int(value.size(1)))
+                return value
+
+        predictor = object.__new__(FormulaIntensityPredictor)
+        torch.nn.Module.__init__(predictor)
+        predictor.formula_dim = 2
+        predictor.formula_node_input = torch.nn.Identity()
+        predictor.formula_node_encoder = RecordingEncoder()
+        predictor.formula_presence_head = torch.nn.Linear(2, 1)
+        predictor.formula_node_head = torch.nn.Linear(2, 1)
+        predictor._candidate_formula_node_repr = lambda output, group: torch.stack([item.repr for item in group])
+        candidates = [
+            SimpleNamespace(sample_id=0, formula_tensor=torch.tensor([1.0, 0.0]), repr=torch.tensor([1.0, 0.0])),
+            SimpleNamespace(sample_id=0, formula_tensor=torch.tensor([2.0, 0.0]), repr=torch.tensor([2.0, 0.0])),
+            SimpleNamespace(sample_id=1, formula_tensor=torch.tensor([1.0, 0.0]), repr=torch.tensor([100.0, 0.0])),
+        ]
+        output = predictor.forward_candidate_output(SimpleNamespace(kept_candidates=candidates, keep_logit=torch.zeros(3)))
+        self.assertEqual(predictor.formula_node_encoder.batch_sizes, [2, 1])
+        self.assertEqual(output.presence_logit.shape, (3,))
+        self.assertAlmostEqual(float(output.logit[:2].sum()), 1.0, places=6)
+        self.assertAlmostEqual(float(output.logit[2:].sum()), 1.0, places=6)
 
 if __name__ == "__main__":
     unittest.main()
