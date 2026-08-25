@@ -223,15 +223,30 @@ class TestRelativeFormulaIntensity(unittest.TestCase):
         predictor.formula_node_head = torch.nn.Linear(2, 1)
         predictor._candidate_formula_node_repr = lambda output, group: torch.stack([item.repr for item in group])
         candidates = [
-            SimpleNamespace(sample_id=0, formula_tensor=torch.tensor([1.0, 0.0]), repr=torch.tensor([1.0, 0.0])),
-            SimpleNamespace(sample_id=0, formula_tensor=torch.tensor([2.0, 0.0]), repr=torch.tensor([2.0, 0.0])),
-            SimpleNamespace(sample_id=1, formula_tensor=torch.tensor([1.0, 0.0]), repr=torch.tensor([100.0, 0.0])),
+            SimpleNamespace(sample_id=0, formula_tensor=torch.tensor([1.0, 0.0]), repr=torch.tensor([1.0, 0.0]), probability=0.8),
+            SimpleNamespace(sample_id=0, formula_tensor=torch.tensor([2.0, 0.0]), repr=torch.tensor([2.0, 0.0]), probability=0.2),
+            SimpleNamespace(sample_id=1, formula_tensor=torch.tensor([1.0, 0.0]), repr=torch.tensor([100.0, 0.0]), probability=1.0),
         ]
         output = predictor.forward_candidate_output(SimpleNamespace(kept_candidates=candidates, keep_logit=torch.zeros(3)))
         self.assertEqual(predictor.formula_node_encoder.batch_sizes, [2, 1])
         self.assertEqual(output.presence_logit.shape, (3,))
         self.assertAlmostEqual(float(output.logit[:2].sum()), 1.0, places=6)
         self.assertAlmostEqual(float(output.logit[2:].sum()), 1.0, places=6)
+
+    def test_candidate_intensity_is_predicted_before_formula_merge(self) -> None:
+        sample_index = torch.tensor([0, 0, 0])
+        selection_probability = torch.tensor([0.8, 0.1, 0.1])
+        intensity = FormulaIntensityPredictor.relative_intensity(
+            torch.zeros(3),
+            torch.zeros(3),
+            sample_index,
+            selection_probability=selection_probability,
+        )
+        self.assertTrue(torch.allclose(intensity, selection_probability))
+        # If candidates 0 and 2 resolve to the same formula, aggregation is
+        # performed only here, after their individual intensities exist.
+        merged = torch.stack([intensity[[0, 2]].sum(), intensity[[1]].sum()])
+        self.assertTrue(torch.allclose(merged, torch.tensor([0.9, 0.1])))
 
 if __name__ == "__main__":
     unittest.main()

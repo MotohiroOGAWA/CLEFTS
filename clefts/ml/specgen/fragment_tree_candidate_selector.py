@@ -28,6 +28,9 @@ class FragmentIonCandidate:
     candidate_logit: float
     probability: float
     score_tensor: Optional[Tensor] = None
+    edge_probability: float = 1.0
+    adduct_probability: float = 1.0
+    probability_tensor: Optional[Tensor] = None
 
 
 @dataclass(frozen=True)
@@ -126,7 +129,7 @@ class FragmentTreeCandidateSelector(nn.Module):
             ion_valid_mask_by_role_adduct=self.feature_model.ion_candidate_valid_mask_by_role_adduct,
             unsaturation_valid_mask_by_role_adduct=self.feature_model.unsaturation_candidate_valid_mask_by_role_adduct,
             radical_valid_mask_by_role_adduct=self.feature_model.radical_candidate_valid_mask_by_role_adduct,
-            kept_candidates=self._select_fragment_ion_candidates(features=features, sample_tree_batch=sample_tree_batch, keep_logit=keep_logit, ion_logit=ion_logit, unsaturation_logit=unsaturation_logit, radical_logit=radical_logit),
+            kept_candidates=self._select_fragment_ion_candidates(features=features, sample_tree_batch=sample_tree_batch, keep_logit=keep_logit, edge_cleave_logit=edge_cleave_logit, ion_logit=ion_logit, unsaturation_logit=unsaturation_logit, radical_logit=radical_logit),
             next_cleavage_candidates=self._select_next_cleavage_candidates(sample_tree_batch=sample_tree_batch, cleave_logit=cleave_logit),
         )
 
@@ -340,7 +343,7 @@ class FragmentTreeCandidateSelector(nn.Module):
             structure=expanded_structure,
         )
 
-    def _select_fragment_ion_candidates(self, *, features, sample_tree_batch, keep_logit: Tensor, ion_logit: Tensor, unsaturation_logit: Tensor, radical_logit: Tensor) -> List[FragmentIonCandidate]:
+    def _select_fragment_ion_candidates(self, *, features, sample_tree_batch, keep_logit: Tensor, edge_cleave_logit: Tensor, ion_logit: Tensor, unsaturation_logit: Tensor, radical_logit: Tensor) -> List[FragmentIonCandidate]:
         structure = features.structure
         device = keep_logit.device
         node_is_precursor_root = sample_tree_batch.node_is_precursor_root.to(device).bool()
@@ -353,7 +356,19 @@ class FragmentTreeCandidateSelector(nn.Module):
             sample_node_index = sample_node_index[~node_is_precursor_root[sample_node_index]]
             if sample_node_index.numel() == 0:
                 continue
-            node_score = keep_logit[sample_node_index]
+            # All fragment-producing edges in one spectrum compete for a
+            # finite probability mass.  The destination node keep score and
+            # its incoming cleavage-edge score jointly define that mass.
+            node_score = keep_logit[sample_node_index].clone()
+            if sample_tree_batch.edge_index.numel() > 0:
+                edge_dst = sample_tree_batch.edge_index[1].to(device).long()
+                for local_index, batch_node_index in enumerate(sample_node_index):
+                    incoming = (edge_dst == batch_node_index).nonzero(as_tuple=False).view(-1)
+                    if incoming.numel() > 0:
+                        node_score[local_index] = node_score[local_index] + torch.logsumexp(
+                            edge_cleave_logit[incoming], dim=0
+                        )
+            node_probability = torch.softmax(node_score, dim=0)
             k = int(node_score.numel())
             if self.max_nodes_for_ion_candidates is not None:
                 k = min(int(self.max_nodes_for_ion_candidates), k)
@@ -372,6 +387,9 @@ class FragmentTreeCandidateSelector(nn.Module):
                         ion_logit=ion_logit,
                         unsaturation_logit=unsaturation_logit,
                         radical_logit=radical_logit,
+                        edge_probability=node_probability[
+                            (sample_node_index == batch_node_index).nonzero(as_tuple=False).view(-1)[0]
+                        ],
                     )
                 )
             sample_candidates.sort(key=lambda item: item.score, reverse=True)
@@ -379,7 +397,7 @@ class FragmentTreeCandidateSelector(nn.Module):
 
         return candidates
 
-    def _score_joint_ion_candidates_for_node(self, *, structure: FragmentTreeStructure, sample_tree_batch, batch_node_index: int, global_node_id: int, sample_id: int, keep_logit: Tensor, ion_logit: Tensor, unsaturation_logit: Tensor, radical_logit: Tensor) -> List[FragmentIonCandidate]:
+    def _score_joint_ion_candidates_for_node(self, *, structure: FragmentTreeStructure, sample_tree_batch, batch_node_index: int, global_node_id: int, sample_id: int, keep_logit: Tensor, ion_logit: Tensor, unsaturation_logit: Tensor, radical_logit: Tensor, edge_probability: Tensor) -> List[FragmentIonCandidate]:
         device = keep_logit.device
         base_formula = structure.node_formula[global_node_id].to(device).float()
         main_adduct_index = int(sample_tree_batch.node_main_adduct_type_index[batch_node_index].detach().cpu().item())
@@ -411,8 +429,12 @@ class FragmentTreeCandidateSelector(nn.Module):
             ],
             dim=0,
         )
-        combined_score = keep_logit[batch_node_index] + candidate_logit
-        top = torch.topk(combined_score, k=min(self.max_fragment_ion_candidates, int(combined_score.numel())))
+        # Ion/adduct states of the same node are mutually exclusive.  This
+        # suppresses isotope-like clusters caused by independent sigmoids.
+        adduct_probability = torch.softmax(candidate_logit, dim=0)
+        joint_probability = edge_probability * adduct_probability
+        combined_score = torch.log(joint_probability.clamp_min(1e-12))
+        top = torch.topk(joint_probability, k=min(self.max_fragment_ion_candidates, int(joint_probability.numel())))
         tensorizer = self.feature_model.formula_tensorizer
         candidates: List[FragmentIonCandidate] = []
         for selected in top.indices.detach().cpu().tolist():
@@ -420,7 +442,7 @@ class FragmentTreeCandidateSelector(nn.Module):
             ion_index, unsaturation_index, radical_index, final_formula, _ = rows[selected]
             formula_cpu = final_formula.detach().cpu()
             score_value = float(combined_score[selected].detach().cpu().item())
-            candidates.append(FragmentIonCandidate(sample_id=sample_id, batch_node_index=batch_node_index, global_node_id=global_node_id, ion_index=ion_index, unsaturation_index=unsaturation_index, radical_index=radical_index, formula=tensorizer.tensor_to_formula(formula_cpu), formula_tensor=formula_cpu, score=score_value, keep_logit=float(keep_logit[batch_node_index].detach().cpu().item()), candidate_logit=float(candidate_logit[selected].detach().cpu().item()), probability=float(torch.sigmoid(combined_score[selected]).detach().cpu().item()), score_tensor=combined_score[selected]))
+            candidates.append(FragmentIonCandidate(sample_id=sample_id, batch_node_index=batch_node_index, global_node_id=global_node_id, ion_index=ion_index, unsaturation_index=unsaturation_index, radical_index=radical_index, formula=tensorizer.tensor_to_formula(formula_cpu), formula_tensor=formula_cpu, score=score_value, keep_logit=float(keep_logit[batch_node_index].detach().cpu().item()), candidate_logit=float(candidate_logit[selected].detach().cpu().item()), probability=float(joint_probability[selected].detach().cpu().item()), score_tensor=combined_score[selected], edge_probability=float(edge_probability.detach().cpu().item()), adduct_probability=float(adduct_probability[selected].detach().cpu().item()), probability_tensor=joint_probability[selected]))
         return candidates
 
     def _select_next_cleavage_candidates(self, *, sample_tree_batch, cleave_logit: Tensor) -> List[NextCleavageCandidate]:

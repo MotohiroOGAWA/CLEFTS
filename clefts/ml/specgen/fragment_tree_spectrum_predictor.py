@@ -85,6 +85,7 @@ class FragmentTreeSpectrumPredictor(nn.Module):
         *,
         expand_cleavages: bool = True,
         normalize_intensity: bool = True,
+        min_peak_intensity: float = 1e-3,
         max_peaks_per_sample: Optional[int] = None,
         max_edges_per_step: Optional[int] = 128,
         max_retained_edges: Optional[int] = 30,
@@ -99,6 +100,9 @@ class FragmentTreeSpectrumPredictor(nn.Module):
         self.formula_intensity_predictor = formula_intensity_predictor
         self.expand_cleavages = bool(expand_cleavages)
         self.normalize_intensity = bool(normalize_intensity)
+        if min_peak_intensity < 0:
+            raise ValueError("min_peak_intensity must be non-negative.")
+        self.min_peak_intensity = float(min_peak_intensity)
         self.max_peaks_per_sample = max_peaks_per_sample
         self.max_edges_per_step = max_edges_per_step
         self.max_retained_edges = max_retained_edges
@@ -170,6 +174,7 @@ class FragmentTreeSpectrumPredictor(nn.Module):
                 peaks = peaks[: self.max_peaks_per_sample]
             if self.normalize_intensity:
                 peaks = self._normalize_intensity(peaks)
+            peaks = [peak for peak in peaks if peak.intensity >= self.min_peak_intensity]
             spectra.append(GeneratedMassSpectrum(sample_id=sample_id, peaks=sorted(peaks, key=lambda peak: peak.mz)))
         return FragmentSpectrumGeneratorOutput(
             spectra=spectra,
@@ -300,6 +305,7 @@ class FragmentSpectrumGenerator(ModelBase):
             self.candidate_selector,
             self.formula_intensity_predictor,
             normalize_intensity=normalize_intensity,
+            min_peak_intensity=min_peak_intensity,
             max_peaks_per_sample=max_peaks_per_sample,
             max_edges_per_step=max_edges_per_step,
             max_retained_edges=max_retained_edges,

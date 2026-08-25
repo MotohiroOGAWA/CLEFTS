@@ -10,9 +10,10 @@ workflows in the neighbouring directories:
 
 The model predicts which molecular fragments annotate an observed peak, their
 ion/unsaturation/radical states, which retained fragments should be cleaved at
-the next depth, and one intensity for each formula.  Formula candidates are
-grouped by `(sample, formula)`, so one peak has one formula while any number of
-molecular fragments may annotate that peak.
+the next depth, and one intensity contribution for each fragment/ion-state
+candidate. Fragment-producing edges compete within a spectrum and ion/adduct
+states compete within a node. Candidate intensities are predicted without a
+formula-composition input and are only then summed by `(sample, formula)`.
 
 ## Why training and inference differ
 
@@ -32,9 +33,10 @@ Inference uses staged pruning:
 4. Retain at most `max_retained_edges` edges (fewer are kept when fewer exist).
 5. Select at most `max_next_cleavage_candidates` retained molecular nodes to
    expand at the next cleavage depth.
-6. Predict a non-negative molecular-node-to-formula-node edge score and sum
-   all scores in the same `(sample, formula)` group.  That sum is the formula
-   intensity.
+6. Multiply the competing edge and node-state probabilities, predict a
+   non-negative intensity for every candidate without using its formula, and
+   only then sum candidate intensities in the same `(sample, formula)` group.
+7. Normalize peak intensities and discard peaks below `min_peak_intensity`.
 
 For example, with `max_edges_per_step=128` and
 `max_retained_edges=30`, 300 candidates are processed as `128`, then
