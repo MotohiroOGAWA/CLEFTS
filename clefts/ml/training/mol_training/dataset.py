@@ -6,32 +6,18 @@ from typing import Dict, List, Optional, Sequence
 
 import torch
 from rdkit import Chem
-from rdkit.Chem import AllChem, Descriptors, rdMolDescriptors
+from rdkit.Chem import AllChem
 from torch.utils.data import Dataset
 from torch_geometric.data import Batch, Data
 from tqdm import tqdm
 
 from ....libs.mmkit.mmkit import Compound
+from ....domain.molecule.descriptors import (
+    DEFAULT_DESCRIPTOR_NAMES,
+    compute_descriptor_values,
+)
 from ...mol.graph_builder import MolGraphBuilder
 from .descriptor_coverage import DEFAULT_DESCRIPTOR_BIN_SPECS, build_descriptor_record_index
-
-
-DEFAULT_DESCRIPTOR_NAMES = (
-    "ExactMolWt",
-    "HeavyAtomCount",
-    "TPSA",
-    "MolLogP",
-    "NumHAcceptors",
-    "NumHDonors",
-    "NumRotatableBonds",
-    "RingCount",
-    "NumAromaticRings",
-    "NumAliphaticRings",
-    "FractionCSP3",
-    "NumHeteroatoms",
-    "FormalCharge",
-    "BertzCT",
-)
 
 
 def load_smiles_file(path: str | Path) -> List[str]:
@@ -40,42 +26,7 @@ def load_smiles_file(path: str | Path) -> List[str]:
 
 
 def compute_descriptors(mol: Chem.Mol, names: Sequence[str] = DEFAULT_DESCRIPTOR_NAMES) -> torch.Tensor:
-    values = []
-    for name in names:
-        if name == "MolWt":
-            value = Descriptors.MolWt(mol)
-        elif name == "ExactMolWt":
-            value = Descriptors.ExactMolWt(mol)
-        elif name == "TPSA":
-            value = rdMolDescriptors.CalcTPSA(mol)
-        elif name == "MolLogP":
-            value = Descriptors.MolLogP(mol)
-        elif name == "NumHAcceptors":
-            value = rdMolDescriptors.CalcNumHBA(mol)
-        elif name == "NumHDonors":
-            value = rdMolDescriptors.CalcNumHBD(mol)
-        elif name == "NumRotatableBonds":
-            value = rdMolDescriptors.CalcNumRotatableBonds(mol)
-        elif name == "RingCount":
-            value = rdMolDescriptors.CalcNumRings(mol)
-        elif name == "NumAromaticRings":
-            value = rdMolDescriptors.CalcNumAromaticRings(mol)
-        elif name == "NumAliphaticRings":
-            value = rdMolDescriptors.CalcNumAliphaticRings(mol)
-        elif name == "FractionCSP3":
-            value = rdMolDescriptors.CalcFractionCSP3(mol)
-        elif name == "HeavyAtomCount":
-            value = mol.GetNumHeavyAtoms()
-        elif name == "NumHeteroatoms":
-            value = Descriptors.NumHeteroatoms(mol)
-        elif name == "FormalCharge":
-            value = Chem.GetFormalCharge(mol)
-        elif name == "BertzCT":
-            value = Descriptors.BertzCT(mol)
-        else:
-            raise ValueError(f"Unsupported descriptor: {name}")
-        values.append(float(value))
-    return torch.tensor(values, dtype=torch.float32)
+    return torch.tensor(compute_descriptor_values(mol, names), dtype=torch.float32)
 
 
 def compute_ecfp(mol: Chem.Mol, *, radius: int = 2, n_bits: int = 2048) -> torch.Tensor:
