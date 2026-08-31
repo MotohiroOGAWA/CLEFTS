@@ -19,20 +19,22 @@ frozen MolEncoder
     |-- molecule features [N_molecule, F_molecule]
     `-- atom features     [N_atom, F_atom]
 
-Stage 1: independent edge ranking
-    every edge x MS/MS sample
-        -> CE/adduct conditioning
+Stage 1: shared structural edge encoding
+    every structural edge (once per stored tree)
         -> ordered SMARTS-slot queries
         -> cross-attention over all source/reactant atoms
-        -> independent scalar score
+        -> shared edge embedding
+    shared edge embedding + CE/adduct embedding
+        -> base score + lightweight dot-product interaction
+        -> sample-specific independent scalar score
         -> intensity-order pairwise RankNet loss
 
 Stage 2: competitive fragment-tree model
-    top beam candidates from stage 1
-        -> sample-specific tree edge features
+    depth-1 edges capped by max_edges_per_depth[0]
         -> Graphormer tree encoder
-        -> mutually competitive edge scores
-        -> cumulative-path beam expansion (at most three rounds)
+        -> rank at most 3 nodes that should fragment again
+        -> evaluate every stored outgoing edge of those nodes
+        -> repeat node selection at the next depth
         -> direct intensity head using cached edge features and both scores
 ```
 
@@ -72,10 +74,12 @@ Important fields include:
 | `sample_edge_index` | Mapping from samples to available tree edges |
 | `target_edge_index` | Required edge IDs for supervised samples |
 | `target_edge_group_index` | Groups of alternative edges that can satisfy a target formula |
+| `target_expand_node_index` | Stored intermediate nodes that must be expanded along supervised paths |
+| `terminal_expand_ptr` | CSR pointer mapping terminal assignments to their stored expand nodes |
 
 Several cleavage events may map to one tree edge. Event representations are
-averaged to obtain an edge representation, while event logits are combined with
-log-sum-exp to obtain the edge absolute_ranker logit.
+averaged into one condition-independent structural edge embedding. Conditions
+are applied only afterward by the lightweight edge-condition scorer.
 
 ## Frozen MolEncoder
 
@@ -139,11 +143,11 @@ Rules for extension:
 The SMARTS center-slot count is not fixed by the embedding layout. Future patterns
 may contain more than two ordered center slots.
 
-## Cheap absolute_ranker
+## Structural edge encoder and conditional scorer
 
-The absolute_ranker is condition-independent. It is shared by all MS/MS samples that
-use the same fragment tree, so collision energy and adduct type are deliberately
-excluded at this stage.
+The structural edge embedding is condition-independent and shared by all MS/MS
+samples using the same stored tree. Collision energy and adduct type are excluded
+from structural encoding and enter only in the later conditional scorer.
 
 For source molecule feature `s` and target molecule feature `t`, the molecular
 input is:
@@ -162,9 +166,16 @@ The molecular input is concatenated with:
 [pattern_embedding, reaction_embedding, product_embedding]
 ```
 
-An MLP produces an event hidden representation. A short linear head produces the
-event logit directly, avoiding an unnecessarily long gradient path through the
-tree encoder and intensity predictor.
+An MLP and local atom attention produce the shared event/edge representation.
+The final sample-specific edge logit is
+
+```text
+base_edge_head(edge_h)
+  + dot(edge_projection(edge_h), condition_projection(condition_h))
+```
+
+The scorer produces scalar values only for valid sample/tree-edge pairs and does
+not materialize a `[num_samples, num_edges, hidden_dim]` tensor.
 
 ## Current absolute_ranker loss
 
@@ -192,36 +203,36 @@ over the complete graph.
 
 ### Depth 1
 
-Nodes without incoming edges are roots. Every outgoing root edge receives a cheap
-absolute_ranker score. The retained set is bounded by:
-
-- `max_edges_per_depth[0]`
-- `max_edges_per_tree`
-
-"Evaluate every depth-1 edge" means evaluate every edge with the cheap
-absolute_ranker. It does not mean run atom attention for every depth-1 edge.
+Nodes without incoming edges are roots. Every outgoing root edge is structurally
+encoded once and receives a condition-dependent score. At most
+`max_edges_per_depth[0]` edges are passed to the sample-tree model per sample.
 
 ### Depth 2 and later
 
-Only target nodes of retained edges become the next frontier:
+After depth-1 edges are scored and capped, the node continuation head selects the
+fragment nodes that should be cleaved again:
 
 ```text
 root
-  -> score/select depth-1 edges
-      -> retained target nodes
-          -> score/select depth-2 edges
-              -> retained target nodes
-                  -> score/select depth-3 edges
+  -> score depth-1 edges; retain the configured depth-1 limit
+      -> select at most 3 expandable nodes
+          -> score stored outgoing edges; retain the depth-2 limit
+              -> select at most 3 expandable nodes
+                  -> score stored outgoing edges; retain the depth-3 limit
 ```
 
-At each depth, the selector applies:
+At each depth the selector ranks expandable fragment nodes and keeps at most
+`max_next_cleavage_candidates`. Their stored outgoing edges are ranked by the
+condition-dependent edge score, then capped by `max_edges_per_depth[d]` for each
+sample.
 
-- `max_edges_per_depth[d]`
-- `max_frontier_nodes_per_depth[d]`
-- the remaining `max_edges_per_tree` budget
+During training, `target_expand_node_index` and `terminal_expand_ptr` from the
+stored `.pt` structure supervise this continuation score. No new fragmentation
+or other cheminformatics processing is performed in the training loop.
 
-When the number of next-frontier nodes exceeds its budget, incoming selected-edge
-logits are aggregated with log-sum-exp to score each target node.
+Node continuation logits are ranked independently per sample. Nodes without any
+stored outgoing edge are excluded. The selected nodes define the eligible child
+edges; `max_edges_per_depth[d]` then bounds that union per sample.
 
 Disconnected trees in a collated batch receive independent root budgets.
 
@@ -406,6 +417,10 @@ Slot queries are mean-pooled and projected to produce the final edge feature.
 
 ## TensorBoard layout
 
+Autograd anomaly detection is disabled by default because it slows training. For
+diagnosis, enable it with `--detect-anomaly`; programmatic callers can pass
+`detect_anomaly=True` to `main` or `build_train_config`.
+
 The same metric's training and validation values are placed on one card. They are
 not separated into different cards.
 
@@ -442,6 +457,25 @@ loss/total       -> train, train_window, validation
 loss/selection   -> train, train_window, validation
 loss/intensity   -> train, train_window, validation
 ```
+
+In addition, the headline values are written as ordinary scalar tags in the run's
+root event file every 50 successful training steps and at every epoch end. This
+makes them visible even when TensorBoard is opened directly on one run directory:
+
+```text
+train/loss/total
+train/loss/selection
+train/loss/intensity
+train/edge/edge_ranking_loss
+train/edge/pairwise_ranking_accuracy
+train/edge/edge_retain_precision
+train/edge/edge_retain_recall
+train/edge/edge_total_loss
+```
+
+Equivalent `train_window/...` and `validation/...` tags are emitted when those
+aggregates are available. A failed batch is not counted as a successful training
+step; its exception is printed and no metric is fabricated for it.
 
 ### Overall absolute_ranker metrics
 
@@ -513,35 +547,60 @@ sample_count=201, max_samples=100
 `pack_compound_chunks(sample_counts, max_samples)` applies first-fit-decreasing
 packing and returns `(compound_index, sample_start, sample_stop)` entries.
 
-Molecule features, absolute_ranker logits, and selected tree structure should be cached
-across chunks belonging to the same compound.
+Molecule features and shared structural edge embeddings should be cached across
+chunks belonging to the same compound. Condition embeddings and scalar edge
+scores remain sample-specific.
 
 Current status: chunking and packing helpers, configuration persistence, and
 preflight integration exist. Automatic sample-pointer slicing and remapping of a
 stored `TrainingFragmentTreeStructure` are not yet connected to the DataLoader.
 
-## Maximum-shape preflight
+## Performance preflight and reports
 
-Before training, a synthetic tensor with shape
+Performance profiling is disabled by default. Pass `--profile-performance` to scan
+the stored training batches, select the batch with the largest estimated
+sample-tree size, and profile one real forward/backward pass with PyTorch Profiler
+before any optimizer update.
+
+Reports are stored under `<run_dir>/performance_profile/`:
 
 ```text
-[max_samples, max_edges_per_tree, edge_feature_dim]
+summary.json         total elapsed time, batch shape, CUDA peak allocated/reserved
+modules.json         module type, parameter count, trainable count, parameter bytes
+operators.json       operator CPU/CUDA time, calls, shapes, and self memory
+operator_table.txt   human-readable PyTorch Profiler table
+trace.json           Chrome/Perfetto trace timeline
 ```
 
-is allocated and used in a condition-fusion operation. Results are written to
+If the dry-run runs out of CUDA memory, `summary.json` is still written with
+`status: cuda_oom`, the peak values, batch shape, and exception. Training then
+stops instead of skipping every batch.
+
+### Lightweight shape preflight
+
+Before training, shape checks model the shared and sample-specific allocations as
+
+```text
+[num_structural_edges, edge_feature_dim]
++ [max_samples, condition_embedding_dim]
++ [num_valid_sample_edge_pairs] scalar scores
+```
+
+Results are written to
 `preflight.json` and numeric values are logged under `preflight/*`.
 
 Recorded fields:
 
 - `device`
 - `max_samples`
-- `max_edges_per_tree`
 - `feature_dim`
 - `edge_sample_pairs`
 - `elapsed_seconds`
 - `cuda_peak_memory_bytes`
 
-This is a worst-shape allocation smoke test. It is not a full profiler for
+This synthetic edge/condition allocation is retained as a lightweight smoke
+test. It is not the full-model measurement; use `performance_profile/summary.json`
+for the real model peak.
 Fragmenter, MolEncoder, shortest-path calculation, attention, and Graphormer.
 
 ## Important configuration options
@@ -554,13 +613,13 @@ Fragmenter, MolEncoder, shortest-path calculation, attention, and Graphormer.
 | `--edge-category-dim` | 32 | Dimension of each category embedding |
 | `--edge-attention-heads` | 8 | Number of atom-attention heads |
 | `--attention-max-graph-distance` | 4 | Hard-mask radius from reaction centers |
-| `--max-edges-per-tree` | 128 | Total retained-edge budget per tree |
-| `--max-edges-per-depth` | 128,64,32,16 | Edge budget at each depth |
-| `--max-frontier-nodes-per-depth` | 16,8,4,2 | Node budget passed to the next depth |
+| `--max-edges-per-depth` | 128,64,32 | Per-sample edge limit for depth 1, 2, and 3 |
+| `--max-next-cleavage-candidates` | 3 | Primary per-sample limit on nodes selected for the next cleavage stage |
 
-`edge_feature_dim` must be divisible by `edge_attention_heads`. Selection does not
-continue beyond the configured `max_edges_per_depth` sequence. If the frontier-node
-sequence is shorter, its final value is reused for later configured depths.
+`edge_feature_dim` must be divisible by `edge_attention_heads`. The effective
+node limit is `max_next_cleavage_candidates`. The number of
+`max_edges_per_depth` values must exactly equal `fragmenter.tree_max_depth`; model
+construction raises `ValueError` otherwise.
 
 ### Condition encoder
 
@@ -574,12 +633,21 @@ sequence is shorter, its final value is reused for later configured depths.
 
 ### Workflow
 
+The standalone command's help formatter shows the value used when every optional
+argument is omitted, including arguments without a separate help description.
+Constrained choices such as `{16}` and their default are shown together:
+
+```text
+--condition-ce-feature-dim {16} (default: 16)
+```
+
 | Option | Default | Meaning |
 |---|---:|---|
 | `--max-samples` | 100 | Workflow sample limit and preflight dimension |
 | `--batch-size` | 1 | Number of structure files per DataLoader batch |
 | `--validation-interval-steps` | 100 | Step-validation interval |
-| `--train-log-interval-steps` | 100 | Training-log interval |
+| `--train-log-interval-steps` | 50 | TensorBoard/metrics training-log interval; epoch aggregates are always logged |
+| `--profile-performance` / `--no-profile-performance` | disabled | Profile the largest estimated stored batch before training |
 
 `batch-size` counts stored structure files, whereas `max-samples` counts MS/MS
 samples. They are different units.
@@ -607,7 +675,7 @@ Example `PROJECT_DIR/config/train_config.json`:
   "device": "cuda",
   "epoch": 100,
   "validation_interval_steps": 100,
-  "train_log_interval_steps": 100,
+  "train_log_interval_steps": 50,
   "save_interval": 1,
   "save_interval_steps": 100,
   "optimizer": {
@@ -691,9 +759,8 @@ python -m clefts.ml.training.fragment_tree_training.training_model \
   --edge-category-dim 32 \
   --edge-attention-heads 8 \
   --attention-max-graph-distance 4 \
-  --max-edges-per-tree 128 \
-  --max-edges-per-depth 128,64,32,16 \
-  --max-frontier-nodes-per-depth 16,8,4,2 \
+  --max-edges-per-depth 128,64,32 \
+  --max-next-cleavage-candidates 3 \
   --max-samples 100 \
   --batch-size 1 \
   --device cuda \
@@ -713,7 +780,8 @@ The positional path is one project directory below the plural parent directory:
 python -m clefts train fragment-tree \
   data/training/fragment_tree_projects/main \
   --mol-encoder-checkpoint data/training/mol_projects/main/best.pt \
-  --max-edges-per-tree 128 \
+  --max-edges-per-depth 128,64,32 \
+  --max-next-cleavage-candidates 3 \
   --max-samples 100 \
   --device cuda
 ```
@@ -745,9 +813,9 @@ new embedding rows when loading the checkpoint.
 1. Intensity weighting is not yet applied to absolute_ranker positives.
    - `intensity / max_intensity` should weight edge and group losses.
    - A small floor should preserve gradients for low-intensity targets.
-2. Recall is not yet capacity-adjusted.
-   - Raw recall can be below one when required targets exceed edge/depth/frontier
-     budgets even under an oracle ranking.
+2. Continuation recall is not yet capacity-adjusted.
+   - Raw recall can be below one when more than three path nodes must continue
+     fragmenting for one sample and depth, even under an oracle ranking.
    - Raw, weighted, oracle-at-budget, and capacity-adjusted recall should be logged
      separately and per depth.
 3. Fragmenter is not yet fully lazy.

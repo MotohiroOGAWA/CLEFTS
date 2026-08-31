@@ -28,6 +28,8 @@ class FragmentTreeFeatureOutput:
     sample_tree_batch: Batch
     absolute_score_logit: Optional[Tensor] = None
     selected_edge_index: Optional[Tensor] = None
+    shared_edge_h: Optional[Tensor] = None
+    condition_h: Optional[Tensor] = None
 
 
 class FragmentTreeSampleData(Data):
@@ -78,6 +80,12 @@ class FragmentTreeFeatureModel(nn.Module):
         self._fragmenter = Fragmenter.from_dict(fragmenter_params)
 
         condition_encoder_params = condition_encoder_params.copy()
+        # New descriptive name; ``feature_dim`` remains accepted for old
+        # model configs and checkpoints.
+        if "condition_embedding_dim" in condition_encoder_params:
+            condition_encoder_params.setdefault(
+                "feature_dim", condition_encoder_params.pop("condition_embedding_dim")
+            )
         condition_encoder_params["adduct_type_strs"] = tuple(
             str(adduct) for adduct in self._fragmenter.adduct_types
         )
@@ -94,6 +102,14 @@ class FragmentTreeFeatureModel(nn.Module):
         self.fragment_edge_encoder = ConditionedFragmentEdgeEncoder(
             **fragment_edge_encoder_params
         )
+        edge_depth_budgets = self.fragment_edge_encoder.max_edges_per_depth
+        if len(edge_depth_budgets) != self._fragmenter.tree_max_depth:
+            raise ValueError(
+                "max_edges_per_depth must contain exactly one value per "
+                "fragmenter depth: "
+                f"got {len(edge_depth_budgets)} values, "
+                f"fragmenter.tree_max_depth={self._fragmenter.tree_max_depth}."
+            )
 
         tree_encoder_params = tree_encoder_params.copy()
         if "hidden_dim" not in tree_encoder_params and "dim" in tree_encoder_params:
@@ -391,6 +407,8 @@ class FragmentTreeFeatureModel(nn.Module):
             sample_tree_batch=sample_tree_batch,
             absolute_score_logit=edge_output.absolute_score_logit,
             selected_edge_index=edge_output.selected_edge_index,
+            shared_edge_h=ft_features.edge_attr,
+            condition_h=sample_tree_batch.condition_tree_repr,
         )
 
     def build_features(
@@ -1085,14 +1103,7 @@ class FragmentTreeFeatureModel(nn.Module):
                     sorted=True,
                 )
 
-            if global_edge_ids.numel() == 0:
-                raise ValueError(
-                    f"No edges found for sample {sample_id}. "
-                    "Each sample must have at least one edge in sample_edge_index "
-                    "or precursor_edge_index_path."
-                )
-
-            if (
+            if global_edge_ids.numel() > 0 and (
                 global_edge_ids.min().item() < 0
                 or global_edge_ids.max().item() >= num_global_edges
             ):
@@ -1109,16 +1120,15 @@ class FragmentTreeFeatureModel(nn.Module):
             global_src_nodes = global_edge_src[global_edge_ids]
             global_dst_nodes = global_edge_dst[global_edge_ids]
 
-            global_node_ids = torch.unique(
-                torch.cat(
-                    [
-                        global_src_nodes,
-                        global_dst_nodes,
-                    ],
-                    dim=0,
-                ),
-                sorted=True,
-            )
+            if global_edge_ids.numel() == 0:
+                has_parent = torch.zeros(num_global_nodes, dtype=torch.bool, device=device)
+                has_parent[global_edge_dst] = True
+                global_node_ids = (~has_parent).nonzero(as_tuple=False).flatten()
+            else:
+                global_node_ids = torch.unique(
+                    torch.cat([global_src_nodes, global_dst_nodes], dim=0),
+                    sorted=True,
+                )
             # [N_s]
 
             if global_node_ids.numel() == 0:
@@ -1187,6 +1197,8 @@ class FragmentTreeFeatureModel(nn.Module):
                     global_edge_src=global_edge_src,
                 )
             )
+            if global_edge_ids.numel() == 0:
+                precursor_root_global_node_ids = global_node_ids
             # [R_s]
 
             if precursor_root_global_node_ids.numel() > 0:
@@ -1323,17 +1335,9 @@ class FragmentTreeFeatureModel(nn.Module):
             )
             # [2, E_s]
 
-            if hasattr(self, "fragment_edge_encoder"):
-                sample_edge_features = self.fragment_edge_encoder.condition_edges(
-                    ft_features,
-                    global_edge_features,
-                    global_edge_ids,
-                    sample_condition_tree_repr[sample_id],
-                )
-            else:
-                # Supports lightweight feature-model fixtures and legacy
-                # externally supplied FragmentTreeFeatures.
-                sample_edge_features = global_edge_features[global_edge_ids]
+            # Structural edge embeddings are shared.  Measurement conditions
+            # are applied later by ConditionEdgeScorer, never by this encoder.
+            sample_edge_features = global_edge_features[global_edge_ids]
             # [E_s, edge_dim]
 
             # -------------------------

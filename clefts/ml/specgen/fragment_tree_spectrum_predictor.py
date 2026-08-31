@@ -248,6 +248,10 @@ class FragmentSpectrumGenerator(ModelBase):
         max_edges_per_step: Optional[int] = 128,
         max_retained_edges: Optional[int] = 30,
         max_next_cleavage_candidates: int = 3,
+        edge_condition_interaction_dim: int = 64,
+        ranking_loss_weight: float = 1.0,
+        ranking_pairs_per_edge: int = 4,
+        ranking_intensity_threshold: float = 0.05,
         mol_encoder_checkpoint: Optional[str] = None,
         freeze_mol_encoder: bool = True,
     ) -> None:
@@ -282,6 +286,10 @@ class FragmentSpectrumGenerator(ModelBase):
             max_next_cleavage_candidates=max_next_cleavage_candidates,
             max_edges_per_step=max_edges_per_step,
             max_retained_edges=max_retained_edges,
+            edge_condition_interaction_dim=edge_condition_interaction_dim,
+            ranking_loss_weight=ranking_loss_weight,
+            ranking_pairs_per_edge=ranking_pairs_per_edge,
+            ranking_intensity_threshold=ranking_intensity_threshold,
         )
         self.formula_intensity_predictor = FragmentTreeFormulaIntensityPredictor(
             self.feature_model,

@@ -6,8 +6,8 @@ The fragment tree is a bipartite-augmented graph with two kinds of nodes and
 two kinds of edges:
 
 - Molecular fragment nodes are encoded by the pretrained `MolEncoder`.
-- Molecular-node-to-molecular-node edges represent cleavages and are encoded
-  by the jointly trained fragment-edge encoder after progressive preselection.
+- Molecular-node-to-molecular-node edges represent cleavages. Their structural
+  embeddings are computed once per stored tree and shared across MS/MS samples.
 - Every selected molecular node is connected to its corresponding formula
   node. Several molecular nodes may connect to the same formula node.
 - The model predicts a non-negative score on every
@@ -21,18 +21,20 @@ formula connections are present while molecular nodes are selected; formula
 coverage is therefore part of the selection objective rather than an
 after-the-fact annotation step.
 
-With `max_edges_per_step=128` and `max_retained_edges=30`, inference evaluates
-at most 128 new cleavage-edge candidates and retains at most 30. If there are
-129 or more candidates, later windows combine the preceding survivors with up
-to 128 new candidates and again retain the best 30. After all windows and
-cleavage depths are processed, formula nodes connected to the selected
-molecular nodes produce the final m/z and summed intensity.
+Inference scores depth-1 edges and retains at most `max_edges_per_depth[0]` per
+sample. It then ranks fragment nodes by their
+continuation logits and selects at most `max_next_cleavage_candidates` nodes per
+sample (3 by default). Every outgoing edge already stored for each selected node
+is considered. The condition scorer retains at most the corresponding
+`max_edges_per_depth[d]` edges per sample. The same node-selection step is
+repeated at subsequent depths. `max_edges_per_step` only chunks computation.
 
-Training and validation avoid this sequential search: all required positive
-target-path edges are included once, random unnecessary edges fill the window
-to at most 128 (or the configured limit), and at most 30 molecular candidates
-are selected. Selection and intensity losses are evaluated together on each
-pass. Validation additionally performs real staged spectrum generation,
+Training uses only the candidate DAG and path annotations already stored in the
+`.pt` structure. In particular, `target_expand_node_index` and
+`terminal_expand_ptr` supervise the node continuation head. The training loop
+does not call Fragmenter, RDKit, or any other chemical fragmentation routine.
+Selection and intensity losses are evaluated together on each pass. Validation
+additionally performs real staged spectrum generation,
 records measured-vs-generated cosine similarity in TensorBoard/TSV, and logs
 five representative mirror plots ordered from high to low similarity.
 

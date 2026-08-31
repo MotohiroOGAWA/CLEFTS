@@ -22,8 +22,8 @@ class FragmentEdgeEncoderOutput:
     original_edge_count: int
 
 
-class ConditionedFragmentEdgeEncoder(nn.Module):
-    """Jointly learned fragment-edge encoder.
+class StructuralEdgeEncoder(nn.Module):
+    """Condition-independent fragment-edge encoder.
 
     All edges receive attention-aware features and an independent score.
     ``max_edges_per_step`` only bounds a compute chunk and never prunes edges.
@@ -41,9 +41,7 @@ class ConditionedFragmentEdgeEncoder(nn.Module):
         num_heads: int = 8,
         attention_max_graph_distance: int = 4,
         max_edges_per_step: int = 128,
-        max_edges_per_tree: int = 128,
-        max_edges_per_depth: Tuple[int, ...] = (128, 64, 32, 16),
-        max_frontier_nodes_per_depth: Tuple[int, ...] = (16, 8, 4, 2),
+        max_edges_per_depth: Tuple[int, ...] = (128, 64, 32),
         dropout: float = 0.1,
     ) -> None:
         super().__init__()
@@ -94,12 +92,7 @@ class ConditionedFragmentEdgeEncoder(nn.Module):
         self.atom_dim = int(atom_dim)
         self.condition_dim = int(condition_dim)
         self.max_edges_per_step = int(max_edges_per_step)
-        # Retained in the constructor only so old config files still load.
-        self.max_edges_per_tree = int(max_edges_per_tree)
         self.max_edges_per_depth = tuple(int(value) for value in max_edges_per_depth)
-        self.max_frontier_nodes_per_depth = tuple(
-            int(value) for value in max_frontier_nodes_per_depth
-        )
         if not self.max_edges_per_depth or min(self.max_edges_per_depth) < 1:
             raise ValueError("max_edges_per_depth values must be positive.")
         self.attention_max_graph_distance = int(attention_max_graph_distance)
@@ -118,6 +111,8 @@ class ConditionedFragmentEdgeEncoder(nn.Module):
         self.absolute_score_head = nn.Linear(feature_dim, 1)
         self.atom_projection = nn.Linear(atom_dim, feature_dim)
         self.center_projection = nn.Linear(atom_dim, feature_dim)
+        # Kept (unused) so older state dictionaries remain loadable.  Edge
+        # encoding no longer consumes this projection.
         self.condition_projection = nn.Sequential(
             nn.LayerNorm(condition_dim), nn.Linear(condition_dim, feature_dim)
         )
@@ -154,9 +149,7 @@ class ConditionedFragmentEdgeEncoder(nn.Module):
             "num_heads": self.num_heads,
             "attention_max_graph_distance": self.attention_max_graph_distance,
             "max_edges_per_step": self.max_edges_per_step,
-            "max_edges_per_tree": self.max_edges_per_tree,
             "max_edges_per_depth": self.max_edges_per_depth,
-            "max_frontier_nodes_per_depth": self.max_frontier_nodes_per_depth,
         }
 
     @staticmethod
@@ -382,29 +375,13 @@ class ConditionedFragmentEdgeEncoder(nn.Module):
         edge_ids: Tensor,
         condition: Tensor,
     ) -> Tensor:
-        """Build sample-conditioned representations for every requested edge."""
-        event_edge = features.structure.cleavage_event_edge_index.long()
-        condition_h = self.condition_projection(condition.view(1, -1)).squeeze(0)
-        outputs = []
-        for edge_chunk in edge_ids.split(self.max_edges_per_step):
-            for edge_id_tensor in edge_chunk:
-                edge_id = int(edge_id_tensor.item())
-                event_ids = (event_edge == edge_id).nonzero(as_tuple=False).flatten()
-                if event_ids.numel() == 0:
-                    outputs.append(edge_h[edge_id] + condition_h)
-                    advance_edge_progress()
-                    continue
-                attended = [
-                    self._bounded_attend_event(
-                        features, int(event_id), edge_h[edge_id] + condition_h
-                    )
-                    for event_id in event_ids.tolist()
-                ]
-                outputs.append(torch.stack(attended).mean(dim=0))
-                advance_edge_progress()
-        if not outputs:
-            return edge_h.new_empty((0, self.feature_dim))
-        return torch.stack(outputs, dim=0)
+        """Compatibility shim returning shared structural representations.
+
+        Conditions are intentionally ignored here.  They are applied only by
+        :class:`ConditionEdgeScorer`, after every structural edge has been
+        encoded once.
+        """
+        return edge_h[edge_ids]
 
     def forward(
         self,
@@ -415,22 +392,70 @@ class ConditionedFragmentEdgeEncoder(nn.Module):
         edge_h, edge_logit = self.encode_base(features)
         selected = torch.arange(edge_h.size(0), device=edge_h.device)
         event_edge = features.structure.cleavage_event_edge_index.long()
+        updated_edge_h = []
         for edge_chunk in selected.split(self.max_edges_per_step):
             for edge_id_tensor in edge_chunk:
                 edge_id = int(edge_id_tensor.item())
                 event_ids = (event_edge == int(edge_id)).nonzero(as_tuple=False).flatten()
                 if event_ids.numel() == 0:
+                    updated_edge_h.append(edge_h[edge_id])
                     advance_edge_progress()
                     continue
+                base_h = edge_h[edge_id]
                 attended = [
-                    self._bounded_attend_event(features, int(event_id), edge_h[int(edge_id)])
+                    self._bounded_attend_event(features, int(event_id), base_h)
                     for event_id in event_ids.tolist()
                 ]
-                edge_h[int(edge_id)] = torch.stack(attended).mean(dim=0)
+                updated_edge_h.append(torch.stack(attended).mean(dim=0))
                 advance_edge_progress()
+        if updated_edge_h:
+            edge_h = torch.stack(updated_edge_h, dim=0)
         return FragmentEdgeEncoderOutput(
             edge_attr=edge_h,
             absolute_score_logit=edge_logit,
             selected_edge_index=selected,
             original_edge_count=int(edge_h.size(0)),
         )
+
+
+class ConditionEdgeScorer(nn.Module):
+    """Lightweight ``base(edge) + dot(edge, condition)`` scorer."""
+
+    def __init__(
+        self,
+        *,
+        edge_dim: int,
+        condition_dim: int,
+        interaction_dim: int = 64,
+    ) -> None:
+        super().__init__()
+        if interaction_dim < 1:
+            raise ValueError("interaction_dim must be positive.")
+        self.base_edge_head = nn.Sequential(nn.LayerNorm(edge_dim), nn.Linear(edge_dim, 1))
+        self.edge_projection = nn.Linear(edge_dim, interaction_dim, bias=False)
+        self.condition_projection = nn.Linear(condition_dim, interaction_dim, bias=False)
+        self.scale = float(interaction_dim) ** -0.5
+
+    def forward(
+        self,
+        shared_edge_h: Tensor,
+        condition_h: Tensor,
+        sample_edge_ids: Tensor,
+        edge_sample_index: Tensor,
+    ) -> Tensor:
+        """Score only valid sample/tree-edge pairs without an ``[S,E,H]`` tensor."""
+        edge_ids = sample_edge_ids.long()
+        sample_ids = edge_sample_index.long()
+        if edge_ids.numel() != sample_ids.numel():
+            raise ValueError("sample_edge_ids and edge_sample_index must be aligned.")
+        projected_edges = self.edge_projection(shared_edge_h)
+        projected_conditions = self.condition_projection(condition_h)
+        base = self.base_edge_head(shared_edge_h).squeeze(-1)
+        interaction = (
+            projected_edges[edge_ids] * projected_conditions[sample_ids]
+        ).sum(dim=-1) * self.scale
+        return base[edge_ids] + interaction
+
+
+# Backward-compatible import/config name used by existing checkpoints.
+ConditionedFragmentEdgeEncoder = StructuralEdgeEncoder

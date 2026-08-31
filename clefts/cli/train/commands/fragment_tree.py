@@ -34,9 +34,7 @@ class FragmentTreeTrainCommand(CLICommand):
         parser.add_argument("--edge-category-dim", type=int, default=32)
         parser.add_argument("--edge-attention-heads", type=int, default=8)
         parser.add_argument("--attention-max-graph-distance", type=int, default=4)
-        parser.add_argument("--max-edges-per-tree", type=int, default=128)
-        parser.add_argument("--max-edges-per-depth", default="128,64,32,16")
-        parser.add_argument("--max-frontier-nodes-per-depth", default="16,8,4,2")
+        parser.add_argument("--max-edges-per-depth", default="128,64,32")
         parser.add_argument("--max-samples", type=int, default=100)
         parser.add_argument("--condition-adduct-embedding-dim", type=int, default=16)
         parser.add_argument("--condition-ce-feature-dim", type=int, choices=(16,), default=16)
@@ -51,6 +49,10 @@ class FragmentTreeTrainCommand(CLICommand):
         parser.add_argument("--max-edges-per-step", type=int, default=128)
         parser.add_argument("--max-retained-edges", type=int, default=30)
         parser.add_argument("--max-next-cleavage-candidates", type=int, default=3)
+        parser.add_argument("--edge-condition-interaction-dim", type=int, default=64)
+        parser.add_argument("--ranking-loss-weight", type=float, default=1.0)
+        parser.add_argument("--ranking-pairs-per-edge", type=int, default=4)
+        parser.add_argument("--ranking-intensity-threshold", type=float, default=0.05)
         parser.add_argument(
             "--experiment-name",
             default=DEFAULT_EXPERIMENT_NAME,
@@ -83,13 +85,24 @@ class FragmentTreeTrainCommand(CLICommand):
         parser.add_argument(
             "--train-log-interval-steps",
             type=int,
-            default=100,
+            default=50,
             help="Log averaged training metrics every N successful steps. Use 0 to disable.",
         )
         parser.add_argument(
             "--validate-at-start",
             action="store_true",
             help="Run validation before the first training epoch.",
+        )
+        parser.add_argument(
+            "--detect-anomaly",
+            action="store_true",
+            help="Enable PyTorch autograd anomaly detection (disabled by default).",
+        )
+        parser.add_argument(
+            "--profile-performance",
+            action=argparse.BooleanOptionalAction,
+            default=False,
+            help="Profile the largest estimated batch before training (default: disabled).",
         )
         parser.add_argument(
             "--save-interval-epochs",
@@ -145,6 +158,8 @@ class FragmentTreeTrainCommand(CLICommand):
                 else args.train_log_interval_steps
             ),
             validate_at_start=args.validate_at_start,
+            detect_anomaly=args.detect_anomaly,
+            profile_performance=args.profile_performance,
             save_interval=args.save_interval_epochs,
             save_interval_steps=(
                 None
@@ -175,11 +190,7 @@ class FragmentTreeTrainCommand(CLICommand):
                 "num_heads": args.edge_attention_heads,
                 "attention_max_graph_distance": args.attention_max_graph_distance,
                 "max_edges_per_step": args.max_edges_per_step,
-                "max_edges_per_tree": args.max_edges_per_tree,
                 "max_edges_per_depth": csv_ints(args.max_edges_per_depth),
-                "max_frontier_nodes_per_depth": csv_ints(
-                    args.max_frontier_nodes_per_depth
-                ),
             },
             tree_encoder_params={
                 "hidden_dim": args.tree_hidden_dim,
@@ -192,6 +203,10 @@ class FragmentTreeTrainCommand(CLICommand):
                 "max_edges_per_step": args.max_edges_per_step,
                 "max_retained_edges": args.max_retained_edges,
                 "max_next_cleavage_candidates": args.max_next_cleavage_candidates,
+                "edge_condition_interaction_dim": args.edge_condition_interaction_dim,
+                "ranking_loss_weight": args.ranking_loss_weight,
+                "ranking_pairs_per_edge": args.ranking_pairs_per_edge,
+                "ranking_intensity_threshold": args.ranking_intensity_threshold,
             },
         )
         run_training(

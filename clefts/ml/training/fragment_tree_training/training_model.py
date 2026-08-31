@@ -15,6 +15,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 from ...common.progress import fixed_tqdm, iteration_edge_progress
+from .performance_profile import run_training_performance_profile
 from .workflow import run_shape_preflight
 
 try:
@@ -437,7 +438,7 @@ def normalize_train_config(
         and config["validation_interval_steps"] <= 0
     ):
         raise ValueError("validation_interval_steps must be positive when specified.")
-    train_log_interval_steps = config.get("train_log_interval_steps", 100)
+    train_log_interval_steps = config.get("train_log_interval_steps", 50)
     config["train_log_interval_steps"] = (
         None if train_log_interval_steps in {None, ""} else int(train_log_interval_steps)
     )
@@ -493,6 +494,8 @@ def normalize_train_config(
     config["validation_valid_records_file"] = str(validation_valid_records_file)
     config["shuffle"] = bool(config.get("shuffle", True))
     config["validate_at_start"] = bool(config.get("validate_at_start", False))
+    config["detect_anomaly"] = bool(config.get("detect_anomaly", False))
+    config["profile_performance"] = bool(config.get("profile_performance", False))
 
     return config
 
@@ -506,7 +509,7 @@ def build_train_config(
     device: str = "cpu",
     epoch: int = 10,
     validation_interval_steps: Optional[int] = 100,
-    train_log_interval_steps: Optional[int] = 100,
+    train_log_interval_steps: Optional[int] = 50,
     save_interval: int = 1,
     save_interval_steps: Optional[int] = 100,
     optimizer_name: str = "AdamW",
@@ -517,6 +520,8 @@ def build_train_config(
     validation_structure_dir: Optional[str | Path] = None,
     shuffle: bool = True,
     validate_at_start: bool = False,
+    detect_anomaly: bool = False,
+    profile_performance: bool = False,
     max_samples: int = 100,
 ) -> Dict[str, Any]:
     if max_samples < 1:
@@ -550,6 +555,8 @@ def build_train_config(
             ),
             "shuffle": bool(shuffle),
             "validate_at_start": bool(validate_at_start),
+            "detect_anomaly": bool(detect_anomaly),
+            "profile_performance": bool(profile_performance),
             "max_samples": int(max_samples),
         },
     )
@@ -595,6 +602,8 @@ def prepare_train_from_config(
         "validation_interval_steps": validation_interval_steps,
         "train_log_interval_steps": train_config.get("train_log_interval_steps"),
         "validate_at_start": bool(train_config.get("validate_at_start", False)),
+        "detect_anomaly": bool(train_config.get("detect_anomaly", False)),
+        "profile_performance": bool(train_config.get("profile_performance", False)),
         "max_samples": int(train_config.get("max_samples", 100)),
         "pattern": "*.pt",
     }
@@ -791,7 +800,7 @@ def run_epoch(
     on_validation_step: Optional[
         Callable[[int, EpochLossMetrics, EpochLossMetrics], None]
     ] = None,
-    train_log_interval_steps: Optional[int] = 100,
+    train_log_interval_steps: Optional[int] = 50,
     on_train_log_step: Optional[
         Callable[[int, EpochLossMetrics, EpochLossMetrics], None]
     ] = None,
@@ -818,8 +827,19 @@ def run_epoch(
     window_selection_samples = 0
     window_intensity_samples = 0
     step_count = 0
+    failed_batch_count = 0
     absolute_ranker_values: Dict[str, List[float]] = {}
+    window_absolute_ranker_values: Dict[str, List[float]] = {}
     iterator = fixed_tqdm(loader, desc=desc, position=1, leave=False)
+
+    def summarize_ranker(values_by_name: Dict[str, List[float]]) -> Dict[str, float]:
+        summary: Dict[str, float] = {}
+        for name, values in values_by_name.items():
+            array = np.asarray(values, dtype=np.float64)
+            summary[f"{name}_mean"] = float(array.mean())
+            for label, quantile in PEAK_SELECTION_QUANTILES:
+                summary[f"{name}_{label}"] = float(np.quantile(array, quantile))
+        return summary
 
     for batch in iterator:
         try:
@@ -856,6 +876,7 @@ def run_epoch(
             intensity_loss = output.get("intensity_loss")
             for name, value in output.get("absolute_ranker_metrics", {}).items():
                 absolute_ranker_values.setdefault(name, []).append(float(value))
+                window_absolute_ranker_values.setdefault(name, []).append(float(value))
             loss_value = float(loss.detach().cpu().item())
             selection_loss_value = (
                 float(selection_loss.detach().cpu().item())
@@ -892,6 +913,10 @@ def run_epoch(
                 total_intensity_samples=total_intensity_samples,
                 steps=step_count,
             )
+            cumulative_metrics = replace(
+                cumulative_metrics,
+                absolute_ranker_summary=summarize_ranker(absolute_ranker_values),
+            )
             window_metrics = make_loss_metrics(
                 total_loss=window_loss,
                 total_selection_loss=window_selection_loss,
@@ -900,6 +925,10 @@ def run_epoch(
                 total_selection_samples=window_selection_samples,
                 total_intensity_samples=window_intensity_samples,
                 steps=step_count,
+            )
+            window_metrics = replace(
+                window_metrics,
+                absolute_ranker_summary=summarize_ranker(window_absolute_ranker_values),
             )
             iterator.set_postfix(
                 loss=cumulative_metrics.loss,
@@ -937,18 +966,21 @@ def run_epoch(
                 window_samples = 0
                 window_selection_samples = 0
                 window_intensity_samples = 0
+                window_absolute_ranker_values.clear()
 
             if on_step_end is not None:
                 on_step_end(global_step, cumulative_metrics, window_metrics)
         except Exception as exc:
+            failed_batch_count += 1
             if is_train and optimizer is not None:
                 optimizer.zero_grad(set_to_none=True)
-            # print(
-            #     "[WARN] Skipping failed batch "
-            #     f"in {desc} at attempted_step={int(start_global_step) + step_count + 1}: "
-            #     f"{type(exc).__name__}: {exc}"
-            # )
-            # traceback.print_exc()
+            print(
+                "[WARN] Skipping failed batch "
+                f"in {desc} at attempted_batch={step_count + failed_batch_count}: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            if failed_batch_count == 1:
+                traceback.print_exc()
             continue
 
     metrics = make_loss_metrics(
@@ -960,13 +992,10 @@ def run_epoch(
         total_intensity_samples=total_intensity_samples,
         steps=step_count,
     )
-    summary: Dict[str, float] = {}
-    for name, values in absolute_ranker_values.items():
-        array = np.asarray(values, dtype=np.float64)
-        summary[f"{name}_mean"] = float(array.mean())
-        for label, quantile in PEAK_SELECTION_QUANTILES:
-            summary[f"{name}_{label}"] = float(np.quantile(array, quantile))
-    return replace(metrics, absolute_ranker_summary=summary)
+    return replace(
+        metrics,
+        absolute_ranker_summary=summarize_ranker(absolute_ranker_values),
+    )
 
 
 def _match_peaks_one_to_one(
@@ -1531,7 +1560,13 @@ def main(
     extra_data: Dict[str, Any],
     validation_interval_steps: Optional[int] = None,
     validate_at_start: bool = False,
+    detect_anomaly: bool = False,
+    profile_performance: bool = False,
 ) -> None:
+    torch.autograd.set_detect_anomaly(detect_anomaly)
+    if detect_anomaly:
+        print("[INFO] torch autograd anomaly detection is enabled.")
+
     ckpt_manager = CheckPointManager(str(experiment_dir))
     ckpt_manager.set_run_dir(str(run_dir))
     ckpt_manager.initialize_metrics(list(METRIC_COLUMNS))
@@ -1549,6 +1584,20 @@ def main(
     global_step = state.global_step
     best_val_loss = state.best_val_loss
 
+    if profile_performance:
+        print("[INFO] Profiling the largest estimated training batch.")
+        performance_report = run_training_performance_profile(
+            model=model,
+            loader=train_loader,
+            device=device,
+            output_dir=run_dir / "performance_profile",
+        )
+        extra_data["performance_profile"] = performance_report
+        print(
+            "[INFO] Performance profile written to "
+            f"{run_dir / 'performance_profile'}"
+        )
+
     patience = early_stopping_info.get("patience")
     patience = None if patience in {None, ""} else int(patience)
     min_delta = float(early_stopping_info.get("min_delta", 0.0))
@@ -1562,13 +1611,16 @@ def main(
     for name, value in dict(extra_data.get("preflight") or {}).items():
         if isinstance(value, (int, float)):
             writer.add_scalar(f"preflight/{name}", float(value), 0)
+    for name, value in dict(extra_data.get("performance_profile") or {}).items():
+        if isinstance(value, (int, float)):
+            writer.add_scalar(f"performance_profile/{name}", float(value), 0)
     writer.flush()
     # Create a useful dashboard immediately. Without this, a new run contains
     # only the event-file header until its first scheduled validation.
     writer.add_scalar("optimizer/lr", float(optimizer.param_groups[0]["lr"]), global_step)
     writer.flush()
     validation_valid_records_file = Path(extra_data["validation_valid_records_file"])
-    train_log_interval_steps = extra_data.get("train_log_interval_steps", 100)
+    train_log_interval_steps = extra_data.get("train_log_interval_steps", 50)
     validation_dataset = (
         MSDataset.load(str(validation_valid_records_file))
         if validation_valid_records_file.exists()
@@ -1662,6 +1714,13 @@ def main(
     ) -> None:
         lr = float(optimizer.param_groups[0]["lr"])
         window_metrics = train_window_metrics or nan_loss_metrics()
+        edge_metric_names = (
+            "edge_ranking_loss",
+            "pairwise_ranking_accuracy",
+            "edge_retain_precision",
+            "edge_retain_recall",
+            "edge_total_loss",
+        )
         metric_row = {
             "event": event,
             "epoch": int(epoch_value),
@@ -1676,6 +1735,12 @@ def main(
             "val_selection_loss": val_metrics.selection_loss,
             "val_intensity_loss": val_metrics.intensity_loss,
             "val_cosine": val_cosine,
+            **{
+                f"train_{name}": train_metrics.absolute_ranker_summary.get(
+                    f"{name}_mean", float("nan")
+                )
+                for name in edge_metric_names
+            },
             **{
                 f"val_{name}": (val_peak_metrics or {}).get(name, float("nan"))
                 for name in PEAK_SELECTION_METRIC_NAMES
@@ -1702,6 +1767,30 @@ def main(
              "validation": val_metrics.intensity_loss}, step_value,
         )
         add_scalar_if_finite("similarity/validation/cosine", val_cosine, step_value)
+        # Write the requested headline metrics into the root event file as
+        # ordinary scalars. SummaryWriter.add_scalars stores series in child
+        # event directories, which makes them easy to miss when TensorBoard is
+        # opened on a single run/log directory.
+        for split, metrics in (
+            ("train", train_metrics),
+            ("train_window", window_metrics),
+            ("validation", val_metrics),
+        ):
+            add_scalar_if_finite(f"{split}/loss/total", metrics.loss, step_value)
+            add_scalar_if_finite(
+                f"{split}/loss/selection", metrics.selection_loss, step_value
+            )
+            add_scalar_if_finite(
+                f"{split}/loss/intensity", metrics.intensity_loss, step_value
+            )
+            for name in edge_metric_names:
+                add_scalar_if_finite(
+                    f"{split}/edge/{name}",
+                    metrics.absolute_ranker_summary.get(
+                        f"{name}_mean", float("nan")
+                    ),
+                    step_value,
+                )
         log_distribution_cards(
             "absolute_ranker",
             {
@@ -1917,6 +2006,18 @@ def main(
         global_step += train_metrics.steps
         last_epoch_index = epoch_index
         last_train_metrics = train_metrics
+
+        # Always emit the complete epoch aggregate, even when the epoch ends
+        # before the next periodic 50-step training log.
+        log_training_metrics(
+            event="train_epoch_end",
+            epoch_value=epoch_index,
+            step_value=global_step,
+            train_metrics=train_metrics,
+            train_window_metrics=None,
+            val_metrics=nan_loss_metrics(),
+            val_cosine=float("nan"),
+        )
 
         should_save = save_interval > 0 and epoch_index % save_interval == 0
         if should_save:
@@ -2151,6 +2252,8 @@ def run_training_from_config(
         extra_data=extra_data,
         validation_interval_steps=validation_interval_steps,
         validate_at_start=bool(dataset_info.get("validate_at_start", False)),
+        detect_anomaly=bool(dataset_info.get("detect_anomaly", False)),
+        profile_performance=bool(dataset_info.get("profile_performance", False)),
     )
 
 def run_training(
@@ -2263,6 +2366,8 @@ def run_training(
         extra_data=extra_data,
         validation_interval_steps=validation_interval_steps,
         validate_at_start=bool(dataset_info.get("validate_at_start", False)),
+        detect_anomaly=bool(dataset_info.get("detect_anomaly", False)),
+        profile_performance=bool(dataset_info.get("profile_performance", False)),
     )
 
 def _csv_int_tuple(value: str) -> Tuple[int, ...]:
@@ -2275,8 +2380,26 @@ def _csv_int_tuple(value: str) -> Tuple[int, ...]:
     return parsed
 
 
+class _AllDefaultsHelpFormatter(argparse.ArgumentDefaultsHelpFormatter):
+    """Show defaults even for arguments that do not define help text."""
+
+    def _format_action_invocation(self, action: argparse.Action) -> str:
+        invocation = super()._format_action_invocation(action)
+        if (
+            action.option_strings
+            and action.help is None
+            and not action.required
+            and action.default is not argparse.SUPPRESS
+        ):
+            invocation += f" (default: {action.default})"
+        return invocation
+
+
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train FragmentTreeTrainingModel.")
+    parser = argparse.ArgumentParser(
+        description="Train FragmentTreeTrainingModel.",
+        formatter_class=_AllDefaultsHelpFormatter,
+    )
     parser.add_argument("--train-dir", required=True)
     parser.add_argument("--val-dir", required=True)
     parser.add_argument(
@@ -2300,17 +2423,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--edge-category-dim", type=int, default=32)
     parser.add_argument("--edge-attention-heads", type=int, default=8)
     parser.add_argument("--attention-max-graph-distance", type=int, default=4)
-    parser.add_argument("--max-edges-per-tree", type=int, default=128)
     parser.add_argument(
-        "--max-edges-per-depth", type=_csv_int_tuple, default=(128, 64, 32, 16)
-    )
-    parser.add_argument(
-        "--max-frontier-nodes-per-depth", type=_csv_int_tuple, default=(16, 8, 4, 2)
+        "--max-edges-per-depth", type=_csv_int_tuple, default=(128, 64, 32)
     )
     parser.add_argument("--max-samples", type=int, default=100)
     parser.add_argument("--max-edges-per-step", type=int, default=128)
     parser.add_argument("--max-retained-edges", type=int, default=30)
     parser.add_argument("--max-next-cleavage-candidates", type=int, default=3)
+    parser.add_argument("--edge-condition-interaction-dim", type=int, default=64)
+    parser.add_argument("--ranking-loss-weight", type=float, default=1.0)
+    parser.add_argument("--ranking-pairs-per-edge", type=int, default=4)
+    parser.add_argument("--ranking-intensity-threshold", type=float, default=0.05)
     parser.add_argument("--experiment-name", default=DEFAULT_EXPERIMENT_NAME)
     parser.add_argument("--ckpt-id", default=None)
     parser.add_argument("--batch-size", type=int, default=1)
@@ -2320,13 +2443,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--train-log-interval-steps",
         type=int,
-        default=100,
-        help="Log averaged training metrics every N successful steps. Default: 100.",
+        default=50,
+        help="Log averaged training metrics every N successful steps. Default: 50.",
     )
     parser.add_argument(
         "--validate-at-start",
         action="store_true",
         help="Run ValStart before the first training epoch (disabled by default).",
+    )
+    parser.add_argument(
+        "--detect-anomaly",
+        action="store_true",
+        help="Enable PyTorch autograd anomaly detection (disabled by default).",
+    )
+    parser.add_argument(
+        "--profile-performance",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Profile the largest estimated batch before training (default: disabled).",
     )
     parser.add_argument("--save-interval-epochs", type=int, default=1)
     parser.add_argument("--save-interval-steps", type=int, default=100)
@@ -2371,9 +2505,7 @@ if __name__ == "__main__":
             "num_heads": args.edge_attention_heads,
             "attention_max_graph_distance": args.attention_max_graph_distance,
             "max_edges_per_step": args.max_edges_per_step,
-            "max_edges_per_tree": args.max_edges_per_tree,
             "max_edges_per_depth": args.max_edges_per_depth,
-            "max_frontier_nodes_per_depth": args.max_frontier_nodes_per_depth,
         },
         tree_encoder_params={
             "hidden_dim": args.tree_hidden_dim,
@@ -2386,6 +2518,10 @@ if __name__ == "__main__":
             "max_edges_per_step": args.max_edges_per_step,
             "max_retained_edges": args.max_retained_edges,
             "max_next_cleavage_candidates": args.max_next_cleavage_candidates,
+            "edge_condition_interaction_dim": args.edge_condition_interaction_dim,
+            "ranking_loss_weight": args.ranking_loss_weight,
+            "ranking_pairs_per_edge": args.ranking_pairs_per_edge,
+            "ranking_intensity_threshold": args.ranking_intensity_threshold,
         },
     )
     train_config_inline = build_train_config(
@@ -2413,6 +2549,8 @@ if __name__ == "__main__":
         validation_structure_dir=val_data_dir,
         shuffle=args.shuffle,
         validate_at_start=args.validate_at_start,
+        detect_anomaly=args.detect_anomaly,
+        profile_performance=args.profile_performance,
         max_samples=args.max_samples,
     )
     train_config_inline["validation_valid_records_file"] = str(

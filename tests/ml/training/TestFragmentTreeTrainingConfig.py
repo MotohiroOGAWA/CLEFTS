@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 
 from clefts.ml.training.fragment_tree_training.training_model import (
+    build_train_config,
     load_and_validate_split_preprocessing,
 )
 
@@ -66,6 +67,19 @@ class TestFragmentTreeTrainingConfig(unittest.TestCase):
                 self.root / "train_structures",
                 self.root / "validation_structures",
             )
+
+    def test_default_train_tensorboard_interval_is_fifty_steps(self) -> None:
+        config = build_train_config(project_dir=self.root / "project")
+        self.assertEqual(config["train_log_interval_steps"], 50)
+
+    def test_anomaly_detection_is_disabled_by_default_and_can_be_enabled(self) -> None:
+        default_config = build_train_config(project_dir=self.root / "default_project")
+        diagnostic_config = build_train_config(
+            project_dir=self.root / "diagnostic_project", detect_anomaly=True
+        )
+        self.assertFalse(default_config["detect_anomaly"])
+        self.assertTrue(diagnostic_config["detect_anomaly"])
+        self.assertFalse(default_config["profile_performance"])
 
 
 if __name__ == "__main__":
