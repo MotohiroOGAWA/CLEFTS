@@ -6,7 +6,7 @@ import json
 import shutil
 import math
 import traceback
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -14,7 +14,8 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
-from tqdm import tqdm
+from ...common.progress import fixed_tqdm, iteration_edge_progress
+from .workflow import run_shape_preflight
 
 try:
     import yaml
@@ -122,6 +123,7 @@ class EpochLossMetrics:
     intensity_loss: float
     samples: int
     steps: int = 0
+    absolute_ranker_summary: Dict[str, float] = field(default_factory=dict)
 
 
 def make_loss_metrics(
@@ -269,19 +271,16 @@ def _fragmenter_params_from_file(path: str | Path) -> Dict[str, Any]:
 def build_model_config_from_pretrained(
     *,
     mol_encoder_checkpoint: str | Path,
-    cleavage_edge_fnet_checkpoint: str | Path,
     fragmenter_params: Dict[str, Any],
     condition_encoder_params: Dict[str, Any],
+    fragment_edge_encoder_params: Dict[str, Any],
     tree_encoder_params: Dict[str, Any],
     dropout: float,
     generator_params: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Build spectrum-training config from the two pretrained checkpoints."""
+    """Build spectrum-training config from a pretrained MolEncoder only."""
     mol_checkpoint = _checkpoint_dict(
         mol_encoder_checkpoint, label="MolEncoder"
-    )
-    cleavage_checkpoint = _checkpoint_dict(
-        cleavage_edge_fnet_checkpoint, label="CleavageEdgeFNet"
     )
     mol_params = dict(mol_checkpoint.get("mol_encoder_params") or {})
     if not mol_params:
@@ -289,89 +288,19 @@ def build_model_config_from_pretrained(
             "MolEncoder checkpoint is missing mol_encoder_params: "
             f"{mol_encoder_checkpoint}"
         )
-    cleavage_params_full = dict(
-        cleavage_checkpoint.get("cleavage_edge_fnet_params") or {}
-    )
-    if not cleavage_params_full:
-        raise KeyError(
-            "CleavageEdgeFNet checkpoint is missing cleavage_edge_fnet_params: "
-            f"{cleavage_edge_fnet_checkpoint}"
-        )
-    pattern_set = cleavage_params_full.get("cleavage_pattern_set_params")
-    if not isinstance(pattern_set, dict):
-        raise KeyError(
-            "CleavageEdgeFNet checkpoint is missing "
-            f"cleavage_pattern_set_params: {cleavage_edge_fnet_checkpoint}"
-        )
-    cleavage_mol_params = dict(cleavage_checkpoint.get("mol_encoder_params") or {})
-    if not cleavage_mol_params:
-        raise KeyError(
-            "CleavageEdgeFNet checkpoint is missing mol_encoder_params: "
-            f"{cleavage_edge_fnet_checkpoint}"
-        )
-    if mol_params != cleavage_mol_params:
-        raise ValueError(
-            "The MolEncoder checkpoint does not match the MolEncoder configuration "
-            "used to pretrain the CleavageEdgeFNet. Select the same MolEncoder "
-            "checkpoint/configuration."
-        )
-
-    dimension_pairs = (
-        ("graph_dim", "mol_dim"),
-        ("node_dim", "atom_dim"),
-    )
-    incompatible_dimensions = {
-        f"mol_encoder_params.{mol_key} / cleavage_edge_fnet_params.{edge_key}": (
-            mol_params.get(mol_key),
-            cleavage_params_full.get(edge_key),
-        )
-        for mol_key, edge_key in dimension_pairs
-        if mol_params.get(mol_key) != cleavage_params_full.get(edge_key)
-    }
-    if incompatible_dimensions:
-        raise ValueError(
-            "The MolEncoder and CleavageEdgeFNet checkpoints were trained with "
-            "incompatible encoder dimensions: "
-            f"{incompatible_dimensions}. Select the MolEncoder checkpoint used "
-            "to pretrain the cleavage model."
-        )
-
     fragmenter_params = dict(fragmenter_params)
-    tree_builder_params = dict(fragmenter_params["fragment_ion_tree_builder"])
-    data_pattern_set = tree_builder_params.get("cleavage_pattern_set")
-    if data_pattern_set != pattern_set:
-        raise ValueError(
-            "The fragmenter saved with the training data has a cleavage pattern "
-            "set that is incompatible with the CleavageEdgeFNet checkpoint."
-        )
-
-    cleavage_params = {
-        key: cleavage_params_full[key]
-        for key in ("feature_dim", "fc_dims")
-        if key in cleavage_params_full
-    }
-    missing_cleavage_params = {
-        "feature_dim", "fc_dims"
-    } - set(cleavage_params)
-    if missing_cleavage_params:
-        raise KeyError(
-            "CleavageEdgeFNet checkpoint is missing construction parameters: "
-            f"{sorted(missing_cleavage_params)}"
-        )
 
     config: Dict[str, Any] = {
         "probability_model_params": {
             "mol_encoder_params": mol_params,
             "condition_encoder_params": dict(condition_encoder_params),
-            "cleavage_edge_fnet_params": cleavage_params,
+            "fragment_edge_encoder_params": dict(fragment_edge_encoder_params),
             "tree_encoder_params": dict(tree_encoder_params),
             "fragmenter_params": fragmenter_params,
             "dropout": float(dropout),
         },
         "mol_encoder_checkpoint": str(mol_encoder_checkpoint),
-        "cleavage_edge_fnet_checkpoint": str(cleavage_edge_fnet_checkpoint),
         "freeze_mol_encoder": True,
-        "freeze_cleavage_edge_fnet": True,
     }
     config.update(dict(generator_params or {}))
     return config
@@ -493,6 +422,9 @@ def normalize_train_config(
     config["batch_size"] = int(config.get("batch_size", 1))
     config["device"] = str(config.get("device", "cpu"))
     config["epoch"] = int(config.get("epoch", config.get("epochs", 10)))
+    config["max_samples"] = int(config.get("max_samples", 100))
+    if config["max_samples"] < 1:
+        raise ValueError("max_samples must be positive.")
 
     validation_interval_steps = config.get("validation_interval_steps", 100)
     config["validation_interval_steps"] = (
@@ -585,7 +517,10 @@ def build_train_config(
     validation_structure_dir: Optional[str | Path] = None,
     shuffle: bool = True,
     validate_at_start: bool = False,
+    max_samples: int = 100,
 ) -> Dict[str, Any]:
+    if max_samples < 1:
+        raise ValueError("max_samples must be positive.")
     optimizer_info: Dict[str, Any] = {
         "name": optimizer_name,
         "lr": float(lr),
@@ -615,6 +550,7 @@ def build_train_config(
             ),
             "shuffle": bool(shuffle),
             "validate_at_start": bool(validate_at_start),
+            "max_samples": int(max_samples),
         },
     )
 
@@ -659,6 +595,7 @@ def prepare_train_from_config(
         "validation_interval_steps": validation_interval_steps,
         "train_log_interval_steps": train_config.get("train_log_interval_steps"),
         "validate_at_start": bool(train_config.get("validate_at_start", False)),
+        "max_samples": int(train_config.get("max_samples", 100)),
         "pattern": "*.pt",
     }
 
@@ -780,6 +717,7 @@ def setup_dataset(
         "val_size": len(val_dataset),
         "validation_interval_steps": dataset_info.get("validation_interval_steps"),
         "train_log_interval_steps": dataset_info.get("train_log_interval_steps"),
+        "max_samples": int(dataset_info.get("max_samples", 100)),
     }
     return train_dataset, val_dataset, train_loader, val_loader, extra_data
 
@@ -880,32 +818,44 @@ def run_epoch(
     window_selection_samples = 0
     window_intensity_samples = 0
     step_count = 0
-    iterator = tqdm(loader, desc=desc)
+    absolute_ranker_values: Dict[str, List[float]] = {}
+    iterator = fixed_tqdm(loader, desc=desc, position=1, leave=False)
 
     for batch in iterator:
         try:
             structure = batch["structure"].to(device)
-            structure = sample_training_edges(
-                structure,
-                max_edges_per_sample=max_training_edges,
-            )
+            # Do not sample or drop edges. Memory is bounded inside the edge
+            # encoder by max_edges_per_step, so training and validation see the
+            # same complete candidate population.
             num_samples = int(structure.num_samples)
             sample_weight = max(num_samples, 1)
 
-            with torch.set_grad_enabled(is_train):
-                output = model(structure)
-                loss = output["loss"]
+            global_edges = int(structure.edge_index.size(1))
+            sample_edges = int(
+                (structure.sample_edge_index[1] >= 0).sum().item()
+                if structure.sample_edge_index.numel()
+                else 0
+            )
+            with iteration_edge_progress(
+                global_edges + sample_edges,
+                desc=f"edges iter {step_count + 1}",
+            ):
+                with torch.set_grad_enabled(is_train):
+                    output = model(structure)
+                    loss = output["loss"]
 
-                if is_train:
-                    optimizer.zero_grad(set_to_none=True)
-                    loss.backward()
-                    if grad_clip_norm is not None and grad_clip_norm > 0:
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
-                    optimizer.step()
+                    if is_train:
+                        optimizer.zero_grad(set_to_none=True)
+                        loss.backward()
+                        if grad_clip_norm is not None and grad_clip_norm > 0:
+                            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+                        optimizer.step()
 
             step_count += 1
             selection_loss = output.get("selection_loss")
             intensity_loss = output.get("intensity_loss")
+            for name, value in output.get("absolute_ranker_metrics", {}).items():
+                absolute_ranker_values.setdefault(name, []).append(float(value))
             loss_value = float(loss.detach().cpu().item())
             selection_loss_value = (
                 float(selection_loss.detach().cpu().item())
@@ -1001,7 +951,7 @@ def run_epoch(
             # traceback.print_exc()
             continue
 
-    return make_loss_metrics(
+    metrics = make_loss_metrics(
         total_loss=total_loss,
         total_selection_loss=total_selection_loss,
         total_intensity_loss=total_intensity_loss,
@@ -1010,6 +960,13 @@ def run_epoch(
         total_intensity_samples=total_intensity_samples,
         steps=step_count,
     )
+    summary: Dict[str, float] = {}
+    for name, values in absolute_ranker_values.items():
+        array = np.asarray(values, dtype=np.float64)
+        summary[f"{name}_mean"] = float(array.mean())
+        for label, quantile in PEAK_SELECTION_QUANTILES:
+            summary[f"{name}_{label}"] = float(np.quantile(array, quantile))
+    return replace(metrics, absolute_ranker_summary=summary)
 
 
 def _match_peaks_one_to_one(
@@ -1256,10 +1213,11 @@ def evaluate_validation_cosine(
     if writer is not None and global_step is not None:
         cosine_summary = np.quantile(scores, [0.0, 0.25, 0.5, 0.75, 1.0])
         writer.add_scalars(
-            "similarity/cosine_distribution",
+            "similarity/validation/cosine_distribution",
             {
                 "min": float(cosine_summary[0]),
                 "q1": float(cosine_summary[1]),
+                "mean": float(np.mean(scores)),
                 "median": float(cosine_summary[2]),
                 "q3": float(cosine_summary[3]),
                 "max": float(cosine_summary[4]),
@@ -1267,21 +1225,17 @@ def evaluate_validation_cosine(
             int(global_step),
         )
         for metric_name, summary in selection_summaries.items():
-            finite_quantiles = {
+            finite_statistics = {
                 name: summary[name]
                 for name, _ in PEAK_SELECTION_QUANTILES
                 if math.isfinite(summary[name])
             }
-            if finite_quantiles:
-                writer.add_scalars(
-                    f"peak_selection/{metric_name}_distribution",
-                    finite_quantiles,
-                    int(global_step),
-                )
             if math.isfinite(summary["mean"]):
-                writer.add_scalar(
-                    f"peak_selection/{metric_name}_mean",
-                    summary["mean"],
+                finite_statistics["mean"] = summary["mean"]
+            if finite_statistics:
+                writer.add_scalars(
+                    f"peak_selection/validation/{metric_name}",
+                    finite_statistics,
                     int(global_step),
                 )
         log_validation_spectrum_quantiles(
@@ -1292,7 +1246,9 @@ def evaluate_validation_cosine(
             global_step=int(global_step),
         )
         writer.flush()
-    with tqdm(total=1, desc="ValCosine", leave=True) as iterator:
+    with fixed_tqdm(
+        total=1, desc="ValCosine", position=1, leave=False
+    ) as iterator:
         iterator.set_postfix(val_cosine=val_cosine)
         iterator.update(1)
     return val_cosine
@@ -1419,9 +1375,11 @@ def predict_validation_msdataset(
     ).to(device)
     predictor.eval()
 
-    for smiles, record_indexes in tqdm(
+    for smiles, record_indexes in fixed_tqdm(
         groups.items(),
         desc="Building validation structures from MSDataset",
+        position=1,
+        leave=False,
         mininterval=1.0,
     ):
         record_indexes = [int(index) for index in record_indexes]
@@ -1601,6 +1559,10 @@ def main(
 
     max_epoch = state.initial_epoch + int(epoch) - 1
     writer = ckpt_manager.summary_writer
+    for name, value in dict(extra_data.get("preflight") or {}).items():
+        if isinstance(value, (int, float)):
+            writer.add_scalar(f"preflight/{name}", float(value), 0)
+    writer.flush()
     # Create a useful dashboard immediately. Without this, a new run contains
     # only the event-file header until its first scheduled validation.
     writer.add_scalar("optimizer/lr", float(optimizer.param_groups[0]["lr"]), global_step)
@@ -1635,6 +1597,27 @@ def main(
         if finite_values:
             writer.add_scalars(main_tag, finite_values, step)
 
+    def log_distribution_cards(
+        namespace: str,
+        summaries: Dict[str, Dict[str, float]],
+        step: int,
+    ) -> None:
+        """One card per metric, containing every split and statistic."""
+        statistics = ("min", "q1", "mean", "median", "q3", "max")
+        grouped: Dict[str, Dict[str, float]] = {}
+        for split, summary in summaries.items():
+            for name, value in summary.items():
+                for statistic in statistics:
+                    suffix = f"_{statistic}"
+                    if name.endswith(suffix):
+                        metric = name[: -len(suffix)]
+                        grouped.setdefault(metric, {})[
+                            f"{split}_{statistic}"
+                        ] = value
+                        break
+        for metric, values in grouped.items():
+            add_scalars_if_finite(f"{namespace}/{metric}", values, step)
+
     def evaluate_current_validation(
         desc: str,
         *,
@@ -1661,7 +1644,7 @@ def main(
                     output_dir=run_dir / "validation",
                     selection_metric_means=selection_metric_means,
                 )
-                if validation_dataset is not None
+                if validation_dataset is not None and not model.absolute_ranker_only
                 else float("nan")
             )
         return metrics, cosine, selection_metric_means
@@ -1703,33 +1686,31 @@ def main(
         ckpt_manager.flush_metrics(flush_dir=str(run_dir))
         add_scalars_if_finite(
             "loss/total",
-            {
-                "train": train_metrics.loss,
-                "train_window": window_metrics.loss,
-                "val": val_metrics.loss,
-            },
-            step_value,
+            {"train": train_metrics.loss, "train_window": window_metrics.loss,
+             "validation": val_metrics.loss}, step_value,
         )
         add_scalars_if_finite(
             "loss/selection",
-            {
-                "train": train_metrics.selection_loss,
-                "train_window": window_metrics.selection_loss,
-                "val": val_metrics.selection_loss,
-            },
-            step_value,
+            {"train": train_metrics.selection_loss,
+             "train_window": window_metrics.selection_loss,
+             "validation": val_metrics.selection_loss}, step_value,
         )
         add_scalars_if_finite(
             "loss/intensity",
+            {"train": train_metrics.intensity_loss,
+             "train_window": window_metrics.intensity_loss,
+             "validation": val_metrics.intensity_loss}, step_value,
+        )
+        add_scalar_if_finite("similarity/validation/cosine", val_cosine, step_value)
+        log_distribution_cards(
+            "absolute_ranker",
             {
-                "train": train_metrics.intensity_loss,
-                "train_window": window_metrics.intensity_loss,
-                "val": val_metrics.intensity_loss,
+                "train": train_metrics.absolute_ranker_summary,
+                "validation": val_metrics.absolute_ranker_summary,
             },
             step_value,
         )
-        add_scalars_if_finite("similarity/cosine", {"val": val_cosine}, step_value)
-        add_scalar_if_finite("similarity/val_cosine", val_cosine, step_value)
+        writer.add_scalar("training/phase", int(model.training_phase.item()), step_value)
         writer.add_scalar("optimizer/lr", lr, step_value)
         writer.flush()
         print(
@@ -1751,7 +1732,15 @@ def main(
     last_epoch_index = state.initial_epoch - 1
     last_train_metrics = nan_loss_metrics()
 
-    for epoch_index in range(state.initial_epoch, max_epoch + 1):
+    epoch_iterator = fixed_tqdm(
+        range(state.initial_epoch, max_epoch + 1),
+        total=max_epoch - state.initial_epoch + 1,
+        desc="epochs",
+        position=0,
+        leave=True,
+    )
+    for epoch_index in epoch_iterator:
+        epoch_iterator.set_description_str(f"epoch {epoch_index}/{max_epoch}")
         validation_epoch = epoch_index - 1
         should_validate_at_epoch_start = (
             epoch_index > state.initial_epoch or validate_at_start
@@ -1771,6 +1760,25 @@ def main(
                 val_cosine=val_cosine,
                 val_peak_metrics=val_peak_metrics,
             )
+            phase_summary = {
+                f"{metric}_{quantile}": min(
+                    float(last_train_metrics.absolute_ranker_summary.get(
+                        f"{metric}_{quantile}", float("-inf")
+                    )),
+                    float(val_metrics.absolute_ranker_summary.get(
+                        f"{metric}_{quantile}", float("-inf")
+                    )),
+                )
+                for metric in (
+                    "target_edge_recall", "target_group_recall", "target_node_recall"
+                )
+                for quantile in ("min", "q1", "median")
+            }
+            if model.update_training_phase(phase_summary):
+                print(
+                    "AbsoluteRanker train/validation thresholds were met; enabling "
+                    "conditioned edge and spectrum training."
+                )
 
         if validation_epoch >= state.initial_epoch and should_validate_at_epoch_start:
             val_loss = val_metrics.loss
@@ -1821,6 +1829,26 @@ def main(
                 val_cosine=step_val_cosine,
                 val_peak_metrics=step_peak_metrics,
             )
+            phase_summary = {
+                key: min(
+                    float(train_epoch_metrics.absolute_ranker_summary.get(key, float("-inf"))),
+                    float(step_val_metrics.absolute_ranker_summary.get(key, float("-inf"))),
+                )
+                for key in (
+                    f"{metric}_{quantile}"
+                    for metric in (
+                        "target_edge_recall",
+                        "target_group_recall",
+                        "target_node_recall",
+                    )
+                    for quantile in ("min", "q1", "median")
+                )
+            }
+            if model.update_training_phase(phase_summary):
+                print(
+                    "AbsoluteRanker validation thresholds were met; enabling "
+                    "conditioned edge and spectrum training."
+                )
 
         def on_train_log_step(
             step_value: int,
@@ -1920,6 +1948,24 @@ def main(
             val_cosine=val_cosine,
             val_peak_metrics=val_peak_metrics,
         )
+        phase_summary = {
+                key: min(
+                    float(last_train_metrics.absolute_ranker_summary.get(key, float("-inf"))),
+                    float(val_metrics.absolute_ranker_summary.get(key, float("-inf"))),
+                )
+                for key in (
+                    f"{metric}_{quantile}"
+                    for metric in (
+                        "target_edge_recall", "target_group_recall", "target_node_recall"
+                    )
+                    for quantile in ("min", "q1", "median")
+                )
+        }
+        if model.update_training_phase(phase_summary):
+            print(
+                "AbsoluteRanker train/validation thresholds were met; enabling "
+                "conditioned edge and spectrum training."
+            )
         val_loss = val_metrics.loss
         step_scheduler(scheduler, val_loss)
         improved = val_loss < best_val_loss - min_delta
@@ -2080,6 +2126,14 @@ def run_training_from_config(
     # Persist the effective configuration used by this run.
     save_config(model_config, run_dir / model_config_resolved.name)
 
+    edge_params = model_config["probability_model_params"]["fragment_edge_encoder_params"]
+    extra_data["preflight"] = run_shape_preflight(
+        max_samples=int(dataset_info["max_samples"]),
+        max_edges_per_step=int(edge_params.get("max_edges_per_step", 128)),
+        feature_dim=int(edge_params.get("feature_dim", 256)),
+        device=device,
+        output_file=run_dir / "preflight.json",
+    )
     main(
         model_config=model_config,
         experiment_dir=experiment_dir,
@@ -2184,6 +2238,14 @@ def run_training(
         ),
     )
 
+    edge_params = model_config["probability_model_params"]["fragment_edge_encoder_params"]
+    extra_data["preflight"] = run_shape_preflight(
+        max_samples=int(dataset_info["max_samples"]),
+        max_edges_per_step=int(edge_params.get("max_edges_per_step", 128)),
+        feature_dim=int(edge_params.get("feature_dim", 256)),
+        device=device,
+        output_file=run_dir / "preflight.json",
+    )
     main(
         model_config=model_config,
         experiment_dir=experiment_dir,
@@ -2217,12 +2279,15 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train FragmentTreeTrainingModel.")
     parser.add_argument("--train-dir", required=True)
     parser.add_argument("--val-dir", required=True)
-    parser.add_argument("--output-dir", required=True)
+    parser.add_argument(
+        "--output-dir",
+        required=True,
+        help="Output directory for one fragment-tree training project.",
+    )
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--mol-encoder-checkpoint", required=True)
-    parser.add_argument("--cleavage-edge-fnet-checkpoint", required=True)
     parser.add_argument("--condition-adduct-embedding-dim", type=int, default=16)
-    parser.add_argument("--condition-ce-feature-dim", type=int, default=16)
+    parser.add_argument("--condition-ce-feature-dim", type=int, choices=(16,), default=16)
     parser.add_argument("--condition-ce-fc-dims", type=_csv_int_tuple, default=(32,))
     parser.add_argument("--condition-feature-dim", type=int, default=64)
     parser.add_argument("--condition-fc-dims", type=_csv_int_tuple, default=(128, 64))
@@ -2231,6 +2296,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tree-num-heads", type=int, default=8)
     parser.add_argument("--tree-max-degree", type=int, default=16)
     parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--edge-feature-dim", type=int, default=256)
+    parser.add_argument("--edge-category-dim", type=int, default=32)
+    parser.add_argument("--edge-attention-heads", type=int, default=8)
+    parser.add_argument("--attention-max-graph-distance", type=int, default=4)
+    parser.add_argument("--max-edges-per-tree", type=int, default=128)
+    parser.add_argument(
+        "--max-edges-per-depth", type=_csv_int_tuple, default=(128, 64, 32, 16)
+    )
+    parser.add_argument(
+        "--max-frontier-nodes-per-depth", type=_csv_int_tuple, default=(16, 8, 4, 2)
+    )
+    parser.add_argument("--max-samples", type=int, default=100)
     parser.add_argument("--max-edges-per-step", type=int, default=128)
     parser.add_argument("--max-retained-edges", type=int, default=30)
     parser.add_argument("--max-next-cleavage-candidates", type=int, default=3)
@@ -2280,7 +2357,6 @@ if __name__ == "__main__":
     )
     model_config_inline = build_model_config_from_pretrained(
         mol_encoder_checkpoint=args.mol_encoder_checkpoint,
-        cleavage_edge_fnet_checkpoint=args.cleavage_edge_fnet_checkpoint,
         fragmenter_params=dict(preprocessing["fragmenter_params"]),
         condition_encoder_params={
             "adduct_embedding_dim": args.condition_adduct_embedding_dim,
@@ -2288,6 +2364,16 @@ if __name__ == "__main__":
             "ce_fc_dims": args.condition_ce_fc_dims,
             "feature_dim": args.condition_feature_dim,
             "fc_dims": args.condition_fc_dims,
+        },
+        fragment_edge_encoder_params={
+            "feature_dim": args.edge_feature_dim,
+            "category_dim": args.edge_category_dim,
+            "num_heads": args.edge_attention_heads,
+            "attention_max_graph_distance": args.attention_max_graph_distance,
+            "max_edges_per_step": args.max_edges_per_step,
+            "max_edges_per_tree": args.max_edges_per_tree,
+            "max_edges_per_depth": args.max_edges_per_depth,
+            "max_frontier_nodes_per_depth": args.max_frontier_nodes_per_depth,
         },
         tree_encoder_params={
             "hidden_dim": args.tree_hidden_dim,
@@ -2327,6 +2413,7 @@ if __name__ == "__main__":
         validation_structure_dir=val_data_dir,
         shuffle=args.shuffle,
         validate_at_start=args.validate_at_start,
+        max_samples=args.max_samples,
     )
     train_config_inline["validation_valid_records_file"] = str(
         val_split_dir / "valid_records.msds"

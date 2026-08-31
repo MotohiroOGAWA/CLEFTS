@@ -48,6 +48,7 @@ class FragmentTreeCandidateSelectionOutput:
     sample_tree_batch: object
     keep_logit: Tensor
     cleave_logit: Tensor
+    edge_absolute_logit: Tensor
     edge_cleave_logit: Tensor
     ion_logit: Tensor
     unsaturation_logit: Tensor
@@ -57,6 +58,8 @@ class FragmentTreeCandidateSelectionOutput:
     radical_valid_mask_by_role_adduct: Tensor
     kept_candidates: List[FragmentIonCandidate]
     next_cleavage_candidates: List[NextCleavageCandidate]
+    absolute_score_logit: Optional[Tensor] = None
+    selected_edge_index: Optional[Tensor] = None
 
 
 
@@ -88,7 +91,7 @@ class FragmentTreeCandidateSelector(nn.Module):
         self.feature_model = feature_model
         self.mol_encoder = feature_model.mol_encoder
         self.fragmenter = feature_model.fragmenter
-        self.cleavage_edge_fnet = feature_model.cleavage_edge_fnet
+        self.fragment_edge_encoder = feature_model.fragment_edge_encoder
         self.max_fragment_ion_candidates = int(max_fragment_ion_candidates)
         self.max_next_cleavage_candidates = int(max_next_cleavage_candidates)
         self.max_edges_per_step = max_edges_per_step
@@ -99,8 +102,14 @@ class FragmentTreeCandidateSelector(nn.Module):
         self.node_keep_head = nn.Sequential(nn.Linear(tree_dim, hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, 1))
         self.node_cleave_head = nn.Sequential(nn.Linear(tree_dim, hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, 1))
         self.edge_cleave_head = nn.Sequential(
-            nn.Linear(tree_dim * 2 + feature_model.cleavage_edge_fnet.feature_dim, hidden_dim),
+            nn.Linear(tree_dim * 2 + feature_model.fragment_edge_encoder.feature_dim, hidden_dim),
             nn.ReLU(),
+            nn.Linear(hidden_dim, 1),
+        )
+        self.edge_absolute_head = nn.Sequential(
+            nn.LayerNorm(feature_model.fragment_edge_encoder.feature_dim),
+            nn.Linear(feature_model.fragment_edge_encoder.feature_dim, hidden_dim),
+            nn.GELU(),
             nn.Linear(hidden_dim, 1),
         )
         self.ion_head = nn.Sequential(nn.Linear(tree_dim, hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, len(feature_model.ion_flat_candidates)))
@@ -113,6 +122,7 @@ class FragmentTreeCandidateSelector(nn.Module):
         sample_tree_batch = feature_output.sample_tree_batch
         keep_logit = self.node_keep_head(sample_tree_batch.x).squeeze(-1)
         cleave_logit = self.node_cleave_head(sample_tree_batch.x).squeeze(-1)
+        edge_absolute_logit = self.edge_absolute_head(sample_tree_batch.edge_attr).squeeze(-1)
         edge_cleave_logit = self._edge_cleave_logit(sample_tree_batch)
         ion_logit = self.ion_head(sample_tree_batch.x)
         unsaturation_logit = self.unsaturation_head(sample_tree_batch.x)
@@ -122,6 +132,7 @@ class FragmentTreeCandidateSelector(nn.Module):
             sample_tree_batch=sample_tree_batch,
             keep_logit=keep_logit,
             cleave_logit=cleave_logit,
+            edge_absolute_logit=edge_absolute_logit,
             edge_cleave_logit=edge_cleave_logit,
             ion_logit=ion_logit,
             unsaturation_logit=unsaturation_logit,
@@ -131,6 +142,8 @@ class FragmentTreeCandidateSelector(nn.Module):
             radical_valid_mask_by_role_adduct=self.feature_model.radical_candidate_valid_mask_by_role_adduct,
             kept_candidates=self._select_fragment_ion_candidates(features=features, sample_tree_batch=sample_tree_batch, keep_logit=keep_logit, edge_cleave_logit=edge_cleave_logit, ion_logit=ion_logit, unsaturation_logit=unsaturation_logit, radical_logit=radical_logit),
             next_cleavage_candidates=self._select_next_cleavage_candidates(sample_tree_batch=sample_tree_batch, cleave_logit=cleave_logit),
+            absolute_score_logit=feature_output.absolute_score_logit,
+            selected_edge_index=feature_output.selected_edge_index,
         )
 
     def _edge_cleave_logit(self, sample_tree_batch) -> Tensor:
@@ -235,7 +248,12 @@ class FragmentTreeCandidateSelector(nn.Module):
         *,
         max_per_sample: Optional[int],
     ) -> dict[int, List[int]]:
-        """Score an edge by its child keep score and edge cleavage score."""
+        """Beam-rank edges by cumulative path score.
+
+        The additive path score is the autoregressive log-score analogue used
+        for fragmentation-graph decoding: a deep edge survives only when its
+        complete sequence of preceding cleavages remains plausible.
+        """
         structure = output.features.structure
         batch = output.sample_tree_batch
         node_score: dict[Tuple[int, int], float] = {}
@@ -256,15 +274,26 @@ class FragmentTreeCandidateSelector(nn.Module):
                 graph_index = int(batch.batch[batch.edge_index[0, local_edge]].detach().cpu().item())
                 sample_id = int(kept_sample_ids[graph_index].item())
                 edge_score[(sample_id, int(global_edge))] = float(
-                    output.edge_cleave_logit[local_edge].detach().cpu().item()
+                    (output.edge_absolute_logit[local_edge]
+                     + output.edge_cleave_logit[local_edge]).detach().cpu().item()
                 )
 
         ranked: dict[int, List[Tuple[float, int]]] = {}
+        path_score: dict[Tuple[int, int], float] = {}
+        edge_src = structure.edge_index[0].detach().cpu().long()
         edge_dst = structure.edge_index[1].detach().cpu().long()
         for sample_id, edge_id in pairs:
             dst = int(edge_dst[edge_id].item())
-            score = node_score.get((sample_id, dst), float("-inf"))
-            score += edge_score.get((sample_id, edge_id), 0.0)
+            score = edge_score.get((sample_id, edge_id), float("-inf"))
+            score += node_score.get((sample_id, dst), 0.0)
+            parent_node = int(edge_src[edge_id].item())
+            parent_scores = [
+                value for (sid, previous_edge), value in path_score.items()
+                if sid == sample_id and int(edge_dst[previous_edge].item()) == parent_node
+            ]
+            if parent_scores:
+                score += max(parent_scores)
+            path_score[(sample_id, edge_id)] = score
             ranked.setdefault(sample_id, []).append((score, edge_id))
         result: dict[int, List[int]] = {}
         for sample_id, rows in ranked.items():
@@ -482,4 +511,3 @@ class FragmentTreeCandidateSelector(nn.Module):
         if main_adduct_index < 0 or main_adduct_index >= mask.size(1):
             raise IndexError(f"main_adduct_index={main_adduct_index} is out of range for mask shape {tuple(mask.shape)}.")
         return mask[int(role_index), int(main_adduct_index)].nonzero(as_tuple=False).view(-1)
-

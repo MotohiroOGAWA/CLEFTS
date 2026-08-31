@@ -7,7 +7,7 @@ two kinds of edges:
 
 - Molecular fragment nodes are encoded by the pretrained `MolEncoder`.
 - Molecular-node-to-molecular-node edges represent cleavages and are encoded
-  by the pretrained `CleavageEdgeFeatureNet` (cleavage fnet).
+  by the jointly trained fragment-edge encoder after progressive preselection.
 - Every selected molecular node is connected to its corresponding formula
   node. Several molecular nodes may connect to the same formula node.
 - The model predicts a non-negative score on every

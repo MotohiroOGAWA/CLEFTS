@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
@@ -18,7 +18,7 @@ from ..common.layers.graphormer import GraphormerEncoder
 from ..input.fragment_tree_features import FragmentTreeFeatures
 from ..input.fragment_tree_structure import FragmentTreeStructure
 from ..mol import FormulaTensorizer, MolEncoder
-from .components.cleavage.cleavage_edge_feature_net import CleavageEdgeFeatureNet
+from .components.fragment_edge import ConditionedFragmentEdgeEncoder
 from .components.condition.condition_encoder import MS2ConditionEncoder
 
 
@@ -26,6 +26,8 @@ from .components.condition.condition_encoder import MS2ConditionEncoder
 class FragmentTreeFeatureOutput:
     ft_features: FragmentTreeFeatures
     sample_tree_batch: Batch
+    absolute_score_logit: Optional[Tensor] = None
+    selected_edge_index: Optional[Tensor] = None
 
 
 class FragmentTreeSampleData(Data):
@@ -62,9 +64,9 @@ class FragmentTreeFeatureModel(nn.Module):
         self,
         mol_encoder_params: Dict,
         condition_encoder_params: Dict,
-        cleavage_edge_fnet_params: Dict,
         tree_encoder_params: Dict,
         fragmenter_params: Dict,
+        fragment_edge_encoder_params: Optional[Dict] = None,
         dropout: float = 0.0,
     ) -> None:
         super(FragmentTreeFeatureModel, self).__init__()
@@ -73,7 +75,6 @@ class FragmentTreeFeatureModel(nn.Module):
         mol_encoder_params["dropout"] = dropout
         self._mol_encoder = MolEncoder(**mol_encoder_params)
         self._freeze_mol_encoder = False
-        self._freeze_cleavage_edge_fnet = False
         self._fragmenter = Fragmenter.from_dict(fragmenter_params)
 
         condition_encoder_params = condition_encoder_params.copy()
@@ -82,20 +83,23 @@ class FragmentTreeFeatureModel(nn.Module):
         )
         self._condition_encoder = MS2ConditionEncoder(**condition_encoder_params)
 
-        cleavage_edge_fnet_params = cleavage_edge_fnet_params.copy()
-        cleavage_edge_fnet_params["cleavage_pattern_set_params"] = (
+        fragment_edge_encoder_params = dict(fragment_edge_encoder_params or {})
+        fragment_edge_encoder_params["cleavage_pattern_set_params"] = (
             self._fragmenter.cleavage_pattern_set.to_dict()
         )
-        cleavage_edge_fnet_params["mol_dim"] = self.mol_encoder.graph_dim
-        cleavage_edge_fnet_params["atom_dim"] = self.mol_encoder.node_dim
-        cleavage_edge_fnet_params["dropout"] = dropout
-        self.cleavage_edge_fnet = CleavageEdgeFeatureNet(**cleavage_edge_fnet_params)
+        fragment_edge_encoder_params["mol_dim"] = self.mol_encoder.graph_dim
+        fragment_edge_encoder_params["atom_dim"] = self.mol_encoder.node_dim
+        fragment_edge_encoder_params["condition_dim"] = self._condition_encoder.feature_dim
+        fragment_edge_encoder_params["dropout"] = dropout
+        self.fragment_edge_encoder = ConditionedFragmentEdgeEncoder(
+            **fragment_edge_encoder_params
+        )
 
         tree_encoder_params = tree_encoder_params.copy()
         if "hidden_dim" not in tree_encoder_params and "dim" in tree_encoder_params:
             tree_encoder_params["hidden_dim"] = tree_encoder_params.pop("dim")
         tree_encoder_params["node_dim"] = self.mol_encoder.graph_dim + 3
-        tree_encoder_params["edge_dim"] = self.cleavage_edge_fnet.feature_dim
+        tree_encoder_params["edge_dim"] = self.fragment_edge_encoder.feature_dim
         tree_encoder_params["max_spatial_dist"] = self.fragmenter.tree_max_depth + 1
         tree_encoder_params["max_edge_dist"] = self.fragmenter.tree_max_depth + 1
         tree_encoder_params["dropout"] = dropout
@@ -264,49 +268,16 @@ class FragmentTreeFeatureModel(nn.Module):
         for param in self._mol_encoder.parameters():
             param.requires_grad = False
 
-    def set_cleavage_edge_fnet_state_dict(self, state_dict: Dict, *, strict: bool = True) -> None:
-        missing_keys, unexpected_keys = self.cleavage_edge_fnet.load_state_dict(
-            state_dict,
-            strict=strict,
-        )
-        if missing_keys or unexpected_keys:
-            raise RuntimeError(
-                "Failed to load CleavageEdgeFeatureNet state_dict cleanly: "
-                f"missing_keys={missing_keys}, unexpected_keys={unexpected_keys}"
-            )
-
-    def load_cleavage_edge_fnet_checkpoint(self, checkpoint: Dict | str | Path, *, strict: bool = True) -> None:
-        if isinstance(checkpoint, (str, Path)):
-            checkpoint = torch.load(checkpoint, map_location="cpu")
-        checkpoint_params = checkpoint.get("cleavage_edge_fnet_params")
-        if checkpoint_params is not None:
-            expected = self.cleavage_edge_fnet.config_dict()
-            for key in ("feature_dim", "mol_dim", "atom_dim", "fc_dims"):
-                expected_value = expected.get(key)
-                actual_value = checkpoint_params.get(key)
-                if key == "fc_dims" and actual_value is not None:
-                    actual_value = tuple(actual_value)
-                if expected_value != actual_value:
-                    raise ValueError(
-                        "CleavageEdgeFeatureNet params do not match current model: "
-                        f"{key}: expected {expected_value}, got {actual_value}"
-                    )
-        state_dict = checkpoint.get("cleavage_edge_fnet_state_dict", checkpoint)
-        self.set_cleavage_edge_fnet_state_dict(state_dict, strict=strict)
-
-    def freeze_cleavage_edge_fnet(self) -> None:
-        self._freeze_cleavage_edge_fnet = True
-        self.cleavage_edge_fnet.eval()
-        for param in self.cleavage_edge_fnet.parameters():
-            param.requires_grad = False
-
     def train(self, mode: bool = True):
         super().train(mode)
         if getattr(self, "_freeze_mol_encoder", False):
             self._mol_encoder.eval()
-        if getattr(self, "_freeze_cleavage_edge_fnet", False):
-            self.cleavage_edge_fnet.eval()
         return self
+
+    @property
+    def cleavage_definitions(self):
+        """Tuple-layout definitions consumed by structure builders."""
+        return self.fragment_edge_encoder
 
 
     @property
@@ -413,11 +384,13 @@ class FragmentTreeFeatureModel(nn.Module):
         self,
         data: Union[FragmentTreeStructure, FragmentTreeFeatures],
     ) -> FragmentTreeFeatureOutput:
-        ft_features = self._build_fragment_tree_features(data)
+        ft_features, edge_output = self._build_fragment_tree_features_with_output(data)
         sample_tree_batch = self._encode_sample_tree(ft_features)
         return FragmentTreeFeatureOutput(
             ft_features=ft_features,
             sample_tree_batch=sample_tree_batch,
+            absolute_score_logit=edge_output.absolute_score_logit,
+            selected_edge_index=edge_output.selected_edge_index,
         )
 
     def build_features(
@@ -761,8 +734,16 @@ class FragmentTreeFeatureModel(nn.Module):
     ) -> "FragmentTreeFeatures":
         """Build FragmentTreeFeatures from structure or return given features."""
 
+        features, _ = self._build_fragment_tree_features_with_output(data)
+        return features
+
+    def _build_fragment_tree_features_with_output(
+        self,
+        data: "FragmentTreeStructure | FragmentTreeFeatures",
+    ):
         if isinstance(data, FragmentTreeFeatures):
-            return data
+            output = self.fragment_edge_encoder(data)
+            return data, output
 
         if not isinstance(data, FragmentTreeStructure):
             raise TypeError(
@@ -777,20 +758,24 @@ class FragmentTreeFeatureModel(nn.Module):
             node_graphs=mol_graph,
         )
 
-        edge_attr = self.cleavage_edge_fnet(ft_features)
+        # Compute the same attention-aware representation for every edge.
+        # The encoder chunks work for memory safety but never prunes candidates.
+        edge_output = self.fragment_edge_encoder(ft_features)
+        edge_attr = edge_output.edge_attr
 
         if edge_attr.size(0) != data.edge_index.size(1):
             raise ValueError(
-                "CleavageEdgeFeatureNet output has invalid edge dimension: "
+                "Fragment-edge encoder output has invalid edge dimension: "
                 f"got {edge_attr.size(0)}, "
                 f"expected {data.edge_index.size(1)}."
             )
 
-        return FragmentTreeFeatures.from_structure(
+        features = FragmentTreeFeatures.from_structure(
             data,
             node_graphs=mol_graph,
             edge_attr=edge_attr,
         )
+        return features, edge_output
 
     def _encode_sample_tree(
         self,
@@ -1338,7 +1323,17 @@ class FragmentTreeFeatureModel(nn.Module):
             )
             # [2, E_s]
 
-            sample_edge_features = global_edge_features[global_edge_ids]
+            if hasattr(self, "fragment_edge_encoder"):
+                sample_edge_features = self.fragment_edge_encoder.condition_edges(
+                    ft_features,
+                    global_edge_features,
+                    global_edge_ids,
+                    sample_condition_tree_repr[sample_id],
+                )
+            else:
+                # Supports lightweight feature-model fixtures and legacy
+                # externally supplied FragmentTreeFeatures.
+                sample_edge_features = global_edge_features[global_edge_ids]
             # [E_s, edge_dim]
 
             # -------------------------

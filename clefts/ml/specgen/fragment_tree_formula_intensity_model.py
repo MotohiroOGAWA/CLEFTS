@@ -78,13 +78,14 @@ class FragmentTreeFormulaIntensityPredictor(nn.Module):
             self.formula_node_encoder = None
             self.formula_node_head = None
             self.formula_presence_head = None
+            self.candidate_edge_input = None
         else:
             self.formula_dim = int(feature_model.formula_tensorizer.dim)
             self.fragment_dim = int(feature_model.tree_encoder.hidden_dim)
             self.hidden_dim = int(hidden_dim or self.fragment_dim)
             self.formula_node_input = nn.Sequential(
                 nn.Linear(
-                    self.fragment_dim + self.hidden_dim * 3,
+                    self.fragment_dim + self.hidden_dim * 4,
                     self.hidden_dim,
                 ),
                 nn.ReLU(),
@@ -101,6 +102,13 @@ class FragmentTreeFormulaIntensityPredictor(nn.Module):
             self.radical_embedding = nn.Embedding(
                 len(feature_model.radical_flat_candidates),
                 self.hidden_dim,
+            )
+            edge_dim = int(feature_model.fragment_edge_encoder.feature_dim)
+            self.candidate_edge_input = nn.Sequential(
+                nn.LayerNorm(edge_dim + 2),
+                nn.Linear(edge_dim + 2, self.hidden_dim),
+                nn.GELU(),
+                nn.Linear(self.hidden_dim, self.hidden_dim),
             )
             encoder_layer = nn.TransformerEncoderLayer(
                 d_model=self.hidden_dim,
@@ -235,12 +243,12 @@ class FragmentTreeFormulaIntensityPredictor(nn.Module):
             # Subtracting a shared maximum preserves the requested ratio while
             # preventing exp overflow/underflow for extreme abundance logits.
             stable_abundance = abundance_logit[mask] - abundance_logit[mask].max()
-            raw_intensity = (
-                selection_probability[mask]
-                * torch.sigmoid(presence_logit[mask])
-                * torch.exp(stable_abundance)
+            log_raw = (
+                torch.log(selection_probability[mask].clamp_min(float(eps)))
+                + F.logsigmoid(presence_logit[mask])
+                + stable_abundance
             )
-            intensity[mask] = raw_intensity / (raw_intensity.sum() + float(eps))
+            intensity[mask] = torch.softmax(log_raw, dim=0)
         return intensity
 
     @staticmethod
@@ -257,6 +265,8 @@ class FragmentTreeFormulaIntensityPredictor(nn.Module):
     ) -> Tensor:
         device = candidate_output.keep_logit.device
         fragment_rows = []
+        batch = candidate_output.sample_tree_batch
+        edge_dst = batch.edge_index[1].to(device).long()
         for candidate in candidates:
             fragment_emb = candidate_output.sample_tree_batch.x[candidate.batch_node_index]
             state_emb = torch.cat(
@@ -275,9 +285,23 @@ class FragmentTreeFormulaIntensityPredictor(nn.Module):
                 ],
                 dim=0,
             )
-            fragment_rows.append(
-                self.formula_node_input(torch.cat([fragment_emb, state_emb], dim=0))
+            incoming = (edge_dst == int(candidate.batch_node_index)).nonzero(
+                as_tuple=False
+            ).flatten()
+            if incoming.numel():
+                edge_feature = batch.edge_attr[incoming].mean(dim=0)
+                absolute_score = candidate_output.edge_absolute_logit[incoming].mean().view(1)
+                competition_score = candidate_output.edge_cleave_logit[incoming].mean().view(1)
+            else:
+                edge_feature = batch.edge_attr.new_zeros((batch.edge_attr.size(-1),))
+                absolute_score = edge_feature.new_zeros((1,))
+                competition_score = edge_feature.new_zeros((1,))
+            edge_repr = self.candidate_edge_input(
+                torch.cat([edge_feature, absolute_score, competition_score], dim=0)
             )
+            fragment_rows.append(self.formula_node_input(
+                torch.cat([fragment_emb, state_emb, edge_repr], dim=0)
+            ))
         return torch.stack(fragment_rows, dim=0)
 
     def _encode_formula_nodes_by_sample(self, node_repr: Tensor, sample_index: Tensor) -> Tensor:

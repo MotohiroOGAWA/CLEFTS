@@ -24,12 +24,22 @@ class FragmentTreeTrainCommand(CLICommand):
         parser.add_argument(
             "project_dir",
             metavar="PROJECT_DIR",
-            help="Training project directory, e.g. data/training/project_single_bond_pos.",
+            help=(
+                "Training project directory, e.g. "
+                "data/training/fragment_tree_projects/main."
+            ),
         )
         parser.add_argument("--mol-encoder-checkpoint", required=True)
-        parser.add_argument("--cleavage-edge-fnet-checkpoint", required=True)
+        parser.add_argument("--edge-feature-dim", type=int, default=256)
+        parser.add_argument("--edge-category-dim", type=int, default=32)
+        parser.add_argument("--edge-attention-heads", type=int, default=8)
+        parser.add_argument("--attention-max-graph-distance", type=int, default=4)
+        parser.add_argument("--max-edges-per-tree", type=int, default=128)
+        parser.add_argument("--max-edges-per-depth", default="128,64,32,16")
+        parser.add_argument("--max-frontier-nodes-per-depth", default="16,8,4,2")
+        parser.add_argument("--max-samples", type=int, default=100)
         parser.add_argument("--condition-adduct-embedding-dim", type=int, default=16)
-        parser.add_argument("--condition-ce-feature-dim", type=int, default=16)
+        parser.add_argument("--condition-ce-feature-dim", type=int, choices=(16,), default=16)
         parser.add_argument("--condition-ce-fc-dims", default="32")
         parser.add_argument("--condition-feature-dim", type=int, default=64)
         parser.add_argument("--condition-fc-dims", default="128,64")
@@ -143,6 +153,7 @@ class FragmentTreeTrainCommand(CLICommand):
             ),
             training_structure_dir=args.training_structure_dir,
             validation_structure_dir=args.validation_structure_dir,
+            max_samples=args.max_samples,
         )
         preprocessing, preprocessing_config_path = load_and_validate_split_preprocessing(
             train_config["training_structure_dir"],
@@ -150,7 +161,6 @@ class FragmentTreeTrainCommand(CLICommand):
         )
         model_config = build_model_config_from_pretrained(
             mol_encoder_checkpoint=args.mol_encoder_checkpoint,
-            cleavage_edge_fnet_checkpoint=args.cleavage_edge_fnet_checkpoint,
             fragmenter_params=dict(preprocessing["fragmenter_params"]),
             condition_encoder_params={
                 "adduct_embedding_dim": args.condition_adduct_embedding_dim,
@@ -158,6 +168,18 @@ class FragmentTreeTrainCommand(CLICommand):
                 "ce_fc_dims": csv_ints(args.condition_ce_fc_dims),
                 "feature_dim": args.condition_feature_dim,
                 "fc_dims": csv_ints(args.condition_fc_dims),
+            },
+            fragment_edge_encoder_params={
+                "feature_dim": args.edge_feature_dim,
+                "category_dim": args.edge_category_dim,
+                "num_heads": args.edge_attention_heads,
+                "attention_max_graph_distance": args.attention_max_graph_distance,
+                "max_edges_per_step": args.max_edges_per_step,
+                "max_edges_per_tree": args.max_edges_per_tree,
+                "max_edges_per_depth": csv_ints(args.max_edges_per_depth),
+                "max_frontier_nodes_per_depth": csv_ints(
+                    args.max_frontier_nodes_per_depth
+                ),
             },
             tree_encoder_params={
                 "hidden_dim": args.tree_hidden_dim,
