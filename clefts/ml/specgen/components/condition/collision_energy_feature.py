@@ -12,9 +12,23 @@ class CollisionEnergyFeatureLayer(nn.Module):
     ):
         super().__init__()
         self._feature_dim = int(feature_dim)
-
+        if self._feature_dim != 16:
+            raise ValueError(
+                "CollisionEnergyFeatureLayer uses eight sin/cos pairs and "
+                "therefore requires feature_dim=16."
+            )
+        self.register_buffer(
+            "frequencies",
+            torch.exp(
+                -torch.log(torch.tensor(10000.0))
+                * torch.arange(8, dtype=torch.float32)
+                / 8.0
+            ),
+        )
+        self.register_buffer("ce_center", torch.tensor(0.0))
+        self.register_buffer("ce_scale", torch.tensor(1.0))
         self.proj = build_fc_layers(
-            input_dim=1,
+            input_dim=16,
             fc_dims=fc_dims,
             output_dim=self._feature_dim,
             dropout=0.0,
@@ -70,7 +84,10 @@ class CollisionEnergyFeatureLayer(nn.Module):
         elif ce.dim() != 2 or ce.size(-1) != 1:
             raise ValueError("ce must be [B] or [B,1]")
 
-        out = self.proj(ce)  # [B, feature_dim]
+        normalized = (ce - self.ce_center) / self.ce_scale.clamp_min(1e-6)
+        angles = normalized * self.frequencies.to(ce.dtype).view(1, -1)
+        encoded = torch.cat((torch.sin(angles), torch.cos(angles)), dim=-1)
+        out = self.proj(encoded)
         out = self.norm(out)
         return out
     

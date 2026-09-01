@@ -1,5 +1,43 @@
 # Spectrum inference
 
+## Fragment-tree and spectrum representation
+
+The fragment tree is a bipartite-augmented graph with two kinds of nodes and
+two kinds of edges:
+
+- Molecular fragment nodes are encoded by the pretrained `MolEncoder`.
+- Molecular-node-to-molecular-node edges represent cleavages. Their structural
+  embeddings are computed once per stored tree and shared across MS/MS samples.
+- Every selected molecular node is connected to its corresponding formula
+  node. Several molecular nodes may connect to the same formula node.
+- The model predicts a non-negative score on every
+  molecular-node-to-formula-node edge. The intensity of a formula node is the
+  sum of all scores on its incident molecular edges; its formula mass and
+  charge determine m/z.
+
+Prediction first selects the necessary molecular nodes from the fragment-tree
+structure and then predicts these molecular-to-formula relation scores. The
+formula connections are present while molecular nodes are selected; formula
+coverage is therefore part of the selection objective rather than an
+after-the-fact annotation step.
+
+Inference scores depth-1 edges and retains at most `max_edges_per_depth[0]` per
+sample. It then ranks fragment nodes by their
+continuation logits and selects at most `max_next_cleavage_candidates` nodes per
+sample (3 by default). Every outgoing edge already stored for each selected node
+is considered. The condition scorer retains at most the corresponding
+`max_edges_per_depth[d]` edges per sample. The same node-selection step is
+repeated at subsequent depths. `max_edges_per_step` only chunks computation.
+
+Training uses only the candidate DAG and path annotations already stored in the
+`.pt` structure. In particular, `target_expand_node_index` and
+`terminal_expand_ptr` supervise the node continuation head. The training loop
+does not call Fragmenter, RDKit, or any other chemical fragmentation routine.
+Selection and intensity losses are evaluated together on each pass. Validation
+additionally performs real staged spectrum generation,
+records measured-vs-generated cosine similarity in TensorBoard/TSV, and logs
+five representative mirror plots ordered from high to low similarity.
+
 `predict_spectrum.py` loads a checkpoint produced by
 `fragment_tree_training` and predicts an MS/MS spectrum. A direct prediction
 needs four values: the trained model, SMILES, collision energy (CE), and

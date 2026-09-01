@@ -85,28 +85,28 @@ class FragmentTreeSpectrumPredictor(nn.Module):
         *,
         expand_cleavages: bool = True,
         normalize_intensity: bool = True,
+        min_peak_intensity: float = 1e-3,
         max_peaks_per_sample: Optional[int] = None,
         max_edges_per_step: Optional[int] = 128,
         max_retained_edges: Optional[int] = 30,
         max_next_cleavage_candidates: int = 3,
         mol_encoder_checkpoint: Optional[str] = None,
         freeze_mol_encoder: bool = True,
-        cleavage_edge_fnet_checkpoint: Optional[str] = None,
-        freeze_cleavage_edge_fnet: bool = True,
     ) -> None:
         super().__init__()
         self.candidate_selector = candidate_selector
         self.formula_intensity_predictor = formula_intensity_predictor
         self.expand_cleavages = bool(expand_cleavages)
         self.normalize_intensity = bool(normalize_intensity)
+        if min_peak_intensity < 0:
+            raise ValueError("min_peak_intensity must be non-negative.")
+        self.min_peak_intensity = float(min_peak_intensity)
         self.max_peaks_per_sample = max_peaks_per_sample
         self.max_edges_per_step = max_edges_per_step
         self.max_retained_edges = max_retained_edges
         self.max_next_cleavage_candidates = int(max_next_cleavage_candidates)
         self.mol_encoder_checkpoint = mol_encoder_checkpoint
         self.freeze_mol_encoder = freeze_mol_encoder
-        self.cleavage_edge_fnet_checkpoint = cleavage_edge_fnet_checkpoint
-        self.freeze_cleavage_edge_fnet = freeze_cleavage_edge_fnet
 
     def forward(
         self,
@@ -116,7 +116,7 @@ class FragmentTreeSpectrumPredictor(nn.Module):
         include_fragment_ion_annotation: bool = False,
     ) -> FragmentSpectrumGeneratorOutput:
         additional_depth = (
-            max(0, int(self.candidate_selector.fragmenter.tree_max_depth) - 1)
+            min(3, max(0, int(self.candidate_selector.fragmenter.tree_max_depth) - 1))
             if self.expand_cleavages
             else 0
         )
@@ -170,6 +170,7 @@ class FragmentTreeSpectrumPredictor(nn.Module):
                 peaks = peaks[: self.max_peaks_per_sample]
             if self.normalize_intensity:
                 peaks = self._normalize_intensity(peaks)
+            peaks = [peak for peak in peaks if peak.intensity >= self.min_peak_intensity]
             spectra.append(GeneratedMassSpectrum(sample_id=sample_id, peaks=sorted(peaks, key=lambda peak: peak.mz)))
         return FragmentSpectrumGeneratorOutput(
             spectra=spectra,
@@ -247,10 +248,12 @@ class FragmentSpectrumGenerator(ModelBase):
         max_edges_per_step: Optional[int] = 128,
         max_retained_edges: Optional[int] = 30,
         max_next_cleavage_candidates: int = 3,
+        edge_condition_interaction_dim: int = 64,
+        ranking_loss_weight: float = 1.0,
+        ranking_pairs_per_edge: int = 4,
+        ranking_intensity_threshold: float = 0.05,
         mol_encoder_checkpoint: Optional[str] = None,
         freeze_mol_encoder: bool = True,
-        cleavage_edge_fnet_checkpoint: Optional[str] = None,
-        freeze_cleavage_edge_fnet: bool = True,
     ) -> None:
         super(FragmentSpectrumGenerator, self).__init__(
             ignore_config_keys=["formula_mz_resolver"],
@@ -275,23 +278,18 @@ class FragmentSpectrumGenerator(ModelBase):
         self.feature_model = FragmentTreeFeatureModel(**probability_model_params)
         if mol_encoder_checkpoint:
             self.feature_model.load_mol_encoder_checkpoint(mol_encoder_checkpoint)
-        if cleavage_edge_fnet_checkpoint:
-            self.feature_model.load_cleavage_edge_fnet_checkpoint(cleavage_edge_fnet_checkpoint)
-            if not mol_encoder_checkpoint:
-                try:
-                    self.feature_model.load_mol_encoder_checkpoint(cleavage_edge_fnet_checkpoint)
-                except KeyError:
-                    pass
         if freeze_mol_encoder:
             self.feature_model.freeze_mol_encoder()
-        if freeze_cleavage_edge_fnet:
-            self.feature_model.freeze_cleavage_edge_fnet()
         self.candidate_selector = FragmentTreeCandidateSelector(
             self.feature_model,
             max_fragment_ion_candidates=(max_fragment_ion_annotations_per_node or max_retained_edges or 30),
             max_next_cleavage_candidates=max_next_cleavage_candidates,
             max_edges_per_step=max_edges_per_step,
             max_retained_edges=max_retained_edges,
+            edge_condition_interaction_dim=edge_condition_interaction_dim,
+            ranking_loss_weight=ranking_loss_weight,
+            ranking_pairs_per_edge=ranking_pairs_per_edge,
+            ranking_intensity_threshold=ranking_intensity_threshold,
         )
         self.formula_intensity_predictor = FragmentTreeFormulaIntensityPredictor(
             self.feature_model,
@@ -300,6 +298,7 @@ class FragmentSpectrumGenerator(ModelBase):
             self.candidate_selector,
             self.formula_intensity_predictor,
             normalize_intensity=normalize_intensity,
+            min_peak_intensity=min_peak_intensity,
             max_peaks_per_sample=max_peaks_per_sample,
             max_edges_per_step=max_edges_per_step,
             max_retained_edges=max_retained_edges,
@@ -319,8 +318,6 @@ class FragmentSpectrumGenerator(ModelBase):
         self.max_next_cleavage_candidates = max_next_cleavage_candidates
         self.mol_encoder_checkpoint = mol_encoder_checkpoint
         self.freeze_mol_encoder = freeze_mol_encoder
-        self.cleavage_edge_fnet_checkpoint = cleavage_edge_fnet_checkpoint
-        self.freeze_cleavage_edge_fnet = freeze_cleavage_edge_fnet
 
     @property
     def probability_model(self) -> FragmentTreeFeatureModel:

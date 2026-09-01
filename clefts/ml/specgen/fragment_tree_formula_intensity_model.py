@@ -40,10 +40,12 @@ class FormulaIntensityTrainingOutput:
     # The historical field name is retained for checkpoint/API compatibility.
     logit: Tensor
     candidates: List[List[FragmentIonCandidate]]
+    presence_logit: Optional[Tensor] = None
+    abundance_logit: Optional[Tensor] = None
 
 
 class FragmentTreeFormulaIntensityPredictor(nn.Module):
-    """Predict final intensities for formula nodes built from selected candidates."""
+    """Predict candidate intensities, then merge candidates with equal formulas."""
 
     def __init__(
         self,
@@ -75,13 +77,15 @@ class FragmentTreeFormulaIntensityPredictor(nn.Module):
             self.radical_embedding = None
             self.formula_node_encoder = None
             self.formula_node_head = None
+            self.formula_presence_head = None
+            self.candidate_edge_input = None
         else:
             self.formula_dim = int(feature_model.formula_tensorizer.dim)
             self.fragment_dim = int(feature_model.tree_encoder.hidden_dim)
             self.hidden_dim = int(hidden_dim or self.fragment_dim)
             self.formula_node_input = nn.Sequential(
                 nn.Linear(
-                    self.fragment_dim + self.formula_dim + self.hidden_dim * 3,
+                    self.fragment_dim + self.hidden_dim * 4,
                     self.hidden_dim,
                 ),
                 nn.ReLU(),
@@ -99,6 +103,13 @@ class FragmentTreeFormulaIntensityPredictor(nn.Module):
                 len(feature_model.radical_flat_candidates),
                 self.hidden_dim,
             )
+            edge_dim = int(feature_model.fragment_edge_encoder.feature_dim)
+            self.candidate_edge_input = nn.Sequential(
+                nn.LayerNorm(edge_dim + 2),
+                nn.Linear(edge_dim + 2, self.hidden_dim),
+                nn.GELU(),
+                nn.Linear(self.hidden_dim, self.hidden_dim),
+            )
             encoder_layer = nn.TransformerEncoderLayer(
                 d_model=self.hidden_dim,
                 nhead=max(1, int(num_attention_heads)),
@@ -110,9 +121,10 @@ class FragmentTreeFormulaIntensityPredictor(nn.Module):
                 num_layers=max(1, int(num_encoder_layers)),
             )
             self.formula_node_head = nn.Linear(self.hidden_dim, 1)
+            self.formula_presence_head = nn.Linear(self.hidden_dim, 1)
 
         self.net = nn.Sequential(
-            nn.Linear(self.formula_dim + 2, self.hidden_dim),
+            nn.Linear(2, self.hidden_dim),
             nn.ReLU(),
             nn.Linear(self.hidden_dim, 1),
         )
@@ -126,7 +138,9 @@ class FragmentTreeFormulaIntensityPredictor(nn.Module):
             group_count = torch.ones_like(group_score)
         elif group_count.dim() == 1:
             group_count = group_count[:, None]
-        x = torch.cat([formula_tensor.float(), group_score.float(), group_count.float()], dim=-1)
+        # Keep formula_tensor in the public signature for compatibility, but
+        # never expose formula identity/composition to the intensity network.
+        x = torch.cat([group_score.float(), group_count.float()], dim=-1)
         return F.softplus(self.net(x).squeeze(-1))
 
     def forward_candidate_output(
@@ -146,38 +160,103 @@ class FragmentTreeFormulaIntensityPredictor(nn.Module):
                 formula_tensor=torch.empty((0, self.formula_dim), device=device),
                 logit=candidate_output.keep_logit.new_empty((0,)),
                 candidates=[],
+                presence_logit=candidate_output.keep_logit.new_empty((0,)),
+                abundance_logit=candidate_output.keep_logit.new_empty((0,)),
             )
-
-        grouped: Dict[Tuple[int, Tuple[float, ...]], List[FragmentIonCandidate]] = {}
-        for candidate in candidates:
-            formula_key = tuple(float(value) for value in candidate.formula_tensor.tolist())
-            grouped.setdefault((int(candidate.sample_id), formula_key), []).append(candidate)
 
         device = candidate_output.keep_logit.device
+        candidate_sample_index = torch.tensor(
+            [int(candidate.sample_id) for candidate in candidates],
+            dtype=torch.long,
+            device=device,
+        )
+        candidate_repr = self._candidate_formula_node_repr(candidate_output, candidates)
+        encoded = self._encode_formula_nodes_by_sample(candidate_repr, candidate_sample_index)
+        candidate_presence_logit = self.formula_presence_head(encoded).squeeze(-1)
+        candidate_abundance_logit = self.formula_node_head(encoded).squeeze(-1)
+        selection_probability = torch.stack(
+            [self._candidate_probability(candidate, device=device) for candidate in candidates]
+        )
+        candidate_intensity = self.relative_intensity(
+            candidate_presence_logit,
+            candidate_abundance_logit,
+            candidate_sample_index,
+            selection_probability=selection_probability,
+        )
+
+        # Formula identity is deliberately used only after intensity prediction.
+        grouped_indexes: Dict[Tuple[int, Tuple[float, ...]], List[int]] = {}
+        for index, candidate in enumerate(candidates):
+            formula_key = tuple(float(value) for value in candidate.formula_tensor.tolist())
+            grouped_indexes.setdefault((int(candidate.sample_id), formula_key), []).append(index)
+
         sample_ids: List[int] = []
         formula_rows: List[Tensor] = []
-        group_intensities: List[Tensor] = []
+        formula_intensities: List[Tensor] = []
+        formula_presence_logits: List[Tensor] = []
+        formula_abundance_logits: List[Tensor] = []
         groups: List[List[FragmentIonCandidate]] = []
-        for (sample_id, _), group in sorted(grouped.items(), key=lambda item: item[0]):
-            candidate_repr = self._candidate_formula_node_repr(candidate_output, group)
-            # One formula node can be annotated by several molecular nodes.
-            # Each relation predicts a non-negative contribution; their sum
-            # is, by definition, the intensity of this formula node.
-            relation_score = F.softplus(
-                self.formula_node_head(candidate_repr).squeeze(-1)
-            )
-            group_intensities.append(relation_score.sum())
+        for (sample_id, _), indexes in sorted(grouped_indexes.items(), key=lambda item: item[0]):
+            index = torch.tensor(indexes, dtype=torch.long, device=device)
+            group = [candidates[item] for item in indexes]
             sample_ids.append(int(sample_id))
             formula_rows.append(group[0].formula_tensor.to(device).float())
+            formula_intensities.append(candidate_intensity[index].sum())
+            group_probability = selection_probability[index]
+            group_presence = (
+                torch.sigmoid(candidate_presence_logit[index]) * group_probability
+            ).sum() / group_probability.sum().clamp_min(1e-12)
+            formula_presence_logits.append(
+                torch.logit(group_presence.clamp(1e-6, 1.0 - 1e-6))
+            )
+            formula_abundance_logits.append(
+                (candidate_abundance_logit[index] * group_probability).sum()
+                / group_probability.sum().clamp_min(1e-12)
+            )
             groups.append(group)
 
         sample_index = torch.tensor(sample_ids, dtype=torch.long, device=device)
         return FormulaIntensityTrainingOutput(
             sample_index=sample_index,
             formula_tensor=torch.stack(formula_rows, dim=0),
-            logit=torch.stack(group_intensities, dim=0),
+            logit=torch.stack(formula_intensities),
             candidates=groups,
+            presence_logit=torch.stack(formula_presence_logits),
+            abundance_logit=torch.stack(formula_abundance_logits),
         )
+
+
+    @staticmethod
+    def relative_intensity(
+        presence_logit: Tensor,
+        abundance_logit: Tensor,
+        sample_index: Tensor,
+        eps: float = 1e-12,
+        selection_probability: Optional[Tensor] = None,
+    ) -> Tensor:
+        """Normalize selection- and presence-gated candidate abundance."""
+        intensity = torch.zeros_like(abundance_logit)
+        if selection_probability is None:
+            selection_probability = torch.ones_like(abundance_logit)
+        for sample_id in sample_index.detach().cpu().unique(sorted=True).tolist():
+            mask = sample_index == int(sample_id)
+            # Subtracting a shared maximum preserves the requested ratio while
+            # preventing exp overflow/underflow for extreme abundance logits.
+            stable_abundance = abundance_logit[mask] - abundance_logit[mask].max()
+            log_raw = (
+                torch.log(selection_probability[mask].clamp_min(float(eps)))
+                + F.logsigmoid(presence_logit[mask])
+                + stable_abundance
+            )
+            intensity[mask] = torch.softmax(log_raw, dim=0)
+        return intensity
+
+    @staticmethod
+    def _candidate_probability(candidate: FragmentIonCandidate, *, device: torch.device) -> Tensor:
+        probability_tensor = getattr(candidate, "probability_tensor", None)
+        if probability_tensor is not None:
+            return probability_tensor.to(device).float()
+        return torch.tensor(float(candidate.probability), dtype=torch.float32, device=device)
 
     def _candidate_formula_node_repr(
         self,
@@ -186,9 +265,10 @@ class FragmentTreeFormulaIntensityPredictor(nn.Module):
     ) -> Tensor:
         device = candidate_output.keep_logit.device
         fragment_rows = []
+        batch = candidate_output.sample_tree_batch
+        edge_dst = batch.edge_index[1].to(device).long()
         for candidate in candidates:
             fragment_emb = candidate_output.sample_tree_batch.x[candidate.batch_node_index]
-            formula_tensor = candidate.formula_tensor.to(device).float()
             state_emb = torch.cat(
                 [
                     self.ion_embedding(
@@ -205,9 +285,23 @@ class FragmentTreeFormulaIntensityPredictor(nn.Module):
                 ],
                 dim=0,
             )
-            fragment_rows.append(
-                self.formula_node_input(torch.cat([fragment_emb, formula_tensor, state_emb], dim=0))
+            incoming = (edge_dst == int(candidate.batch_node_index)).nonzero(
+                as_tuple=False
+            ).flatten()
+            if incoming.numel():
+                edge_feature = batch.edge_attr[incoming].mean(dim=0)
+                absolute_score = candidate_output.edge_absolute_logit[incoming].mean().view(1)
+                competition_score = candidate_output.edge_cleave_logit[incoming].mean().view(1)
+            else:
+                edge_feature = batch.edge_attr.new_zeros((batch.edge_attr.size(-1),))
+                absolute_score = edge_feature.new_zeros((1,))
+                competition_score = edge_feature.new_zeros((1,))
+            edge_repr = self.candidate_edge_input(
+                torch.cat([edge_feature, absolute_score, competition_score], dim=0)
             )
+            fragment_rows.append(self.formula_node_input(
+                torch.cat([fragment_emb, state_emb, edge_repr], dim=0)
+            ))
         return torch.stack(fragment_rows, dim=0)
 
     def _encode_formula_nodes_by_sample(self, node_repr: Tensor, sample_index: Tensor) -> Tensor:

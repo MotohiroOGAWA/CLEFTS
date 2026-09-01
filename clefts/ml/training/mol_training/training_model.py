@@ -845,6 +845,15 @@ def write_feature_target_summary(
     return summary
 
 
+def pretraining_stage_output_dir(
+    output_dir: Path, config: MolEncoderConfig, config_count: int
+) -> Path:
+    """Avoid a redundant runs/config-id level when no config search occurs."""
+    if config_count < 1:
+        raise ValueError("config_count must be positive.")
+    return output_dir if config_count == 1 else output_dir / "runs" / config.id
+
+
 def run_pretraining_stage(
     args: argparse.Namespace,
     *,
@@ -855,6 +864,7 @@ def run_pretraining_stage(
     train_feature_record_index: Dict[str, Dict[str, Dict[str, List[int]]]],
     device: torch.device,
     output_dir: Path,
+    config_count: int,
 ) -> Dict[str, object]:
     balanced_feature_record_index = None
     if not args.disable_balanced_record_sampling and train_feature_record_index:
@@ -877,7 +887,7 @@ def run_pretraining_stage(
         descriptor_names=train_dataset.descriptor_names,
     ).to(device)
 
-    stage_dir = output_dir / "runs" / config.id
+    stage_dir = pretraining_stage_output_dir(output_dir, config, config_count)
     best = train_epochs(
         model,
         train_loader,
@@ -1008,6 +1018,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 train_feature_record_index=train_feature_record_index,
                 device=device,
                 output_dir=output_dir,
+                config_count=len(configs),
             )
         )
 

@@ -1,15 +1,333 @@
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Tuple
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
-from ..input.training_fragment_tree_structure import TrainingFragmentTreeStructure
-from .fragment_tree_candidate_selector import FragmentTreeCandidateSelectionOutput
-from .fragment_tree_formula_intensity_model import FragmentTreeFormulaIntensityPredictor
+from ...input.training_fragment_tree_structure import TrainingFragmentTreeStructure
+from ...specgen.fragment_tree_candidate_selector import FragmentTreeCandidateSelectionOutput
+from ...specgen.fragment_tree_formula_intensity_model import FragmentTreeFormulaIntensityPredictor
+
+
+class PairwiseEdgeIntensityRankingLoss(nn.Module):
+    """Rank independently scored edges by observed peak intensity.
+
+    Only adjacent unequal-intensity targets and target-vs-background pairs are
+    used.  This retains RankNet's ordering objective without constructing the
+    quadratic set of every possible pair.
+    """
+
+    def __init__(
+        self,
+        ranking_pairs_per_edge: int = 4,
+        intensity_threshold: float = 0.05,
+    ) -> None:
+        super().__init__()
+        if ranking_pairs_per_edge < 1:
+            raise ValueError("ranking_pairs_per_edge must be positive.")
+        if intensity_threshold < 0:
+            raise ValueError("intensity_threshold must be non-negative.")
+        self.ranking_pairs_per_edge = int(ranking_pairs_per_edge)
+        self.intensity_threshold = float(intensity_threshold)
+
+    def build_pairs(self, output, target) -> Tuple[Tensor, Tensor]:
+        """Build bounded pairs within the same sample and source fragment."""
+        logit = output.edge_absolute_logit
+        batch = output.sample_tree_batch
+        edge_ids = batch.edge_id_global.to(logit.device).long()
+        edge_graph = batch.batch[batch.edge_index[0]].to(logit.device).long()
+        sample_ids = batch.kept_sample_ids.to(logit.device).long()[edge_graph]
+        node_ids = getattr(batch, "node_id_global", None)
+        if node_ids is None:
+            # Lightweight/legacy batches still preserve source identity via
+            # their local edge index.
+            source_ids = batch.edge_index[0].to(logit.device).long()
+        else:
+            source_ids = node_ids.to(logit.device).long()[batch.edge_index[0]]
+        target_pairs = target.target_edge_index.to(logit.device).long()
+        target_groups = target.target_edge_group_index.to(logit.device).long()
+        formula_peak = target.formula_peak_index.to(logit.device).long()
+        peak_intensity = target.sample_peak_intensity.to(logit.device).float()
+        better_rows: List[int] = []
+        worse_rows: List[int] = []
+
+        for sample_id in sample_ids.unique(sorted=True).tolist():
+            rows = (target_pairs[0] == int(sample_id)).nonzero(as_tuple=False).flatten()
+            sample_mask = sample_ids == int(sample_id)
+            intensity_by_row: Dict[int, float] = {}
+            alternative_rows: set[int] = set()
+            # A formula/mz group can have several valid explanatory edges.
+            # Treat the current highest-scoring alternative as the latent
+            # representative instead of forcing every alternative positive.
+            for group_id in target_groups[rows].unique(sorted=True).tolist():
+                group_rows = rows[target_groups[rows] == int(group_id)]
+                group_edge_ids = target_pairs[1, group_rows].unique()
+                candidates = (
+                    sample_mask
+                    & torch.isin(edge_ids, group_edge_ids)
+                ).nonzero(as_tuple=False).flatten()
+                if candidates.numel() == 0:
+                    continue
+                alternative_rows.update(int(value) for value in candidates.tolist())
+                representative = int(candidates[torch.argmax(logit[candidates])].item())
+                intensity_by_row[representative] = float(
+                    peak_intensity[formula_peak[int(group_id)]].item()
+                )
+            for source_id in source_ids[sample_mask].unique(sorted=True).tolist():
+                local = (sample_mask & (source_ids == int(source_id))).nonzero(as_tuple=False).flatten()
+                local = torch.tensor(
+                    [
+                        int(index)
+                        for index in local.tolist()
+                        if int(index) not in alternative_rows or int(index) in intensity_by_row
+                    ],
+                    dtype=torch.long,
+                    device=logit.device,
+                )
+                if local.numel() < 2:
+                    continue
+                raw = logit.new_tensor([
+                    intensity_by_row.get(int(index), 0.0)
+                    for index in local
+                ])
+                values = torch.sqrt(raw.clamp_min(0.0))
+                order = torch.argsort(values, descending=True, stable=True)
+                ordered_local, ordered_values = local[order], values[order]
+                # At most K lower-intensity partners per edge; no quadratic
+                # materialization and no cross-source/depth comparisons.
+                for high in range(int(ordered_local.numel())):
+                    added = 0
+                    for low in range(high + 1, int(ordered_local.numel())):
+                        if float(ordered_values[high] - ordered_values[low]) <= self.intensity_threshold:
+                            continue
+                        better_rows.append(int(ordered_local[high]))
+                        worse_rows.append(int(ordered_local[low]))
+                        added += 1
+                        if added >= self.ranking_pairs_per_edge:
+                            break
+        return (
+            torch.tensor(better_rows, dtype=torch.long, device=logit.device),
+            torch.tensor(worse_rows, dtype=torch.long, device=logit.device),
+        )
+
+    def forward(
+        self,
+        output: FragmentTreeCandidateSelectionOutput,
+        target: TrainingFragmentTreeStructure,
+    ) -> Tensor:
+        logit = output.edge_absolute_logit
+        if logit.numel() == 0:
+            return logit.sum() * 0.0
+        if not hasattr(output.sample_tree_batch, "edge_id_global"):
+            raise ValueError("sample_tree_batch must expose edge_id_global.")
+        better, worse = self.build_pairs(output, target)
+        if better.numel() == 0:
+            return logit.sum() * 0.0
+        return F.softplus(-(logit[better] - logit[worse])).mean()
+
+    @torch.no_grad()
+    def metrics(self, output, target) -> Dict[str, float]:
+        loss = float(self(output, target).detach().cpu().item())
+        better, worse = self.build_pairs(output, target)
+        accuracy = (
+            float((output.edge_absolute_logit[better] > output.edge_absolute_logit[worse]).float().mean().item())
+            if better.numel() else 0.0
+        )
+        return {"edge_ranking_loss": loss, "pairwise_ranking_accuracy": accuracy}
+
+
+class FragmentEdgeAbsoluteRankerTrainingLoss(nn.Module):
+    """Direct supervision for the cheap, condition-independent edge selector."""
+
+    def __init__(self, adduct_labels: Optional[Dict[int, str]] = None) -> None:
+        super().__init__()
+        self.adduct_labels = dict(adduct_labels or {})
+
+    @staticmethod
+    def _tensorboard_label(value: str) -> str:
+        return value.strip().replace("/", "∕").replace(" ", "_")
+
+    def forward(self, edge_output, target: TrainingFragmentTreeStructure):
+        logits = edge_output.absolute_score_logit
+        finite = torch.isfinite(logits)
+        target_pairs = target.target_edge_index.to(logits.device).long()
+        target_groups = target.target_edge_group_index.to(logits.device).long()
+        positive_ids = target_pairs[1].unique(sorted=True) if target_pairs.numel() else logits.new_empty((0,), dtype=torch.long)
+        positive_ids = positive_ids[(positive_ids >= 0) & (positive_ids < logits.numel())]
+        negative = finite.clone()
+        if positive_ids.numel():
+            negative[positive_ids] = False
+        components = []
+        # Multiple edges in one (sample, formula/mz) group are alternatives:
+        # logsumexp is a smooth OR, so at least one explanation must score high.
+        group_losses = []
+        if target_pairs.numel():
+            for sample_id in target_pairs[0].unique(sorted=True).tolist():
+                sample_rows = target_pairs[0] == int(sample_id)
+                for group_id in target_groups[sample_rows].unique(sorted=True).tolist():
+                    ids = target_pairs[1, sample_rows & (target_groups == int(group_id))]
+                    ids = ids[(ids >= 0) & (ids < logits.numel())]
+                    ids = ids[finite[ids]].unique()
+                    if ids.numel():
+                        group_losses.append(F.softplus(-torch.logsumexp(logits[ids], dim=0)))
+        if group_losses:
+            components.append(torch.stack(group_losses).mean())
+        if negative.any():
+            components.append(
+                F.binary_cross_entropy_with_logits(
+                    logits[negative], torch.zeros_like(logits[negative])
+                )
+            )
+        loss = torch.stack(components).mean() if components else logits[finite].sum() * 0.0
+        return loss, self.metrics(edge_output, target)
+
+    def metrics(self, edge_output, target: TrainingFragmentTreeStructure) -> Dict[str, float]:
+        selected = set(edge_output.selected_edge_index.detach().cpu().tolist())
+        target_edges = target.target_edge_index.detach().cpu().long()
+        unique_edges = set(target_edges[1].tolist()) if target_edges.numel() else set()
+        edge_recall = (
+            len(unique_edges & selected) / len(unique_edges) if unique_edges else 1.0
+        )
+
+        group_total = 0
+        group_kept = 0
+        if target_edges.numel():
+            groups = target.target_edge_group_index.detach().cpu().long()
+            for sample_id in target_edges[0].unique(sorted=True).tolist():
+                sample_mask = target_edges[0] == int(sample_id)
+                for group_id in groups[sample_mask].unique(sorted=True).tolist():
+                    mask = sample_mask & (groups == int(group_id))
+                    group_edge_ids = set(target_edges[1, mask].tolist())
+                    group_total += 1
+                    group_kept += int(bool(group_edge_ids & selected))
+        group_recall = group_kept / group_total if group_total else 1.0
+
+        edge_dst = target.edge_index[1].detach().cpu().long()
+        target_nodes = {int(edge_dst[edge]) for edge in unique_edges}
+        selected_nodes = {int(edge_dst[edge]) for edge in selected}
+        node_recall = (
+            len(target_nodes & selected_nodes) / len(target_nodes) if target_nodes else 1.0
+        )
+        original = int(edge_output.original_edge_count)
+        retained = int(edge_output.selected_edge_index.numel())
+        metrics = {
+            "target_edge_recall": float(edge_recall),
+            "target_group_recall": float(group_recall),
+            "target_node_recall": float(node_recall),
+            "original_edge_count": float(original),
+            "retained_edge_count": float(retained),
+            "pruned_fraction": float(1.0 - retained / max(original, 1)),
+            "over_limit": float(original > retained),
+        }
+        metrics.update(self._depth_metrics(target, target_edges, selected))
+        # Condition slices are diagnostic only: the absolute_ranker remains
+        # condition-independent, but every sample's target coverage is visible.
+        if target_edges.numel():
+            sample_ids = target_edges[0].unique(sorted=True)
+            ce_values = target.sample_ce_value.detach().cpu().float()
+            finite_ce = ce_values[torch.isfinite(ce_values)]
+            ce_cuts = (
+                torch.quantile(finite_ce, torch.tensor([0.25, 0.5, 0.75])).tolist()
+                if finite_ce.numel()
+                else [0.0, 0.0, 0.0]
+            )
+            sliced: Dict[str, List[float]] = {}
+            for sample_id in sample_ids.tolist():
+                sample_set = set(target_edges[1, target_edges[0] == sample_id].tolist())
+                recall = len(sample_set & selected) / max(len(sample_set), 1)
+                adduct = int(target.sample_adduct_type_index[sample_id].item())
+                adduct_label = self._tensorboard_label(
+                    self.adduct_labels.get(adduct, f"unknown-{adduct}")
+                )
+                ce = float(ce_values[sample_id].item())
+                ce_bin = sum(ce > cut for cut in ce_cuts) if torch.isfinite(ce_values[sample_id]) else -1
+                ce_label = {
+                    -1: "non-finite",
+                    0: "min-to-q1",
+                    1: "q1-to-median",
+                    2: "median-to-q3",
+                    3: "q3-to-max",
+                }[ce_bin]
+                sliced.setdefault(
+                    f"by_adduct/{adduct_label}/target_edge_recall", []
+                ).append(recall)
+                sliced.setdefault(
+                    f"by_ce_range/{ce_label}/target_edge_recall", []
+                ).append(recall)
+            metrics.update(
+                {name: float(sum(values) / len(values)) for name, values in sliced.items()}
+            )
+        return metrics
+
+    @staticmethod
+    def _depth_metrics(
+        target: TrainingFragmentTreeStructure,
+        target_edges: Tensor,
+        selected: set[int],
+    ) -> Dict[str, float]:
+        """Natural absolute_ranker coverage for every cleavage depth."""
+        if not target_edges.numel() or not target.edge_index.numel():
+            return {}
+        edge_index = target.edge_index.detach().cpu().long()
+        edge_src, edge_dst = edge_index[0], edge_index[1]
+        num_nodes = int(target.num_nodes)
+        has_parent = torch.zeros((num_nodes,), dtype=torch.bool)
+        has_parent[edge_dst] = True
+        node_depth = torch.full((num_nodes,), -1, dtype=torch.long)
+        node_depth[~has_parent] = 0
+        # The stored fragment tree is a DAG. Repeated relaxation also handles
+        # collated disconnected trees and chooses the shortest reachable depth.
+        for _ in range(num_nodes):
+            known = node_depth[edge_src] >= 0
+            if not known.any():
+                break
+            candidate = node_depth[edge_src[known]] + 1
+            destinations = edge_dst[known]
+            changed = False
+            for destination, depth in zip(destinations.tolist(), candidate.tolist()):
+                current = int(node_depth[destination].item())
+                if current < 0 or depth < current:
+                    node_depth[destination] = int(depth)
+                    changed = True
+            if not changed:
+                break
+        edge_depth = node_depth[edge_src] + 1
+        groups = target.target_edge_group_index.detach().cpu().long()
+        result: Dict[str, float] = {}
+        valid_target = (
+            (target_edges[1] >= 0) & (target_edges[1] < edge_depth.numel())
+        )
+        for depth in edge_depth[target_edges[1, valid_target]].unique(sorted=True).tolist():
+            if depth < 1:
+                continue
+            row_mask = valid_target.clone()
+            row_mask[valid_target] = edge_depth[target_edges[1, valid_target]] == int(depth)
+            depth_pairs = target_edges[:, row_mask]
+            depth_edges = set(depth_pairs[1].tolist())
+            prefix = f"by_depth/depth_{int(depth)}"
+            result[f"{prefix}/target_edge_recall"] = (
+                len(depth_edges & selected) / len(depth_edges) if depth_edges else 1.0
+            )
+            depth_nodes = {int(edge_dst[edge]) for edge in depth_edges}
+            selected_nodes = {int(edge_dst[edge]) for edge in depth_edges & selected}
+            result[f"{prefix}/target_node_recall"] = (
+                len(depth_nodes & selected_nodes) / len(depth_nodes) if depth_nodes else 1.0
+            )
+            group_total = 0
+            group_kept = 0
+            for sample_id in depth_pairs[0].unique(sorted=True).tolist():
+                sample_rows = row_mask & (target_edges[0] == int(sample_id))
+                for group_id in groups[sample_rows].unique(sorted=True).tolist():
+                    group_rows = sample_rows & (groups == int(group_id))
+                    group_edge_ids = set(target_edges[1, group_rows].tolist())
+                    group_total += 1
+                    group_kept += int(bool(group_edge_ids & selected))
+            result[f"{prefix}/target_group_recall"] = (
+                group_kept / group_total if group_total else 1.0
+            )
+        return result
 
 
 class FormulaGroupCoverageLoss(nn.Module):
@@ -152,6 +470,15 @@ class FormulaGroupCoverageLoss(nn.Module):
 class FragmentTreeSelectionTrainingLoss(nn.Module):
     """Loss for peak-wise fragment coverage, state prediction, and cleavage."""
 
+    def __init__(self, intensity_alpha: float = 0.2, intensity_gamma: float = 0.5) -> None:
+        super().__init__()
+        if not 0.0 < intensity_alpha <= 1.0:
+            raise ValueError("intensity_alpha must be in (0, 1].")
+        if intensity_gamma <= 0.0:
+            raise ValueError("intensity_gamma must be positive.")
+        self.intensity_alpha = float(intensity_alpha)
+        self.intensity_gamma = float(intensity_gamma)
+
     def forward(
         self,
         output: FragmentTreeCandidateSelectionOutput,
@@ -221,6 +548,7 @@ class FragmentTreeSelectionTrainingLoss(nn.Module):
     ) -> Tensor:
         batch_node_by_sample_node = self._batch_node_by_sample_node(output, device=device)
         losses: List[Tensor] = []
+        weights: List[Tensor] = []
 
         for peak_key in self._target_peak_keys(target, device=device):
             row_index = self._target_peak_mask(target, peak_key=peak_key, device=device)
@@ -233,10 +561,20 @@ class FragmentTreeSelectionTrainingLoss(nn.Module):
                 continue
             peak_logit = output.keep_logit[batch_node_indexes]
             losses.append(F.softplus(-torch.logsumexp(peak_logit, dim=0)))
+            peak_intensity = target.target_intensity[row_index].to(device).float().max()
+            sample_mask = target.target_sample_index.to(device).long() == int(peak_key[0])
+            sample_max = target.target_intensity.to(device).float()[sample_mask].max().clamp_min(1e-12)
+            weights.append(self.intensity_weight(peak_intensity / sample_max))
 
         if len(losses) == 0:
             return output.keep_logit.sum() * 0.0
-        return torch.stack(losses).mean()
+        return self._weighted_mean(losses, weights, output.keep_logit)
+
+    def intensity_weight(self, normalized_intensity: Tensor) -> Tensor:
+        normalized_intensity = normalized_intensity.float().clamp(0.0, 1.0)
+        return self.intensity_alpha + (1.0 - self.intensity_alpha) * normalized_intensity.pow(
+            self.intensity_gamma
+        )
 
     def _keep_negative_loss(
         self,
@@ -616,16 +954,32 @@ class FragmentTreeSelectionTrainingLoss(nn.Module):
         cleave_target = torch.zeros_like(output.cleave_logit, dtype=torch.float32, device=device)
         cleave_mask = ~batch.node_is_precursor_root.to(device).bool()
 
-        if target.target_edge_index.numel() == 0:
+        if target.target_expand_node_index.numel() == 0:
             return cleave_target, cleave_mask
 
-        target_edge_index = target.target_edge_index.to(device).long()
-        target_sample_index = target_edge_index[0]
-        target_global_edge_index = target_edge_index[1]
-        target_global_src_node = target.edge_index.to(device).long()[0, target_global_edge_index]
+        # Stored supervision already contains the intermediate nodes on every
+        # assigned fragmentation path.  Use it directly; training must never
+        # invoke Fragmenter/RDKit to create new cleavages.
+        assignment_samples = target.target_sample_index.to(device).long()
+        expand_nodes = target.target_expand_node_index.to(device).long()
+        expand_ptr = target.terminal_expand_ptr.to(device).long()
+        sample_parts: List[Tensor] = []
+        node_parts: List[Tensor] = []
+        for assignment_id in range(int(assignment_samples.numel())):
+            start = int(expand_ptr[assignment_id].item())
+            end = int(expand_ptr[assignment_id + 1].item())
+            if end <= start:
+                continue
+            nodes = expand_nodes[start:end]
+            node_parts.append(nodes)
+            sample_parts.append(
+                torch.full_like(nodes, int(assignment_samples[assignment_id].item()))
+            )
+        if not node_parts:
+            return cleave_target, cleave_mask
         positive_pairs = self._target_sample_node_pairs(
-            target_sample_index=target_sample_index,
-            target_node_index=target_global_src_node,
+            target_sample_index=torch.cat(sample_parts),
+            target_node_index=torch.cat(node_parts),
         )
         self._apply_positive_node_pairs(
             target_tensor=cleave_target,
@@ -670,7 +1024,13 @@ class FragmentTreeSelectionTrainingLoss(nn.Module):
 
 
 class FragmentTreeIntensityTrainingLoss(nn.Module):
-    """Loss for per-formula intensities over selected formula nodes."""
+    """Formula-level Huber, spectrum cosine, and balanced presence losses."""
+
+    def __init__(self, huber_weight: float = 1.0, cosine_weight: float = 1.0, presence_weight: float = 1.0) -> None:
+        super().__init__()
+        self.huber_weight = float(huber_weight)
+        self.cosine_weight = float(cosine_weight)
+        self.presence_weight = float(presence_weight)
 
     def forward(
         self,
@@ -692,24 +1052,41 @@ class FragmentTreeIntensityTrainingLoss(nn.Module):
                 sample_id=sample_id,
                 device=device,
             )
-            sample_target_mask = target.target_sample_index.to(device).long() == sample_id
-            if sample_target_mask.any():
-                max_target_intensity = target.target_intensity.to(device).float()[
-                    sample_target_mask
-                ].max().clamp_min(1e-12)
-                target_intensity = (target_weight / max_target_intensity).clamp(0.0, 1.0)
-            else:
-                target_intensity = target_weight
-            losses.append(
-                F.smooth_l1_loss(
-                    intensity_output.logit[pred_index],
-                    target_intensity,
+            target_intensity = target_weight / target_weight.sum().clamp_min(1e-12)
+            predicted_intensity = intensity_output.logit[pred_index]
+            huber_loss = F.smooth_l1_loss(predicted_intensity, target_intensity)
+            cosine_loss = self.cosine_loss(predicted_intensity, target_intensity)
+            sample_loss = self.huber_weight * huber_loss + self.cosine_weight * cosine_loss
+            presence_logit = getattr(intensity_output, "presence_logit", None)
+            if presence_logit is not None:
+                presence_target = (target_weight > 0).to(presence_logit.dtype)
+                sample_loss = sample_loss + self.presence_weight * self.balanced_presence_loss(
+                    presence_logit[pred_index], presence_target
                 )
-            )
+            losses.append(sample_loss)
 
         if len(losses) == 0:
             return intensity_output.logit.sum() * 0.0
         return torch.stack(losses).mean()
+
+    @staticmethod
+    def cosine_loss(predicted: Tensor, target: Tensor, eps: float = 1e-8) -> Tensor:
+        return 1.0 - F.cosine_similarity(
+            predicted.unsqueeze(0), target.unsqueeze(0), dim=1, eps=eps
+        ).squeeze(0)
+
+    @staticmethod
+    def balanced_presence_loss(logit: Tensor, target: Tensor) -> Tensor:
+        positive = target > 0.5
+        negative = ~positive
+        components: List[Tensor] = []
+        if positive.any():
+            components.append(F.binary_cross_entropy_with_logits(logit[positive], target[positive]))
+        if negative.any():
+            components.append(F.binary_cross_entropy_with_logits(logit[negative], target[negative]))
+        if not components:
+            return logit.sum() * 0.0
+        return torch.stack(components).mean()
 
     @staticmethod
     def _target_weight_for_predictions(
@@ -720,12 +1097,16 @@ class FragmentTreeIntensityTrainingLoss(nn.Module):
         device: torch.device,
     ) -> Tensor:
         target_weight = predicted_formula.new_zeros((predicted_formula.size(0),))
-        target_mask = target.target_sample_index.to(device).long() == int(sample_id)
+        formula_peak_index = target.formula_peak_index.to(device).long()
+        formula_sample_index = target.peak_sample_index.to(device).long()[formula_peak_index]
+        target_mask = formula_sample_index == int(sample_id)
         if not target_mask.any():
             return target_weight
 
-        target_formula = target.target_assignment_formula.to(device).float()[target_mask]
-        target_intensity = target.target_intensity.to(device).float()[target_mask]
+        target_formula = target.target_formula.to(device).float()[target_mask]
+        target_intensity = target.sample_peak_intensity.to(device).float()[
+            formula_peak_index[target_mask]
+        ]
         for pred_index, formula in enumerate(predicted_formula):
             formula_mask = torch.all(target_formula == formula, dim=1)
             if formula_mask.any():
@@ -754,6 +1135,25 @@ class FragmentTreeTrainingModel(nn.Module):
             else FragmentTreeIntensityTrainingLoss()
         )
         self._checkpoint_model_config: Dict[str, Any] = {}
+        feature_model = candidate_selector.feature_model
+        adduct_labels = {
+            int(index): str(adduct)
+            for index, adduct in feature_model.main_adduct_types.items()
+        }
+        self.ranking_loss_weight = float(getattr(candidate_selector, "ranking_loss_weight", 1.0))
+        self.absolute_ranker_loss_fn = PairwiseEdgeIntensityRankingLoss(
+            ranking_pairs_per_edge=int(getattr(candidate_selector, "ranking_pairs_per_edge", 4)),
+            intensity_threshold=float(getattr(candidate_selector, "ranking_intensity_threshold", 0.05)),
+        )
+        self.register_buffer("training_phase", torch.tensor(1, dtype=torch.long))
+
+    @property
+    def absolute_ranker_only(self) -> bool:
+        return False
+
+    def update_training_phase(self, validation_summary: Dict[str, float]) -> bool:
+        """Compatibility hook; both architectural stages train jointly."""
+        return False
 
     def set_checkpoint_model_config(self, model_config: Dict[str, Any]) -> None:
         self._checkpoint_model_config = dict(model_config)
@@ -763,6 +1163,7 @@ class FragmentTreeTrainingModel(nn.Module):
 
     def forward(self, batch: TrainingFragmentTreeStructure):
         output = self.candidate_selector(batch)
+        absolute_ranker_loss = self.absolute_ranker_loss_fn(output, batch)
         selection_loss = self.loss_fn(output, batch)
         if self.intensity_predictor is None:
             intensity_output = None
@@ -770,11 +1171,54 @@ class FragmentTreeTrainingModel(nn.Module):
         else:
             intensity_output = self.intensity_predictor.forward_candidate_output(output)
             intensity_loss = self.intensity_loss_fn(intensity_output, batch)
-        loss = selection_loss + intensity_loss
+        edge_total_loss = selection_loss + self.ranking_loss_weight * absolute_ranker_loss
+        loss = edge_total_loss + intensity_loss
+        absolute_ranker_metrics = self.absolute_ranker_loss_fn.metrics(output, batch)
+        absolute_ranker_metrics.update(self._edge_retain_metrics(output, batch))
+        absolute_ranker_metrics.update({
+            "edge_retain_loss": float(selection_loss.detach().cpu().item()),
+            "edge_total_loss": float(edge_total_loss.detach().cpu().item()),
+        })
         return {
             "loss": loss,
             "selection_loss": selection_loss,
             "intensity_loss": intensity_loss,
+            "absolute_ranker_loss": absolute_ranker_loss,
+            "edge_retain_loss": selection_loss,
+            "edge_ranking_loss": absolute_ranker_loss,
+            "edge_total_loss": edge_total_loss,
             "candidate_output": output,
             "intensity_output": intensity_output,
+            "absolute_ranker_metrics": absolute_ranker_metrics,
+        }
+
+    @staticmethod
+    @torch.no_grad()
+    def _edge_retain_metrics(output, target) -> Dict[str, float]:
+        logits = output.edge_absolute_logit
+        sample_tree_batch = output.sample_tree_batch
+        if logits.numel() == 0:
+            return {"edge_retain_precision": 1.0, "edge_retain_recall": 1.0}
+        edge_graph = sample_tree_batch.batch[
+            sample_tree_batch.edge_index[0]
+        ].to(logits.device).long()
+        sample_ids = sample_tree_batch.kept_sample_ids.to(logits.device).long()[edge_graph]
+        edge_ids = sample_tree_batch.edge_id_global.to(logits.device).long()
+        positive_pairs = {
+            (int(sample_id), int(edge_id))
+            for sample_id, edge_id in target.target_edge_index.detach().cpu().t().tolist()
+        }
+        truth = torch.tensor(
+            [
+                (int(sample_id), int(edge_id)) in positive_pairs
+                for sample_id, edge_id in zip(sample_ids.tolist(), edge_ids.tolist())
+            ],
+            dtype=torch.bool,
+            device=logits.device,
+        )
+        predicted = logits > 0
+        true_positive = int((predicted & truth).sum().item())
+        return {
+            "edge_retain_precision": true_positive / max(int(predicted.sum().item()), 1),
+            "edge_retain_recall": true_positive / max(int(truth.sum().item()), 1),
         }

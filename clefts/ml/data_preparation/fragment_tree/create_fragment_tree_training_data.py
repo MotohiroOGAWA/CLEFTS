@@ -25,6 +25,7 @@ from clefts.utils.parallel_subprocess import run_parallel_subprocesses
 ORIGINAL_INDEX_COLUMN = "__fragment_tree_original_index"
 STRUCTURE_DATA_DIR_NAME = "data"
 DEFAULT_PREPROCESSING_CONFIG_NAME = "preprocessing_config.json"
+DEFAULT_FRAGMENTER_CONFIG_NAME = "fragmenter.json"
 from clefts.ml.input.fragment_tree_training_data import (
     build_fragment_tree_structure_files,
     build_fragment_tree_structure_files_from_existing,
@@ -364,6 +365,34 @@ def write_preprocessing_config(
         json.dump(context.to_dict(), f, indent=2)
         f.write("\n")
     print(f"wrote preprocessing config: {output_path}")
+
+
+def write_fragmenter_config(
+    *,
+    context: FragmentTreePreprocessingContext,
+    structure_dir: str | Path,
+    overwrite: bool = False,
+) -> None:
+    """Write a config that can be loaded directly by ``Fragmenter.from_json``."""
+    output_path = Path(structure_dir) / DEFAULT_FRAGMENTER_CONFIG_NAME
+    config = context.fragmenter.to_dict()
+
+    if output_path.exists() and not overwrite:
+        with output_path.open("r", encoding="utf-8") as f:
+            existing_config = json.load(f)
+        if existing_config == config:
+            print(f"kept identical existing fragmenter config: {output_path}")
+            return
+        raise ValueError(
+            f"The fragmenter settings differ from {output_path}. Use a different "
+            "output directory, or rebuild all data with --overwrite."
+        )
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8") as f:
+        json.dump(config, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    print(f"wrote fragmenter config: {output_path}")
 
 
 def structure_data_dir(structure_dir: str | Path) -> Path:
@@ -1046,6 +1075,17 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
         output_file=preprocessing_config_output_path,
         overwrite=bool(args.overwrite_preprocessing_config),
     )
+    write_fragmenter_config(
+        context=generator,
+        structure_dir=train_structure_dir,
+        overwrite=bool(args.overwrite),
+    )
+    if args.validation_input is not None or validation_uses_structures:
+        write_fragmenter_config(
+            context=generator,
+            structure_dir=validation_structure_dir,
+            overwrite=bool(args.overwrite),
+        )
 
     pattern_set = generator.fragmenter.cleavage_pattern_set
 
