@@ -1,0 +1,52 @@
+{
+  "name": "clefts-workbench",
+  "displayName": "CLEFTS Workbench",
+  "description": "Run and inspect CLEFTS applications from VS Code.",
+  "version": "0.1.0",
+  "publisher": "clefts",
+  "engines": { "vscode": "^1.80.0" },
+  "categories": ["Other", "Machine Learning"],
+  "activationEvents": [
+    "onCommand:clefts.openWorkbench",
+    "onCommand:clefts.openResult",
+    "onCustomEditor:clefts.resultViewer"
+  ],
+  "main": "./src/extension.js",
+  "contributes": {
+    "commands": [
+      { "command": "clefts.openWorkbench", "title": "CLEFTS: Open Workbench" },
+      { "command": "clefts.openResult", "title": "CLEFTS: Open Result" }
+    ],
+    "customEditors": [
+      {
+        "viewType": "clefts.resultViewer",
+        "displayName": "CLEFTS Result",
+        "selector": [{ "filenamePattern": "*.clefts-result" }],
+        "priority": "default"
+      }
+    ],
+    "configuration": {
+      "title": "CLEFTS",
+      "properties": {
+        "clefts.pythonPath": {
+          "type": "string",
+          "default": "python",
+          "description": "Python executable used for CLEFTS CLI commands."
+        },
+        "clefts.applicationRoot": {
+          "type": "string",
+          "default": "",
+          "description": "CLEFTS Python project directory. Empty means the parent of this extension."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "dev": "code --extensionDevelopmentPath=. --new-window .",
+    "check": "node --check src/extension.js",
+    "package": "npx @vscode/vsce package"
+  },
+  "devDependencies": { "@vscode/vsce": "2.15.0" },
+  "overrides": { "cheerio": "1.0.0-rc.12" },
+  "license": "MIT"
+}
