@@ -467,14 +467,14 @@ The neighborhood graph is an induced subgraph created by collecting nodes whose 
 
 ### 11.3 Context graph
 
-The context graph is an induced subgraph created by collecting nodes whose distance from the center node satisfies `r1 <= distance <= r2`.
+The context graph is an induced subgraph created by collecting nodes whose distance from the center node satisfies `r1 < distance <= r2`. Therefore, with the default `r1 = 1`, the center and its 1-hop neighbors are not included in the context graph.
 
 - node feature: `node_h` after `MolEncoder`
 - edge structure: edges within the context range
 - edge feature: original `edge_attr`
 - readout: mean of anchor node representations
 
-Anchor nodes are taken from the range `r1 <= distance <= K`.
+Anchor nodes are taken from the overlap range `r1 < distance <= K`.
 
 ### 11.4 Dedicated GNN
 
@@ -872,9 +872,22 @@ A single run mainly produces the following outputs.
 - `mol_encoder_pretraining_summary.json`
 - `mol_encoder_pretrained.pt`
 
-### 20.2 Per-run output
+### 20.2 Training-stage output
 
-Each config ID produces the following directory.
+When exactly one node-dimension/graph-dimension configuration is requested, no
+hyperparameter selection directory is needed and these files are written directly
+under `--output-dir`:
+
+```text
+<output_dir>/pretraining_metrics.csv
+<output_dir>/pretraining_summary.json
+<output_dir>/pretraining_best.pt
+<output_dir>/pretraining_last.pt
+<output_dir>/tensorboard/
+<output_dir>/tensorboard_command.txt
+```
+
+When two or more configurations are requested, each config ID uses:
 
 ```text
 runs/<config_id>/

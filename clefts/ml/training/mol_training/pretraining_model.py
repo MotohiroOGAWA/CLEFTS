@@ -23,6 +23,17 @@ from .masking import (
 )
 
 
+def nodes_in_open_closed_radius(
+    distances: Dict[int, int], inner_radius: int, outer_radius: int
+) -> List[int]:
+    """Return nodes satisfying ``inner_radius < distance <= outer_radius``."""
+    return [
+        node
+        for node, distance in distances.items()
+        if inner_radius < distance <= outer_radius
+    ]
+
+
 def _group_decoders(in_dim: int, groups: Tuple[FeatureGroup, ...]) -> nn.ModuleDict:
     return nn.ModuleDict(
         {
@@ -290,12 +301,12 @@ class MolPretrainingModel(nn.Module):
             center = int(torch.randint(data.x.size(0), (1,), device=data.x.device).item())
             distances = self._node_distances(data.edge_index, center, self.context_r2, data.x.size(0))
             neighborhood_nodes = [node for node, distance in distances.items() if distance <= self.context_k]
-            context_nodes = [node for node, distance in distances.items() if self.context_r1 <= distance <= self.context_r2]
-            anchor_nodes = [
-                node
-                for node, distance in distances.items()
-                if self.context_r1 <= distance <= self.context_k
-            ]
+            context_nodes = nodes_in_open_closed_radius(
+                distances, self.context_r1, self.context_r2
+            )
+            anchor_nodes = nodes_in_open_closed_radius(
+                distances, self.context_r1, self.context_k
+            )
             if not neighborhood_nodes or not context_nodes or not anchor_nodes:
                 continue
             neighborhoods.append(
