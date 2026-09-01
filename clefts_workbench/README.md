@@ -26,6 +26,46 @@ Set `clefts.pythonPath` when the required Python environment is not available as
 - Every output directory receives a `fragment-tree.clefts-result` manifest. Opening it in Explorer displays the run status, structure and table counts, and output-file list in the CLEFTS result viewer.
 - Select a JSON or TSV entry in the result viewer to open it in the standard VS Code editor.
 
+## Cleavage Pattern Set editor
+
+Select `Cleavage Pattern Set` on the left side of the Workbench navigation. The tab provides its own `Load Configuration` and `Save Configuration` actions for `*.clevageset.json` documents. It allows you to:
+
+- edit the pattern-set name;
+- add and remove patterns;
+- edit each pattern name and `reactant_smarts` value;
+- add and remove products;
+- edit each product name and `smarts` value.
+- load or save an individual pattern as `*.clevage.json`;
+- build a pattern visually from a SMILES structure using RDKit;
+- select atoms and bonds and assign exact, any-heavy-atom, C/N, or C/N/O atom constraints;
+- delete atoms and change or remove bonds when generating a product.
+
+The editor reads and writes this JSON shape:
+
+```json
+{
+  "cleavage_pattern_set": {
+    "name": "single_bond_cleavage_pattern_set",
+    "patterns": [
+      {
+        "name": "single_bond_cleavage",
+        "reactant_smarts": "[!#1:1]-[!#1:2]",
+        "products": [
+          {
+            "name": "single_bond_cleavage",
+            "smarts": "[!#1:1]"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+`Apply Reactant` and `Add Product` validate their generated SMARTS/SMIRKS with CLEFTS `_CleavagePattern.from_rules()`. Validation failures appear as VS Code error notifications.
+
+Opening a `*.clevageset.json` file directly in Explorer also uses the dedicated structured editor. Directly opened documents support VS Code save, undo, and redo. Use `Reopen Editor With... > Text Editor` when raw JSON editing is preferred.
+
 ## Package
 
 ```bash
@@ -34,4 +74,4 @@ npm run check
 npm run package
 ```
 
-Install the generated `.vsix` with `Extensions: Install from VSIX...` in VS Code.
+Packages are written to `artifacts/clefts_workbench-<version>.vsix`, keeping generated files out of the extension root. Install the generated file with `Extensions: Install from VSIX...` in VS Code.

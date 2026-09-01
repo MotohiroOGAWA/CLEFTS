@@ -2,6 +2,7 @@ const vscode = require('vscode');
 const fs = require('fs');
 const path = require('path');
 const { spawn } = require('child_process');
+const cleavagePatternSetEditor = require('./features/cleavage-pattern-set/editor');
 
 const RESULT_NAME = 'fragment-tree.clefts-result';
 let runningProcess;
@@ -18,6 +19,7 @@ function activate(context) {
       supportsMultipleEditorsPerDocument: true
     })
   );
+  cleavagePatternSetEditor.register(context);
   enableDevelopmentReload(context, output);
 }
 
@@ -43,7 +45,29 @@ function enableDevelopmentReload(context, output) {
 
 function projectRoot(context) {
   const configured = vscode.workspace.getConfiguration('clefts').get('applicationRoot', '').trim();
-  return configured ? path.resolve(configured) : path.resolve(context.extensionPath, '..');
+  const workspaceFolders = vscode.workspace.workspaceFolders || [];
+  if (configured) {
+    const base = workspaceFolders[0] ? workspaceFolders[0].uri.fsPath : process.cwd();
+    const candidate = path.resolve(base, configured);
+    if (isCleftsRoot(candidate)) return candidate;
+    throw new Error(`clefts.applicationRoot does not point to a CLEFTS application: ${configured}`);
+  }
+  for (const folder of workspaceFolders) {
+    let current = folder.uri.fsPath;
+    while (true) {
+      for (const candidate of [current, path.join(current, 'mnt', 'app'), path.join(current, 'app')]) {
+        if (isCleftsRoot(candidate)) return candidate;
+      }
+      const parent = path.dirname(current);
+      if (parent === current) break;
+      current = parent;
+    }
+  }
+  throw new Error('CLEFTS application root was not found. Open the CLEFTS workspace or set clefts.applicationRoot to a workspace-relative path.');
+}
+
+function isCleftsRoot(candidate) {
+  return fs.existsSync(path.join(candidate, 'clefts')) && fs.existsSync(path.join(candidate, 'pyproject.toml'));
 }
 
 function defaultConfig(context) {
@@ -116,11 +140,77 @@ function openWorkbench(context, output) {
         await runFragmentTree(context, output, normalizeConfig(message.config), panel);
       } else if (message.type === 'stop') {
         if (runningProcess) runningProcess.kill('SIGTERM');
+      } else if (message.type === 'loadCleavagePatternSet') {
+        const picked = await vscode.window.showOpenDialog({ filters: { 'CLEFTS Cleavage Pattern Set': ['clevageset.json'] }, canSelectMany: false });
+        if (picked && picked[0]) {
+          const value = cleavagePatternSetEditor.normalizeDocument(JSON.parse(await fs.promises.readFile(picked[0].fsPath, 'utf8')));
+          panel.webview.postMessage({ type: 'cleavagePatternSet', value, path: picked[0].fsPath });
+        }
+      } else if (message.type === 'saveCleavagePatternSet') {
+        const value = cleavagePatternSetEditor.normalizeDocument(message.value);
+        const defaultUri = message.path ? vscode.Uri.file(message.path) : vscode.Uri.file('patterns.clevageset.json');
+        const selected = await vscode.window.showSaveDialog({ filters: { 'CLEFTS Cleavage Pattern Set': ['clevageset.json'] }, defaultUri });
+        if (selected) {
+          const target = selected.fsPath.endsWith(cleavagePatternSetEditor.FILE_SUFFIX) ? selected : vscode.Uri.file(`${selected.fsPath}${cleavagePatternSetEditor.FILE_SUFFIX}`);
+          await fs.promises.writeFile(target.fsPath, `${JSON.stringify(value, null, 2)}\n`);
+          panel.webview.postMessage({ type: 'cleavagePatternSetSaved', path: target.fsPath });
+          vscode.window.showInformationMessage(`Saved ${path.basename(target.fsPath)}`);
+        }
+      } else if (message.type === 'loadCleavagePattern') {
+        const picked = await vscode.window.showOpenDialog({ filters: { 'CLEFTS Cleavage Pattern': ['clevage.json'] }, canSelectMany: false });
+        if (picked && picked[0]) {
+          const pattern = normalizePattern(JSON.parse(await fs.promises.readFile(picked[0].fsPath, 'utf8')));
+          panel.webview.postMessage({ type: 'cleavagePatternLoaded', pattern, index: message.index });
+        }
+      } else if (message.type === 'saveCleavagePattern') {
+        const pattern = normalizePattern(message.pattern);
+        const selected = await vscode.window.showSaveDialog({ filters: { 'CLEFTS Cleavage Pattern': ['clevage.json'] }, defaultUri: vscode.Uri.file(`${safeFileStem(pattern.name || 'pattern')}.clevage.json`) });
+        if (selected) {
+          const target = selected.fsPath.endsWith('.clevage.json') ? selected : vscode.Uri.file(`${selected.fsPath}.clevage.json`);
+          await fs.promises.writeFile(target.fsPath, `${JSON.stringify(pattern, null, 2)}\n`);
+          vscode.window.showInformationMessage(`Saved ${path.basename(target.fsPath)}`);
+        }
+      } else if (message.type === 'chemistry') {
+        const result = await runChemistryBackend(context, message.command, message.payload);
+        panel.webview.postMessage({ type: 'chemistryResult', requestId: message.requestId, result });
       }
     } catch (error) {
+      if (message.type === 'chemistry') panel.webview.postMessage({ type: 'chemistryError', requestId: message.requestId, message: String(error.message || error) });
       panel.webview.postMessage({ type: 'status', status: 'error', text: String(error.message || error) });
       vscode.window.showErrorMessage(`CLEFTS: ${error.message || error}`);
     }
+  });
+}
+
+function normalizePattern(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('The cleavage pattern must be a JSON object.');
+  return {
+    name: String(value.name || ''), reactant_smarts: String(value.reactant_smarts || ''),
+    products: Array.isArray(value.products) ? value.products.map(product => ({ name: String(product && product.name || ''), smarts: String(product && product.smarts || '') })) : []
+  };
+}
+
+function safeFileStem(value) { return String(value).trim().replace(/[^A-Za-z0-9_.-]+/g, '_') || 'pattern'; }
+
+function runChemistryBackend(context, command, payload) {
+  return new Promise((resolve, reject) => {
+    const python = vscode.workspace.getConfiguration('clefts').get('pythonPath', 'python');
+    const script = path.join(context.extensionPath, 'src', 'features', 'cleavage-pattern-set', 'backend.py');
+    let root;
+    try { root = projectRoot(context); }
+    catch (error) { reject(error); return; }
+    if (!isCleftsRoot(root)) { reject(new Error('The detected working directory is not a CLEFTS application.')); return; }
+    const pythonPath = ['.', process.env.PYTHONPATH].filter(Boolean).join(path.delimiter);
+    const child = spawn(python, [script], { cwd: root, env: { ...process.env, PYTHONPATH: pythonPath } });
+    let stdout = '', stderr = '';
+    child.stdout.on('data', chunk => { stdout += chunk.toString(); });
+    child.stderr.on('data', chunk => { stderr += chunk.toString(); });
+    child.on('error', reject);
+    child.on('close', () => {
+      try { const response = JSON.parse(stdout); response.ok ? resolve(response.result) : reject(new Error(response.error)); }
+      catch (_) { reject(new Error(stderr || stdout || 'The RDKit backend did not return a response.')); }
+    });
+    child.stdin.end(JSON.stringify({ command, payload }));
   });
 }
 
@@ -255,9 +345,10 @@ const HELP = {
 
 function workbenchHtml(config, fragmenterText) {
   return `<!doctype html><html><head><meta charset="UTF-8"><style>${commonCss()}${formCss()}</style></head><body><main>
-  <header><div><span class="eyebrow">CLEFTS PLATFORM</span><h1>Workbench</h1><p class="muted">Fragment Tree Data Preparation</p></div><div class="actions"><button id="load">Load Configuration</button><button id="save">Save Configuration</button></div></header>
-  <nav><button class="tab active">Data preparation</button><button class="tab" disabled>Training <small>coming soon</small></button></nav>
-  <form id="form">
+  <header><div><span class="eyebrow">CLEFTS PLATFORM</span><h1>Workbench</h1><p id="appSubtitle" class="muted">Fragment Tree Data Preparation</p></div><div id="dataActions" class="actions"><button id="load">Load Configuration</button><button id="save">Save Configuration</button></div></header>
+  <nav><button class="tab" data-app="cleavage">Cleavage Pattern Set</button><button class="tab active" data-app="data">Data Preparation</button><button class="tab" disabled>Training <small>coming soon</small></button></nav>
+  <div id="cleavageApp" hidden><section><div class="section-title"><div><h2>Cleavage Pattern Set Configuration</h2><p id="cleavagePath" class="muted">Not saved</p></div><div class="actions"><button type="button" id="loadCleavage">Load Configuration</button><button type="button" id="saveCleavage">Save Configuration</button></div></div><label>Pattern set name<input id="cleavageSetName" placeholder="single_bond_cleavage_pattern_set"></label></section><section id="visualBuilder" hidden><div class="section-title"><div><h2>Visual Pattern Builder</h2><p class="muted">Select atoms and bonds, configure atom constraints, then apply the reactant.</p></div><button type="button" id="closeBuilder">Close</button></div><div class="row"><label class="grow">Source SMILES<input id="builderSmiles" placeholder="O=c1cc(-c2ccc(O)cc2)oc2cc(O)cc(O)c12"></label><button type="button" id="drawMolecule" class="primary">Draw Structure</button></div><div id="moleculeCanvas" class="molecule-canvas"></div><div id="atomConstraints"></div><label>Pattern name<input id="builderPatternName" placeholder="flavonoid_substructure"></label><div class="actions"><button type="button" id="applyReactant" class="primary">Apply Reactant</button></div><div id="productBuilder" hidden><h3>Product Transformation</h3><p class="muted">Uncheck atoms to delete them. Change or remove selected bonds, then generate a product SMARTS.</p><label>Product name<input id="builderProductName" placeholder="fragment_product"></label><div id="productAtoms"></div><div id="productBonds"></div><button type="button" id="applyProduct" class="primary">Add Product</button></div></section><div id="cleavagePatterns"></div><div class="actions"><button type="button" id="addCleavagePattern" class="primary">Add Pattern</button><button type="button" id="addVisualPattern">Add Pattern Visually</button><button type="button" id="loadSinglePattern">Load Pattern</button></div></div>
+  <form id="form" data-app-panel="data">
     <section><h2>Input and Output</h2>${pathField('trainInput','Training MSDataset *','file')}${pathField('validationInput','Validation MSDataset','file')}${pathField('outputDir','Output directory *','folder')}</section>
     <section><div class="section-title"><div><h2>Fragmenter Parameters</h2><p class="muted">Edit the complete Fragmenter JSON used by the CLI.</p></div><div class="actions"><button type="button" id="loadFragmenter">Load Fragmenter</button><button type="button" id="saveFragmenter">Save Fragmenter</button></div></div>${pathField('params','Fragmenter parameters JSON *','file')}<textarea id="fragmenterEditor" spellcheck="false" title="Fragmenter configuration JSON passed through the CLI --params option."></textarea></section>
     <section><h2>Fragment tree</h2><div class="grid">${field('symbols','Symbols (space separated)','text')}${field('maxNode','Max nodes','number')}${field('maxEdge','Max edges','number')}${field('smilesColumn','SMILES column','text')}${field('precursorMzColumn','Precursor m/z column','text')}${field('adductTypeColumn','Adduct column','text')}${field('collisionEnergyColumn','Collision energy column','text')}${field('instrumentColumn','Instrument column','text')}</div></section>
@@ -272,19 +363,37 @@ function check(name,label) { return `<label class="check" data-help="${HELP[name
 function safeJson(value) { return JSON.stringify(value).replace(/</g, '\\u003c'); }
 function webviewScript() { return `
     const form=document.getElementById('form'), statusEl=document.getElementById('status'), stop=document.getElementById('stop');
+    let cleavagePath='',cleavageModel={cleavage_pattern_set:{name:'',patterns:[]}};
+    const htmlEscape=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
     function setConfig(c){ for(const [k,v] of Object.entries(c)){const el=form.elements[k];if(!el)continue;if(el.type==='checkbox')el.checked=!!v;else el.value=Array.isArray(v)?v.join(' '):v??'';} }
     function getConfig(){const c={application:'fragment-tree-data-preparation'};for(const el of form.elements){if(!el.name)continue;if(el.type==='checkbox')c[el.name]=el.checked;else if(el.type==='number')c[el.name]=el.value===''?'':Number(el.value);else c[el.name]=el.value;}c.symbols=String(c.symbols).split(/[ ,]+/).filter(Boolean);return c;}
     const fragmenterEditor=document.getElementById('fragmenterEditor'); fragmenterEditor.value=initialFragmenter;
     const tooltip=document.getElementById('helpTooltip'); let tooltipTimer;
     document.querySelectorAll('[data-help]').forEach(el=>{el.addEventListener('mouseenter',()=>{tooltipTimer=setTimeout(()=>{const r=el.getBoundingClientRect();tooltip.textContent=el.dataset.help;tooltip.style.left=Math.min(r.left,window.innerWidth-390)+'px';tooltip.style.top=(r.bottom+7)+'px';tooltip.classList.add('visible');},500);});el.addEventListener('mouseleave',()=>{clearTimeout(tooltipTimer);tooltip.classList.remove('visible');});});
     setConfig(initial); document.querySelectorAll('[data-pick]').forEach(b=>b.onclick=()=>vscode.postMessage({type:'pick',field:b.dataset.pick,kind:b.dataset.kind}));
+    document.querySelectorAll('[data-app]').forEach(button=>button.onclick=()=>{document.querySelectorAll('[data-app]').forEach(x=>x.classList.toggle('active',x===button));const cleavage=button.dataset.app==='cleavage';document.getElementById('cleavageApp').hidden=!cleavage;form.hidden=cleavage;document.getElementById('dataActions').hidden=cleavage;document.getElementById('appSubtitle').textContent=cleavage?'Cleavage Pattern Set Editor':'Fragment Tree Data Preparation';});
     document.getElementById('save').onclick=()=>vscode.postMessage({type:'saveConfig',config:getConfig()}); document.getElementById('load').onclick=()=>vscode.postMessage({type:'loadConfig'});
+    function renderCleavage(){document.getElementById('cleavageSetName').value=cleavageModel.cleavage_pattern_set.name;document.getElementById('cleavagePatterns').innerHTML=cleavageModel.cleavage_pattern_set.patterns.map((p,pi)=>\`<section class="pattern-card"><div class="section-title"><h2>Pattern \${pi+1}</h2><div class="actions"><button type="button" data-load-pattern="\${pi}">Load</button><button type="button" data-save-pattern="\${pi}">Save</button><button type="button" class="danger" data-remove-pattern="\${pi}">Remove Pattern</button></div></div><div class="grid"><label>Pattern name<input data-pattern="\${pi}" data-key="name" value="\${htmlEscape(p.name)}" placeholder="single_bond_cleavage"></label><label>Reactant SMARTS<input data-pattern="\${pi}" data-key="reactant_smarts" value="\${htmlEscape(p.reactant_smarts)}" placeholder="[!#1:1]-[!#1:2]"></label></div><div class="section-title product-title"><h3>Products</h3><button type="button" data-add-product="\${pi}">Add Product</button></div><div class="product-list">\${p.products.map((product,xi)=>\`<div class="product-row"><label>Product name<input data-pattern="\${pi}" data-product="\${xi}" data-key="name" value="\${htmlEscape(product.name)}"></label><label>Product SMARTS<input data-pattern="\${pi}" data-product="\${xi}" data-key="smarts" value="\${htmlEscape(product.smarts)}" placeholder="[!#1:1]"></label><button type="button" class="danger" data-remove-product="\${pi}:\${xi}">Remove</button></div>\`).join('')}</div></section>\`).join('');}
+    document.getElementById('cleavageSetName').oninput=e=>cleavageModel.cleavage_pattern_set.name=e.target.value;document.getElementById('addCleavagePattern').onclick=()=>{cleavageModel.cleavage_pattern_set.patterns.push({name:'',reactant_smarts:'',products:[]});renderCleavage()};
+    document.getElementById('cleavagePatterns').addEventListener('input',e=>{const pi=Number(e.target.dataset.pattern);if(!Number.isInteger(pi))return;const xi=e.target.dataset.product;if(xi===undefined)cleavageModel.cleavage_pattern_set.patterns[pi][e.target.dataset.key]=e.target.value;else cleavageModel.cleavage_pattern_set.patterns[pi].products[Number(xi)][e.target.dataset.key]=e.target.value;});
+    document.getElementById('cleavagePatterns').addEventListener('click',e=>{const b=e.target.closest('button');if(!b)return;if(b.dataset.addProduct!==undefined)cleavageModel.cleavage_pattern_set.patterns[Number(b.dataset.addProduct)].products.push({name:'',smarts:''});else if(b.dataset.removePattern!==undefined)cleavageModel.cleavage_pattern_set.patterns.splice(Number(b.dataset.removePattern),1);else if(b.dataset.removeProduct){const [pi,xi]=b.dataset.removeProduct.split(':').map(Number);cleavageModel.cleavage_pattern_set.patterns[pi].products.splice(xi,1)}else if(b.dataset.savePattern!==undefined){vscode.postMessage({type:'saveCleavagePattern',pattern:cleavageModel.cleavage_pattern_set.patterns[Number(b.dataset.savePattern)]});return}else if(b.dataset.loadPattern!==undefined){vscode.postMessage({type:'loadCleavagePattern',index:Number(b.dataset.loadPattern)});return}else return;renderCleavage()});
+    document.getElementById('loadCleavage').onclick=()=>vscode.postMessage({type:'loadCleavagePatternSet'});document.getElementById('saveCleavage').onclick=()=>vscode.postMessage({type:'saveCleavagePatternSet',value:cleavageModel,path:cleavagePath});renderCleavage();
+    document.getElementById('loadSinglePattern').onclick=()=>vscode.postMessage({type:'loadCleavagePattern',index:-1});
+    let chemistrySequence=0,chemistryWaiters=new Map(),molGraph=null,selectedAtoms=new Set(),selectedBonds=new Set(),atomConstraintState={},atomMapBySource={},visualPatternIndex=-1;
+    function chemistry(command,payload){return new Promise((resolve,reject)=>{const requestId=++chemistrySequence;chemistryWaiters.set(requestId,{resolve,reject});vscode.postMessage({type:'chemistry',requestId,command,payload})})}
+    function renderMolecule(){if(!molGraph)return;const xs=molGraph.atoms.map(a=>a.x),ys=molGraph.atoms.map(a=>a.y),minX=Math.min(...xs),maxX=Math.max(...xs),minY=Math.min(...ys),maxY=Math.max(...ys),sx=x=>40+(x-minX)/(maxX-minX||1)*620,sy=y=>40+(y-minY)/(maxY-minY||1)*360;document.getElementById('moleculeCanvas').innerHTML=\`<svg viewBox="0 0 700 440">\${molGraph.bonds.map(b=>\`<line data-mol-bond="\${b.index}" class="mol-bond \${selectedBonds.has(b.index)?'selected':''}" x1="\${sx(molGraph.atoms[b.begin].x)}" y1="\${sy(molGraph.atoms[b.begin].y)}" x2="\${sx(molGraph.atoms[b.end].x)}" y2="\${sy(molGraph.atoms[b.end].y)}"/>\`).join('')}\${molGraph.atoms.map(a=>\`<g data-mol-atom="\${a.index}" class="mol-atom \${selectedAtoms.has(a.index)?'selected':''}" transform="translate(\${sx(a.x)} \${sy(a.y)})"><circle r="15"/><text text-anchor="middle" dominant-baseline="central">\${a.symbol}</text></g>\`).join('')}</svg>\`;document.getElementById('atomConstraints').innerHTML=[...selectedAtoms].sort((a,b)=>a-b).map(i=>{const current=atomConstraintState[i]||'exact';return \`<label class="constraint">Atom \${i} (\${molGraph.atoms[i].symbol})<select data-constraint="\${i}"><option value="exact" \${current==='exact'?'selected':''}>Exact element</option><option value="any-heavy" \${current==='any-heavy'?'selected':''}>Any non-hydrogen atom</option><option value="C,N" \${current==='C,N'?'selected':''}>C or N</option><option value="C,N,O" \${current==='C,N,O'?'selected':''}>C, N, or O</option></select></label>\`}).join('');}
+    document.getElementById('addVisualPattern').onclick=()=>{document.getElementById('visualBuilder').hidden=false;document.getElementById('builderSmiles').focus()};document.getElementById('closeBuilder').onclick=()=>document.getElementById('visualBuilder').hidden=true;
+    document.getElementById('drawMolecule').onclick=async()=>{try{molGraph=await chemistry('molecule',{smiles:document.getElementById('builderSmiles').value});selectedAtoms=new Set();selectedBonds=new Set();atomConstraintState={};renderMolecule()}catch(e){}};
+    document.getElementById('atomConstraints').onchange=e=>{if(e.target.dataset.constraint!==undefined)atomConstraintState[e.target.dataset.constraint]=e.target.value};
+    document.getElementById('moleculeCanvas').onclick=e=>{const atom=e.target.closest('[data-mol-atom]'),bond=e.target.closest('[data-mol-bond]');if(atom){const i=Number(atom.dataset.molAtom);selectedAtoms.has(i)?selectedAtoms.delete(i):selectedAtoms.add(i)}else if(bond){const i=Number(bond.dataset.molBond);selectedBonds.has(i)?selectedBonds.delete(i):selectedBonds.add(i)}renderMolecule()};
+    document.getElementById('applyReactant').onclick=async()=>{const constraints={};document.querySelectorAll('[data-constraint]').forEach(x=>constraints[x.dataset.constraint]=x.value);try{const result=await chemistry('reactant',{smiles:document.getElementById('builderSmiles').value,name:document.getElementById('builderPatternName').value,atoms:[...selectedAtoms],bonds:[...selectedBonds],constraints});atomMapBySource=result.atomMapBySource;cleavageModel.cleavage_pattern_set.patterns.push({name:document.getElementById('builderPatternName').value,reactant_smarts:result.smarts,products:[]});visualPatternIndex=cleavageModel.cleavage_pattern_set.patterns.length-1;renderCleavage();document.getElementById('productBuilder').hidden=false;document.getElementById('productAtoms').innerHTML=[...selectedAtoms].sort((a,b)=>a-b).map(i=>\`<label class="check"><input type="checkbox" data-keep-atom="\${i}" checked>Retain atom \${i} (map \${atomMapBySource[i]})</label>\`).join('');document.getElementById('productBonds').innerHTML=[...selectedBonds].sort((a,b)=>a-b).map(i=>\`<label>Bond \${i}<select data-product-bond="\${i}"><option value="preserve">Preserve</option><option value="1">Single</option><option value="2">Double</option><option value="3">Triple</option><option value="remove">Remove</option></select></label>\`).join('')}catch(e){}};
+    document.getElementById('applyProduct').onclick=async()=>{const keptAtoms=[...document.querySelectorAll('[data-keep-atom]:checked')].map(x=>Number(x.dataset.keepAtom)),bondOverrides={};document.querySelectorAll('[data-product-bond]').forEach(x=>{if(x.value!=='preserve')bondOverrides[x.dataset.productBond]=x.value});let pattern,added=false;try{const result=await chemistry('product',{smiles:document.getElementById('builderSmiles').value,atoms:[...selectedAtoms],keptAtoms,atomMapBySource,bondOverrides});pattern=cleavageModel.cleavage_pattern_set.patterns[visualPatternIndex];pattern.products.push({name:document.getElementById('builderProductName').value,smarts:result.smarts});added=true;await chemistry('validate',pattern);renderCleavage()}catch(e){if(added)pattern.products.pop()}};
     document.getElementById('loadFragmenter').onclick=()=>vscode.postMessage({type:'loadFragmenter'}); document.getElementById('saveFragmenter').onclick=()=>vscode.postMessage({type:'saveFragmenter',path:form.elements.params.value,text:fragmenterEditor.value});
     form.onsubmit=e=>{e.preventDefault();vscode.postMessage({type:'run',config:getConfig(),fragmenterText:fragmenterEditor.value});}; stop.onclick=()=>vscode.postMessage({type:'stop'});
-    window.addEventListener('message',e=>{const m=e.data;if(m.type==='picked')form.elements[m.field].value=m.value;if(m.type==='config')setConfig(m.config);if(m.type==='fragmenter'){form.elements.params.value=m.path;fragmenterEditor.value=m.text;}if(m.type==='fragmenterSaved')form.elements.params.value=m.path;if(m.type==='status'){statusEl.textContent=m.text;statusEl.className='status '+m.status;stop.disabled=m.status!=='running';if(m.command)document.getElementById('command').textContent=m.command;}});`;
+    window.addEventListener('message',e=>{const m=e.data;if(m.type==='picked')form.elements[m.field].value=m.value;if(m.type==='config')setConfig(m.config);if(m.type==='fragmenter'){form.elements.params.value=m.path;fragmenterEditor.value=m.text;}if(m.type==='fragmenterSaved')form.elements.params.value=m.path;if(m.type==='cleavagePatternSet'){cleavageModel=m.value;cleavagePath=m.path;document.getElementById('cleavagePath').textContent=m.path;renderCleavage()}if(m.type==='cleavagePatternSetSaved'){cleavagePath=m.path;document.getElementById('cleavagePath').textContent=m.path}if(m.type==='cleavagePatternLoaded'){if(m.index>=0)cleavageModel.cleavage_pattern_set.patterns[m.index]=m.pattern;else cleavageModel.cleavage_pattern_set.patterns.push(m.pattern);renderCleavage()}if(m.type==='chemistryResult'){const waiter=chemistryWaiters.get(m.requestId);if(waiter){waiter.resolve(m.result);chemistryWaiters.delete(m.requestId)}}if(m.type==='chemistryError'){const waiter=chemistryWaiters.get(m.requestId);if(waiter){waiter.reject(new Error(m.message));chemistryWaiters.delete(m.requestId)}}if(m.type==='status'){statusEl.textContent=m.text;statusEl.className='status '+m.status;stop.disabled=m.status!=='running';if(m.command)document.getElementById('command').textContent=m.command;}});`;
 }
 function commonCss() { return `:root{color-scheme:light dark;--accent:#36c5a2;--panel:color-mix(in srgb,var(--vscode-editor-background) 88%,var(--vscode-editor-foreground));--border:color-mix(in srgb,var(--vscode-editor-foreground) 18%,transparent)}*{box-sizing:border-box}body{font-family:var(--vscode-font-family);color:var(--vscode-editor-foreground);background:var(--vscode-editor-background);margin:0}main{max-width:1100px;margin:auto;padding:32px}header{display:flex;align-items:flex-start;justify-content:space-between;gap:20px;margin-bottom:28px}h1{font-size:32px;margin:4px 0}h2{font-size:17px;margin:0 0 18px}.eyebrow{color:var(--accent);font-weight:700;letter-spacing:.14em;font-size:11px}.muted,small{opacity:.65}button{font:inherit;color:inherit;background:var(--vscode-button-secondaryBackground);border:1px solid var(--border);border-radius:6px;padding:8px 13px;cursor:pointer}button:hover{background:var(--vscode-button-secondaryHoverBackground)}section{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:22px;margin:14px 0}.cards{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;background:none;border:0;padding:0}.cards article{background:var(--panel);border:1px solid var(--border);padding:18px;border-radius:9px}.cards b{display:block;font-size:23px;color:var(--accent)}.cards span{opacity:.65}.files{display:grid;gap:4px}.file{display:flex;justify-content:space-between;text-align:left;background:transparent;border:0;border-bottom:1px solid var(--border);border-radius:0}.file em{opacity:.55;font-style:normal}dl{display:grid;grid-template-columns:110px 1fr;gap:10px}dt{opacity:.6}dd{margin:0;overflow-wrap:anywhere}code{font-family:var(--vscode-editor-font-family);font-size:12px}@media(max-width:700px){.cards{grid-template-columns:1fr 1fr}main{padding:18px}}`; }
-function formCss() { return `nav{display:flex;gap:8px;margin-bottom:18px}.tab{border-radius:20px}.tab.active{border-color:var(--accent)}label{display:block;font-size:12px;opacity:.8;margin:12px 0}input,select,textarea{width:100%;display:block;margin-top:6px;padding:9px;color:var(--vscode-input-foreground);background:var(--vscode-input-background);border:1px solid var(--vscode-input-border,var(--border));border-radius:5px;font:inherit}.path{display:flex;gap:7px}.path input{flex:1}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:0 16px}.checks{display:flex;flex-wrap:wrap;gap:8px 22px}.check{display:flex;align-items:center;gap:7px}.check input{width:auto;margin:0}.section-title{display:flex;align-items:flex-start;justify-content:space-between;gap:16px}.section-title h2{margin-bottom:4px}.section-title p{margin:0}.actions{display:flex;gap:8px}textarea{min-height:280px;resize:vertical;font-family:var(--vscode-editor-font-family);font-size:12px;line-height:1.5}#helpTooltip{position:fixed;z-index:50;display:none;max-width:380px;padding:9px 11px;border:1px solid var(--vscode-editorHoverWidget-border,var(--border));border-radius:5px;background:var(--vscode-editorHoverWidget-background);color:var(--vscode-editorHoverWidget-foreground);box-shadow:0 4px 14px #0005;font-size:12px;line-height:1.4}#helpTooltip.visible{display:block}.primary{background:var(--vscode-button-background);color:var(--vscode-button-foreground);font-weight:600}.primary:hover{background:var(--vscode-button-hoverBackground)}footer{position:sticky;bottom:0;background:var(--vscode-editor-background);border-top:1px solid var(--border);padding:17px 0;display:flex;justify-content:space-between;align-items:center;gap:20px}.status{font-weight:600}.status.running{color:#e9b949}.status.completed{color:var(--accent)}.status.error,.status.failed{color:#ef6b73}#command{display:block;opacity:.65;max-width:700px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:5px}@media(max-width:700px){.grid{grid-template-columns:1fr}footer{position:static}}`; }
+function formCss() { return `nav{display:flex;gap:8px;margin-bottom:18px}.tab{border-radius:20px}.tab.active{border-color:var(--accent)}[hidden]{display:none!important}label{display:block;font-size:12px;opacity:.8;margin:12px 0}input,select,textarea{width:100%;display:block;margin-top:6px;padding:9px;color:var(--vscode-input-foreground);background:var(--vscode-input-background);border:1px solid var(--vscode-input-border,var(--border));border-radius:5px;font:inherit}.path{display:flex;gap:7px}.path input{flex:1}.row{display:flex;align-items:end;gap:12px}.grow{flex:1}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:0 16px}.checks{display:flex;flex-wrap:wrap;gap:8px 22px}.check{display:flex;align-items:center;gap:7px}.check input{width:auto;margin:0}.section-title{display:flex;align-items:flex-start;justify-content:space-between;gap:16px}.section-title h2{margin-bottom:4px}.section-title p{margin:0}.actions{display:flex;gap:8px}textarea{min-height:280px;resize:vertical;font-family:var(--vscode-editor-font-family);font-size:12px;line-height:1.5}.pattern-card{border-left:3px solid var(--accent)}.product-title{align-items:center;margin-top:18px}.product-title h3{margin:0}.product-list{margin-left:18px}.product-row{display:grid;grid-template-columns:1fr 1fr auto;gap:12px;align-items:end;border-top:1px solid var(--border);padding:6px 0}.danger{color:var(--vscode-errorForeground)}.molecule-canvas{min-height:260px;margin:16px 0;border:1px solid var(--border);border-radius:8px;background:var(--vscode-editor-background)}.molecule-canvas svg{width:100%;height:440px}.mol-bond{stroke:var(--vscode-editor-foreground);stroke-width:5;cursor:pointer}.mol-bond.selected{stroke:var(--accent);stroke-width:9}.mol-atom circle{fill:var(--vscode-editor-background);stroke:var(--vscode-editor-foreground);stroke-width:2}.mol-atom text{fill:var(--vscode-editor-foreground);font-size:13px;font-weight:700;pointer-events:none}.mol-atom{cursor:pointer}.mol-atom.selected circle{fill:var(--accent);stroke:var(--accent)}.constraint{display:inline-block;width:220px;margin-right:10px}#productBuilder{margin-top:22px;padding-top:16px;border-top:1px solid var(--border)}#helpTooltip{position:fixed;z-index:50;display:none;max-width:380px;padding:9px 11px;border:1px solid var(--vscode-editorHoverWidget-border,var(--border));border-radius:5px;background:var(--vscode-editorHoverWidget-background);color:var(--vscode-editorHoverWidget-foreground);box-shadow:0 4px 14px #0005;font-size:12px;line-height:1.4}#helpTooltip.visible{display:block}.primary{background:var(--vscode-button-background);color:var(--vscode-button-foreground);font-weight:600}.primary:hover{background:var(--vscode-button-hoverBackground)}footer{position:sticky;bottom:0;background:var(--vscode-editor-background);border-top:1px solid var(--border);padding:17px 0;display:flex;justify-content:space-between;align-items:center;gap:20px}.status{font-weight:600}.status.running{color:#e9b949}.status.completed{color:var(--accent)}.status.error,.status.failed{color:#ef6b73}#command{display:block;opacity:.65;max-width:700px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:5px}@media(max-width:700px){.grid,.product-row{grid-template-columns:1fr}.row{display:block}footer{position:static}}`; }
 
 function deactivate() { if (runningProcess) runningProcess.kill('SIGTERM'); }
 module.exports = { activate, deactivate, buildArgs, normalizeConfig };
