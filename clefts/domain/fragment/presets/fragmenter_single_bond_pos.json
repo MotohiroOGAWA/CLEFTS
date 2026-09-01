@@ -1,0 +1,150 @@
+{
+  "fragment_ion_tree_builder": {
+    "max_depth": 3,
+    "cleavage_pattern_set": {
+      "name": "single_bond_cleavage_pattern_set",
+      "patterns": [
+        {
+          "name": "single_bond_cleavage",
+          "reactant_smarts": "[!#1:1]-[!#1:2]",
+          "products": [
+            {
+              "name": "single_bond_cleavage",
+              "smarts": "[!#1:1]"
+            }
+          ]
+        }
+      ]
+    },
+    "fragment_ion_adduct_rule_set": {
+      "name": "",
+      "adduct_rules": [
+        {
+          "name": "pos_H_r1_u2",
+          "adduct_type": "[M+H]+",
+          "radical": true,
+          "unsaturation": 2,
+          "ion_shifts": [
+            {
+              "ion_shift": "[M-H]+",
+              "atoms": [
+                "C",
+                "P",
+                "S"
+              ]
+            },
+            {
+              "ion_shift": "[M+H]+",
+              "atoms": [
+                "P",
+                "S",
+                "N",
+                "O"
+              ]
+            }
+          ]
+        },
+        {
+          "name": "pos_Na_r1_u2",
+          "adduct_type": "[M+Na]+",
+          "radical": true,
+          "unsaturation": 2,
+          "ion_shifts": [
+            {
+              "ion_shift": "[M+Na]+"
+            },
+            {
+              "ion_shift": "[M-H]+",
+              "atoms": [
+                "C",
+                "P",
+                "S"
+              ]
+            },
+            {
+              "ion_shift": "[M+H]+",
+              "atoms": [
+                "P",
+                "S",
+                "N",
+                "O"
+              ]
+            }
+          ]
+        },
+        {
+          "name": "pos_NH4_r1_u2",
+          "adduct_type": "[M+H4N]+",
+          "radical": true,
+          "unsaturation": 2,
+          "ion_shifts": [
+            {
+              "ion_shift": "[M+H4N]+"
+            },
+            {
+              "ion_shift": "[M+H]+",
+              "atoms": [
+                "P",
+                "S",
+                "N",
+                "O"
+              ]
+            },
+            {
+              "ion_shift": "[M-H]+",
+              "atoms": [
+                "C",
+                "P",
+                "S"
+              ]
+            }
+          ]
+        },
+        {
+          "name": "pos_2M_H_to_M_r1_u2",
+          "adduct_type": "[2M+H]+",
+          "radical": true,
+          "unsaturation": 2,
+          "ion_shifts": [
+            {
+              "ion_shift": "[2M+H]+",
+              "atoms": [
+                "P",
+                "S",
+                "N",
+                "O"
+              ]
+            },
+            {
+              "ion_shift": "[2M-H]+",
+              "atoms": [
+                "C",
+                "P",
+                "S"
+              ]
+            },
+            {
+              "ion_shift": "[M+H]+",
+              "atoms": [
+                "P",
+                "S",
+                "N",
+                "O"
+              ]
+            },
+            {
+              "ion_shift": "[M-H]+",
+              "atoms": [
+                "C",
+                "P",
+                "S"
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "precursor_candidate_max_depth": 1,
+  "mass_tolerance": "0.01Da,10ppm"
+}

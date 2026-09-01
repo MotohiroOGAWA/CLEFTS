@@ -1,0 +1,32 @@
+{
+  "adduct_rules": [
+    {
+      "name": "neg_H_r1_u2",
+      "adduct_type": "[M-H]-",
+      "radical": true,
+      "unsaturation": 2,
+      "ion_shifts": [
+        {
+          "atoms": ["C", "P", "S", "N", "O"],
+          "ion_shift": "[M-H]-"
+        }
+      ]
+    },
+    {
+      "name": "pos_2M_minus_H_to_M_r1_u2",
+      "adduct_type": "[2M-H]-",
+      "radical": true,
+      "unsaturation": 2,
+      "ion_shifts": [
+        {
+          "atoms": ["P", "S", "N", "O"],
+          "ion_shift": "[M+H]+"
+        },
+        {
+          "atoms": ["C", "P", "S"],
+          "ion_shift": "[M-H]+"
+        }
+      ]
+    }
+  ]
+}

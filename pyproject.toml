@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "clefts"
+version = "0.1.0"
+description = "CLEFTS: CLeavage-Expressive Fragmentation Tree Spectrum generator for LC-MS/MS analysis and molecular annotation"
+authors = [
+    { name = "Motohiro Ogawa" }
+]
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+dependencies = [
+    "tqdm",
+    "numpy",
+    "pandas",
+    "h5py",
+    "pyarrow",
+    "gradio",
+]
+
+[project.scripts]
+clefts = "clefts.cli.main:main"
+
+[tool.setuptools.packages.find]
+include = ["clefts*"]
+
+[project.optional-dependencies]
+docs = [
+    "sphinx>=8",
+    "furo",
+    "sphinx-autodoc-typehints",
+    "myst-parser",
+    "myst-nb",
+]
+
+[tool.mypy]
+files = ["clefts"]
+show_error_codes = true
+strict = true
+enable_error_code = ["ignore-without-code", "redundant-expr", "truthy-bool"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

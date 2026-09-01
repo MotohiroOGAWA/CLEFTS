@@ -1,0 +1,50 @@
+from __future__ import annotations
+
+from contextlib import contextmanager
+from contextvars import ContextVar
+from typing import Iterator, Optional
+
+from tqdm import tqdm
+
+
+TQDM_NCOLS = 108
+TQDM_BAR_FORMAT = (
+    "{desc:<18.18} {percentage:3.0f}%|{bar:30}| "
+    "{n_fmt:>6}/{total_fmt:<6} [{elapsed}<{remaining}, {rate_fmt}]"
+)
+
+_edge_bar: ContextVar[Optional[tqdm]] = ContextVar("fragment_edge_bar", default=None)
+
+
+def fixed_tqdm(*args, position: int, leave: bool, **kwargs) -> tqdm:
+    """Construct a fixed-width bar that never follows terminal resizing."""
+    kwargs.setdefault("ncols", TQDM_NCOLS)
+    kwargs.setdefault("dynamic_ncols", False)
+    kwargs.setdefault("position", int(position))
+    kwargs.setdefault("leave", bool(leave))
+    kwargs.setdefault("bar_format", TQDM_BAR_FORMAT)
+    kwargs.setdefault("mininterval", 0.1)
+    return tqdm(*args, **kwargs)
+
+
+@contextmanager
+def iteration_edge_progress(total: int, *, desc: str = "edges") -> Iterator[None]:
+    bar = fixed_tqdm(
+        total=max(int(total), 0),
+        desc=desc,
+        position=2,
+        leave=False,
+    )
+    token = _edge_bar.set(bar)
+    try:
+        yield
+    finally:
+        _edge_bar.reset(token)
+        bar.close()
+
+
+def advance_edge_progress(count: int = 1) -> None:
+    bar = _edge_bar.get()
+    if bar is not None:
+        remaining = max(int(bar.total or 0) - int(bar.n), 0)
+        bar.update(min(max(int(count), 0), remaining))

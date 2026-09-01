@@ -1,0 +1,9 @@
+{
+  "name": "",
+  "patterns": [
+    {
+      "name": "heavy atom single bond cleavage",
+      "smirks": "[!#1:1]-!@[!#1:2]>>[!#1:1][H]"
+    }
+  ]
+}
