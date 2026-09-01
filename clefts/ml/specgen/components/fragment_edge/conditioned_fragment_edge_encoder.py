@@ -42,6 +42,8 @@ class StructuralEdgeEncoder(nn.Module):
         attention_max_graph_distance: int = 4,
         max_edges_per_step: int = 128,
         max_edges_per_depth: Tuple[int, ...] = (128, 64, 32),
+        training_edges_per_sample: int = 32,
+        training_zero_edge_fraction: float = 0.25,
         dropout: float = 0.1,
     ) -> None:
         super().__init__()
@@ -93,6 +95,12 @@ class StructuralEdgeEncoder(nn.Module):
         self.condition_dim = int(condition_dim)
         self.max_edges_per_step = int(max_edges_per_step)
         self.max_edges_per_depth = tuple(int(value) for value in max_edges_per_depth)
+        self.training_edges_per_sample = int(training_edges_per_sample)
+        self.training_zero_edge_fraction = float(training_zero_edge_fraction)
+        if self.training_edges_per_sample < 1:
+            raise ValueError("training_edges_per_sample must be positive.")
+        if not 0.0 <= self.training_zero_edge_fraction <= 1.0:
+            raise ValueError("training_zero_edge_fraction must be between 0 and 1.")
         if not self.max_edges_per_depth or min(self.max_edges_per_depth) < 1:
             raise ValueError("max_edges_per_depth values must be positive.")
         self.attention_max_graph_distance = int(attention_max_graph_distance)
@@ -383,6 +391,67 @@ class StructuralEdgeEncoder(nn.Module):
         """
         return edge_h[edge_ids]
 
+    def _sample_training_edges(self, structure, edge_logit: Tensor) -> Tensor:
+        """Choose influential positives, hard negatives, and zero-intensity exploration."""
+        if not hasattr(structure, "target_edge_index"):
+            return torch.arange(edge_logit.numel(), device=edge_logit.device)
+        target_pairs = structure.target_edge_index.to(edge_logit.device).long()
+        target_groups = structure.target_edge_group_index.to(edge_logit.device).long()
+        formula_peak = structure.formula_peak_index.to(edge_logit.device).long()
+        intensities = structure.sample_peak_intensity.to(edge_logit.device).float()
+        sample_edges = structure.sample_edge_index.to(edge_logit.device).long()
+        selected: set[int] = set()
+        for sample_id in range(int(structure.num_samples)):
+            assigned = sample_edges[1, sample_edges[0] == sample_id]
+            assigned = assigned[(assigned >= 0) & (assigned < edge_logit.numel())].unique()
+            rows = (target_pairs[0] == sample_id).nonzero(as_tuple=False).flatten()
+            groups = target_groups[rows].unique(sorted=True) if rows.numel() else target_groups[:0]
+            ranked_groups = sorted(
+                groups.tolist(),
+                key=lambda group: float(intensities[formula_peak[int(group)]].item()),
+                reverse=True,
+            )
+            positive_budget = max(
+                1,
+                self.training_edges_per_sample
+                - int(round(self.training_edges_per_sample * self.training_zero_edge_fraction)),
+            )
+            sample_positive: set[int] = set()
+            all_alternatives: set[int] = set()
+            for group in ranked_groups[:positive_budget]:
+                group_rows = rows[target_groups[rows] == int(group)]
+                alternatives = target_pairs[1, group_rows]
+                alternatives = alternatives[
+                    (alternatives >= 0) & (alternatives < edge_logit.numel())
+                ].unique()
+                all_alternatives.update(int(value) for value in alternatives.tolist())
+                if alternatives.numel():
+                    probability = torch.softmax(edge_logit[alternatives].detach(), dim=0)
+                    choice = int(alternatives[torch.multinomial(probability, 1)].item())
+                    sample_positive.add(choice)
+            selected.update(sample_positive)
+            negative_budget = max(self.training_edges_per_sample - len(sample_positive), 0)
+            negative = torch.tensor(
+                [int(value) for value in assigned.tolist() if int(value) not in all_alternatives],
+                dtype=torch.long,
+                device=edge_logit.device,
+            )
+            if negative.numel() and negative_budget:
+                hard_count = min((negative_budget + 1) // 2, int(negative.numel()))
+                hard = negative[torch.topk(edge_logit[negative], hard_count).indices]
+                remaining = negative[~torch.isin(negative, hard)]
+                random_count = min(negative_budget - hard_count, int(remaining.numel()))
+                random = (
+                    remaining[torch.randperm(remaining.numel(), device=remaining.device)[:random_count]]
+                    if random_count else remaining[:0]
+                )
+                selected.update(int(value) for value in torch.cat((hard, random)).tolist())
+        if not selected:
+            finite = torch.isfinite(edge_logit)
+            count = min(self.training_edges_per_sample, int(finite.sum().item()))
+            return torch.topk(edge_logit.masked_fill(~finite, -torch.inf), count).indices
+        return torch.tensor(sorted(selected), dtype=torch.long, device=edge_logit.device)
+
     def forward(
         self,
         features: FragmentTreeFeatures,
@@ -390,12 +459,22 @@ class StructuralEdgeEncoder(nn.Module):
         selected_edge_index: Optional[Tensor] = None,
     ) -> FragmentEdgeEncoderOutput:
         edge_h, edge_logit = self.encode_base(features)
-        selected = torch.arange(edge_h.size(0), device=edge_h.device)
+        if selected_edge_index is not None:
+            selected = selected_edge_index.to(edge_h.device).long().unique(sorted=True)
+        elif self.training and torch.is_grad_enabled():
+            selected = self._sample_training_edges(features.structure, edge_logit)
+        else:
+            selected = torch.arange(edge_h.size(0), device=edge_h.device)
+        selected_set = set(int(value) for value in selected.detach().cpu().tolist())
         event_edge = features.structure.cleavage_event_edge_index.long()
         updated_edge_h = []
-        for edge_chunk in selected.split(self.max_edges_per_step):
+        all_edges = torch.arange(edge_h.size(0), device=edge_h.device)
+        for edge_chunk in all_edges.split(self.max_edges_per_step):
             for edge_id_tensor in edge_chunk:
                 edge_id = int(edge_id_tensor.item())
+                if edge_id not in selected_set:
+                    updated_edge_h.append(edge_h[edge_id])
+                    continue
                 event_ids = (event_edge == int(edge_id)).nonzero(as_tuple=False).flatten()
                 if event_ids.numel() == 0:
                     updated_edge_h.append(edge_h[edge_id])

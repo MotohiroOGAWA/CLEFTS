@@ -2426,6 +2426,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-edges-per-depth", type=_csv_int_tuple, default=(128, 64, 32)
     )
+    parser.add_argument("--training-edges-per-sample", type=int, default=32)
+    parser.add_argument("--training-zero-edge-fraction", type=float, default=0.25)
     parser.add_argument("--max-samples", type=int, default=100)
     parser.add_argument("--max-edges-per-step", type=int, default=128)
     parser.add_argument("--max-retained-edges", type=int, default=30)
@@ -2506,6 +2508,8 @@ if __name__ == "__main__":
             "attention_max_graph_distance": args.attention_max_graph_distance,
             "max_edges_per_step": args.max_edges_per_step,
             "max_edges_per_depth": args.max_edges_per_depth,
+            "training_edges_per_sample": args.training_edges_per_sample,
+            "training_zero_edge_fraction": args.training_zero_edge_fraction,
         },
         tree_encoder_params={
             "hidden_dim": args.tree_hidden_dim,

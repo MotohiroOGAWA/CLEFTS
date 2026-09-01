@@ -54,20 +54,42 @@ class PairwiseEdgeIntensityRankingLoss(nn.Module):
         worse_rows: List[int] = []
 
         for sample_id in sample_ids.unique(sorted=True).tolist():
-            intensity_by_edge: Dict[int, float] = {}
             rows = (target_pairs[0] == int(sample_id)).nonzero(as_tuple=False).flatten()
-            for row in rows.tolist():
-                edge_id = int(target_pairs[1, row].item())
-                group_id = int(target_groups[row].item())
-                value = float(peak_intensity[formula_peak[group_id]].item())
-                intensity_by_edge[edge_id] = max(value, intensity_by_edge.get(edge_id, 0.0))
             sample_mask = sample_ids == int(sample_id)
+            intensity_by_row: Dict[int, float] = {}
+            alternative_rows: set[int] = set()
+            # A formula/mz group can have several valid explanatory edges.
+            # Treat the current highest-scoring alternative as the latent
+            # representative instead of forcing every alternative positive.
+            for group_id in target_groups[rows].unique(sorted=True).tolist():
+                group_rows = rows[target_groups[rows] == int(group_id)]
+                group_edge_ids = target_pairs[1, group_rows].unique()
+                candidates = (
+                    sample_mask
+                    & torch.isin(edge_ids, group_edge_ids)
+                ).nonzero(as_tuple=False).flatten()
+                if candidates.numel() == 0:
+                    continue
+                alternative_rows.update(int(value) for value in candidates.tolist())
+                representative = int(candidates[torch.argmax(logit[candidates])].item())
+                intensity_by_row[representative] = float(
+                    peak_intensity[formula_peak[int(group_id)]].item()
+                )
             for source_id in source_ids[sample_mask].unique(sorted=True).tolist():
                 local = (sample_mask & (source_ids == int(source_id))).nonzero(as_tuple=False).flatten()
+                local = torch.tensor(
+                    [
+                        int(index)
+                        for index in local.tolist()
+                        if int(index) not in alternative_rows or int(index) in intensity_by_row
+                    ],
+                    dtype=torch.long,
+                    device=logit.device,
+                )
                 if local.numel() < 2:
                     continue
                 raw = logit.new_tensor([
-                    intensity_by_edge.get(int(edge_ids[index].item()), 0.0)
+                    intensity_by_row.get(int(index), 0.0)
                     for index in local
                 ])
                 values = torch.sqrt(raw.clamp_min(0.0))
@@ -131,21 +153,27 @@ class FragmentEdgeAbsoluteRankerTrainingLoss(nn.Module):
         logits = edge_output.absolute_score_logit
         finite = torch.isfinite(logits)
         target_pairs = target.target_edge_index.to(logits.device).long()
-        positive_ids = (
-            target_pairs[1].unique(sorted=True)
-            if target_pairs.numel()
-            else logits.new_empty((0,), dtype=torch.long)
-        )
-        positive_ids = positive_ids[
-            (positive_ids >= 0) & (positive_ids < logits.numel())
-        ]
-        positive_ids = positive_ids[finite[positive_ids]]
+        target_groups = target.target_edge_group_index.to(logits.device).long()
+        positive_ids = target_pairs[1].unique(sorted=True) if target_pairs.numel() else logits.new_empty((0,), dtype=torch.long)
+        positive_ids = positive_ids[(positive_ids >= 0) & (positive_ids < logits.numel())]
         negative = finite.clone()
         if positive_ids.numel():
             negative[positive_ids] = False
         components = []
-        if positive_ids.numel():
-            components.append(F.softplus(-logits[positive_ids]).mean())
+        # Multiple edges in one (sample, formula/mz) group are alternatives:
+        # logsumexp is a smooth OR, so at least one explanation must score high.
+        group_losses = []
+        if target_pairs.numel():
+            for sample_id in target_pairs[0].unique(sorted=True).tolist():
+                sample_rows = target_pairs[0] == int(sample_id)
+                for group_id in target_groups[sample_rows].unique(sorted=True).tolist():
+                    ids = target_pairs[1, sample_rows & (target_groups == int(group_id))]
+                    ids = ids[(ids >= 0) & (ids < logits.numel())]
+                    ids = ids[finite[ids]].unique()
+                    if ids.numel():
+                        group_losses.append(F.softplus(-torch.logsumexp(logits[ids], dim=0)))
+        if group_losses:
+            components.append(torch.stack(group_losses).mean())
         if negative.any():
             components.append(
                 F.binary_cross_entropy_with_logits(

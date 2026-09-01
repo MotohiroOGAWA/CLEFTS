@@ -6,9 +6,13 @@ import torch
 import torch.nn as nn
 
 from clefts.ml.specgen.components.fragment_edge import ConditionEdgeScorer
+from clefts.ml.specgen.components.fragment_edge.conditioned_fragment_edge_encoder import (
+    StructuralEdgeEncoder,
+)
 from clefts.ml.specgen.fragment_tree_candidate_selector import FragmentTreeCandidateSelector
 from clefts.ml.specgen.fragment_tree_feature_model import FragmentTreeFeatureModel
 from clefts.ml.training.fragment_tree_training.model import (
+    FragmentEdgeAbsoluteRankerTrainingLoss,
     FragmentTreeSelectionTrainingLoss,
     FragmentTreeTrainingModel,
     PairwiseEdgeIntensityRankingLoss,
@@ -159,3 +163,38 @@ def test_edge_depth_budget_count_must_match_fragmenter_depth():
         assert "fragmenter.tree_max_depth=3" in str(exc)
     else:
         raise AssertionError("Expected max_edges_per_depth length validation.")
+
+
+def test_training_edge_sampler_keeps_one_alternative_and_zero_edges():
+    encoder = StructuralEdgeEncoder.__new__(StructuralEdgeEncoder)
+    nn.Module.__init__(encoder)
+    encoder.training_edges_per_sample = 4
+    encoder.training_zero_edge_fraction = 0.5
+    structure = SimpleNamespace(
+        num_samples=1,
+        target_edge_index=torch.tensor([[0, 0], [0, 1]]),
+        target_edge_group_index=torch.tensor([0, 0]),
+        formula_peak_index=torch.tensor([0]),
+        sample_peak_intensity=torch.tensor([1.0]),
+        sample_edge_index=torch.tensor([[0, 0, 0, 0, 0], [0, 1, 2, 3, 4]]),
+    )
+    torch.manual_seed(0)
+    selected = encoder._sample_training_edges(
+        structure, torch.tensor([0.0, 0.0, 5.0, 1.0, -1.0])
+    )
+    values = set(selected.tolist())
+    assert len(values & {0, 1}) == 1
+    assert 2 in values  # highest-scoring zero-intensity hard negative
+    assert len(values) <= 4
+
+
+def test_alternative_edge_group_uses_smooth_or_not_all_positive():
+    loss_fn = FragmentEdgeAbsoluteRankerTrainingLoss()
+    loss_fn.metrics = lambda edge_output, target: {}
+    target = SimpleNamespace(
+        target_edge_index=torch.tensor([[0, 0], [0, 1]]),
+        target_edge_group_index=torch.tensor([0, 0]),
+    )
+    one_high = SimpleNamespace(absolute_score_logit=torch.tensor([5.0, -5.0, -5.0]))
+    both_low = SimpleNamespace(absolute_score_logit=torch.tensor([-5.0, -5.0, -5.0]))
+    assert loss_fn(one_high, target)[0] < loss_fn(both_low, target)[0]

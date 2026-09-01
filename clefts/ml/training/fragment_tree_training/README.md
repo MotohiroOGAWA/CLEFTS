@@ -179,16 +179,38 @@ not materialize a `[num_samples, num_edges, hidden_dim]` tensor.
 
 ## Current absolute_ranker loss
 
-Edges appearing in `target_edge_index` are positive edges. The current loss uses:
+`target_edge_group_index` groups alternative edges that can explain the same
+target formula/m/z. These alternatives are not all forced to be positive. The
+group uses a smooth multiple-instance-learning OR:
 
 ```text
-positive component = mean(softplus(-positive_logits))
+group_score = logsumexp(alternative_edge_logits)
+positive component = mean(softplus(-group_score))
 negative component = BCEWithLogits(negative_logits, 0)
 loss = mean(available components)
 ```
 
-Positive and negative components are averaged separately so that a large number
-of negatives does not automatically dominate the positive component.
+Thus one sufficiently strong explanation can satisfy a measured peak. Pairwise
+intensity ranking likewise uses the currently highest-scoring alternative as a
+latent representative and excludes the other alternatives from zero-intensity
+negative pairs. This avoids training mutually valid paths against each other.
+
+### Training-only influential-edge sampling
+
+Inference (`eval`) computes the attention-aware representation and absolute score
+for every stored edge. During training, the inexpensive base logits are first
+computed for all edges, then expensive reaction-center atom attention is limited
+per sample. The default sampler keeps up to 32 edges per sample using:
+
+1. target groups ordered by measured intensity, selecting one alternative path
+   per retained group;
+2. high-base-score zero-intensity edges as hard negatives;
+3. random zero-intensity edges for exploration.
+
+Alternative paths are sampled from a softmax of their detached base logits, so a
+single currently preferred explanation is trained in one step without permanently
+discarding other explanations. The selected structural edges are shared across
+conditions in the same stored tree.
 
 Important current limitation: the positive component is not yet weighted by
 `intensity / max_intensity`. A high-intensity target edge and a low-intensity
@@ -615,6 +637,8 @@ Fragmenter, MolEncoder, shortest-path calculation, attention, and Graphormer.
 | `--attention-max-graph-distance` | 4 | Hard-mask radius from reaction centers |
 | `--max-edges-per-depth` | 128,64,32 | Per-sample edge limit for depth 1, 2, and 3 |
 | `--max-next-cleavage-candidates` | 3 | Primary per-sample limit on nodes selected for the next cleavage stage |
+| `--training-edges-per-sample` | 32 | Training-only budget for expensive attention-aware edge encoding |
+| `--training-zero-edge-fraction` | 0.25 | Fraction reserved for hard/random zero-intensity edges |
 
 `edge_feature_dim` must be divisible by `edge_attention_heads`. The effective
 node limit is `max_next_cleavage_candidates`. The number of
