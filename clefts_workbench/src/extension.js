@@ -372,6 +372,20 @@ async function resultHtml(manifestPath) {
 
 async function readStructureManifests(root) {
   const results = [];
+  const localManifest = path.join(root, 'manifest.tsv');
+  if (fs.existsSync(localManifest)) {
+    const lines = (await fs.promises.readFile(localManifest, 'utf8')).trim().split(/\r?\n/);
+    if (lines.length && lines[0]) {
+      const columns = lines[0].split('\t');
+      const rows = lines.slice(1).map(line => {
+        const values = line.split('\t'), row = Object.fromEntries(columns.map((column, index) => [column, values[index] || '']));
+        row.relative = row.file ? path.join('data', row.file) : '';
+        row.exists = Boolean(row.relative && fs.existsSync(path.join(root, row.relative)));
+        return row;
+      });
+      results.push({ directory: path.basename(root), relativeBase: '', rows });
+    }
+  }
   for (const directory of ['train_structures', 'validation_structures']) {
     const file = path.join(root, directory, 'manifest.tsv');
     if (!fs.existsSync(file)) continue;
@@ -385,14 +399,14 @@ async function readStructureManifests(root) {
       row.exists = Boolean(row.relative && fs.existsSync(path.join(root, row.relative)));
       return row;
     });
-    results.push({ directory, rows });
+    results.push({ directory, relativeBase: directory, rows });
   }
   return results;
 }
 
 function manifestTableHtml(manifest) {
   const columns = ['file', 'status', 'smiles', 'num_input_records', 'num_valid_samples', 'rejected_sample_count', 'rejection_log', 'num_nodes', 'num_edges'];
-  return `<h3>${escapeHtml(manifest.directory)}</h3><div class="table-scroll"><table><thead><tr>${columns.map(column => `<th>${escapeHtml(column)}</th>`).join('')}</tr></thead><tbody>${manifest.rows.map(row => `<tr>${columns.map(column => { const value = row[column] || ''; if (column === 'file' && value && row.exists) return `<td><button class="manifest-file" data-open-file="${encodeURIComponent(row.relative)}">${escapeHtml(value)}</button></td>`; if (column === 'file' && value) return `<td><span>${escapeHtml(value)}</span><small class="missing-file">not generated (${escapeHtml(row.status || 'missing')})</small></td>`; if (column === 'rejection_log' && value) return `<td><button class="manifest-file" data-open-file="${encodeURIComponent(path.join(manifest.directory, value))}">${escapeHtml(value)}</button></td>`; return `<td>${escapeHtml(value)}</td>`; }).join('')}</tr>`).join('')}</tbody></table></div>`;
+  return `<h3>${escapeHtml(manifest.directory)}</h3><div class="table-scroll"><table><thead><tr>${columns.map(column => `<th>${escapeHtml(column)}</th>`).join('')}</tr></thead><tbody>${manifest.rows.map(row => `<tr>${columns.map(column => { const value = row[column] || ''; if (column === 'file' && value && row.exists) return `<td><button class="manifest-file" data-open-file="${encodeURIComponent(row.relative)}">${escapeHtml(value)}</button></td>`; if (column === 'file' && value) return `<td><span>${escapeHtml(value)}</span><small class="missing-file">not generated (${escapeHtml(row.status || 'missing')})</small></td>`; if (column === 'rejection_log' && value) return `<td><button class="manifest-file" data-open-file="${encodeURIComponent(path.join(manifest.relativeBase || '', value))}">${escapeHtml(value)}</button></td>`; return `<td>${escapeHtml(value)}</td>`; }).join('')}</tr>`).join('')}</tbody></table></div>`;
 }
 
 function inspectFragmentTreeResult(context, target) {

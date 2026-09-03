@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
 import shutil
 import sys
@@ -1008,6 +1009,41 @@ def prepare_validation_input(
     return str(output)
 
 
+def write_split_result_markers(
+    *,
+    output_root: Path,
+    args: argparse.Namespace,
+) -> list[Path]:
+    """Write one independently openable Workbench result per generated split."""
+    written = []
+    split_inputs = {
+        "train": args.train_input,
+        "validation": args.validation_input or args.validation_structures_input_dir,
+    }
+    for split_name, source_input in split_inputs.items():
+        structure_dir = output_root / f"{split_name}_structures"
+        manifest_file = structure_dir / "manifest.tsv"
+        if not manifest_file.exists():
+            continue
+        marker = structure_dir / "fragment-tree.pft"
+        payload = {
+            "schemaVersion": 1,
+            "application": "fragment-tree-data-preparation",
+            "resultType": "fragment-tree-structure-split",
+            "split": split_name,
+            "status": "completed",
+            "outputDirectory": str(structure_dir.resolve()),
+            "sourceInput": None if source_input is None else str(source_input),
+            "manifest": "manifest.tsv",
+            "dataDirectory": "data",
+            "finishedAt": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        }
+        marker.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+        written.append(marker)
+        print(f"wrote {split_name} result: {marker}")
+    return written
+
+
 def main(args: Optional[argparse.Namespace] = None) -> None:
     if args is None:
         args = parse_args()
@@ -1153,6 +1189,7 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
             pattern_set=pattern_set,
             num_workers=max(1, int(args.num_workers)),
         )
+        write_split_result_markers(output_root=output_root, args=args)
         return
 
     if args.num_workers > 1:
@@ -1182,6 +1219,7 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
                 assignment_score_output=validation_assignment_score_output,
                 split_name="validation",
             )
+        write_split_result_markers(output_root=output_root, args=args)
         return
 
     build_structure_files_for_input(
@@ -1228,6 +1266,7 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
             pattern_set=pattern_set,
             num_workers=max(1, int(args.num_workers)),
         )
+    write_split_result_markers(output_root=output_root, args=args)
 
 
 if __name__ == "__main__":
