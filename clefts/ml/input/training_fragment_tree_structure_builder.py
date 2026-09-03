@@ -79,6 +79,12 @@ class TrainingSampleInputRow:
 
 @dataclass
 class TrainingFragmentTreeStructureBuilder(SingleFragmentTreeStructureBuilder):
+    def reset(self) -> None:
+        super().reset()
+        # Aligned with the rows passed to the most recent add call.  A None
+        # entry means that the sample was accepted.
+        self.sample_rejection_reasons: List[Optional[Dict[str, str]]] = []
+
     def add_training_sample(
         self,
         dataset: MSDataset,
@@ -114,6 +120,7 @@ class TrainingFragmentTreeStructureBuilder(SingleFragmentTreeStructureBuilder):
         )
 
         sample_rows: List[Optional[TrainingSampleInputRow]] = []
+        rejection_reasons: List[Optional[Dict[str, str]]] = []
         peak_sets: List[Tuple[Adduct, Tuple[float, ...]]] = []
 
         for record_index in range(len(dataset)):
@@ -140,6 +147,7 @@ class TrainingFragmentTreeStructureBuilder(SingleFragmentTreeStructureBuilder):
                     file=sys.stderr,
                 )
                 sample_rows.append(None)
+                rejection_reasons.append({"stage": "metadata_parsing", "reason": f"{type(exc).__name__}: {exc}"})
                 continue
 
             peak_mz = tuple(float(peak.mz) for peak in record.peaks)
@@ -152,6 +160,7 @@ class TrainingFragmentTreeStructureBuilder(SingleFragmentTreeStructureBuilder):
                     source_label=f"record_index={record_index}",
                 )
             )
+            rejection_reasons.append(None)
             peak_sets.append((precursor_type, peak_mz))
 
         assignments = self._context.fragmenter.assign_fragment_pathways_to_peak_sets(
@@ -166,6 +175,7 @@ class TrainingFragmentTreeStructureBuilder(SingleFragmentTreeStructureBuilder):
             fragment_ion_tree=fragment_ion_tree,
             fragment_compound_by_smiles=fragment_compound_by_smiles,
             desc="Adding training samples",
+            rejection_reasons=rejection_reasons,
         )
 
     def add_training_samples_from_structure(
@@ -204,6 +214,7 @@ class TrainingFragmentTreeStructureBuilder(SingleFragmentTreeStructureBuilder):
             fragment_ion_tree=fragment_ion_tree,
             fragment_compound_by_smiles=fragment_compound_by_smiles,
             desc="Rebuilding training samples",
+            rejection_reasons=[None] * len(sample_rows),
         )
 
     def _build_and_register_fragment_ion_tree(
@@ -274,11 +285,13 @@ class TrainingFragmentTreeStructureBuilder(SingleFragmentTreeStructureBuilder):
         fragment_ion_tree: FragmentIonTree,
         fragment_compound_by_smiles: Dict[str, Compound],
         desc: str,
+        rejection_reasons: List[Optional[Dict[str, str]]],
     ) -> np.ndarray:
+        self.sample_rejection_reasons = rejection_reasons
         sample_indexes: List[int] = []
         assignment_index = 0
 
-        for row in tqdm(sample_rows, desc=desc, mininterval=1.0):
+        for row_index, row in enumerate(tqdm(sample_rows, desc=desc, mininterval=1.0)):
             if row is None:
                 sample_indexes.append(-1)
                 continue
@@ -289,7 +302,7 @@ class TrainingFragmentTreeStructureBuilder(SingleFragmentTreeStructureBuilder):
             ) = assignments[assignment_index]
             assignment_index += 1
 
-            sample_index = self._add_assigned_training_sample(
+            sample_index, rejection = self._add_assigned_training_sample(
                 row=row,
                 precursor_fragment_pathways=precursor_fragment_pathways,
                 fragment_pathways_by_peaks=fragment_pathways_by_peaks,
@@ -297,6 +310,8 @@ class TrainingFragmentTreeStructureBuilder(SingleFragmentTreeStructureBuilder):
                 fragment_ion_tree=fragment_ion_tree,
                 fragment_compound_by_smiles=fragment_compound_by_smiles,
             )
+            if rejection is not None:
+                self.sample_rejection_reasons[row_index] = rejection
             sample_indexes.append(sample_index)
 
         return np.asarray(sample_indexes, dtype=int)
@@ -310,9 +325,12 @@ class TrainingFragmentTreeStructureBuilder(SingleFragmentTreeStructureBuilder):
         smiles: str,
         fragment_ion_tree: FragmentIonTree,
         fragment_compound_by_smiles: Dict[str, Compound],
-    ) -> int:
+    ) -> Tuple[int, Optional[Dict[str, str]]]:
         if len(precursor_fragment_pathways) == 0:
-            return -1
+            return -1, {
+                "stage": "precursor_assignment",
+                "reason": "No precursor pathway matched the precursor m/z and adduct within the configured mass tolerance.",
+            }
 
         sample_index = len(self.samples)
         sample = TrainingFragmentTreeSample(
@@ -342,7 +360,7 @@ class TrainingFragmentTreeStructureBuilder(SingleFragmentTreeStructureBuilder):
                 f"adduct_type={self._context.fragmenter.adduct_types[int(row.adduct_type_index)]}: {exc}",
                 file=sys.stderr,
             )
-            return -1
+            return -1, {"stage": "sample_construction", "reason": f"{type(exc).__name__}: {exc}"}
 
         if not (
             len(sample.precursor_edge_indexes)
@@ -356,10 +374,13 @@ class TrainingFragmentTreeStructureBuilder(SingleFragmentTreeStructureBuilder):
             )
 
         if len(sample.precursor_edge_indexes) == 0:
-            return -1
+            return -1, {
+                "stage": "precursor_registration",
+                "reason": "Precursor pathways were found but none could be registered in the fragment tree.",
+            }
 
         self.samples[int(sample_index)] = sample
-        return int(sample_index)
+        return int(sample_index), None
 
     def to_structure(self) -> TrainingFragmentTreeStructure:
         structure = super().to_structure()

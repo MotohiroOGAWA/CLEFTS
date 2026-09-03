@@ -111,7 +111,15 @@ def inspect_structure(file_path: Path) -> dict:
         "edges": graph_edges,
         "truncated": graph_node_count < int(structure.num_nodes),
     }
-    return {"file": str(file_path), "metadata": metadata, "summary": {"samples": int(structure.num_samples), "nodes": int(structure.num_nodes), "edges": int(structure.num_edges), "peaks": total_peaks, "assignedPeaks": assigned_peaks, "depthCounts": depth_counts}, "graph": graph, "samples": samples, "truncated": int(structure.num_samples) > max_samples or total_peaks > max_peaks}
+    target_summary = {
+        "schemaVersion": metadata.get("target_schema_version", "legacy/unknown"),
+        "depthPolicy": metadata.get("target_depth_policy", "unknown"),
+        "formulas": int(structure.target_formula.size(0)),
+        "assignments": int(structure.target_terminal_node_index.numel()),
+        "pathEdges": int(structure.target_path_edge_index.numel()),
+        "expandNodes": int(structure.target_expand_node_index.numel()),
+    }
+    return {"file": str(file_path), "metadata": metadata, "summary": {"samples": int(structure.num_samples), "nodes": int(structure.num_nodes), "edges": int(structure.num_edges), "peaks": total_peaks, "assignedPeaks": assigned_peaks, "depthCounts": depth_counts, "targets": target_summary}, "graph": graph, "samples": samples, "truncated": int(structure.num_samples) > max_samples or total_peaks > max_peaks}
 
 
 if __name__ == "__main__":

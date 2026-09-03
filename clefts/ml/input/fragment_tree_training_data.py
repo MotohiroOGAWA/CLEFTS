@@ -226,6 +226,7 @@ def build_fragment_tree_structure_files(
         raise ValueError("No SMILES groups were found for structure generation.")
 
     manifest_rows: List[Dict[str, object]] = []
+    rejection_rows: List[Dict[str, object]] = []
     saved_files: List[Path] = []
     builder = TrainingFragmentTreeStructureBuilder(feature_model)
 
@@ -275,6 +276,23 @@ def build_fragment_tree_structure_files(
                 max_edge=max_edge,
             )
             valid_sample_count = int((sample_indexes >= 0).sum())
+            for local_index, (record_index, sample_index) in enumerate(zip(record_indexes, sample_indexes.tolist())):
+                if int(sample_index) >= 0:
+                    continue
+                metadata_row = dataset.metadata.iloc[record_index]
+                rejection = builder.sample_rejection_reasons[local_index] or {
+                    "stage": "unknown", "reason": "Sample was rejected without a recorded reason."
+                }
+                rejection_rows.append({
+                    "record_index": int(record_index),
+                    "source_record_index": int(metadata_row.get("__fragment_tree_original_index", record_index)),
+                    "SpecID": "" if pd.isna(metadata_row.get("SpecID")) else str(metadata_row.get("SpecID")),
+                    "smiles": smiles,
+                    "adduct": "" if pd.isna(metadata_row.get(adduct_type_column)) else str(metadata_row.get(adduct_type_column)),
+                    "collision_energy": "" if pd.isna(metadata_row.get(collision_energy_column)) else str(metadata_row.get(collision_energy_column)),
+                    "stage": rejection["stage"],
+                    "reason": rejection["reason"],
+                })
 
             if valid_sample_count <= 0:
                 manifest_rows.append(
@@ -282,6 +300,8 @@ def build_fragment_tree_structure_files(
                         "file": structure_file.name,
                         "smiles": smiles,
                         "num_input_records": len(record_indexes),
+                        "rejected_sample_count": len(record_indexes),
+                        "rejection_log": "rejected_samples.tsv",
                         "status": "no_valid_samples",
                     }
                 )
@@ -362,6 +382,10 @@ def build_fragment_tree_structure_files(
     manifest_path = Path(manifest_file) if manifest_file is not None else output_path / "manifest.tsv"
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     manifest.to_csv(manifest_path, sep="\t", index=False)
+    rejection_columns = ["record_index", "source_record_index", "SpecID", "smiles", "adduct", "collision_energy", "stage", "reason"]
+    pd.DataFrame(rejection_rows, columns=rejection_columns).to_csv(
+        manifest_path.with_name("rejected_samples.tsv"), sep="\t", index=False
+    )
 
     return saved_files
 
@@ -388,6 +412,7 @@ def build_fragment_tree_structure_files_from_existing(
         raise FileNotFoundError(f"No structure .preft.pt files found in {input_path}.")
 
     manifest_rows: List[Dict[str, object]] = []
+    rejection_rows: List[Dict[str, object]] = []
     saved_files: List[Path] = []
     builder = TrainingFragmentTreeStructureBuilder(feature_model)
 
@@ -422,8 +447,28 @@ def build_fragment_tree_structure_files_from_existing(
             builder.reset()
             sample_indexes = builder.add_training_samples_from_structure(item.structure, smiles=smiles, max_node=max_node, max_edge=max_edge)
             valid_sample_count = int((sample_indexes >= 0).sum())
+            raw_adducts = metadata.get("sample_adduct_types", [])
+            raw_ce = metadata.get("sample_collision_energy_raw", [])
+            spec_ids = metadata.get("spec_ids", [])
+            source_indexes = metadata.get("source_record_indexes", metadata.get("record_indexes", []))
+            for sample_id, sample_index in enumerate(sample_indexes.tolist()):
+                if int(sample_index) >= 0:
+                    continue
+                rejection = builder.sample_rejection_reasons[sample_id] or {
+                    "stage": "unknown", "reason": "Sample was rejected without a recorded reason."
+                }
+                rejection_rows.append({
+                    "record_index": sample_id,
+                    "source_record_index": source_indexes[sample_id] if sample_id < len(source_indexes) else sample_id,
+                    "SpecID": spec_ids[sample_id] if sample_id < len(spec_ids) else "",
+                    "smiles": smiles,
+                    "adduct": raw_adducts[sample_id] if sample_id < len(raw_adducts) else str(item.structure.sample_adduct_type_index[sample_id].item()),
+                    "collision_energy": raw_ce[sample_id] if sample_id < len(raw_ce) else str(item.structure.sample_ce_value[sample_id].item()),
+                    "stage": rejection["stage"],
+                    "reason": rejection["reason"],
+                })
             if valid_sample_count <= 0:
-                manifest_rows.append({"file": target_file.name, "smiles": smiles, "num_input_records": item.structure.num_samples, "status": "no_valid_samples"})
+                manifest_rows.append({"file": target_file.name, "smiles": smiles, "num_input_records": item.structure.num_samples, "rejected_sample_count": item.structure.num_samples, "rejection_log": "rejected_samples.tsv", "status": "no_valid_samples"})
                 continue
 
             record_indexes = metadata.get("record_indexes", [])
@@ -446,5 +491,9 @@ def build_fragment_tree_structure_files_from_existing(
     manifest_path = Path(manifest_file) if manifest_file is not None else output_path / "manifest.tsv"
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     manifest.to_csv(manifest_path, sep="\t", index=False)
+    rejection_columns = ["record_index", "source_record_index", "SpecID", "smiles", "adduct", "collision_energy", "stage", "reason"]
+    pd.DataFrame(rejection_rows, columns=rejection_columns).to_csv(
+        manifest_path.with_name("rejected_samples.tsv"), sep="\t", index=False
+    )
 
     return saved_files
