@@ -97,6 +97,7 @@ class TrainingFragmentTreeStructureBuilder(SingleFragmentTreeStructureBuilder):
         max_node: int = -1,
         max_edge: int = -1,
         max_depth: Optional[int] = None,
+        require_precursor_path_targets: bool = True,
     ) -> np.ndarray:
         """Add same-SMILES MSDataset records as training samples."""
         if len(dataset) == 0:
@@ -176,6 +177,7 @@ class TrainingFragmentTreeStructureBuilder(SingleFragmentTreeStructureBuilder):
             fragment_compound_by_smiles=fragment_compound_by_smiles,
             desc="Adding training samples",
             rejection_reasons=rejection_reasons,
+            require_precursor_path_targets=require_precursor_path_targets,
         )
 
     def add_training_samples_from_structure(
@@ -186,6 +188,7 @@ class TrainingFragmentTreeStructureBuilder(SingleFragmentTreeStructureBuilder):
         max_node: int = -1,
         max_edge: int = -1,
         max_depth: Optional[int] = None,
+        require_precursor_path_targets: bool = True,
     ) -> np.ndarray:
         """Rebuild training samples from a saved structure and current model."""
         fragment_ion_tree, fragment_compound_by_smiles = (
@@ -215,6 +218,7 @@ class TrainingFragmentTreeStructureBuilder(SingleFragmentTreeStructureBuilder):
             fragment_compound_by_smiles=fragment_compound_by_smiles,
             desc="Rebuilding training samples",
             rejection_reasons=[None] * len(sample_rows),
+            require_precursor_path_targets=require_precursor_path_targets,
         )
 
     def _build_and_register_fragment_ion_tree(
@@ -286,6 +290,7 @@ class TrainingFragmentTreeStructureBuilder(SingleFragmentTreeStructureBuilder):
         fragment_compound_by_smiles: Dict[str, Compound],
         desc: str,
         rejection_reasons: List[Optional[Dict[str, str]]],
+        require_precursor_path_targets: bool,
     ) -> np.ndarray:
         self.sample_rejection_reasons = rejection_reasons
         sample_indexes: List[int] = []
@@ -309,6 +314,7 @@ class TrainingFragmentTreeStructureBuilder(SingleFragmentTreeStructureBuilder):
                 smiles=smiles,
                 fragment_ion_tree=fragment_ion_tree,
                 fragment_compound_by_smiles=fragment_compound_by_smiles,
+                require_precursor_path_targets=require_precursor_path_targets,
             )
             if rejection is not None:
                 self.sample_rejection_reasons[row_index] = rejection
@@ -325,6 +331,7 @@ class TrainingFragmentTreeStructureBuilder(SingleFragmentTreeStructureBuilder):
         smiles: str,
         fragment_ion_tree: FragmentIonTree,
         fragment_compound_by_smiles: Dict[str, Compound],
+        require_precursor_path_targets: bool,
     ) -> Tuple[int, Optional[Dict[str, str]]]:
         if len(precursor_fragment_pathways) == 0:
             return -1, {
@@ -352,6 +359,7 @@ class TrainingFragmentTreeStructureBuilder(SingleFragmentTreeStructureBuilder):
                 fragment_ion_tree=fragment_ion_tree,
                 fragment_pathways_by_peaks=fragment_pathways_by_peaks,
                 fragment_compound_by_smiles=fragment_compound_by_smiles,
+                require_precursor_path_targets=require_precursor_path_targets,
             )
         except Exception as exc:
             print(
@@ -648,11 +656,20 @@ class TrainingFragmentTreeStructureBuilder(SingleFragmentTreeStructureBuilder):
         fragment_ion_tree: FragmentIonTree,
         fragment_pathways_by_peaks: Sequence[FragmentPathwayGroup],
         fragment_compound_by_smiles: Dict[str, Compound],
+        require_precursor_path_targets: bool,
     ) -> None:
         formula_tensorizer = self._get_formula_tensorizer()
         group_index_by_peak_formula: Dict[Tuple[int, str], int] = {}
 
         for peak_index, fragment_pathways in enumerate(fragment_pathways_by_peaks):
+            # A peak target is meaningful only when its pathway explicitly
+            # passes through an observed precursor for this sample.  Do not
+            # fall back to treating the molecular root as a precursor.
+            if require_precursor_path_targets:
+                fragment_pathways = tuple(
+                    pathway for pathway in fragment_pathways
+                    if any(node.is_precursor for node in pathway.nodes)
+                )
             if len(fragment_pathways) == 0:
                 continue
 

@@ -89,6 +89,16 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--require-precursor-path-targets",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Require every supervised peak pathway to explicitly pass through "
+            "a precursor node. Use --no-require-precursor-path-targets to keep "
+            "pathways without a precursor marker."
+        ),
+    )
+    parser.add_argument(
         "--output-dir",
         required=True,
         help=(
@@ -555,6 +565,7 @@ def build_structure_files_for_input(
         overwrite=args.overwrite,
         manifest_file=manifest_file,
         valid_record_indexes=valid_record_indexes if save_valid else None,
+        require_precursor_path_targets=args.require_precursor_path_targets,
     )
 
     if save_valid:
@@ -629,6 +640,7 @@ def build_structure_files_for_existing_input(
         max_edge=args.max_edge,
         overwrite=args.overwrite,
         manifest_file=manifest_file,
+        require_precursor_path_targets=args.require_precursor_path_targets,
     )
 
     print(f"saved structure files: {len(saved_files)}")
@@ -852,6 +864,8 @@ def run_parallel_for_input(
         part_event_outputs.append(temp_events)
         if args.instrument_column is not None:
             command.extend(["--instrument-column", str(args.instrument_column)])
+        if not args.require_precursor_path_targets:
+            command.append("--no-require-precursor-path-targets")
         if save_valid:
             command.extend(
                 [

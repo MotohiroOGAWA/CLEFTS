@@ -211,6 +211,7 @@ def build_fragment_tree_structure_files(
     overwrite: bool = False,
     manifest_file: Optional[str | Path] = None,
     valid_record_indexes: Optional[List[int]] = None,
+    require_precursor_path_targets: bool = True,
 ) -> List[Path]:
     """Build and save one FragmentTreeStructure file per SMILES group."""
 
@@ -274,6 +275,7 @@ def build_fragment_tree_structure_files(
                 instrument_column=instrument_column,
                 max_node=max_node,
                 max_edge=max_edge,
+                require_precursor_path_targets=require_precursor_path_targets,
             )
             valid_sample_count = int((sample_indexes >= 0).sum())
             for local_index, (record_index, sample_index) in enumerate(zip(record_indexes, sample_indexes.tolist())):
@@ -342,6 +344,7 @@ def build_fragment_tree_structure_files(
                 "num_edges": int(structure.num_edges),
                 "max_node": int(max_node),
                 "max_edge": int(max_edge),
+                "require_precursor_path_targets": bool(require_precursor_path_targets),
                 "sample_collision_energy_raw": raw_collision_energy,
                 "sample_adduct_types": raw_adduct_types,
             }
@@ -400,6 +403,7 @@ def build_fragment_tree_structure_files_from_existing(
     max_edge: int = -1,
     overwrite: bool = False,
     manifest_file: Optional[str | Path] = None,
+    require_precursor_path_targets: bool = True,
 ) -> List[Path]:
     """Build/copy structure files from an existing structure directory."""
 
@@ -445,7 +449,7 @@ def build_fragment_tree_structure_files_from_existing(
                 continue
 
             builder.reset()
-            sample_indexes = builder.add_training_samples_from_structure(item.structure, smiles=smiles, max_node=max_node, max_edge=max_edge)
+            sample_indexes = builder.add_training_samples_from_structure(item.structure, smiles=smiles, max_node=max_node, max_edge=max_edge, require_precursor_path_targets=require_precursor_path_targets)
             valid_sample_count = int((sample_indexes >= 0).sum())
             raw_adducts = metadata.get("sample_adduct_types", [])
             raw_ce = metadata.get("sample_collision_energy_raw", [])
@@ -479,7 +483,7 @@ def build_fragment_tree_structure_files_from_existing(
                 valid_record_indexes = list(range(item.structure.num_samples))
 
             structure = builder.to_structure()
-            new_metadata = {**metadata, "target_schema_version": 2, "target_depth_policy": "minimum-post-precursor-cleavage-depth", "smiles": smiles, "record_indexes": valid_record_indexes, "sample_indexes": [int(index) for index in sample_indexes.tolist()], "num_input_records": int(len(valid_record_indexes)), "num_valid_samples": int(structure.num_samples), "num_nodes": int(structure.num_nodes), "num_edges": int(structure.num_edges), "max_node": int(max_node), "max_edge": int(max_edge), "source_structure_file": str(source_file)}
+            new_metadata = {**metadata, "target_schema_version": 2, "target_depth_policy": "minimum-post-precursor-cleavage-depth", "require_precursor_path_targets": bool(require_precursor_path_targets), "smiles": smiles, "record_indexes": valid_record_indexes, "sample_indexes": [int(index) for index in sample_indexes.tolist()], "num_input_records": int(len(valid_record_indexes)), "num_valid_samples": int(structure.num_samples), "num_nodes": int(structure.num_nodes), "num_edges": int(structure.num_edges), "max_node": int(max_node), "max_edge": int(max_edge), "source_structure_file": str(source_file)}
             save_fragment_tree_structure(structure=structure, output_file=target_file, metadata=new_metadata)
             saved_files.append(target_file)
             manifest_rows.append({"file": target_file.name, "status": "rebuilt", **new_metadata})

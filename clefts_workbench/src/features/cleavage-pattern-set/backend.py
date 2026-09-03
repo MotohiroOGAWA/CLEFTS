@@ -12,6 +12,7 @@ from rdkit.Chem import rdDepictor
 from rdkit.Chem.Draw import rdMolDraw2D
 
 from clefts.domain.fragment.cleavage._CleavagePattern import _CleavagePattern, ProductRule
+from clefts.libs.mmkit.mmkit import Adduct, Formula
 
 
 def molecule(payload: dict[str, Any]) -> dict[str, Any]:
@@ -46,7 +47,35 @@ def depict(payload: dict[str, Any]) -> dict[str, Any]:
     drawer.DrawMolecule(mol)
     drawer.FinishDrawing()
     svg = drawer.GetDrawingText().replace("svg:", "")
-    return {"canonicalSmiles": Chem.MolToSmiles(mol), "svg": svg}
+    neutral_formula = Formula.from_mol(mol).plain
+    used_adduct = str(payload.get("usedAdduct", ""))
+    state_modified = bool(payload.get("stateModified"))
+    precursor_mol = Chem.MolFromSmiles(str(payload.get("precursorSmiles", "")))
+    precursor_mass = Formula.from_mol(precursor_mol).plain.exact_mass if precursor_mol is not None else None
+    adduct_rows = []
+    for text in dict.fromkeys(str(value) for value in payload.get("adducts", []) if value):
+        try:
+            adduct = Adduct.parse(text)
+            ion_formula = adduct.apply_to_formula(neutral_formula)
+            if not ion_formula.is_nonnegative:
+                raise ValueError("resulting formula contains a negative element count")
+            adduct_rows.append({
+                "adduct": str(adduct),
+                "formula": str(ion_formula),
+                "mz": adduct.apply_to_mz(neutral_formula.exact_mass),
+                "neutralLoss": None if precursor_mass is None else adduct.apply_to_mz(precursor_mass) - adduct.apply_to_mz(neutral_formula.exact_mass),
+                "used": str(adduct) == used_adduct,
+                "stateModified": str(adduct) == used_adduct and state_modified,
+            })
+        except Exception as exc:
+            adduct_rows.append({"adduct": text, "error": str(exc)})
+    return {
+        "canonicalSmiles": Chem.MolToSmiles(mol),
+        "svg": svg,
+        "formula": str(neutral_formula),
+        "exactMass": neutral_formula.exact_mass,
+        "adducts": adduct_rows,
+    }
 
 
 def _source(payload: dict[str, Any]) -> Chem.Mol:
