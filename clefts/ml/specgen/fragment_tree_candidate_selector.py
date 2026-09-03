@@ -307,10 +307,14 @@ class FragmentTreeCandidateSelector(nn.Module):
             ):
                 graph_index = int(batch.batch[batch.edge_index[0, local_edge]].detach().cpu().item())
                 sample_id = int(kept_sample_ids[graph_index].item())
-                edge_score[(sample_id, int(global_edge))] = float(
-                    (output.edge_absolute_logit[local_edge]
-                     + output.edge_cleave_logit[local_edge]).detach().cpu().item()
+                # Log-probability increments are never positive.  Therefore a
+                # child path cannot outrank its own prefix merely because its
+                # local raw logit is large.
+                local_score = (
+                    torch.nn.functional.logsigmoid(output.edge_absolute_logit[local_edge])
+                    + torch.nn.functional.logsigmoid(output.edge_cleave_logit[local_edge])
                 )
+                edge_score[(sample_id, int(global_edge))] = float(local_score.detach().cpu().item())
 
         ranked: dict[int, List[Tuple[float, int]]] = {}
         path_score: dict[Tuple[int, int], float] = {}
@@ -319,7 +323,9 @@ class FragmentTreeCandidateSelector(nn.Module):
         for sample_id, edge_id in pairs:
             dst = int(edge_dst[edge_id].item())
             score = edge_score.get((sample_id, edge_id), float("-inf"))
-            score += node_score.get((sample_id, dst), 0.0)
+            score += float(torch.nn.functional.logsigmoid(
+                torch.tensor(node_score.get((sample_id, dst), 0.0))
+            ).item())
             parent_node = int(edge_src[edge_id].item())
             parent_scores = [
                 value for (sid, previous_edge), value in path_score.items()
@@ -447,13 +453,25 @@ class FragmentTreeCandidateSelector(nn.Module):
         has_parent = torch.zeros(structure.num_nodes, dtype=torch.bool, device=edge_src.device)
         has_parent[edge_dst] = True
         roots = (~has_parent).nonzero(as_tuple=False).flatten()
-        depth_one_edges = torch.isin(edge_src, roots).nonzero(as_tuple=False).flatten()
-        allowed = set(depth_one_edges.detach().cpu().tolist())
-        pairs = [
-            (int(sample_id), int(edge_id))
-            for sample_id, edge_id in structure.sample_edge_index.detach().cpu().t().tolist()
-            if int(edge_id) in allowed
-        ]
+        root_set = set(int(value) for value in roots.detach().cpu().tolist())
+        precursor_sources: dict[int, set[int]] = {
+            sample: set(root_set) for sample in range(structure.num_samples)
+        }
+        paths = structure.precursor_edge_index_path.detach().cpu().long()
+        precursor_samples = structure.precursor_sample_index.detach().cpu().long()
+        edge_dst_cpu = edge_dst.detach().cpu()
+        for row, sample_id in zip(paths, precursor_samples.tolist()):
+            valid = row[row >= 0]
+            if valid.numel():
+                precursor_sources.setdefault(int(sample_id), set()).add(
+                    int(edge_dst_cpu[int(valid[-1])].item())
+                )
+        pairs = []
+        for sample_id, edge_id in structure.sample_edge_index.detach().cpu().t().tolist():
+            if int(edge_id) < 0:
+                continue
+            if int(edge_src[int(edge_id)].item()) in precursor_sources.get(int(sample_id), root_set):
+                pairs.append((int(sample_id), int(edge_id)))
         pairs = self._top_conditioned_edge_pairs(
             features, pairs, max_per_sample=self.fragment_edge_encoder.max_edges_per_depth[0]
         )

@@ -76,6 +76,15 @@ Important fields include:
 | `target_edge_group_index` | Groups of alternative edges that can satisfy a target formula |
 | `target_expand_node_index` | Stored intermediate nodes that must be expanded along supervised paths |
 | `terminal_expand_ptr` | CSR pointer mapping terminal assignments to their stored expand nodes |
+| `target_peak_depth` | One preselected minimum post-precursor cleavage depth per observed peak (`-1` means empty) |
+| `target_path_edge_index` | Ordered edge paths for each terminal assignment |
+| `terminal_path_ptr` | CSR pointer mapping assignments to complete edge paths |
+
+Targets are frozen during preprocessing.  For each observed `sample_peak_mz`,
+only assignments at the smallest cleavage depth after the actual precursor node
+are retained.  Thus a peak is represented by exactly one depth-specific node
+family (or an empty family), while formulas and alternative molecular paths at
+that depth remain grouped together.
 
 Several cleavage events may map to one tree edge. Event representations are
 averaged into one condition-independent structural edge embedding. Conditions

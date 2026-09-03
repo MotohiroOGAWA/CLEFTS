@@ -122,10 +122,59 @@ class PairwiseEdgeIntensityRankingLoss(nn.Module):
             return logit.sum() * 0.0
         if not hasattr(output.sample_tree_batch, "edge_id_global"):
             raise ValueError("sample_tree_batch must expose edge_id_global.")
-        better, worse = self.build_pairs(output, target)
-        if better.numel() == 0:
+        batch = output.sample_tree_batch
+        edge_ids = batch.edge_id_global.to(logit.device).long()
+        edge_graph = batch.batch[batch.edge_index[0]].to(logit.device).long()
+        sample_ids = batch.kept_sample_ids.to(logit.device).long()[edge_graph]
+        target_edges = target.target_edge_index.to(logit.device).long()
+        target_groups = target.target_edge_group_index.to(logit.device).long()
+        formula_peak = target.formula_peak_index.to(logit.device).long()
+        intensities = target.sample_peak_intensity.to(logit.device).float().clamp_min(0)
+        losses: List[Tensor] = []
+        weights: List[Tensor] = []
+        for sample_id in sample_ids.unique(sorted=True).tolist():
+            rows = (target_edges[0] == int(sample_id)).nonzero(as_tuple=False).flatten()
+            group_rows = []
+            alternatives: set[int] = set()
+            for group_id in target_groups[rows].unique(sorted=True).tolist():
+                members = rows[target_groups[rows] == int(group_id)]
+                ids = target_edges[1, members].unique()
+                candidate = (sample_ids == int(sample_id)) & torch.isin(edge_ids, ids)
+                indexes = candidate.nonzero(as_tuple=False).flatten()
+                if not indexes.numel():
+                    continue
+                alternatives.update(int(v) for v in indexes.tolist())
+                # logsumexp is log(sum(exp(score))): the requested sum of all
+                # alternative absolute evidences without rewarding group size
+                # through a forced all-positive label.
+                evidence = torch.logsumexp(logit[indexes], dim=0)
+                intensity = intensities[formula_peak[int(group_id)]]
+                group_rows.append((evidence, intensity))
+            group_rows.sort(key=lambda item: float(item[1]), reverse=True)
+            for high, low in zip(group_rows, group_rows[1:]):
+                if float(torch.sqrt(high[1]) - torch.sqrt(low[1])) <= self.intensity_threshold:
+                    continue
+                losses.append(F.softplus(-(high[0] - low[0])))
+                weights.append(high[1].clamp_min(1e-12))
+            # Observed formula groups also compete against unassigned edges,
+            # including edges at the same depth.  Bound this comparison count.
+            background = torch.tensor([
+                index for index in (sample_ids == int(sample_id)).nonzero(as_tuple=False).flatten().tolist()
+                if int(index) not in alternatives
+            ], dtype=torch.long, device=logit.device)
+            if background.numel() and group_rows:
+                hard = background[torch.topk(logit[background], k=min(self.ranking_pairs_per_edge, int(background.numel()))).indices]
+                background_evidence = torch.logsumexp(logit[hard], dim=0)
+                for evidence, intensity in group_rows[: self.ranking_pairs_per_edge]:
+                    if float(intensity) <= 0:
+                        continue
+                    losses.append(F.softplus(-(evidence - background_evidence)))
+                    weights.append(intensity.clamp_min(1e-12))
+        if not losses:
             return logit.sum() * 0.0
-        return F.softplus(-(logit[better] - logit[worse])).mean()
+        loss_values = torch.stack(losses)
+        loss_weights = torch.stack(weights)
+        return (loss_values * loss_weights).sum() / loss_weights.sum().clamp_min(1e-12)
 
     @torch.no_grad()
     def metrics(self, output, target) -> Dict[str, float]:
@@ -495,15 +544,10 @@ class FragmentTreeSelectionTrainingLoss(nn.Module):
 
         cleave_target, cleave_mask = self._build_cleave_targets(output, target, device=device)
         if cleave_mask.any():
-            losses.append(
-                self._balanced_node_bce_loss(
-                    logit=output.cleave_logit,
-                    target=cleave_target,
-                    mask=cleave_mask,
-                    output=output,
-                    device=device,
-                )
-            )
+            losses.append(self._expand_node_ranking_loss(
+                output, target, cleave_target=cleave_target,
+                cleave_mask=cleave_mask, device=device,
+            ))
 
         edge_group_loss = self._edge_group_coverage_loss(output, target, device=device)
         edge_negative_loss = self._edge_negative_loss(output, target, device=device)
@@ -821,6 +865,31 @@ class FragmentTreeSelectionTrainingLoss(nn.Module):
         if len(sample_losses) == 0:
             return logit.sum() * 0.0
         return torch.stack(sample_losses).mean()
+
+    def _expand_node_ranking_loss(
+        self, output, target, *, cleave_target: Tensor,
+        cleave_mask: Tensor, device: torch.device,
+    ) -> Tensor:
+        """At least one stored path intermediate must beat every outsider."""
+        batch = output.sample_tree_batch
+        kept = batch.kept_sample_ids.to(device).long()
+        graph_by_node = batch.batch.to(device).long()
+        losses: List[Tensor] = []
+        weights: List[Tensor] = []
+        for graph_id, sample_id in enumerate(kept.tolist()):
+            local = cleave_mask & (graph_by_node == graph_id)
+            positive = local & (cleave_target > 0.5)
+            negative = local & ~positive
+            if not positive.any() or not negative.any():
+                continue
+            positive_score = torch.logsumexp(output.cleave_logit[positive], dim=0)
+            hard_negative = output.cleave_logit[negative].max()
+            losses.append(F.softplus(-(positive_score - hard_negative)))
+            peak_start = int(target.sample_peak_ptr[sample_id])
+            peak_end = int(target.sample_peak_ptr[sample_id + 1])
+            sample_intensity = target.sample_peak_intensity[peak_start:peak_end].to(device).float()
+            weights.append(sample_intensity.max().clamp_min(1e-12) if sample_intensity.numel() else output.cleave_logit.new_tensor(1.0))
+        return self._weighted_mean(losses, weights, output.cleave_logit)
 
     def _edge_group_coverage_loss(
         self,

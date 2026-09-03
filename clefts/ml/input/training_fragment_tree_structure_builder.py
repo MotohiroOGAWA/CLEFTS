@@ -32,6 +32,8 @@ class TrainingFormulaTarget:
     formula_tensor: Tensor
     intensity: float
     expand_node_indexes: Tuple[int, ...] = ()
+    edge_path_indexes: Tuple[int, ...] = ()
+    cleavage_depth: int = -1
 
 
 @dataclass
@@ -424,8 +426,15 @@ class TrainingFragmentTreeStructureBuilder(SingleFragmentTreeStructureBuilder):
         formula_assignment_ptr_values: List[int] = [0]
         target_expand_node_indexes: List[int] = []
         terminal_expand_ptr_values: List[int] = [0]
+        target_path_edge_indexes: List[int] = []
+        terminal_path_ptr_values: List[int] = [0]
+        target_peak_depth_values = [-1] * len(sample_peak_mz_values)
 
-        for assignments in assignments_by_formula:
+        global_peak_by_formula_index = {
+            int(formula_index): int(global_peak_index)
+            for (global_peak_index, _), formula_index in formula_key_to_index.items()
+        }
+        for formula_index, assignments in enumerate(assignments_by_formula):
             for target in assignments:
                 target_terminal_node_indexes.append(int(target.node_index))
                 target_ion_indexes.append(int(target.ion_index))
@@ -439,6 +448,11 @@ class TrainingFragmentTreeStructureBuilder(SingleFragmentTreeStructureBuilder):
                     seen_expand_nodes.add(node_index)
                     target_expand_node_indexes.append(node_index)
                 terminal_expand_ptr_values.append(len(target_expand_node_indexes))
+                target_path_edge_indexes.extend(int(edge) for edge in target.edge_path_indexes)
+                terminal_path_ptr_values.append(len(target_path_edge_indexes))
+                global_peak = global_peak_by_formula_index.get(int(formula_index), -1)
+                if 0 <= global_peak < len(target_peak_depth_values):
+                    target_peak_depth_values[global_peak] = int(target.cleavage_depth)
             formula_assignment_ptr_values.append(len(target_terminal_node_indexes))
 
         return TrainingFragmentTreeStructure(
@@ -519,6 +533,9 @@ class TrainingFragmentTreeStructureBuilder(SingleFragmentTreeStructureBuilder):
                 dtype=torch.long,
                 device=structure.device,
             ),
+            target_peak_depth=torch.tensor(target_peak_depth_values, dtype=torch.long, device=structure.device),
+            target_path_edge_index=torch.tensor(target_path_edge_indexes, dtype=torch.long, device=structure.device),
+            terminal_path_ptr=torch.tensor(terminal_path_ptr_values, dtype=torch.long, device=structure.device),
         )
 
     def _make_fragment_compound_by_smiles(
@@ -613,6 +630,17 @@ class TrainingFragmentTreeStructureBuilder(SingleFragmentTreeStructureBuilder):
             if len(fragment_pathways) == 0:
                 continue
 
+            # Freeze one target family per observed peak before training.  The
+            # depth is counted from the precursor node, not necessarily from
+            # the molecular-tree root (neutral-loss precursor adducts can have
+            # several root -> precursor paths).
+            pathway_depths = [self._fragmentation_depth(pathway) for pathway in fragment_pathways]
+            minimum_depth = min(pathway_depths)
+            fragment_pathways = tuple(
+                pathway for pathway, depth in zip(fragment_pathways, pathway_depths)
+                if depth == minimum_depth
+            )
+
             peak_intensity = (
                 float(sample.peak_intensity[peak_index])
                 if peak_index < len(sample.peak_intensity)
@@ -637,13 +665,20 @@ class TrainingFragmentTreeStructureBuilder(SingleFragmentTreeStructureBuilder):
                     for edge_index in edge_index_path
                     if edge_index >= 0
                 ]
+                precursor_positions = [
+                    index for index, node in enumerate(fragment_pathway.nodes)
+                    if node.is_precursor
+                ]
+                precursor_position = precursor_positions[-1] if precursor_positions else 0
+                fragmentation_edge_indexes = valid_edge_indexes[precursor_position:]
                 sample.target_edge_indexes.update(valid_edge_indexes)
                 sample.edge_indexes.update(valid_edge_indexes)
                 for node_index in range(len(fragment_pathway) - 1):
                     src_smiles = fragment_pathway.get_node(node_index).smiles
                     dst_smiles = fragment_pathway.get_node(node_index + 1).smiles
                     src_node_index = self._get_node_index(src_smiles)
-                    expand_node_indexes_for_terminal.append(int(src_node_index))
+                    if node_index > precursor_position:
+                        expand_node_indexes_for_terminal.append(int(src_node_index))
                     sample.edge_indexes.update(
                         self._get_outgoing_edge_indexes_from_fragment_ion_tree(
                             fragment_ion_tree=fragment_ion_tree,
@@ -689,11 +724,23 @@ class TrainingFragmentTreeStructureBuilder(SingleFragmentTreeStructureBuilder):
                         ),
                         intensity=peak_intensity,
                         expand_node_indexes=tuple(expand_node_indexes_for_terminal),
+                        edge_path_indexes=tuple(fragmentation_edge_indexes),
+                        cleavage_depth=int(minimum_depth),
                     ),
                     main_adduct_type=self._context.fragmenter.adduct_types[
                         int(sample.adduct_type_index)
                     ],
                 )
+
+    @staticmethod
+    def _fragmentation_depth(fragment_pathway) -> int:
+        """Number of cleavages after the actual precursor in a pathway."""
+        precursor_positions = [
+            index for index, node in enumerate(fragment_pathway.nodes)
+            if node.is_precursor
+        ]
+        start = precursor_positions[-1] if precursor_positions else 0
+        return max(len(fragment_pathway.nodes) - 1 - start, 0)
 
     def _add_or_replace_formula_target(
         self,

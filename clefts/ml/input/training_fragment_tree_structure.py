@@ -61,6 +61,15 @@ class TrainingFragmentTreeStructure(FragmentTreeStructure):
     terminal_expand_ptr: Tensor
     # [A + 1] Expand-node pointer per terminal node/state assignment.
 
+    target_peak_depth: Tensor
+    # [K] Selected minimum post-precursor cleavage depth, or -1 for no target.
+
+    target_path_edge_index: Tensor
+    # [P] Ordered global edge IDs for every terminal assignment path.
+
+    terminal_path_ptr: Tensor
+    # [A + 1] CSR pointer into target_path_edge_index.
+
     def __post_init__(self) -> None:
         super().__post_init__()
         if self.sample_peak_mz.dim() != 1:
@@ -86,6 +95,23 @@ class TrainingFragmentTreeStructure(FragmentTreeStructure):
             raise ValueError("formula_assignment_ptr must have shape [num_target_formulas + 1].")
         if self.terminal_expand_ptr.dim() != 1 or self.terminal_expand_ptr.numel() != assignment_count + 1:
             raise ValueError("terminal_expand_ptr must have shape [num_terminal_assignments + 1].")
+        if self.target_peak_depth.dim() != 1 or self.target_peak_depth.numel() != self.sample_peak_mz.numel():
+            raise ValueError("target_peak_depth must be 1D and aligned with sample peaks.")
+        if self.terminal_path_ptr.dim() != 1 or self.terminal_path_ptr.numel() != assignment_count + 1:
+            raise ValueError("terminal_path_ptr must have shape [num_terminal_assignments + 1].")
+        if self.target_path_edge_index.dim() != 1:
+            raise ValueError("target_path_edge_index must be 1D.")
+        for name, ptr, expected_end in (
+            ("sample_peak_ptr", self.sample_peak_ptr, self.sample_peak_mz.numel()),
+            ("peak_formula_ptr", self.peak_formula_ptr, self.target_formula.size(0)),
+            ("formula_assignment_ptr", self.formula_assignment_ptr, assignment_count),
+            ("terminal_expand_ptr", self.terminal_expand_ptr, self.target_expand_node_index.numel()),
+            ("terminal_path_ptr", self.terminal_path_ptr, self.target_path_edge_index.numel()),
+        ):
+            if int(ptr[0]) != 0 or int(ptr[-1]) != int(expected_end) or bool((ptr[1:] < ptr[:-1]).any()):
+                raise ValueError(f"{name} must be a monotone CSR pointer spanning its data tensor.")
+        if bool((self.target_peak_depth < -1).any()):
+            raise ValueError("target_peak_depth values must be -1 or a non-negative depth.")
 
     def to(self, device: torch.device | str) -> "TrainingFragmentTreeStructure":
         base = super().to(device)
@@ -123,6 +149,9 @@ class TrainingFragmentTreeStructure(FragmentTreeStructure):
             formula_assignment_ptr=self.formula_assignment_ptr.to(device),
             target_expand_node_index=self.target_expand_node_index.to(device),
             terminal_expand_ptr=self.terminal_expand_ptr.to(device),
+            target_peak_depth=self.target_peak_depth.to(device),
+            target_path_edge_index=self.target_path_edge_index.to(device),
+            terminal_path_ptr=self.terminal_path_ptr.to(device),
         )
 
     @property
@@ -204,12 +233,17 @@ class TrainingFragmentTreeStructure(FragmentTreeStructure):
             return torch.empty((2, 0), dtype=torch.long, device=self.edge_index.device)
         rows = []
         edge_dst = self.edge_index[1].long()
-        for sample_id, node_id in zip(
+        path_ptr = self.terminal_path_ptr.long()
+        for assignment_id, (sample_id, node_id) in enumerate(zip(
             self.target_sample_index.detach().cpu().tolist(),
             self.target_terminal_node_index.detach().cpu().tolist(),
-        ):
-            for edge_id in (edge_dst == int(node_id)).nonzero(as_tuple=False).view(-1).tolist():
-                rows.append((int(sample_id), int(edge_id)))
+        )):
+            start, end = int(path_ptr[assignment_id]), int(path_ptr[assignment_id + 1])
+            if end > start:
+                rows.append((int(sample_id), int(self.target_path_edge_index[end - 1])))
+            else:  # compatibility for programmatically constructed legacy targets
+                for edge_id in (edge_dst == int(node_id)).nonzero(as_tuple=False).view(-1).tolist():
+                    rows.append((int(sample_id), int(edge_id)))
         if not rows:
             return torch.empty((2, 0), dtype=torch.long, device=self.edge_index.device)
         return torch.tensor(rows, dtype=torch.long, device=self.edge_index.device).t().contiguous()
@@ -221,11 +255,13 @@ class TrainingFragmentTreeStructure(FragmentTreeStructure):
             return torch.empty((0,), dtype=torch.long, device=self.edge_index.device)
         groups = []
         edge_dst = self.edge_index[1].long()
-        for formula_id, node_id in zip(
+        path_ptr = self.terminal_path_ptr.long()
+        for assignment_id, (formula_id, node_id) in enumerate(zip(
             self.assignment_formula_index.detach().cpu().tolist(),
             self.target_terminal_node_index.detach().cpu().tolist(),
-        ):
-            count = int((edge_dst == int(node_id)).sum().item())
+        )):
+            start, end = int(path_ptr[assignment_id]), int(path_ptr[assignment_id + 1])
+            count = 1 if end > start else int((edge_dst == int(node_id)).sum().item())
             groups.extend([int(formula_id)] * count)
         return torch.tensor(groups, dtype=torch.long, device=self.edge_index.device)
 
@@ -382,6 +418,26 @@ class TrainingFragmentTreeStructure(FragmentTreeStructure):
             dim=0,
         )
 
+        target_peak_depth = torch.cat(
+            [structure.target_peak_depth.to(target_device) for structure in training_structures]
+        )
+        edge_offsets = []
+        edge_offset = 0
+        for structure in training_structures:
+            edge_offsets.append(edge_offset)
+            edge_offset += structure.num_edges
+        target_path_edge_index = torch.cat([
+            structure.target_path_edge_index.to(target_device).long() + offset
+            for structure, offset in zip(training_structures, edge_offsets)
+        ])
+        terminal_path_ptr_parts = []
+        path_offset = 0
+        for structure in training_structures:
+            ptr = structure.terminal_path_ptr.to(target_device).long()
+            terminal_path_ptr_parts.append(ptr[:-1] + path_offset)
+            path_offset += int(ptr[-1])
+        terminal_path_ptr = torch.cat(terminal_path_ptr_parts + [torch.tensor([path_offset], device=target_device)])
+
         return cls(
             node_smiles=base.node_smiles,
             node_graph=base.node_graph,
@@ -416,4 +472,7 @@ class TrainingFragmentTreeStructure(FragmentTreeStructure):
             formula_assignment_ptr=formula_assignment_ptr,
             target_expand_node_index=target_expand_node_index,
             terminal_expand_ptr=terminal_expand_ptr,
+            target_peak_depth=target_peak_depth,
+            target_path_edge_index=target_path_edge_index,
+            terminal_path_ptr=terminal_path_ptr,
         )

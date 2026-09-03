@@ -406,11 +406,6 @@ class StructuralEdgeEncoder(nn.Module):
             assigned = assigned[(assigned >= 0) & (assigned < edge_logit.numel())].unique()
             rows = (target_pairs[0] == sample_id).nonzero(as_tuple=False).flatten()
             groups = target_groups[rows].unique(sorted=True) if rows.numel() else target_groups[:0]
-            ranked_groups = sorted(
-                groups.tolist(),
-                key=lambda group: float(intensities[formula_peak[int(group)]].item()),
-                reverse=True,
-            )
             positive_budget = max(
                 1,
                 self.training_edges_per_sample
@@ -418,7 +413,23 @@ class StructuralEdgeEncoder(nn.Module):
             )
             sample_positive: set[int] = set()
             all_alternatives: set[int] = set()
-            for group in ranked_groups[:positive_budget]:
+            group_list = groups.tolist()
+            if group_list:
+                group_weight = torch.tensor([
+                    float(intensities[formula_peak[int(group)]].clamp_min(0).item())
+                    for group in group_list
+                ], device=edge_logit.device)
+                if float(group_weight.sum()) <= 0:
+                    group_weight.fill_(1.0)
+                chosen = torch.multinomial(
+                    group_weight,
+                    num_samples=min(positive_budget, len(group_list)),
+                    replacement=False,
+                ).tolist()
+                sampled_groups = [group_list[index] for index in chosen]
+            else:
+                sampled_groups = []
+            for group in sampled_groups:
                 group_rows = rows[target_groups[rows] == int(group)]
                 alternatives = target_pairs[1, group_rows]
                 alternatives = alternatives[
@@ -428,7 +439,20 @@ class StructuralEdgeEncoder(nn.Module):
                 if alternatives.numel():
                     probability = torch.softmax(edge_logit[alternatives].detach(), dim=0)
                     choice = int(alternatives[torch.multinomial(probability, 1)].item())
-                    sample_positive.add(choice)
+                    required_for_pair = {choice}
+                    # Once a peak/formula pair has been sampled, compute only
+                    # the ordered path edges needed by that comparison.  Do
+                    # not admit another pair if doing so would exceed the
+                    # configured expensive-edge budget.
+                    if hasattr(structure, "terminal_path_ptr"):
+                        assignment_formula = structure.assignment_formula_index.to(edge_logit.device).long()
+                        path_ptr = structure.terminal_path_ptr.to(edge_logit.device).long()
+                        path_edges = structure.target_path_edge_index.to(edge_logit.device).long()
+                        for assignment_id in (assignment_formula == int(group)).nonzero(as_tuple=False).flatten().tolist():
+                            start, end = int(path_ptr[assignment_id]), int(path_ptr[assignment_id + 1])
+                            required_for_pair.update(int(value) for value in path_edges[start:end].tolist())
+                    if len(sample_positive | required_for_pair) <= positive_budget:
+                        sample_positive.update(required_for_pair)
             selected.update(sample_positive)
             negative_budget = max(self.training_edges_per_sample - len(sample_positive), 0)
             negative = torch.tensor(

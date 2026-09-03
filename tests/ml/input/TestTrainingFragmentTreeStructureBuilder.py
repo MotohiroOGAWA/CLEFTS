@@ -40,6 +40,16 @@ class _FakeModel:
 
 
 class TestTrainingFragmentTreeStructureBuilder(unittest.TestCase):
+    def test_fragmentation_depth_is_relative_to_precursor(self) -> None:
+        class Node:
+            def __init__(self, is_precursor=False):
+                self.is_precursor = is_precursor
+
+        pathway = type("Pathway", (), {"nodes": (Node(), Node(True), Node(), Node())})()
+        self.assertEqual(
+            TrainingFragmentTreeStructureBuilder._fragmentation_depth(pathway), 2
+        )
+
     def test_to_structure_builds_peak_formula_terminal_expand_pointers(self) -> None:
         builder = TrainingFragmentTreeStructureBuilder(_FakeModel())
         self._populate_builder(builder)
@@ -96,6 +106,8 @@ class TestTrainingFragmentTreeStructureBuilder(unittest.TestCase):
             structure.terminal_expand_ptr,
             torch.tensor([0, 2, 3], dtype=torch.long),
         )
+        self.assertTensorEqual(structure.target_peak_depth, torch.tensor([-1, -1, -1]))
+        self.assertTensorEqual(structure.terminal_path_ptr, torch.tensor([0, 0, 0]))
 
         # Backward-compatible flattened assignment views.
         self.assertTensorEqual(structure.target_node_index, torch.tensor([2, 1], dtype=torch.long))
@@ -114,8 +126,8 @@ class TestTrainingFragmentTreeStructureBuilder(unittest.TestCase):
         )
         self.assertTensorEqual(structure.target_node_keep, torch.tensor([0.0, 1.0, 1.0]))
         self.assertTensorEqual(structure.target_node_expand, torch.tensor([1.0, 1.0, 0.0]))
-        self.assertEqual(tuple(structure.target_edge_index.shape), (2, 0))
-        self.assertEqual(tuple(structure.target_edge_group_index.shape), (0,))
+        self.assertTensorEqual(structure.target_edge_index, torch.tensor([[0, 1], [1, 0]]))
+        self.assertTensorEqual(structure.target_edge_group_index, torch.tensor([0, 1]))
 
     def test_from_structures_offsets_nodes_and_pointers(self) -> None:
         builder_a = TrainingFragmentTreeStructureBuilder(_FakeModel())
@@ -152,6 +164,7 @@ class TestTrainingFragmentTreeStructureBuilder(unittest.TestCase):
             batched.terminal_expand_ptr,
             torch.tensor([0, 2, 3, 5, 6], dtype=torch.long),
         )
+        self.assertTensorEqual(batched.target_peak_depth, torch.full((6,), -1, dtype=torch.long))
 
     def _populate_builder(self, builder: TrainingFragmentTreeStructureBuilder) -> None:
         builder.node_smiles = ["root", "mid", "terminal"]

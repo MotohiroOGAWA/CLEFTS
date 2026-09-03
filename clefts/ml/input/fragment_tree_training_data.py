@@ -299,6 +299,8 @@ def build_fragment_tree_structure_files(
                 else None
             )
             metadata = {
+                "target_schema_version": 2,
+                "target_depth_policy": "minimum-post-precursor-cleavage-depth",
                 "smiles": smiles,
                 "record_indexes": [int(index) for index in record_indexes],
                 "source_record_indexes": source_record_indexes,
@@ -413,7 +415,7 @@ def build_fragment_tree_structure_files_from_existing(
                 valid_record_indexes = list(range(item.structure.num_samples))
 
             structure = builder.to_structure()
-            new_metadata = {**metadata, "smiles": smiles, "record_indexes": valid_record_indexes, "sample_indexes": [int(index) for index in sample_indexes.tolist()], "num_input_records": int(len(valid_record_indexes)), "num_valid_samples": int(structure.num_samples), "num_nodes": int(structure.num_nodes), "num_edges": int(structure.num_edges), "max_node": int(max_node), "max_edge": int(max_edge), "source_structure_file": str(source_file)}
+            new_metadata = {**metadata, "target_schema_version": 2, "target_depth_policy": "minimum-post-precursor-cleavage-depth", "smiles": smiles, "record_indexes": valid_record_indexes, "sample_indexes": [int(index) for index in sample_indexes.tolist()], "num_input_records": int(len(valid_record_indexes)), "num_valid_samples": int(structure.num_samples), "num_nodes": int(structure.num_nodes), "num_edges": int(structure.num_edges), "max_node": int(max_node), "max_edge": int(max_edge), "source_structure_file": str(source_file)}
             save_fragment_tree_structure(structure=structure, output_file=target_file, metadata=new_metadata)
             saved_files.append(target_file)
             manifest_rows.append({"file": target_file.name, "status": "rebuilt", **new_metadata})
