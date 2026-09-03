@@ -1,6 +1,6 @@
 # Creating Fragment Tree Training Data
 
-`create_fragment_tree_training_data.py` groups an `MSDataset` by SMILES and creates one training `FragmentTreeStructure` (`.pt`) file for each SMILES group. Executable dataset-building workflows and reporting helpers live in `clefts.ml.data_preparation`; reusable dataset and structure classes remain in `clefts.ml.input`.
+`create_fragment_tree_training_data.py` groups an `MSDataset` by SMILES and creates one training `FragmentTreeStructure` (`.preft.pt`) file for each SMILES group. Executable dataset-building workflows and reporting helpers live in `clefts.ml.data_preparation`; reusable dataset and structure classes remain in `clefts.ml.input`.
 
 Run the commands below from the repository's `mnt/app` directory.
 
@@ -56,7 +56,7 @@ OUTPUT_DIR/
 │   └── train_assigned_cleavage_events_by_pattern_reaction_product.tsv
 ├── train_structures/
 │   ├── fragmenter.json
-│   ├── data/*.pt
+│   ├── data/*.preft.pt
 │   ├── manifest.tsv
 │   └── assignment_scores.tsv
 └── validation_structures/
@@ -77,7 +77,7 @@ With `--num-workers 2` or greater, each worker writes
 `part_*_assigned_cleavage_events_by_sample.tsv` under the split's parallel
 temporary directory immediately after building its chunk. The parent process
 only sums the chunk aggregates and concatenates the per-sample rows. It does
-not rescan every final `.pt` file after all structure workers finish. The part
+not rescan every final `.preft.pt` file after all structure workers finish. The part
 files are removed with the other parallel temporary files unless
 `--keep-parallel-temp` is specified.
 

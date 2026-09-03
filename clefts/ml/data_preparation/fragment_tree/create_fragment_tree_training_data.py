@@ -27,11 +27,16 @@ STRUCTURE_DATA_DIR_NAME = "data"
 DEFAULT_PREPROCESSING_CONFIG_NAME = "preprocessing_config.json"
 DEFAULT_FRAGMENTER_CONFIG_NAME = "fragmenter.json"
 from clefts.ml.input.fragment_tree_training_data import (
+    FRAGMENT_TREE_STRUCTURE_GLOBS,
     build_fragment_tree_structure_files,
     build_fragment_tree_structure_files_from_existing,
     group_record_indexes_by_smiles,
     load_fragment_tree_structure_file,
 )
+
+
+def find_structure_files(directory: Path) -> list[Path]:
+    return sorted({path for pattern in FRAGMENT_TREE_STRUCTURE_GLOBS for path in directory.glob(pattern)})
 from clefts.ml.input.fragment_tree_preprocessing_context import (
     FragmentTreePreprocessingContext,
 )
@@ -41,7 +46,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Build training FragmentTreeStructure files from an MSDataset. "
-            "Records are grouped by SMILES, and each SMILES group is saved as one .pt file."
+            "Records are grouped by SMILES, and each SMILES group is saved as one .preft.pt file."
         )
     )
     parser.add_argument(
@@ -87,8 +92,8 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         "--output-dir",
         required=True,
         help=(
-            "Output root directory. Structure .pt files are written under "
-            "train_structures/data, and validation .pt files under "
+            "Output root directory. Structure .preft.pt files are written under "
+            "train_structures/data, and validation .preft.pt files under "
             "validation_structures/data when --validation-input is provided."
         ),
     )
@@ -133,7 +138,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--overwrite",
         action="store_true",
-        help="Overwrite existing .pt structure files.",
+        help="Overwrite existing .preft.pt structure files.",
     )
     parser.add_argument(
         "--save-train-valid-records",
@@ -257,10 +262,10 @@ def load_cleavage_pattern_set_from_params(path: str | Path) -> CleavagePatternSe
 
 def resolve_structure_input_data_dir(path: str | Path) -> Path:
     input_dir = Path(path)
-    if any(input_dir.glob("*.pt")):
+    if find_structure_files(input_dir):
         return input_dir
     data_dir = input_dir / STRUCTURE_DATA_DIR_NAME
-    if any(data_dir.glob("*.pt")):
+    if find_structure_files(data_dir):
         return data_dir
     return input_dir
 
@@ -918,7 +923,7 @@ def write_split_cleavage_event_statistics(
         (statistics_dir / legacy_name).unlink(missing_ok=True)
 
     write_assigned_cleavage_event_statistics(
-        structure_files=sorted(structure_data_directory.glob("*.pt")),
+        structure_files=find_structure_files(structure_data_directory),
         pattern_set=pattern_set,
         output_file=(
             output_root
@@ -954,7 +959,7 @@ def prepare_validation_input(
     if args.validation_input is None or args.validation_smiles_ratio is None:
         return args.validation_input
     train_smiles = []
-    for structure_file in sorted(train_structure_data_dir.glob("*.pt")):
+    for structure_file in find_structure_files(train_structure_data_dir):
         item = load_fragment_tree_structure_file(structure_file, map_location="cpu")
         smiles = item.metadata.get("smiles")
         if smiles is None and len(item.structure.node_smiles) > 0:
@@ -1063,7 +1068,7 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
     if (
         args.overwrite_preprocessing_config
         and train_structure_data_dir.exists()
-        and any(train_structure_data_dir.glob("*.pt"))
+        and bool(find_structure_files(train_structure_data_dir))
         and not args.overwrite
     ):
         raise ValueError(

@@ -9,6 +9,7 @@ sys.path.insert(0, ".")
 
 from rdkit import Chem
 from rdkit.Chem import rdDepictor
+from rdkit.Chem.Draw import rdMolDraw2D
 
 from clefts.domain.fragment.cleavage._CleavagePattern import _CleavagePattern, ProductRule
 
@@ -33,6 +34,19 @@ def molecule(payload: dict[str, Any]) -> dict[str, Any]:
             "aromatic": bond.GetIsAromatic(), "inRing": bond.IsInRing(),
         })
     return {"canonicalSmiles": "" if is_smarts else Chem.MolToSmiles(mol), "sourceType": "smarts" if is_smarts else "smiles", "atoms": atoms, "bonds": bonds}
+
+
+def depict(payload: dict[str, Any]) -> dict[str, Any]:
+    """Return RDKit's own SVG depiction instead of approximating bonds in JS."""
+    mol = Chem.MolFromSmiles(str(payload.get("smiles", "")))
+    if mol is None:
+        raise ValueError("Invalid SMILES.")
+    rdDepictor.Compute2DCoords(mol)
+    drawer = rdMolDraw2D.MolDraw2DSVG(640, 400)
+    drawer.DrawMolecule(mol)
+    drawer.FinishDrawing()
+    svg = drawer.GetDrawingText().replace("svg:", "")
+    return {"canonicalSmiles": Chem.MolToSmiles(mol), "svg": svg}
 
 
 def _source(payload: dict[str, Any]) -> Chem.Mol:
@@ -136,7 +150,7 @@ def validate(payload: dict[str, Any]) -> dict[str, Any]:
     return {"valid": True, "pattern": pattern.to_dict()}
 
 
-COMMANDS = {"molecule": molecule, "reactant": reactant, "product": product, "validate": validate}
+COMMANDS = {"molecule": molecule, "depict": depict, "reactant": reactant, "product": product, "validate": validate}
 
 
 def main() -> int:

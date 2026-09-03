@@ -16,6 +16,9 @@ from ...libs.msentity.msentity import MSDataset
 from .fragment_tree_structure import FragmentTreeStructure
 from .training_fragment_tree_structure_builder import TrainingFragmentTreeStructureBuilder
 
+FRAGMENT_TREE_STRUCTURE_SUFFIX = ".preft.pt"
+FRAGMENT_TREE_STRUCTURE_GLOBS = ("*.preft.pt", "*.preft", "*.pt")
+
 
 @dataclass(frozen=True)
 class FragmentTreeStructureFileItem:
@@ -121,7 +124,7 @@ class FragmentTreeStructureFileDataset(Dataset[FragmentTreeStructureFileItem]):
         self,
         root_dir: str | Path,
         *,
-        pattern: str = "*.pt",
+        pattern: str = "*.preft.pt",
         map_location: str | torch.device = "cpu",
         device: Optional[str | torch.device] = None,
     ) -> None:
@@ -172,7 +175,7 @@ def make_fragment_tree_structure_dataloader(
     batch_size: int = 1,
     shuffle: bool = False,
     num_workers: int = 0,
-    pattern: str = "*.pt",
+    pattern: str = "*.preft.pt",
     map_location: str | torch.device = "cpu",
     device: Optional[str | torch.device] = None,
 ) -> DataLoader:
@@ -233,7 +236,7 @@ def build_fragment_tree_structure_files(
             continue
 
         file_stem = make_structure_file_stem(smiles, index=group_index)
-        structure_file = output_path / f"{file_stem}.pt"
+        structure_file = output_path / f"{file_stem}{FRAGMENT_TREE_STRUCTURE_SUFFIX}"
 
         if structure_file.exists() and not overwrite:
             saved_files.append(structure_file)
@@ -285,6 +288,14 @@ def build_fragment_tree_structure_files(
                 continue
 
             structure = builder.to_structure()
+            raw_collision_energy = [None] * int(structure.num_samples)
+            raw_adduct_types = [None] * int(structure.num_samples)
+            for local_record_index, built_sample_index in enumerate(sample_indexes.tolist()):
+                if int(built_sample_index) < 0:
+                    continue
+                record = sub_dataset[local_record_index]
+                raw_collision_energy[int(built_sample_index)] = str(record[collision_energy_column])
+                raw_adduct_types[int(built_sample_index)] = str(record[adduct_type_column])
             source_record_indexes = [
                 int(dataset.metadata.iloc[index].get("__fragment_tree_original_index", index))
                 for index in record_indexes
@@ -311,6 +322,8 @@ def build_fragment_tree_structure_files(
                 "num_edges": int(structure.num_edges),
                 "max_node": int(max_node),
                 "max_edge": int(max_edge),
+                "sample_collision_energy_raw": raw_collision_energy,
+                "sample_adduct_types": raw_adduct_types,
             }
             if spec_ids is not None:
                 metadata["spec_ids"] = spec_ids
@@ -370,16 +383,22 @@ def build_fragment_tree_structure_files_from_existing(
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
-    source_files = sorted(input_path.glob("*.pt"))
+    source_files = sorted({path for pattern in FRAGMENT_TREE_STRUCTURE_GLOBS for path in input_path.glob(pattern)})
     if len(source_files) == 0:
-        raise FileNotFoundError(f"No structure .pt files found in {input_path}.")
+        raise FileNotFoundError(f"No structure .preft.pt files found in {input_path}.")
 
     manifest_rows: List[Dict[str, object]] = []
     saved_files: List[Path] = []
     builder = TrainingFragmentTreeStructureBuilder(feature_model)
 
     for source_file in tqdm(source_files, desc="Building from existing structures", mininterval=1.0):
-        target_file = output_path / source_file.name
+        source_stem = source_file.name
+        for suffix in FRAGMENT_TREE_STRUCTURE_GLOBS:
+            literal_suffix = suffix.removeprefix("*")
+            if source_stem.endswith(literal_suffix):
+                source_stem = source_stem[: -len(literal_suffix)]
+                break
+        target_file = output_path / f"{source_stem}{FRAGMENT_TREE_STRUCTURE_SUFFIX}"
         if target_file.exists() and not overwrite:
             item = load_fragment_tree_structure_file(target_file, map_location="cpu")
             metadata = dict(item.metadata)

@@ -4,7 +4,7 @@ A VS Code extension for configuring, running, and inspecting CLEFTS applications
 
 ## Development
 
-1. Open this directory in VS Code and press `F5` to launch an Extension Development Host, or run `npm run dev`.
+1. Open this directory in VS Code and press `F5` to launch an Extension Development Host, or run `npm run dev`. The F5 launch configuration automatically opens the parent CLEFTS application directory, so `Open Folder` is not required on each restart.
 2. Run `CLEFTS: Open Workbench` from the Command Palette.
 3. Select the input, edit or load the Fragmenter parameters, select an output directory, and press `Run CLI`.
 
@@ -22,9 +22,15 @@ Set `clefts.pythonPath` when the required Python environment is not available as
 
 - `Save Configuration` and `Load Configuration` export and import Workbench settings as JSON.
 - Fragmenter parameters have a dedicated JSON editor and separate `Load Fragmenter` and `Save Fragmenter` actions.
-- Every run also writes `clefts-run-config.json` to its output directory.
-- Every output directory receives a `fragment-tree.clefts-result` manifest. Opening it in Explorer displays the run status, structure and table counts, and output-file list in the CLEFTS result viewer.
+- Every run also writes `fragment-tree.pft.json` to its output directory.
+- Every output directory receives a `fragment-tree.pft` result manifest. Opening it in Explorer displays the run status and structure manifests in the CLEFTS result viewer.
 - Select a JSON or TSV entry in the result viewer to open it in the standard VS Code editor.
+- Select an individual `.preft.pt` structure to inspect its fragment-tree drawing,
+  samples, peaks, selected
+  cleavage depth, formula groups, terminal nodes, ordered edge paths, and
+  expansion nodes directly inside the result viewer.
+- The Workbench header includes `Open Result` for reopening any generated
+  `fragment-tree.pft` file.
 
 ## Cleavage Pattern Set editor
 

@@ -605,7 +605,7 @@ def prepare_train_from_config(
         "detect_anomaly": bool(train_config.get("detect_anomaly", False)),
         "profile_performance": bool(train_config.get("profile_performance", False)),
         "max_samples": int(train_config.get("max_samples", 100)),
-        "pattern": "*.pt",
+        "pattern": "*.preft.pt",
     }
 
     now_str = datetime.now().strftime("%Y%m%d%H%M%S")
@@ -687,7 +687,7 @@ def setup_dataset(
     *,
     num_workers: int = 0,
 ) -> Tuple[FragmentTreeStructureFileDataset, FragmentTreeStructureFileDataset, DataLoader, DataLoader, Dict[str, Any]]:
-    pattern = str(dataset_info.get("pattern", "*.pt"))
+    pattern = str(dataset_info.get("pattern", "*.preft.pt"))
     train_dataset = FragmentTreeStructureFileDataset(
         Path(dataset_info["training_structure_dir"]),
         pattern=pattern,

@@ -258,7 +258,7 @@ condition-dependent edge score, then capped by `max_edges_per_depth[d]` for each
 sample.
 
 During training, `target_expand_node_index` and `terminal_expand_ptr` from the
-stored `.pt` structure supervise this continuation score. No new fragmentation
+stored `.preft.pt` structure supervise this continuation score. No new fragmentation
 or other cheminformatics processing is performed in the training loop.
 
 Node continuation logits are ranked independently per sample. Nodes without any

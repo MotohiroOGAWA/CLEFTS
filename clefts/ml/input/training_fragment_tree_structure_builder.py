@@ -133,7 +133,12 @@ class TrainingFragmentTreeStructureBuilder(SingleFragmentTreeStructureBuilder):
                         f"Record SMILES {record_smiles!r} does not match "
                         f"dataset SMILES {smiles!r}."
                     )
-            except Exception:
+            except Exception as exc:
+                print(
+                    "[WARN] Skipping training record during metadata parsing: "
+                    f"record_index={record_index}, error={type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                )
                 sample_rows.append(None)
                 continue
 
