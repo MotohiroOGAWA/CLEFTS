@@ -391,10 +391,11 @@ def main() -> None:
     parser.add_argument("--num-workers", type=int, default=1)
     args = parser.parse_args()
     structures_dir = Path(args.structures_dir)
-    if not any(structures_dir.glob("*.pt")):
+    if not any(structures_dir.glob("*.preft")) and not any(structures_dir.glob("*.pt")):
         structures_dir = structures_dir / "data"
+    structure_files = sorted(set(structures_dir.glob("*.preft")) | set(structures_dir.glob("*.pt")))
     write_assigned_cleavage_event_statistics(
-        structure_files=sorted(structures_dir.glob("*.pt")),
+        structure_files=structure_files,
         pattern_set=_load_pattern_set(args.params),
         output_file=args.output,
         num_workers=max(1, args.num_workers),

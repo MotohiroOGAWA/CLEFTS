@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
 import shutil
 import sys
@@ -27,11 +28,16 @@ STRUCTURE_DATA_DIR_NAME = "data"
 DEFAULT_PREPROCESSING_CONFIG_NAME = "preprocessing_config.json"
 DEFAULT_FRAGMENTER_CONFIG_NAME = "fragmenter.json"
 from clefts.ml.input.fragment_tree_training_data import (
+    FRAGMENT_TREE_STRUCTURE_GLOBS,
     build_fragment_tree_structure_files,
     build_fragment_tree_structure_files_from_existing,
     group_record_indexes_by_smiles,
     load_fragment_tree_structure_file,
 )
+
+
+def find_structure_files(directory: Path) -> list[Path]:
+    return sorted({path for pattern in FRAGMENT_TREE_STRUCTURE_GLOBS for path in directory.glob(pattern)})
 from clefts.ml.input.fragment_tree_preprocessing_context import (
     FragmentTreePreprocessingContext,
 )
@@ -41,7 +47,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Build training FragmentTreeStructure files from an MSDataset. "
-            "Records are grouped by SMILES, and each SMILES group is saved as one .pt file."
+            "Records are grouped by SMILES, and each SMILES group is saved as one .preft.pt file."
         )
     )
     parser.add_argument(
@@ -84,11 +90,21 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--require-precursor-path-targets",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Require every supervised peak pathway to explicitly pass through "
+            "a precursor node. Use --no-require-precursor-path-targets to keep "
+            "pathways without a precursor marker."
+        ),
+    )
+    parser.add_argument(
         "--output-dir",
         required=True,
         help=(
-            "Output root directory. Structure .pt files are written under "
-            "train_structures/data, and validation .pt files under "
+            "Output root directory. Structure .preft.pt files are written under "
+            "train_structures/data, and validation .preft.pt files under "
             "validation_structures/data when --validation-input is provided."
         ),
     )
@@ -133,7 +149,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--overwrite",
         action="store_true",
-        help="Overwrite existing .pt structure files.",
+        help="Overwrite existing .preft.pt structure files.",
     )
     parser.add_argument(
         "--save-train-valid-records",
@@ -257,10 +273,10 @@ def load_cleavage_pattern_set_from_params(path: str | Path) -> CleavagePatternSe
 
 def resolve_structure_input_data_dir(path: str | Path) -> Path:
     input_dir = Path(path)
-    if any(input_dir.glob("*.pt")):
+    if find_structure_files(input_dir):
         return input_dir
     data_dir = input_dir / STRUCTURE_DATA_DIR_NAME
-    if any(data_dir.glob("*.pt")):
+    if find_structure_files(data_dir):
         return data_dir
     return input_dir
 
@@ -550,6 +566,7 @@ def build_structure_files_for_input(
         overwrite=args.overwrite,
         manifest_file=manifest_file,
         valid_record_indexes=valid_record_indexes if save_valid else None,
+        require_precursor_path_targets=args.require_precursor_path_targets,
     )
 
     if save_valid:
@@ -624,6 +641,7 @@ def build_structure_files_for_existing_input(
         max_edge=args.max_edge,
         overwrite=args.overwrite,
         manifest_file=manifest_file,
+        require_precursor_path_targets=args.require_precursor_path_targets,
     )
 
     print(f"saved structure files: {len(saved_files)}")
@@ -847,6 +865,8 @@ def run_parallel_for_input(
         part_event_outputs.append(temp_events)
         if args.instrument_column is not None:
             command.extend(["--instrument-column", str(args.instrument_column)])
+        if not args.require_precursor_path_targets:
+            command.append("--no-require-precursor-path-targets")
         if save_valid:
             command.extend(
                 [
@@ -918,7 +938,7 @@ def write_split_cleavage_event_statistics(
         (statistics_dir / legacy_name).unlink(missing_ok=True)
 
     write_assigned_cleavage_event_statistics(
-        structure_files=sorted(structure_data_directory.glob("*.pt")),
+        structure_files=find_structure_files(structure_data_directory),
         pattern_set=pattern_set,
         output_file=(
             output_root
@@ -954,7 +974,7 @@ def prepare_validation_input(
     if args.validation_input is None or args.validation_smiles_ratio is None:
         return args.validation_input
     train_smiles = []
-    for structure_file in sorted(train_structure_data_dir.glob("*.pt")):
+    for structure_file in find_structure_files(train_structure_data_dir):
         item = load_fragment_tree_structure_file(structure_file, map_location="cpu")
         smiles = item.metadata.get("smiles")
         if smiles is None and len(item.structure.node_smiles) > 0:
@@ -987,6 +1007,41 @@ def prepare_validation_input(
     )
     print(f"saved validation max Tanimoto indexes: {report_file}")
     return str(output)
+
+
+def write_split_result_markers(
+    *,
+    output_root: Path,
+    args: argparse.Namespace,
+) -> list[Path]:
+    """Write one independently openable Workbench result per generated split."""
+    written = []
+    split_inputs = {
+        "train": args.train_input,
+        "validation": args.validation_input or args.validation_structures_input_dir,
+    }
+    for split_name, source_input in split_inputs.items():
+        structure_dir = output_root / f"{split_name}_structures"
+        manifest_file = structure_dir / "manifest.tsv"
+        if not manifest_file.exists():
+            continue
+        marker = structure_dir / "fragment-tree.pft"
+        payload = {
+            "schemaVersion": 1,
+            "application": "fragment-tree-data-preparation",
+            "resultType": "fragment-tree-structure-split",
+            "split": split_name,
+            "status": "completed",
+            "outputDirectory": str(structure_dir.resolve()),
+            "sourceInput": None if source_input is None else str(source_input),
+            "manifest": "manifest.tsv",
+            "dataDirectory": "data",
+            "finishedAt": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        }
+        marker.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+        written.append(marker)
+        print(f"wrote {split_name} result: {marker}")
+    return written
 
 
 def main(args: Optional[argparse.Namespace] = None) -> None:
@@ -1063,7 +1118,7 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
     if (
         args.overwrite_preprocessing_config
         and train_structure_data_dir.exists()
-        and any(train_structure_data_dir.glob("*.pt"))
+        and bool(find_structure_files(train_structure_data_dir))
         and not args.overwrite
     ):
         raise ValueError(
@@ -1134,6 +1189,7 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
             pattern_set=pattern_set,
             num_workers=max(1, int(args.num_workers)),
         )
+        write_split_result_markers(output_root=output_root, args=args)
         return
 
     if args.num_workers > 1:
@@ -1163,6 +1219,7 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
                 assignment_score_output=validation_assignment_score_output,
                 split_name="validation",
             )
+        write_split_result_markers(output_root=output_root, args=args)
         return
 
     build_structure_files_for_input(
@@ -1209,6 +1266,7 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
             pattern_set=pattern_set,
             num_workers=max(1, int(args.num_workers)),
         )
+    write_split_result_markers(output_root=output_root, args=args)
 
 
 if __name__ == "__main__":

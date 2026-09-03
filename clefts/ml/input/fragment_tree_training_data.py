@@ -16,6 +16,9 @@ from ...libs.msentity.msentity import MSDataset
 from .fragment_tree_structure import FragmentTreeStructure
 from .training_fragment_tree_structure_builder import TrainingFragmentTreeStructureBuilder
 
+FRAGMENT_TREE_STRUCTURE_SUFFIX = ".preft.pt"
+FRAGMENT_TREE_STRUCTURE_GLOBS = ("*.preft.pt", "*.preft", "*.pt")
+
 
 @dataclass(frozen=True)
 class FragmentTreeStructureFileItem:
@@ -121,7 +124,7 @@ class FragmentTreeStructureFileDataset(Dataset[FragmentTreeStructureFileItem]):
         self,
         root_dir: str | Path,
         *,
-        pattern: str = "*.pt",
+        pattern: str = "*.preft.pt",
         map_location: str | torch.device = "cpu",
         device: Optional[str | torch.device] = None,
     ) -> None:
@@ -172,7 +175,7 @@ def make_fragment_tree_structure_dataloader(
     batch_size: int = 1,
     shuffle: bool = False,
     num_workers: int = 0,
-    pattern: str = "*.pt",
+    pattern: str = "*.preft.pt",
     map_location: str | torch.device = "cpu",
     device: Optional[str | torch.device] = None,
 ) -> DataLoader:
@@ -208,6 +211,7 @@ def build_fragment_tree_structure_files(
     overwrite: bool = False,
     manifest_file: Optional[str | Path] = None,
     valid_record_indexes: Optional[List[int]] = None,
+    require_precursor_path_targets: bool = True,
 ) -> List[Path]:
     """Build and save one FragmentTreeStructure file per SMILES group."""
 
@@ -223,6 +227,7 @@ def build_fragment_tree_structure_files(
         raise ValueError("No SMILES groups were found for structure generation.")
 
     manifest_rows: List[Dict[str, object]] = []
+    rejection_rows: List[Dict[str, object]] = []
     saved_files: List[Path] = []
     builder = TrainingFragmentTreeStructureBuilder(feature_model)
 
@@ -233,7 +238,7 @@ def build_fragment_tree_structure_files(
             continue
 
         file_stem = make_structure_file_stem(smiles, index=group_index)
-        structure_file = output_path / f"{file_stem}.pt"
+        structure_file = output_path / f"{file_stem}{FRAGMENT_TREE_STRUCTURE_SUFFIX}"
 
         if structure_file.exists() and not overwrite:
             saved_files.append(structure_file)
@@ -270,8 +275,26 @@ def build_fragment_tree_structure_files(
                 instrument_column=instrument_column,
                 max_node=max_node,
                 max_edge=max_edge,
+                require_precursor_path_targets=require_precursor_path_targets,
             )
             valid_sample_count = int((sample_indexes >= 0).sum())
+            for local_index, (record_index, sample_index) in enumerate(zip(record_indexes, sample_indexes.tolist())):
+                if int(sample_index) >= 0:
+                    continue
+                metadata_row = dataset.metadata.iloc[record_index]
+                rejection = builder.sample_rejection_reasons[local_index] or {
+                    "stage": "unknown", "reason": "Sample was rejected without a recorded reason."
+                }
+                rejection_rows.append({
+                    "record_index": int(record_index),
+                    "source_record_index": int(metadata_row.get("__fragment_tree_original_index", record_index)),
+                    "SpecID": "" if pd.isna(metadata_row.get("SpecID")) else str(metadata_row.get("SpecID")),
+                    "smiles": smiles,
+                    "adduct": "" if pd.isna(metadata_row.get(adduct_type_column)) else str(metadata_row.get(adduct_type_column)),
+                    "collision_energy": "" if pd.isna(metadata_row.get(collision_energy_column)) else str(metadata_row.get(collision_energy_column)),
+                    "stage": rejection["stage"],
+                    "reason": rejection["reason"],
+                })
 
             if valid_sample_count <= 0:
                 manifest_rows.append(
@@ -279,12 +302,22 @@ def build_fragment_tree_structure_files(
                         "file": structure_file.name,
                         "smiles": smiles,
                         "num_input_records": len(record_indexes),
+                        "rejected_sample_count": len(record_indexes),
+                        "rejection_log": "rejected_samples.tsv",
                         "status": "no_valid_samples",
                     }
                 )
                 continue
 
             structure = builder.to_structure()
+            raw_collision_energy = [None] * int(structure.num_samples)
+            raw_adduct_types = [None] * int(structure.num_samples)
+            for local_record_index, built_sample_index in enumerate(sample_indexes.tolist()):
+                if int(built_sample_index) < 0:
+                    continue
+                record = sub_dataset[local_record_index]
+                raw_collision_energy[int(built_sample_index)] = str(record[collision_energy_column])
+                raw_adduct_types[int(built_sample_index)] = str(record[adduct_type_column])
             source_record_indexes = [
                 int(dataset.metadata.iloc[index].get("__fragment_tree_original_index", index))
                 for index in record_indexes
@@ -299,6 +332,8 @@ def build_fragment_tree_structure_files(
                 else None
             )
             metadata = {
+                "target_schema_version": 2,
+                "target_depth_policy": "minimum-post-precursor-cleavage-depth",
                 "smiles": smiles,
                 "record_indexes": [int(index) for index in record_indexes],
                 "source_record_indexes": source_record_indexes,
@@ -309,6 +344,9 @@ def build_fragment_tree_structure_files(
                 "num_edges": int(structure.num_edges),
                 "max_node": int(max_node),
                 "max_edge": int(max_edge),
+                "require_precursor_path_targets": bool(require_precursor_path_targets),
+                "sample_collision_energy_raw": raw_collision_energy,
+                "sample_adduct_types": raw_adduct_types,
             }
             if spec_ids is not None:
                 metadata["spec_ids"] = spec_ids
@@ -347,6 +385,10 @@ def build_fragment_tree_structure_files(
     manifest_path = Path(manifest_file) if manifest_file is not None else output_path / "manifest.tsv"
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     manifest.to_csv(manifest_path, sep="\t", index=False)
+    rejection_columns = ["record_index", "source_record_index", "SpecID", "smiles", "adduct", "collision_energy", "stage", "reason"]
+    pd.DataFrame(rejection_rows, columns=rejection_columns).to_csv(
+        manifest_path.with_name("rejected_samples.tsv"), sep="\t", index=False
+    )
 
     return saved_files
 
@@ -361,6 +403,7 @@ def build_fragment_tree_structure_files_from_existing(
     max_edge: int = -1,
     overwrite: bool = False,
     manifest_file: Optional[str | Path] = None,
+    require_precursor_path_targets: bool = True,
 ) -> List[Path]:
     """Build/copy structure files from an existing structure directory."""
 
@@ -368,16 +411,23 @@ def build_fragment_tree_structure_files_from_existing(
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
-    source_files = sorted(input_path.glob("*.pt"))
+    source_files = sorted({path for pattern in FRAGMENT_TREE_STRUCTURE_GLOBS for path in input_path.glob(pattern)})
     if len(source_files) == 0:
-        raise FileNotFoundError(f"No structure .pt files found in {input_path}.")
+        raise FileNotFoundError(f"No structure .preft.pt files found in {input_path}.")
 
     manifest_rows: List[Dict[str, object]] = []
+    rejection_rows: List[Dict[str, object]] = []
     saved_files: List[Path] = []
     builder = TrainingFragmentTreeStructureBuilder(feature_model)
 
     for source_file in tqdm(source_files, desc="Building from existing structures", mininterval=1.0):
-        target_file = output_path / source_file.name
+        source_stem = source_file.name
+        for suffix in FRAGMENT_TREE_STRUCTURE_GLOBS:
+            literal_suffix = suffix.removeprefix("*")
+            if source_stem.endswith(literal_suffix):
+                source_stem = source_stem[: -len(literal_suffix)]
+                break
+        target_file = output_path / f"{source_stem}{FRAGMENT_TREE_STRUCTURE_SUFFIX}"
         if target_file.exists() and not overwrite:
             item = load_fragment_tree_structure_file(target_file, map_location="cpu")
             metadata = dict(item.metadata)
@@ -399,10 +449,30 @@ def build_fragment_tree_structure_files_from_existing(
                 continue
 
             builder.reset()
-            sample_indexes = builder.add_training_samples_from_structure(item.structure, smiles=smiles, max_node=max_node, max_edge=max_edge)
+            sample_indexes = builder.add_training_samples_from_structure(item.structure, smiles=smiles, max_node=max_node, max_edge=max_edge, require_precursor_path_targets=require_precursor_path_targets)
             valid_sample_count = int((sample_indexes >= 0).sum())
+            raw_adducts = metadata.get("sample_adduct_types", [])
+            raw_ce = metadata.get("sample_collision_energy_raw", [])
+            spec_ids = metadata.get("spec_ids", [])
+            source_indexes = metadata.get("source_record_indexes", metadata.get("record_indexes", []))
+            for sample_id, sample_index in enumerate(sample_indexes.tolist()):
+                if int(sample_index) >= 0:
+                    continue
+                rejection = builder.sample_rejection_reasons[sample_id] or {
+                    "stage": "unknown", "reason": "Sample was rejected without a recorded reason."
+                }
+                rejection_rows.append({
+                    "record_index": sample_id,
+                    "source_record_index": source_indexes[sample_id] if sample_id < len(source_indexes) else sample_id,
+                    "SpecID": spec_ids[sample_id] if sample_id < len(spec_ids) else "",
+                    "smiles": smiles,
+                    "adduct": raw_adducts[sample_id] if sample_id < len(raw_adducts) else str(item.structure.sample_adduct_type_index[sample_id].item()),
+                    "collision_energy": raw_ce[sample_id] if sample_id < len(raw_ce) else str(item.structure.sample_ce_value[sample_id].item()),
+                    "stage": rejection["stage"],
+                    "reason": rejection["reason"],
+                })
             if valid_sample_count <= 0:
-                manifest_rows.append({"file": target_file.name, "smiles": smiles, "num_input_records": item.structure.num_samples, "status": "no_valid_samples"})
+                manifest_rows.append({"file": target_file.name, "smiles": smiles, "num_input_records": item.structure.num_samples, "rejected_sample_count": item.structure.num_samples, "rejection_log": "rejected_samples.tsv", "status": "no_valid_samples"})
                 continue
 
             record_indexes = metadata.get("record_indexes", [])
@@ -413,7 +483,7 @@ def build_fragment_tree_structure_files_from_existing(
                 valid_record_indexes = list(range(item.structure.num_samples))
 
             structure = builder.to_structure()
-            new_metadata = {**metadata, "smiles": smiles, "record_indexes": valid_record_indexes, "sample_indexes": [int(index) for index in sample_indexes.tolist()], "num_input_records": int(len(valid_record_indexes)), "num_valid_samples": int(structure.num_samples), "num_nodes": int(structure.num_nodes), "num_edges": int(structure.num_edges), "max_node": int(max_node), "max_edge": int(max_edge), "source_structure_file": str(source_file)}
+            new_metadata = {**metadata, "target_schema_version": 2, "target_depth_policy": "minimum-post-precursor-cleavage-depth", "require_precursor_path_targets": bool(require_precursor_path_targets), "smiles": smiles, "record_indexes": valid_record_indexes, "sample_indexes": [int(index) for index in sample_indexes.tolist()], "num_input_records": int(len(valid_record_indexes)), "num_valid_samples": int(structure.num_samples), "num_nodes": int(structure.num_nodes), "num_edges": int(structure.num_edges), "max_node": int(max_node), "max_edge": int(max_edge), "source_structure_file": str(source_file)}
             save_fragment_tree_structure(structure=structure, output_file=target_file, metadata=new_metadata)
             saved_files.append(target_file)
             manifest_rows.append({"file": target_file.name, "status": "rebuilt", **new_metadata})
@@ -425,5 +495,9 @@ def build_fragment_tree_structure_files_from_existing(
     manifest_path = Path(manifest_file) if manifest_file is not None else output_path / "manifest.tsv"
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     manifest.to_csv(manifest_path, sep="\t", index=False)
+    rejection_columns = ["record_index", "source_record_index", "SpecID", "smiles", "adduct", "collision_energy", "stage", "reason"]
+    pd.DataFrame(rejection_rows, columns=rejection_columns).to_csv(
+        manifest_path.with_name("rejected_samples.tsv"), sep="\t", index=False
+    )
 
     return saved_files
