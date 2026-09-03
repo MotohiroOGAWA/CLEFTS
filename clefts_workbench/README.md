@@ -37,8 +37,13 @@ Select `Cleavage Pattern Set` on the left side of the Workbench navigation. The 
 - edit each product name and `smarts` value.
 - load or save an individual pattern as `*.clevage.json`;
 - build a pattern visually from a SMILES structure using RDKit;
-- select atoms and bonds and assign exact, any-heavy-atom, C/N, or C/N/O atom constraints;
-- delete atoms and change or remove bonds when generating a product.
+- draw single, double, triple, and aromatic bonds in a PubChem-style structure view;
+- select atoms and bonds individually or with a freehand lasso, and clear the selection explicitly;
+- show element symbols and source atom indices on every atom;
+- open a dedicated VS Code periodic-table panel with the current elements preselected and return the applied selection;
+- use the source element initially or choose any non-hydrogen atom;
+- combine single, double, triple, and aromatic bond types with OR (initially the source bond type), and optionally require a ring bond;
+- edit the reactant graph directly in Product Transformation to retain/delete atoms and preserve, change, or delete bonds.
 
 The editor reads and writes this JSON shape:
 
