@@ -2,7 +2,7 @@
   "name": "clefts-workbench",
   "displayName": "CLEFTS Workbench",
   "description": "Run and inspect CLEFTS applications from VS Code.",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "publisher": "clefts",
   "engines": { "vscode": "^1.80.0" },
   "categories": ["Other", "Machine Learning"],

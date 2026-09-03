@@ -69,6 +69,11 @@ METRIC_COLUMNS = (
     "val_top20_recall",
     "val_matched_intensity_mae",
     "val_matched_intensity_weighted_mae",
+    "train_edge_ranking_loss",
+    "train_pairwise_ranking_accuracy",
+    "train_edge_retain_precision",
+    "train_edge_retain_recall",
+    "train_edge_total_loss",
     "lr",
 )
 
@@ -844,20 +849,14 @@ def run_epoch(
     for batch in iterator:
         try:
             structure = batch["structure"].to(device)
-            # Do not sample or drop edges. Memory is bounded inside the edge
-            # encoder by max_edges_per_step, so training and validation see the
-            # same complete candidate population.
+            # Target/formula pairs are selected by the edge encoder before its
+            # expensive attention pass. ``max_edges_per_step`` is a hard cap.
             num_samples = int(structure.num_samples)
             sample_weight = max(num_samples, 1)
 
             global_edges = int(structure.edge_index.size(1))
-            sample_edges = int(
-                (structure.sample_edge_index[1] >= 0).sum().item()
-                if structure.sample_edge_index.numel()
-                else 0
-            )
             with iteration_edge_progress(
-                global_edges + sample_edges,
+                min(global_edges, int(max_training_edges)),
                 desc=f"edges iter {step_count + 1}",
             ):
                 with torch.set_grad_enabled(is_train):
@@ -945,10 +944,6 @@ def run_epoch(
                 and on_validation_step is not None
                 and global_step % validation_interval_steps == 0
             )
-            if validation_due:
-                on_validation_step(global_step, cumulative_metrics, window_metrics)
-                model.train(is_train)
-
             train_log_due = (
                 is_train
                 and train_log_interval_steps is not None
@@ -958,6 +953,13 @@ def run_epoch(
             )
             if train_log_due:
                 on_train_log_step(global_step, cumulative_metrics, window_metrics)
+
+            # Persist and flush the cheap training metrics before starting a
+            # potentially long validation pass at the same step. This keeps
+            # TensorBoard live at exactly train_log_interval_steps.
+            if validation_due:
+                on_validation_step(global_step, cumulative_metrics, window_metrics)
+                model.train(is_train)
 
             if validation_due or train_log_due:
                 window_loss = 0.0
@@ -1944,13 +1946,6 @@ def main(
             train_epoch_metrics: EpochLossMetrics,
             train_window_metrics: EpochLossMetrics,
         ) -> None:
-            # Validation at the same step already includes all train metrics.
-            if (
-                validation_interval_steps is not None
-                and validation_interval_steps > 0
-                and step_value % validation_interval_steps == 0
-            ):
-                return
             log_training_metrics(
                 event="train_step",
                 epoch_value=epoch_index,
@@ -2418,7 +2413,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tree-num-layers", type=int, default=2)
     parser.add_argument("--tree-num-heads", type=int, default=8)
     parser.add_argument("--tree-max-degree", type=int, default=16)
-    parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument(
+        "--dropout", type=float, default=0.5,
+        help="Global dropout used throughout the constructed fragment-tree model.",
+    )
     parser.add_argument("--edge-feature-dim", type=int, default=256)
     parser.add_argument("--edge-category-dim", type=int, default=32)
     parser.add_argument("--edge-attention-heads", type=int, default=8)
@@ -2481,9 +2479,24 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
+def _workbench_training_config(args: argparse.Namespace) -> Dict[str, Any]:
+    """Return a training configuration that the VS Code Workbench can reload."""
+    config: Dict[str, Any] = {"application": "fragment-tree-training"}
+    for key, value in vars(args).items():
+        parts = key.split("_")
+        workbench_key = parts[0] + "".join(part.title() for part in parts[1:])
+        config[workbench_key] = value
+    return config
+
+
 if __name__ == "__main__":
     args = parse_args()
-    project_dir = args.output_dir
+    project_dir = Path(args.output_dir)
+    project_dir.mkdir(parents=True, exist_ok=True)
+    save_config(
+        _workbench_training_config(args),
+        project_dir / "fragment_tree.pfttrain.json",
+    )
     train_split_dir = Path(args.train_dir)
     val_split_dir = Path(args.val_dir)
     train_data_dir = train_split_dir / "data" if (train_split_dir / "data").is_dir() else train_split_dir

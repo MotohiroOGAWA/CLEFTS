@@ -48,3 +48,17 @@ def advance_edge_progress(count: int = 1) -> None:
     if bar is not None:
         remaining = max(int(bar.total or 0) - int(bar.n), 0)
         bar.update(min(max(int(count), 0), remaining))
+        # The surrounding optimization step continues with candidate heads,
+        # losses, backward, and optimizer work. Close this bar as soon as its
+        # actual edge-attention phase is complete so that those later phases
+        # do not look like a stalled edge calculation.
+        if int(bar.n) >= int(bar.total or 0):
+            bar.close()
+
+
+def set_edge_progress_total(total: int) -> None:
+    """Replace a provisional edge total after the bounded set is selected."""
+    bar = _edge_bar.get()
+    if bar is not None:
+        bar.total = max(int(total), 0)
+        bar.refresh()

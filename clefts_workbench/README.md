@@ -1,6 +1,6 @@
 # CLEFTS Workbench for VS Code
 
-A VS Code extension for configuring, running, and inspecting CLEFTS applications. The first release includes Fragment Tree training-data preparation.
+A VS Code extension for configuring, running, and inspecting CLEFTS applications. It includes Fragment Tree data preparation and model training.
 
 ## Development
 
@@ -15,6 +15,14 @@ The extension does not duplicate the data-preparation implementation. It invokes
 ```bash
 python -m clefts.ml.data_preparation.fragment_tree.create_fragment_tree_training_data ...
 ```
+
+The `Training` tab follows the same workflow: select the generated training and validation structure directories, configure the model and optimizer, then run or copy the existing training CLI command:
+
+```bash
+python -m clefts.ml.training.fragment_tree_training.training_model ...
+```
+
+Training configurations use the dedicated `*.pfttrain.json` suffix. Every CLI run writes `fragment_tree.pfttrain.json` into its output directory, and the same file can be loaded from the Training tab. The Workbench only passes arguments to the CLI and displays its output; training, configuration output, checkpoints, and model artifacts remain owned by the Python implementation.
 
 Set `clefts.pythonPath` when the required Python environment is not available as `python`. The CLEFTS project directory defaults to the parent directory of this extension and can be overridden with `clefts.applicationRoot`.
 

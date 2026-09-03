@@ -10,7 +10,7 @@ from torch import Tensor
 from torch.utils.checkpoint import checkpoint
 
 from clefts.domain.fragment.cleavage import CleavagePatternSet
-from clefts.ml.common.progress import advance_edge_progress
+from clefts.ml.common.progress import advance_edge_progress, set_edge_progress_total
 from ....input.fragment_tree_features import FragmentTreeFeatures
 
 
@@ -401,7 +401,10 @@ class StructuralEdgeEncoder(nn.Module):
         intensities = structure.sample_peak_intensity.to(edge_logit.device).float()
         sample_edges = structure.sample_edge_index.to(edge_logit.device).long()
         selected: set[int] = set()
-        for sample_id in range(int(structure.num_samples)):
+        sample_order = torch.randperm(int(structure.num_samples)).tolist()
+        for sample_id in sample_order:
+            if len(selected) >= self.max_edges_per_step:
+                break
             assigned = sample_edges[1, sample_edges[0] == sample_id]
             assigned = assigned[(assigned >= 0) & (assigned < edge_logit.numel())].unique()
             rows = (target_pairs[0] == sample_id).nonzero(as_tuple=False).flatten()
@@ -451,10 +454,17 @@ class StructuralEdgeEncoder(nn.Module):
                         for assignment_id in (assignment_formula == int(group)).nonzero(as_tuple=False).flatten().tolist():
                             start, end = int(path_ptr[assignment_id]), int(path_ptr[assignment_id + 1])
                             required_for_pair.update(int(value) for value in path_edges[start:end].tolist())
-                    if len(sample_positive | required_for_pair) <= positive_budget:
+                    if (
+                        len(sample_positive | required_for_pair) <= positive_budget
+                        and len(selected | sample_positive | required_for_pair)
+                        <= self.max_edges_per_step
+                    ):
                         sample_positive.update(required_for_pair)
             selected.update(sample_positive)
-            negative_budget = max(self.training_edges_per_sample - len(sample_positive), 0)
+            negative_budget = min(
+                max(self.training_edges_per_sample - len(sample_positive), 0),
+                max(self.max_edges_per_step - len(selected), 0),
+            )
             negative = torch.tensor(
                 [int(value) for value in assigned.tolist() if int(value) not in all_alternatives],
                 dtype=torch.long,
@@ -472,9 +482,16 @@ class StructuralEdgeEncoder(nn.Module):
                 selected.update(int(value) for value in torch.cat((hard, random)).tolist())
         if not selected:
             finite = torch.isfinite(edge_logit)
-            count = min(self.training_edges_per_sample, int(finite.sum().item()))
+            count = min(
+                self.training_edges_per_sample,
+                self.max_edges_per_step,
+                int(finite.sum().item()),
+            )
             return torch.topk(edge_logit.masked_fill(~finite, -torch.inf), count).indices
-        return torch.tensor(sorted(selected), dtype=torch.long, device=edge_logit.device)
+        selected_tensor = torch.tensor(
+            sorted(selected), dtype=torch.long, device=edge_logit.device
+        )
+        return selected_tensor
 
     def forward(
         self,
@@ -489,6 +506,7 @@ class StructuralEdgeEncoder(nn.Module):
             selected = self._sample_training_edges(features.structure, edge_logit)
         else:
             selected = torch.arange(edge_h.size(0), device=edge_h.device)
+        set_edge_progress_total(int(selected.numel()))
         selected_set = set(int(value) for value in selected.detach().cpu().tolist())
         event_edge = features.structure.cleavage_event_edge_index.long()
         updated_edge_h = []

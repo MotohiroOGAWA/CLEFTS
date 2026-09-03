@@ -93,21 +93,47 @@ function defaultConfig(context) {
   };
 }
 
+function defaultTrainingConfig(context) {
+  const root = projectRoot(context);
+  return {
+    application: 'fragment-tree-training', trainDir: '', valDir: '',
+    outputDir: path.join(root, 'data', 'training', 'fragment_tree_models', 'gui-run'),
+    molEncoderCheckpoint: '', numWorkers: 0,
+    conditionAdductEmbeddingDim: 16, conditionCeFeatureDim: 16,
+    conditionCeFcDims: '32', conditionFeatureDim: 64, conditionFcDims: '128,64',
+    treeHiddenDim: 128, treeNumLayers: 2, treeNumHeads: 8, treeMaxDegree: 16,
+    dropout: 0.5, edgeFeatureDim: 256, edgeCategoryDim: 32,
+    edgeAttentionHeads: 8, attentionMaxGraphDistance: 4,
+    maxEdgesPerDepth: '128,64,32', trainingEdgesPerSample: 32,
+    trainingZeroEdgeFraction: 0.25, maxSamples: 100, maxEdgesPerStep: 128,
+    maxRetainedEdges: 30, maxNextCleavageCandidates: 3,
+    edgeConditionInteractionDim: 64, rankingLossWeight: 1.0,
+    rankingPairsPerEdge: 4, rankingIntensityThreshold: 0.05,
+    experimentName: 'exp_main', ckptId: '', batchSize: 1, device: 'cpu',
+    epochs: 10, validationIntervalSteps: 100, trainLogIntervalSteps: 50,
+    validateAtStart: false, detectAnomaly: false, profilePerformance: false,
+    saveIntervalEpochs: 1, saveIntervalSteps: 100, optimizer: 'AdamW',
+    lr: 0.00001, weightDecay: 0, gradClipNorm: 1.0,
+    earlyStoppingPatience: '', shuffle: true
+  };
+}
+
 function openWorkbench(context, output) {
   const panel = vscode.window.createWebviewPanel('clefts.workbench', 'CLEFTS Workbench', vscode.ViewColumn.One, {
     enableScripts: true, retainContextWhenHidden: true
   });
   const initialConfig = defaultConfig(context);
+  const initialTrainingConfig = defaultTrainingConfig(context);
   let initialFragmenter = '{}';
   try { initialFragmenter = fs.readFileSync(initialConfig.params, 'utf8'); } catch (_) {}
-  panel.webview.html = workbenchHtml(initialConfig, initialFragmenter);
+  panel.webview.html = workbenchHtml(initialConfig, initialFragmenter, initialTrainingConfig);
   panel.webview.onDidReceiveMessage(async message => {
     try {
       if (message.type === 'pick') {
         const folders = message.kind === 'folder';
         const picked = await vscode.window.showOpenDialog({ canSelectFiles: !folders, canSelectFolders: folders, canSelectMany: false });
         if (picked && picked[0]) {
-          panel.webview.postMessage({ type: 'picked', field: message.field, value: picked[0].fsPath });
+          panel.webview.postMessage({ type: 'picked', form: message.form, field: message.field, value: picked[0].fsPath });
           if (message.field === 'params') {
             const text = await fs.promises.readFile(picked[0].fsPath, 'utf8');
             JSON.parse(text);
@@ -137,6 +163,15 @@ function openWorkbench(context, output) {
           const config = JSON.parse(await fs.promises.readFile(picked[0].fsPath, 'utf8'));
           panel.webview.postMessage({ type: 'config', config: { ...defaultConfig(context), ...config } });
         }
+      } else if (message.type === 'saveTrainingConfig') {
+        const target = await vscode.window.showSaveDialog({ filters: { 'CLEFTS training configuration': ['pfttrain.json'] }, defaultUri: vscode.Uri.file('fragment_tree.pfttrain.json') });
+        if (target) await fs.promises.writeFile(target.fsPath, JSON.stringify(normalizeTrainingConfig(message.config), null, 2) + '\n');
+      } else if (message.type === 'loadTrainingConfig') {
+        const picked = await vscode.window.showOpenDialog({ filters: { 'CLEFTS training configuration': ['pfttrain.json'] }, canSelectMany: false });
+        if (picked && picked[0]) {
+          const config = JSON.parse(await fs.promises.readFile(picked[0].fsPath, 'utf8'));
+          panel.webview.postMessage({ type: 'trainingConfig', config: { ...defaultTrainingConfig(context), ...config } });
+        }
       } else if (message.type === 'openResult') {
         await openResultPicker();
       } else if (message.type === 'copyCommand') {
@@ -150,6 +185,20 @@ function openWorkbench(context, output) {
         await fs.promises.mkdir(path.dirname(message.config.params), { recursive: true });
         await fs.promises.writeFile(message.config.params, JSON.stringify(JSON.parse(message.fragmenterText), null, 2) + '\n');
         await runFragmentTree(context, output, normalizeConfig(message.config), panel);
+      } else if (message.type === 'copyTrainingCommand') {
+        const python = vscode.workspace.getConfiguration('clefts').get('pythonPath', 'python');
+        const command = shellDisplay(python, buildTrainingArgs(normalizeTrainingConfig(message.config)));
+        await vscode.env.clipboard.writeText(command);
+        panel.webview.postMessage({ type: 'trainingStatus', status: 'idle', text: 'Command copied.', command });
+      } else if (message.type === 'runTraining') {
+        await runTraining(context, output, normalizeTrainingConfig(message.config), panel);
+      } else if (message.type === 'pickCheckpoint') {
+        const checkpointId = await showCheckpointPicker(
+          message.outputDir, message.experimentName
+        );
+        if (checkpointId !== undefined) {
+          panel.webview.postMessage({ type: 'checkpointPicked', checkpointId });
+        }
       } else if (message.type === 'stop') {
         if (runningProcess) runningProcess.kill('SIGTERM');
       } else if (message.type === 'loadCleavagePatternSet') {
@@ -191,9 +240,41 @@ function openWorkbench(context, output) {
       }
     } catch (error) {
       if (message.type === 'chemistry') panel.webview.postMessage({ type: 'chemistryError', requestId: message.requestId, message: String(error.message || error) });
-      panel.webview.postMessage({ type: 'status', status: 'error', text: String(error.message || error) });
+      const trainingMessage = ['runTraining', 'copyTrainingCommand', 'saveTrainingConfig', 'loadTrainingConfig'].includes(message.type);
+      panel.webview.postMessage({ type: trainingMessage ? 'trainingStatus' : 'status', status: 'error', text: String(error.message || error) });
       vscode.window.showErrorMessage(`CLEFTS: ${error.message || error}`);
     }
+  });
+}
+
+async function showCheckpointPicker(outputDir, experimentName) {
+  if (!outputDir) throw new Error('Select the model output directory first.');
+  const treePath = path.join(
+    outputDir, 'experiments', experimentName || 'exp_main',
+    'checkpoints', 'ckpt_tree.tsv'
+  );
+  if (!fs.existsSync(treePath)) {
+    throw new Error(`Checkpoint history was not found: ${treePath}`);
+  }
+  const lines = (await fs.promises.readFile(treePath, 'utf8')).trim().split(/\r?\n/);
+  const headers = lines.shift().split('\t');
+  const rows = lines.filter(Boolean).map(line => {
+    const values = line.split('\t');
+    return Object.fromEntries(headers.map((header, index) => [header, values[index] || '']));
+  }).reverse();
+  return new Promise(resolve => {
+    const picker = vscode.window.createWebviewPanel(
+      'clefts.checkpointHistory', 'CLEFTS Checkpoint History',
+      vscode.ViewColumn.Active, { enableScripts: true }
+    );
+    const branches = [...new Set(rows.map(row => row.branch_id))];
+    picker.webview.html = `<!doctype html><html><head><meta charset="UTF-8"><style>${commonCss()}.history{max-width:1050px}.toolbar{display:flex;gap:8px;align-items:center}.toolbar input{flex:1;padding:8px;color:var(--vscode-input-foreground);background:var(--vscode-input-background);border:1px solid var(--border)}table{font-size:12px}.graph{display:flex;align-items:center;min-width:${Math.max(branches.length * 20, 30)}px;height:34px}.lane{width:20px;height:34px;position:relative}.lane::before{content:'';position:absolute;left:9px;top:-8px;bottom:-8px;border-left:2px solid color-mix(in srgb,var(--accent) 45%,transparent)}.lane.node::after{content:'';position:absolute;left:4px;top:12px;width:10px;height:10px;border:2px solid var(--accent);border-radius:50%;background:var(--vscode-editor-background)}tr{cursor:pointer}tr:hover td{background:color-mix(in srgb,var(--accent) 10%,transparent)}tr.selected td{background:color-mix(in srgb,var(--accent) 20%,transparent)}code{white-space:nowrap}</style></head><body><main class="history"><header><div><span class="eyebrow">CHECKPOINT GRAPH</span><h1>${escapeHtml(experimentName || 'exp_main')}</h1><p class="muted">${escapeHtml(treePath)}</p></div></header><div class="toolbar"><input id="filter" placeholder="Filter ID, name, epoch, step, or comment"><button id="cancel">Cancel</button><button id="use" class="primary" disabled>Use checkpoint</button></div><table><thead><tr><th>Graph</th><th>ID</th><th>Name</th><th>Epoch</th><th>Step</th><th>Parent</th><th>Comment</th></tr></thead><tbody id="rows"></tbody></table></main><script>const vscode=acquireVsCodeApi(),rows=${safeJson(rows)},branches=${safeJson(branches)},esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));let selected='';const body=document.getElementById('rows'),filter=document.getElementById('filter'),use=document.getElementById('use');function render(){const q=filter.value.toLowerCase();body.innerHTML=rows.filter(r=>Object.values(r).join(' ').toLowerCase().includes(q)).map(r=>'<tr data-id="'+esc(r.id)+'" class="'+(selected===r.id?'selected':'')+'"><td><div class="graph">'+branches.map(b=>'<span class="lane '+(b===r.branch_id?'node':'')+'"></span>').join('')+'</div></td><td><code>'+esc(r.id)+'</code></td><td>'+esc(r.name)+'</td><td>'+esc(r.epoch)+'</td><td>'+esc(r.iter)+'</td><td><code>'+esc(r.parent_id)+'</code></td><td>'+esc(r.comment)+'</td></tr>').join('')}body.onclick=e=>{const row=e.target.closest('tr[data-id]');if(!row)return;selected=row.dataset.id;use.disabled=false;render()};body.ondblclick=e=>{const row=e.target.closest('tr[data-id]');if(row)vscode.postMessage({type:'select',id:row.dataset.id})};filter.oninput=render;use.onclick=()=>vscode.postMessage({type:'select',id:selected});document.getElementById('cancel').onclick=()=>vscode.postMessage({type:'cancel'});render()</script></body></html>`;
+    let settled = false;
+    picker.webview.onDidReceiveMessage(message => {
+      if (message.type === 'select') { settled = true; resolve(message.id); picker.dispose(); }
+      if (message.type === 'cancel') picker.dispose();
+    });
+    picker.onDidDispose(() => { if (!settled) resolve(undefined); });
   });
 }
 
@@ -259,6 +340,33 @@ function normalizeConfig(config) {
   return { ...config, symbols: Array.isArray(config.symbols) ? config.symbols : String(config.symbols || '').split(/[ ,]+/).filter(Boolean) };
 }
 
+function normalizeTrainingConfig(config) { return { ...config }; }
+
+async function runTraining(context, output, config, panel) {
+  if (runningProcess) throw new Error('Another CLEFTS process is already running.');
+  for (const key of ['trainDir', 'valDir', 'outputDir', 'molEncoderCheckpoint']) {
+    if (!config[key]) throw new Error(`${key} is required.`);
+  }
+  const root = projectRoot(context);
+  const python = vscode.workspace.getConfiguration('clefts').get('pythonPath', 'python');
+  const args = buildTrainingArgs(config);
+  const command = shellDisplay(python, args);
+  output.clear(); output.show(true); output.appendLine(`$ ${command}`);
+  panel.webview.postMessage({ type: 'trainingStatus', status: 'running', text: 'Running training CLI…', command });
+  runningProcess = spawn(python, args, { cwd: root, env: process.env });
+  runningProcess.stdout.on('data', chunk => output.append(chunk.toString()));
+  runningProcess.stderr.on('data', chunk => output.append(chunk.toString()));
+  runningProcess.on('error', error => {
+    runningProcess = undefined;
+    panel.webview.postMessage({ type: 'trainingStatus', status: 'error', text: error.message });
+  });
+  runningProcess.on('close', code => {
+    runningProcess = undefined;
+    panel.webview.postMessage({ type: 'trainingStatus', status: code === 0 ? 'completed' : 'failed', text: code === 0 ? 'Training completed.' : `Training failed with exit code ${code}.` });
+    if (code === 0) vscode.window.showInformationMessage('CLEFTS fragment tree training completed.');
+  });
+}
+
 async function runFragmentTree(context, output, config, panel) {
   if (runningProcess) throw new Error('Another CLEFTS process is already running.');
   for (const key of ['trainInput', 'outputDir', 'params']) if (!config[key]) throw new Error(`${key} is required.`);
@@ -300,6 +408,41 @@ function buildArgs(c) {
   for (const [key, flag] of Object.entries(flags)) if (c[key]) a.push(flag);
   if (c.saveValidationValidRecords === false) a.push('--no-save-validation-valid-records');
   if (c.requirePrecursorPathTargets === false) a.push('--no-require-precursor-path-targets');
+  return a;
+}
+
+function buildTrainingArgs(c) {
+  const a = ['-m', 'clefts.ml.training.fragment_tree_training.training_model',
+    '--train-dir', c.trainDir, '--val-dir', c.valDir, '--output-dir', c.outputDir,
+    '--mol-encoder-checkpoint', c.molEncoderCheckpoint];
+  const values = {
+    numWorkers: '--num-workers', conditionAdductEmbeddingDim: '--condition-adduct-embedding-dim',
+    conditionCeFeatureDim: '--condition-ce-feature-dim', conditionCeFcDims: '--condition-ce-fc-dims',
+    conditionFeatureDim: '--condition-feature-dim', conditionFcDims: '--condition-fc-dims',
+    treeHiddenDim: '--tree-hidden-dim', treeNumLayers: '--tree-num-layers',
+    treeNumHeads: '--tree-num-heads', treeMaxDegree: '--tree-max-degree', dropout: '--dropout',
+    edgeFeatureDim: '--edge-feature-dim', edgeCategoryDim: '--edge-category-dim',
+    edgeAttentionHeads: '--edge-attention-heads', attentionMaxGraphDistance: '--attention-max-graph-distance',
+    maxEdgesPerDepth: '--max-edges-per-depth', trainingEdgesPerSample: '--training-edges-per-sample',
+    trainingZeroEdgeFraction: '--training-zero-edge-fraction', maxSamples: '--max-samples',
+    maxEdgesPerStep: '--max-edges-per-step', maxRetainedEdges: '--max-retained-edges',
+    maxNextCleavageCandidates: '--max-next-cleavage-candidates',
+    edgeConditionInteractionDim: '--edge-condition-interaction-dim', rankingLossWeight: '--ranking-loss-weight',
+    rankingPairsPerEdge: '--ranking-pairs-per-edge', rankingIntensityThreshold: '--ranking-intensity-threshold',
+    experimentName: '--experiment-name', ckptId: '--ckpt-id', batchSize: '--batch-size', device: '--device',
+    epochs: '--epochs', validationIntervalSteps: '--validation-interval-steps',
+    trainLogIntervalSteps: '--train-log-interval-steps', saveIntervalEpochs: '--save-interval-epochs',
+    saveIntervalSteps: '--save-interval-steps', optimizer: '--optimizer', lr: '--lr',
+    weightDecay: '--weight-decay', gradClipNorm: '--grad-clip-norm',
+    earlyStoppingPatience: '--early-stopping-patience'
+  };
+  for (const [key, flag] of Object.entries(values)) {
+    if (c[key] !== '' && c[key] !== null && c[key] !== undefined) a.push(flag, String(c[key]));
+  }
+  if (c.validateAtStart) a.push('--validate-at-start');
+  if (c.detectAnomaly) a.push('--detect-anomaly');
+  if (c.profilePerformance) a.push('--profile-performance');
+  if (c.shuffle === false) a.push('--no-shuffle');
   return a;
 }
 
@@ -458,12 +601,48 @@ const HELP = {
   overwrite: 'Overwrite existing .preft.pt structure files.', overwritePreprocessingConfig: 'Overwrite an existing preprocessing configuration without prompting.',
   saveTrainValidRecords: 'Save successfully processed training records as an MSDataset.', saveValidationValidRecords: 'Save successfully processed validation records as an MSDataset.',
   keepParallelTemp: 'Keep temporary parallel-processing files after merging.'
+  ,trainDir: 'Directory containing generated training structures and preprocessing_config.json.',
+  valDir: 'Directory containing generated validation structures with compatible preprocessing settings.',
+  molEncoderCheckpoint: 'Pretrained molecular encoder checkpoint used by FragmentTreeFeatureModel.',
+  conditionAdductEmbeddingDim: 'Width of the learned main-adduct embedding.',
+  conditionCeFeatureDim: 'Fixed feature width produced from collision energy.',
+  conditionCeFcDims: 'Comma-separated hidden widths in the collision-energy MLP.',
+  conditionFeatureDim: 'Output width of the complete spectrum-condition encoder.',
+  conditionFcDims: 'Comma-separated hidden widths used to fuse adduct and collision-energy features.',
+  treeHiddenDim: 'Node representation width in the fragment-tree transformer.',
+  treeNumLayers: 'Number of fragment-tree transformer layers.',
+  treeNumHeads: 'Attention heads used by every fragment-tree transformer layer.',
+  treeMaxDegree: 'Largest node degree represented by the tree positional encoding.',
+  dropout: 'Dropout shared by the constructed fragment-tree model.',
+  edgeFeatureDim: 'Width of each structural cleavage-edge representation.',
+  edgeCategoryDim: 'Embedding width for cleavage pattern, reaction, and product IDs.',
+  edgeAttentionHeads: 'Attention heads used while an edge attends to nearby atoms.',
+  attentionMaxGraphDistance: 'Maximum atom-graph distance visible from a cleavage center.',
+  maxEdgesPerDepth: 'Comma-separated inference budgets for successive cleavage depths.',
+  trainingEdgesPerSample: 'Target/path and background candidates proposed per sample before the global step cap.',
+  trainingZeroEdgeFraction: 'Fraction of the per-sample proposal budget reserved for unassigned/background edges.',
+  maxSamples: 'Maximum spectra packed into one loaded compound batch.',
+  maxEdgesPerStep: 'Hard upper bound on edges receiving expensive atom attention in one optimization step.',
+  maxRetainedEdges: 'Highest-scoring edges retained at each progressive inference stage.',
+  maxNextCleavageCandidates: 'Nodes allowed to produce the next cleavage depth during inference.',
+  edgeConditionInteractionDim: 'Projection width for the edge × spectrum-condition score.',
+  rankingLossWeight: 'Multiplier applied to the absolute edge-ranking loss.',
+  rankingPairsPerEdge: 'Maximum bounded comparisons constructed for one evidence edge.',
+  rankingIntensityThreshold: 'Minimum intensity difference required for an ordered comparison.',
+  experimentName: 'Checkpoint experiment directory name.', ckptId: 'Optional checkpoint identifier to resume.',
+  batchSize: 'Number of prepared compound batches per optimizer step.', device: 'PyTorch execution device.',
+  epochs: 'Number of complete training epochs.', validationIntervalSteps: 'Run validation after this many optimizer steps; use 0 to disable step validation.',
+  trainLogIntervalSteps: 'Write training metrics after this many steps.', saveIntervalEpochs: 'Save a checkpoint after this many epochs.',
+  saveIntervalSteps: 'Save a checkpoint after this many steps; use 0 to disable.', earlyStoppingPatience: 'Stop after this many non-improving validations; blank disables it.',
+  optimizer: 'PyTorch optimizer class name.', lr: 'Optimizer learning rate.', weightDecay: 'Optimizer weight decay.', gradClipNorm: 'Maximum gradient norm; non-positive disables clipping.',
+  validateAtStart: 'Run validation before the first training update.', detectAnomaly: 'Enable PyTorch autograd anomaly detection.',
+  profilePerformance: 'Write detailed runtime performance profiles.', shuffle: 'Shuffle training structure batches each epoch.'
 };
 
-function workbenchHtml(config, fragmenterText) {
-  return `<!doctype html><html><head><meta charset="UTF-8"><style>${commonCss()}${formCss()}</style></head><body><main>
+function workbenchHtml(config, fragmenterText, trainingConfig) {
+  return `<!doctype html><html><head><meta charset="UTF-8"><style>${commonCss()}${formCss()}${trainingCss()}</style></head><body><main>
   <header><div><span class="eyebrow">CLEFTS PLATFORM</span><h1>Workbench</h1><p id="appSubtitle" class="muted">Fragment Tree Data Preparation</p></div><div id="dataActions" class="actions"><button id="openResult">Open Result</button><button id="load">Load Configuration</button><button id="save">Save Configuration</button></div></header>
-  <nav><button class="tab" data-app="cleavage">Cleavage Pattern Set</button><button class="tab active" data-app="data">Data Preparation</button><button class="tab" disabled>Training <small>coming soon</small></button></nav>
+  <nav><button class="tab" data-app="cleavage">Cleavage Pattern Set</button><button class="tab active" data-app="data">Data Preparation</button><button class="tab" data-app="training">Training</button></nav>
   <div id="cleavageApp" hidden><section><div class="section-title"><div><h2>Cleavage Pattern Set Configuration</h2><p id="cleavagePath" class="muted">Not saved</p></div><div class="actions"><button type="button" id="loadCleavage">Load Configuration</button><button type="button" id="saveCleavage">Save Configuration</button></div></div><label>Pattern set name<input id="cleavageSetName" placeholder="single_bond_cleavage_pattern_set"></label></section><section id="visualBuilder" hidden><div class="section-title"><div><h2>Visual Pattern Builder</h2><p class="muted">Click or right-click items individually, or hold either mouse button and draw a loop around atoms and bonds.</p></div><div class="actions"><button type="button" id="clearSelection">Clear all</button><button type="button" id="closeBuilder">Close</button></div></div><div class="row"><label class="grow">Source SMILES<input id="builderSmiles" placeholder="O=c1cc(-c2ccc(O)cc2)oc2cc(O)cc(O)c12"></label><button type="button" id="drawMolecule" class="primary">Draw Structure</button></div><div id="moleculeCanvas" class="molecule-canvas"></div><div class="builder-columns"><div><h3>Atom queries</h3><div id="atomConstraints" class="query-list"></div></div><div><h3>Bond queries</h3><div id="bondConstraints" class="query-list"></div></div></div><label>Pattern name<input id="builderPatternName" placeholder="flavonoid_substructure"></label><div class="actions"><button type="button" id="applyReactant" class="primary">Apply Reactant</button></div><div id="productBuilder" hidden><h3>Product Transformation</h3><p class="muted">Edit the reactant graph directly: click or right-click an atom to retain/delete it; click or right-click a bond to select it, then choose its product bond type.</p><div id="productCanvas" class="molecule-canvas product-canvas"></div><div id="productBondTools" class="bond-tools"><span>No bond selected</span></div><label>Product name<input id="builderProductName" placeholder="fragment_product"></label><button type="button" id="applyProduct" class="primary">Add Product</button></div></section><div id="cleavagePatterns"></div><div class="actions"><button type="button" id="addCleavagePattern" class="primary">Add Pattern</button><button type="button" id="addVisualPattern">Add Pattern Visually</button><button type="button" id="loadSinglePattern">Load Pattern</button></div></div>
   <form id="form" data-app-panel="data">
     <section><h2>Input and Output</h2>${pathField('trainInput','Training MSDataset *','file')}${pathField('validationInput','Validation MSDataset','file')}${pathField('outputDir','Output directory *','folder')}</section>
@@ -472,23 +651,37 @@ function workbenchHtml(config, fragmenterText) {
     <section><h2>Validation sampling</h2><div class="grid">${field('validationSmilesRatio','SMILES ratio','number','any')}${field('tanimotoNumBins','Tanimoto bins','number')}${field('tanimotoRadius','Morgan radius','number')}${field('tanimotoNBits','Morgan bits','number')}${field('validationSamplingSeed','Random seed','number')}</div>${pathField('validationStructuresInputDir','Existing validation structures','folder')}</section>
     <section><h2>Performance & output</h2><div class="grid">${field('numWorkers','Workers','number')}${field('chunkSize','Chunk size','number')}<label data-help="${HELP.structureRebuildPolicy}">Rebuild policy<select name="structureRebuildPolicy"><option value="all-fragments">all-fragments (recommended)</option><option value="root">root only</option><option value="always">always</option></select></label></div><div class="checks">${check('overwrite','Overwrite structures')}${check('overwritePreprocessingConfig','Overwrite preprocessing config')}${check('saveTrainValidRecords','Save valid training records')}${check('saveValidationValidRecords','Save valid validation records')}${check('keepParallelTemp','Keep parallel temp')}</div></section>
     <footer><div><div id="status" class="status idle">Ready</div><code id="command"></code></div><div class="actions"><button type="button" id="copyCommand">Copy Command</button><button type="button" id="stop" disabled>Stop</button><button type="submit" class="primary">Run</button></div></footer>
-  </form><div id="helpTooltip" role="tooltip"></div><script>const vscode=acquireVsCodeApi(); const initial=${safeJson(config)}; const initialFragmenter=${safeJson(fragmenterText)}; ${webviewScript()}</script></main></body></html>`;
+  </form>
+  <form id="trainingForm" data-app-panel="training" hidden>
+    <section class="model-map"><div class="section-title"><div><h2>FragmentTreeTrainingModel architecture</h2><p class="muted">Tensor flow for both learning and progressive prediction. Select any model node to edit the parameters consumed there.</p></div><div class="actions"><button type="button" id="loadTraining">Load Configuration</button><button type="button" id="saveTraining">Save Configuration</button></div></div><div class="architecture"><div class="architecture-input"><button type="button" data-open-model="io"><b>TrainingFragmentTreeStructure</b><code>[node, edge, sample, target, path tensors]</code><span>Prepared tensors + frozen pretrained MolEncoder</span></button></div><div class="architecture-branches"><button type="button" data-open-model="condition"><b>ConditionEncoder</b><code>adduct + collision energy → condition_h</code><span>Adduct embedding and condition MLP</span></button><button type="button" data-open-model="tree"><b>FragmentTreeEncoder</b><code>molecular node graph → node_h</code><span>Tree-aware transformer representation</span></button><button type="button" data-open-model="edge"><b>StructuralEdgeEncoder</b><code>cleavage event + local atoms → edge_h</code><span>Bounded expensive atom attention</span></button></div><div class="architecture-merge"><button type="button" data-open-model="edge"><b>ConditionEdgeScorer + CandidateSelector heads</b><code>edge_h × condition_h + node_h → absolute / retain / cleave / state logits</code><span>Shared learned scores used by both paths below</span></button></div><div class="architecture-modes"><div class="mode training-mode"><strong>TRAINING PATH</strong><button type="button" data-open-model="ranking"><b>Pair and target losses</b><code>intensity-weighted comparisons + path supervision</code><span>ranking + selection + formula intensity → total loss</span></button><button type="button" data-open-model="run"><b>Backward / Optimizer</b><code>total loss → gradients → checkpoint graph</code><span>Scheduled train logs and validation</span></button></div><div class="mode prediction-mode"><strong>PREDICTION PATH</strong><button type="button" data-open-model="edge"><b>Progressive edge selection</b><code>depth 1 → top edges → next cleavage nodes</code><span>Repeat scoring with retained survivors</span></button><button type="button" data-open-model="edge"><b>Spectrum candidates</b><code>absolute scores → formula candidates → intensities</code><span>Inference budgets control compute cost</span></button></div></div></div><p id="modelHint" class="model-hint">Select a model component to locate the parameters consumed by it.</p></section>
+    <section data-model-block="io"><div><h2>Training data and output</h2><p class="muted">The Workbench passes these paths to the existing training CLI.</p></div>${pathField('trainDir','Training structures directory *','folder','training')}${pathField('valDir','Validation structures directory *','folder','training')}${pathField('outputDir','Model output directory *','folder','training')}${pathField('molEncoderCheckpoint','Molecular encoder checkpoint *','file','training')}</section>
+    <section data-model-block="condition"><h2>Condition encoder</h2><div class="grid">${field('conditionAdductEmbeddingDim','Adduct embedding dim','number')}${field('conditionCeFeatureDim','CE feature dim','number')}${field('conditionCeFcDims','CE FC dims (CSV)','text')}${field('conditionFeatureDim','Condition feature dim','number')}${field('conditionFcDims','Condition FC dims (CSV)','text')}${field('dropout','Shared dropout','number','any')}</div></section>
+    <section data-model-block="tree"><h2>Fragment tree encoder</h2><div class="grid">${field('treeHiddenDim','Hidden dimension','number')}${field('treeNumLayers','Transformer layers','number')}${field('treeNumHeads','Attention heads','number')}${field('treeMaxDegree','Maximum node degree','number')}</div></section>
+    <section data-model-block="edge"><h2>Edge scorer and bounded candidate selection</h2><p class="muted">Pairs are selected first. Expensive edge attention is capped by Max edges / step.</p><div class="grid">${field('edgeFeatureDim','Edge feature dim','number')}${field('edgeCategoryDim','Category embedding dim','number')}${field('edgeAttentionHeads','Attention heads','number')}${field('attentionMaxGraphDistance','Atom graph distance','number')}${field('maxEdgesPerDepth','Inference edges / depth (CSV)','text')}${field('trainingEdgesPerSample','Candidate edges / sample','number')}${field('trainingZeroEdgeFraction','Background fraction','number','any')}${field('maxSamples','Samples / batch structure','number')}${field('maxEdgesPerStep','Expensive edges / step','number')}${field('maxRetainedEdges','Inference retained edges','number')}${field('maxNextCleavageCandidates','Next-cleavage nodes','number')}${field('edgeConditionInteractionDim','Condition interaction dim','number')}</div></section>
+    <section data-model-block="ranking"><h2>Losses</h2><div class="model-losses"><span>Absolute edge ranking</span><span>+</span><span>Candidate selection</span><span>+</span><span>Formula intensity</span></div><div class="grid">${field('rankingLossWeight','Ranking loss weight','number','any')}${field('rankingPairsPerEdge','Comparisons / edge','number')}${field('rankingIntensityThreshold','Intensity difference threshold','number','any')}</div></section>
+    <section data-model-block="run"><h2>Training, optimizer, and checkpoints</h2><div class="grid">${field('experimentName','Experiment name','text')}<label data-help="${HELP.ckptId}">Resume checkpoint ID<div class="path"><input name="ckptId"><button type="button" id="checkpointGraph">Graph…</button></div><small class="field-help">${HELP.ckptId}</small></label>${field('batchSize','Batch size','number')}<label>Device<select name="device"><option value="cpu">cpu</option><option value="cuda">cuda</option><option value="mps">mps</option></select><small class="field-help">${HELP.device}</small></label>${field('epochs','Epochs','number')}${field('numWorkers','Data-loader workers','number')}${field('validationIntervalSteps','Validation interval steps','number')}${field('trainLogIntervalSteps','Log interval steps','number')}${field('saveIntervalEpochs','Save interval epochs','number')}${field('saveIntervalSteps','Save interval steps','number')}${field('earlyStoppingPatience','Early-stopping patience','number')}<label>Optimizer<select name="optimizer"><option value="AdamW">AdamW</option><option value="Adam">Adam</option><option value="SGD">SGD</option></select><small class="field-help">${HELP.optimizer}</small></label>${field('lr','Learning rate','number','any')}${field('weightDecay','Weight decay','number','any')}${field('gradClipNorm','Gradient clipping norm','number','any')}</div><div class="checks">${check('validateAtStart','Validate at start')}${check('detectAnomaly','Detect anomaly')}${check('profilePerformance','Profile performance')}${check('shuffle','Shuffle')}</div></section>
+    <footer><div><div id="trainingStatus" class="status idle">Ready</div><code id="trainingCommand"></code></div><div class="actions"><button type="button" id="trainingCopyCommand">Copy Command</button><button type="button" id="trainingStop" disabled>Stop</button><button type="submit" class="primary">Run Training</button></div></footer>
+  </form><div id="helpTooltip" role="tooltip"></div><script>const vscode=acquireVsCodeApi(); const initial=${safeJson(config)}; const initialTraining=${safeJson(trainingConfig)}; const initialFragmenter=${safeJson(fragmenterText)}; ${webviewScript()}</script></main></body></html>`;
 }
-function pathField(name,label,kind) { return `<label data-help="${HELP[name] || ''}">${label}<div class="path"><input name="${name}"><button type="button" data-pick="${name}" data-kind="${kind}">Browse</button></div></label>`; }
-function field(name,label,type,step='1') { return `<label data-help="${HELP[name] || ''}">${label}<input name="${name}" type="${type}"${type==='number'?` step="${step}"`:''}></label>`; }
-function check(name,label) { return `<label class="check" data-help="${HELP[name] || ''}"><input name="${name}" type="checkbox">${label}</label>`; }
+function pathField(name,label,kind,form='data') { return `<label data-help="${HELP[name] || ''}">${label}<div class="path"><input name="${name}"><button type="button" data-pick="${name}" data-kind="${kind}" data-form="${form}">Browse</button></div>${HELP[name]?`<small class="field-help">${HELP[name]}</small>`:''}</label>`; }
+function field(name,label,type,step='1') { return `<label data-help="${HELP[name] || ''}">${label}<input name="${name}" type="${type}"${type==='number'?` step="${step}"`:''}>${HELP[name]?`<small class="field-help">${HELP[name]}</small>`:''}</label>`; }
+function check(name,label) { return `<label class="check" data-help="${HELP[name] || ''}"><input name="${name}" type="checkbox"><span>${label}${HELP[name]?`<small class="field-help">${HELP[name]}</small>`:''}</span></label>`; }
 function safeJson(value) { return JSON.stringify(value).replace(/</g, '\\u003c'); }
 function webviewScript() { return `
-    const form=document.getElementById('form'), statusEl=document.getElementById('status'), stop=document.getElementById('stop');
+    const form=document.getElementById('form'), trainingForm=document.getElementById('trainingForm'), statusEl=document.getElementById('status'), stop=document.getElementById('stop'),trainingStatusEl=document.getElementById('trainingStatus'),trainingStop=document.getElementById('trainingStop');
     let cleavagePath='',cleavageModel={cleavage_pattern_set:{name:'',patterns:[]}};
     const htmlEscape=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-    function setConfig(c){ for(const [k,v] of Object.entries(c)){const el=form.elements[k];if(!el)continue;if(el.type==='checkbox')el.checked=!!v;else el.value=Array.isArray(v)?v.join(' '):v??'';} }
-    function getConfig(){const c={application:'fragment-tree-data-preparation'};for(const el of form.elements){if(!el.name)continue;if(el.type==='checkbox')c[el.name]=el.checked;else if(el.type==='number')c[el.name]=el.value===''?'':Number(el.value);else c[el.name]=el.value;}c.symbols=String(c.symbols).split(/[ ,]+/).filter(Boolean);return c;}
+    function setFormConfig(target,c){for(const [k,v] of Object.entries(c)){const el=target.elements[k];if(!el)continue;if(el.type==='checkbox')el.checked=!!v;else el.value=Array.isArray(v)?v.join(target===trainingForm?',':' '):v??'';}}
+    function readForm(target,application){const c={application};for(const el of target.elements){if(!el.name)continue;if(el.type==='checkbox')c[el.name]=el.checked;else if(el.type==='number')c[el.name]=el.value===''?'':Number(el.value);else c[el.name]=el.value;}return c;}
+    function setConfig(c){setFormConfig(form,c)}
+    function getConfig(){const c=readForm(form,'fragment-tree-data-preparation');c.symbols=String(c.symbols).split(/[ ,]+/).filter(Boolean);return c;}
+    function getTrainingConfig(){return readForm(trainingForm,'fragment-tree-training')}
     const fragmenterEditor=document.getElementById('fragmenterEditor'); fragmenterEditor.value=initialFragmenter;
     const tooltip=document.getElementById('helpTooltip'); let tooltipTimer;
     document.querySelectorAll('[data-help]').forEach(el=>{el.addEventListener('mouseenter',()=>{tooltipTimer=setTimeout(()=>{const r=el.getBoundingClientRect();tooltip.textContent=el.dataset.help;tooltip.style.left=Math.min(r.left,window.innerWidth-390)+'px';tooltip.style.top=(r.bottom+7)+'px';tooltip.classList.add('visible');},500);});el.addEventListener('mouseleave',()=>{clearTimeout(tooltipTimer);tooltip.classList.remove('visible');});});
-    setConfig(initial); document.querySelectorAll('[data-pick]').forEach(b=>b.onclick=()=>vscode.postMessage({type:'pick',field:b.dataset.pick,kind:b.dataset.kind}));
-    document.querySelectorAll('[data-app]').forEach(button=>button.onclick=()=>{document.querySelectorAll('[data-app]').forEach(x=>x.classList.toggle('active',x===button));const cleavage=button.dataset.app==='cleavage';document.getElementById('cleavageApp').hidden=!cleavage;form.hidden=cleavage;document.getElementById('dataActions').hidden=cleavage;document.getElementById('appSubtitle').textContent=cleavage?'Cleavage Pattern Set Editor':'Fragment Tree Data Preparation';});
+    setConfig(initial);setFormConfig(trainingForm,initialTraining); document.querySelectorAll('[data-pick]').forEach(b=>b.onclick=()=>vscode.postMessage({type:'pick',form:b.dataset.form||'data',field:b.dataset.pick,kind:b.dataset.kind}));
+    document.querySelectorAll('[data-open-model]').forEach(button=>button.onclick=()=>{const key=button.dataset.openModel,target=trainingForm.querySelector('[data-model-block="'+key+'"]');document.querySelectorAll('[data-open-model]').forEach(x=>x.classList.toggle('selected',x===button));document.querySelectorAll('[data-model-block]').forEach(x=>x.classList.toggle('selected',x===target));document.getElementById('modelHint').textContent=button.querySelector('b').textContent+': '+button.querySelector('span').textContent;target.scrollIntoView({behavior:'smooth',block:'start'});});
+    document.querySelectorAll('[data-app]').forEach(button=>button.onclick=()=>{document.querySelectorAll('[data-app]').forEach(x=>x.classList.toggle('active',x===button));const app=button.dataset.app;document.getElementById('cleavageApp').hidden=app!=='cleavage';form.hidden=app!=='data';trainingForm.hidden=app!=='training';document.getElementById('dataActions').hidden=app!=='data';document.getElementById('appSubtitle').textContent=app==='cleavage'?'Cleavage Pattern Set Editor':app==='training'?'Fragment Tree Training':'Fragment Tree Data Preparation';});
     document.getElementById('save').onclick=()=>vscode.postMessage({type:'saveConfig',config:getConfig()}); document.getElementById('load').onclick=()=>vscode.postMessage({type:'loadConfig'}); document.getElementById('openResult').onclick=()=>vscode.postMessage({type:'openResult'});
     function renderCleavage(){document.getElementById('cleavageSetName').value=cleavageModel.cleavage_pattern_set.name;document.getElementById('cleavagePatterns').innerHTML=cleavageModel.cleavage_pattern_set.patterns.map((p,pi)=>\`<section class="pattern-card"><div class="section-title"><h2>Pattern \${pi+1}</h2><div class="actions"><button type="button" data-edit-visual="\${pi}">Edit Visually</button><button type="button" data-load-pattern="\${pi}">Load</button><button type="button" data-save-pattern="\${pi}">Save</button><button type="button" class="danger" data-remove-pattern="\${pi}">Remove Pattern</button></div></div><div class="grid"><label>Pattern name<input data-pattern="\${pi}" data-key="name" value="\${htmlEscape(p.name)}" placeholder="single_bond_cleavage"></label><label>Reactant SMARTS<input data-pattern="\${pi}" data-key="reactant_smarts" value="\${htmlEscape(p.reactant_smarts)}" placeholder="[!#1:1]-[!#1:2]"></label></div><div class="section-title product-title"><h3>Products</h3><button type="button" data-add-product="\${pi}">Add Product</button></div><div class="product-list">\${p.products.map((product,xi)=>\`<div class="product-row"><label>Product name<input data-pattern="\${pi}" data-product="\${xi}" data-key="name" value="\${htmlEscape(product.name)}"></label><label>Product SMARTS<input data-pattern="\${pi}" data-product="\${xi}" data-key="smarts" value="\${htmlEscape(product.smarts)}" placeholder="[!#1:1]"></label><button type="button" class="danger" data-remove-product="\${pi}:\${xi}">Remove</button></div>\`).join('')}</div></section>\`).join('');}
     document.getElementById('cleavageSetName').oninput=e=>cleavageModel.cleavage_pattern_set.name=e.target.value;document.getElementById('addCleavagePattern').onclick=()=>{cleavageModel.cleavage_pattern_set.patterns.push({name:'',reactant_smarts:'',products:[]});renderCleavage()};
@@ -536,10 +729,13 @@ function webviewScript() { return `
     document.getElementById('applyProduct').onclick=async()=>{let pattern,added=false;try{const result=await chemistry('product',{...sourcePayload(),atoms:[...selectedAtoms],keptAtoms:[...productKeptAtoms],atomMapBySource,bondOverrides:productBondOverrides});pattern=cleavageModel.cleavage_pattern_set.patterns[visualPatternIndex];pattern.products.push({name:document.getElementById('builderProductName').value,smarts:result.smarts});added=true;await chemistry('validate',pattern);renderCleavage()}catch(e){if(added)pattern.products.pop()}};
     document.getElementById('loadFragmenter').onclick=()=>vscode.postMessage({type:'loadFragmenter'}); document.getElementById('saveFragmenter').onclick=()=>vscode.postMessage({type:'saveFragmenter',path:form.elements.params.value,text:fragmenterEditor.value});
     form.onsubmit=e=>{e.preventDefault();vscode.postMessage({type:'run',config:getConfig(),fragmenterText:fragmenterEditor.value});}; document.getElementById('copyCommand').onclick=()=>vscode.postMessage({type:'copyCommand',config:getConfig()}); stop.onclick=()=>vscode.postMessage({type:'stop'});
-    window.addEventListener('message',e=>{const m=e.data;if(m.type==='picked')form.elements[m.field].value=m.value;if(m.type==='config')setConfig(m.config);if(m.type==='fragmenter'){form.elements.params.value=m.path;fragmenterEditor.value=m.text;}if(m.type==='fragmenterSaved')form.elements.params.value=m.path;if(m.type==='cleavagePatternSet'){cleavageModel=m.value;cleavagePath=m.path;document.getElementById('cleavagePath').textContent=m.path;renderCleavage()}if(m.type==='cleavagePatternSetSaved'){cleavagePath=m.path;document.getElementById('cleavagePath').textContent=m.path}if(m.type==='cleavagePatternLoaded'){if(m.index>=0)cleavageModel.cleavage_pattern_set.patterns[m.index]=m.pattern;else cleavageModel.cleavage_pattern_set.patterns.push(m.pattern);renderCleavage()}if(m.type==='elementSelectionResult'){const atom=elementRequests.get(m.requestId);if(atom!==undefined&&m.elements.length){atomConstraintState[atom].elements=m.elements;atomConstraintState[atom].mode='elements';elementRequests.delete(m.requestId);queryPanels()}}if(m.type==='chemistryResult'){const waiter=chemistryWaiters.get(m.requestId);if(waiter){waiter.resolve(m.result);chemistryWaiters.delete(m.requestId)}}if(m.type==='chemistryError'){const waiter=chemistryWaiters.get(m.requestId);if(waiter){waiter.reject(new Error(m.message));chemistryWaiters.delete(m.requestId)}}if(m.type==='status'){statusEl.textContent=m.text;statusEl.className='status '+m.status;stop.disabled=m.status!=='running';if(m.command)document.getElementById('command').textContent=m.command;}});`;
+    trainingForm.onsubmit=e=>{e.preventDefault();vscode.postMessage({type:'runTraining',config:getTrainingConfig()})};document.getElementById('trainingCopyCommand').onclick=()=>vscode.postMessage({type:'copyTrainingCommand',config:getTrainingConfig()});trainingStop.onclick=()=>vscode.postMessage({type:'stop'});document.getElementById('saveTraining').onclick=()=>vscode.postMessage({type:'saveTrainingConfig',config:getTrainingConfig()});document.getElementById('loadTraining').onclick=()=>vscode.postMessage({type:'loadTrainingConfig'});
+    document.getElementById('checkpointGraph').onclick=()=>vscode.postMessage({type:'pickCheckpoint',outputDir:trainingForm.elements.outputDir.value,experimentName:trainingForm.elements.experimentName.value});
+    window.addEventListener('message',e=>{const m=e.data;if(m.type==='picked'){const target=m.form==='training'?trainingForm:form;if(target.elements[m.field])target.elements[m.field].value=m.value}if(m.type==='checkpointPicked')trainingForm.elements.ckptId.value=m.checkpointId;if(m.type==='config')setConfig(m.config);if(m.type==='trainingConfig')setFormConfig(trainingForm,m.config);if(m.type==='fragmenter'){form.elements.params.value=m.path;fragmenterEditor.value=m.text;}if(m.type==='fragmenterSaved')form.elements.params.value=m.path;if(m.type==='cleavagePatternSet'){cleavageModel=m.value;cleavagePath=m.path;document.getElementById('cleavagePath').textContent=m.path;renderCleavage()}if(m.type==='cleavagePatternSetSaved'){cleavagePath=m.path;document.getElementById('cleavagePath').textContent=m.path}if(m.type==='cleavagePatternLoaded'){if(m.index>=0)cleavageModel.cleavage_pattern_set.patterns[m.index]=m.pattern;else cleavageModel.cleavage_pattern_set.patterns.push(m.pattern);renderCleavage()}if(m.type==='elementSelectionResult'){const atom=elementRequests.get(m.requestId);if(atom!==undefined&&m.elements.length){atomConstraintState[atom].elements=m.elements;atomConstraintState[atom].mode='elements';elementRequests.delete(m.requestId);queryPanels()}}if(m.type==='chemistryResult'){const waiter=chemistryWaiters.get(m.requestId);if(waiter){waiter.resolve(m.result);chemistryWaiters.delete(m.requestId)}}if(m.type==='chemistryError'){const waiter=chemistryWaiters.get(m.requestId);if(waiter){waiter.reject(new Error(m.message));chemistryWaiters.delete(m.requestId)}}if(m.type==='status'){statusEl.textContent=m.text;statusEl.className='status '+m.status;stop.disabled=m.status!=='running';if(m.command)document.getElementById('command').textContent=m.command;}if(m.type==='trainingStatus'){trainingStatusEl.textContent=m.text;trainingStatusEl.className='status '+m.status;trainingStop.disabled=m.status!=='running';if(m.command)document.getElementById('trainingCommand').textContent=m.command;}});`;
 }
 function commonCss() { return `:root{color-scheme:light dark;--accent:#36c5a2;--panel:color-mix(in srgb,var(--vscode-editor-background) 88%,var(--vscode-editor-foreground));--border:color-mix(in srgb,var(--vscode-editor-foreground) 18%,transparent)}*{box-sizing:border-box}body{font-family:var(--vscode-font-family);color:var(--vscode-editor-foreground);background:var(--vscode-editor-background);margin:0}main{max-width:1100px;margin:auto;padding:32px}header{display:flex;align-items:flex-start;justify-content:space-between;gap:20px;margin-bottom:28px}h1{font-size:32px;margin:4px 0}h2{font-size:17px;margin:0 0 18px}.eyebrow{color:var(--accent);font-weight:700;letter-spacing:.14em;font-size:11px}.muted,small{opacity:.65}button{font:inherit;color:inherit;background:var(--vscode-button-secondaryBackground);border:1px solid var(--border);border-radius:6px;padding:8px 13px;cursor:pointer}button:hover{background:var(--vscode-button-secondaryHoverBackground)}section{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:22px;margin:14px 0}.cards{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;background:none;border:0;padding:0}.cards article{background:var(--panel);border:1px solid var(--border);padding:18px;border-radius:9px}.cards b{display:block;font-size:23px;color:var(--accent)}.cards span{opacity:.65}.files{display:grid;gap:4px}.file{display:flex;justify-content:space-between;text-align:left;background:transparent;border:0;border-bottom:1px solid var(--border);border-radius:0}.file em{opacity:.55;font-style:normal}dl{display:grid;grid-template-columns:110px 1fr;gap:10px}dt{opacity:.6}dd{margin:0;overflow-wrap:anywhere}code{font-family:var(--vscode-editor-font-family);font-size:12px}details{border-top:1px solid var(--border);padding:10px 0}summary{cursor:pointer;font-weight:600}table{width:100%;border-collapse:collapse;margin-top:10px;font-size:12px}th,td{text-align:left;vertical-align:top;border-bottom:1px solid var(--border);padding:7px}.formula{margin-bottom:7px}.formula small{display:block;margin-top:3px;font-family:var(--vscode-editor-font-family)}.warning{color:var(--vscode-editorWarning-foreground)}@media(max-width:700px){.cards{grid-template-columns:1fr 1fr}main{padding:18px}table{display:block;overflow:auto}}`; }
-function formCss() { return `nav{display:flex;gap:8px;margin-bottom:18px}.tab{border-radius:20px}.tab.active{border-color:var(--accent)}[hidden]{display:none!important}label{display:block;font-size:12px;opacity:.8;margin:12px 0}input,select,textarea{width:100%;display:block;margin-top:6px;padding:9px;color:var(--vscode-input-foreground);background:var(--vscode-input-background);border:1px solid var(--vscode-input-border,var(--border));border-radius:5px;font:inherit}.path{display:flex;gap:7px}.path input{flex:1}.row{display:flex;align-items:end;gap:12px}.grow{flex:1}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:0 16px}.checks{display:flex;flex-wrap:wrap;gap:8px 22px}.check{display:flex;align-items:center;gap:7px}.check input{width:auto;margin:0}.section-title{display:flex;align-items:flex-start;justify-content:space-between;gap:16px}.section-title h2{margin-bottom:4px}.section-title p{margin:0}.actions{display:flex;gap:8px}textarea{min-height:280px;resize:vertical;font-family:var(--vscode-editor-font-family);font-size:12px;line-height:1.5}.pattern-card{border-left:3px solid var(--accent)}.product-title{align-items:center;margin-top:18px}.product-title h3{margin:0}.product-list{margin-left:18px}.product-row{display:grid;grid-template-columns:1fr 1fr auto;gap:12px;align-items:end;border-top:1px solid var(--border);padding:6px 0}.danger{color:var(--vscode-errorForeground)}.molecule-canvas{min-height:260px;margin:16px 0;border:1px solid var(--border);border-radius:8px;background:var(--vscode-editor-background);color:var(--vscode-editor-foreground);touch-action:none;user-select:none}.molecule-canvas svg{display:block;width:100%;height:440px}.bond-group{stroke:currentColor;stroke-width:3;stroke-linecap:round;cursor:pointer}.bond-aromatic .aromatic-mark{stroke-dasharray:8 6}.bond-group.selected{stroke:var(--accent);stroke-width:5}.bond-group.deleted{opacity:.2;stroke-dasharray:5 4}.bond-hit{stroke:transparent!important;stroke-width:24}.mol-atom{cursor:pointer}.atom-hit{fill:transparent;stroke:transparent}.atom-label-bg{fill:var(--vscode-editor-background);stroke:color-mix(in srgb,var(--vscode-editor-foreground) 45%,transparent);stroke-width:1.5}.mol-atom text{fill:var(--vscode-editor-foreground);font-size:16px;font-family:var(--vscode-font-family);font-weight:700;pointer-events:none}.mol-atom .atom-index{font-size:11px;font-weight:600;fill:var(--vscode-descriptionForeground)}.mol-atom.selected .atom-label-bg{stroke:var(--accent);stroke-width:3;fill:color-mix(in srgb,var(--accent) 20%,var(--vscode-editor-background))}.mol-atom.selected .atom-hit{fill:#36c5a214}.mol-atom.deleted{opacity:.25}.selection-lasso{fill:none;stroke:var(--vscode-editor-foreground);stroke-width:2.5;stroke-dasharray:7 5;stroke-linecap:round;stroke-linejoin:round;pointer-events:none}.builder-columns{display:grid;grid-template-columns:1fr 1fr;gap:18px}.query-list{display:grid;gap:8px}.query-card{border:1px solid var(--border);border-radius:7px;padding:10px}.query-head{display:flex;justify-content:space-between}.query-modes,.bond-type-choices,.bond-tools{display:flex;flex-wrap:wrap;gap:5px;margin-top:8px}.query-card button,.bond-tools button{padding:5px 8px}.query-card button.active,.bond-tools button.active{background:var(--accent);color:#10251f;border-color:var(--accent)}.element-picker{width:100%;margin-top:8px}.element-summary{margin-top:7px;padding:6px 8px;border-radius:4px;background:var(--vscode-textBlockQuote-background);font-size:12px}.product-canvas{max-height:350px}.product-canvas svg{height:350px}.bond-tools{align-items:center;margin-bottom:12px}#productBuilder{margin-top:22px;padding-top:16px;border-top:1px solid var(--border)}#helpTooltip{position:fixed;z-index:50;display:none;max-width:380px;padding:9px 11px;border:1px solid var(--vscode-editorHoverWidget-border,var(--border));border-radius:5px;background:var(--vscode-editorHoverWidget-background);color:var(--vscode-editorHoverWidget-foreground);box-shadow:0 4px 14px #0005;font-size:12px;line-height:1.4}#helpTooltip.visible{display:block}.primary{background:var(--vscode-button-background);color:var(--vscode-button-foreground);font-weight:600}.primary:hover{background:var(--vscode-button-hoverBackground)}footer{position:sticky;bottom:0;background:var(--vscode-editor-background);border-top:1px solid var(--border);padding:17px 0;display:flex;justify-content:space-between;align-items:center;gap:20px}.status{font-weight:600}.status.running{color:#e9b949}.status.completed{color:var(--accent)}.status.error,.status.failed{color:#ef6b73}#command{display:block;opacity:.65;max-width:700px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:5px}@media(max-width:700px){.grid,.product-row,.builder-columns{grid-template-columns:1fr}.row{display:block}footer{position:static}}`; }
+function trainingCss() { return `.model-map{background:color-mix(in srgb,var(--vscode-editor-background) 94%,var(--accent))}.architecture{display:grid;gap:13px;margin-top:15px}.architecture-input,.architecture-merge,.architecture-branches{display:grid;gap:9px}.architecture-branches{grid-template-columns:1fr 1fr 1.35fr}.architecture-modes{display:grid;grid-template-columns:1fr 1fr;gap:12px}.mode{display:grid;grid-template-columns:1fr 1fr;gap:8px;border:1px solid var(--border);border-radius:8px;padding:10px}.mode strong{grid-column:1/-1;font-size:10px;letter-spacing:.14em}.training-mode strong{color:#e9b949}.prediction-mode strong{color:#63a8ff}.architecture button{position:relative;text-align:left;min-height:78px;background:var(--vscode-editor-background)}.architecture button b,.architecture button code,.architecture button span{display:block}.architecture button b{color:var(--accent);margin-bottom:5px}.architecture button code{font-size:11px;margin-bottom:5px;white-space:normal}.architecture button span{font-size:11px;opacity:.68}.architecture button.selected{outline:2px solid var(--accent);background:color-mix(in srgb,var(--accent) 14%,var(--vscode-editor-background))}.architecture-input button::after,.architecture-branches button::after,.architecture-merge button::after{content:'↓';position:absolute;left:50%;bottom:-22px;color:var(--accent);z-index:2;font-size:17px}.model-hint{margin:13px 0 0;font-size:12px;opacity:.75}[data-model-block]{scroll-margin-top:12px;transition:border-color .15s,box-shadow .15s}[data-model-block].selected{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent)}.model-losses{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:12px}.model-losses span:nth-child(odd){padding:8px 11px;border:1px solid var(--border);border-radius:18px;background:var(--vscode-editor-background)}.field-help{display:block;margin-top:5px;line-height:1.35;opacity:.7}.check .field-help{margin-top:2px}.check{align-items:flex-start}@media(max-width:850px){.architecture-branches,.architecture-modes,.mode{grid-template-columns:1fr}.mode strong{grid-column:1}.architecture button::after{display:none}}`; }
+function formCss() { return `nav{display:flex;gap:8px;margin-bottom:18px}.tab{border-radius:20px}.tab.active{border-color:var(--accent)}[hidden]{display:none!important}label{display:block;font-size:12px;opacity:.8;margin:12px 0}input,select,textarea{width:100%;display:block;margin-top:6px;padding:9px;color:var(--vscode-input-foreground);background:var(--vscode-input-background);border:1px solid var(--vscode-input-border,var(--border));border-radius:5px;font:inherit}.path{display:flex;gap:7px}.path input{flex:1}.row{display:flex;align-items:end;gap:12px}.grow{flex:1}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:0 16px}.checks{display:flex;flex-wrap:wrap;gap:8px 22px}.check{display:flex;align-items:center;gap:7px}.check input{width:auto;margin:0}.section-title{display:flex;align-items:flex-start;justify-content:space-between;gap:16px}.section-title h2{margin-bottom:4px}.section-title p{margin:0}.actions{display:flex;gap:8px}textarea{min-height:280px;resize:vertical;font-family:var(--vscode-editor-font-family);font-size:12px;line-height:1.5}.pattern-card{border-left:3px solid var(--accent)}.product-title{align-items:center;margin-top:18px}.product-title h3{margin:0}.product-list{margin-left:18px}.product-row{display:grid;grid-template-columns:1fr 1fr auto;gap:12px;align-items:end;border-top:1px solid var(--border);padding:6px 0}.danger{color:var(--vscode-errorForeground)}.molecule-canvas{min-height:260px;margin:16px 0;border:1px solid var(--border);border-radius:8px;background:var(--vscode-editor-background);color:var(--vscode-editor-foreground);touch-action:none;user-select:none}.molecule-canvas svg{display:block;width:100%;height:440px}.bond-group{stroke:currentColor;stroke-width:3;stroke-linecap:round;cursor:pointer}.bond-aromatic .aromatic-mark{stroke-dasharray:8 6}.bond-group.selected{stroke:var(--accent);stroke-width:5}.bond-group.deleted{opacity:.2;stroke-dasharray:5 4}.bond-hit{stroke:transparent!important;stroke-width:24}.mol-atom{cursor:pointer}.atom-hit{fill:transparent;stroke:transparent}.atom-label-bg{fill:var(--vscode-editor-background);stroke:color-mix(in srgb,var(--vscode-editor-foreground) 45%,transparent);stroke-width:1.5}.mol-atom text{fill:var(--vscode-editor-foreground);font-size:16px;font-family:var(--vscode-font-family);font-weight:700;pointer-events:none}.mol-atom .atom-index{font-size:11px;font-weight:600;fill:var(--vscode-descriptionForeground)}.mol-atom.selected .atom-label-bg{stroke:var(--accent);stroke-width:3;fill:color-mix(in srgb,var(--accent) 20%,var(--vscode-editor-background))}.mol-atom.selected .atom-hit{fill:#36c5a214}.mol-atom.deleted{opacity:.25}.selection-lasso{fill:none;stroke:var(--vscode-editor-foreground);stroke-width:2.5;stroke-dasharray:7 5;stroke-linecap:round;stroke-linejoin:round;pointer-events:none}.builder-columns{display:grid;grid-template-columns:1fr 1fr;gap:18px}.query-list{display:grid;gap:8px}.query-card{border:1px solid var(--border);border-radius:7px;padding:10px}.query-head{display:flex;justify-content:space-between}.query-modes,.bond-type-choices,.bond-tools{display:flex;flex-wrap:wrap;gap:5px;margin-top:8px}.query-card button,.bond-tools button{padding:5px 8px}.query-card button.active,.bond-tools button.active{background:var(--accent);color:#10251f;border-color:var(--accent)}.element-picker{width:100%;margin-top:8px}.element-summary{margin-top:7px;padding:6px 8px;border-radius:4px;background:var(--vscode-textBlockQuote-background);font-size:12px}.product-canvas{max-height:350px}.product-canvas svg{height:350px}.bond-tools{align-items:center;margin-bottom:12px}#productBuilder{margin-top:22px;padding-top:16px;border-top:1px solid var(--border)}#helpTooltip{position:fixed;z-index:50;display:none;max-width:380px;padding:9px 11px;border:1px solid var(--vscode-editorHoverWidget-border,var(--border));border-radius:5px;background:var(--vscode-editorHoverWidget-background);color:var(--vscode-editorHoverWidget-foreground);box-shadow:0 4px 14px #0005;font-size:12px;line-height:1.4}#helpTooltip.visible{display:block}.primary{background:var(--vscode-button-background);color:var(--vscode-button-foreground);font-weight:600}.primary:hover{background:var(--vscode-button-hoverBackground)}footer{position:sticky;bottom:0;background:var(--vscode-editor-background);border-top:1px solid var(--border);padding:17px 0;display:flex;justify-content:space-between;align-items:center;gap:20px}.status{font-weight:600}.status.running{color:#e9b949}.status.completed{color:var(--accent)}.status.error,.status.failed{color:#ef6b73}footer code{display:block;opacity:.65;max-width:700px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:5px}@media(max-width:700px){.grid,.product-row,.builder-columns{grid-template-columns:1fr}.row{display:block}footer{position:static}}`; }
 
 function deactivate() { if (runningProcess) runningProcess.kill('SIGTERM'); }
-module.exports = { activate, deactivate, buildArgs, normalizeConfig, resultHtml };
+module.exports = { activate, deactivate, buildArgs, normalizeConfig, buildTrainingArgs, normalizeTrainingConfig, resultHtml, workbenchHtml };
