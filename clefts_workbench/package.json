@@ -2,14 +2,15 @@
   "name": "clefts-workbench",
   "displayName": "CLEFTS Workbench",
   "description": "Run and inspect CLEFTS applications from VS Code.",
-  "version": "0.1.0",
+  "version": "0.4.0",
   "publisher": "clefts",
   "engines": { "vscode": "^1.80.0" },
   "categories": ["Other", "Machine Learning"],
   "activationEvents": [
     "onCommand:clefts.openWorkbench",
     "onCommand:clefts.openResult",
-    "onCustomEditor:clefts.resultViewer"
+    "onCustomEditor:clefts.resultViewer",
+    "onCustomEditor:clefts.cleavagePatternSetEditor"
   ],
   "main": "./src/extension.js",
   "contributes": {
@@ -22,6 +23,12 @@
         "viewType": "clefts.resultViewer",
         "displayName": "CLEFTS Result",
         "selector": [{ "filenamePattern": "*.clefts-result" }],
+        "priority": "default"
+      },
+      {
+        "viewType": "clefts.cleavagePatternSetEditor",
+        "displayName": "CLEFTS Cleavage Pattern Set",
+        "selector": [{ "filenamePattern": "*.clevageset.json" }],
         "priority": "default"
       }
     ],
@@ -36,15 +43,15 @@
         "clefts.applicationRoot": {
           "type": "string",
           "default": "",
-          "description": "CLEFTS Python project directory. Empty means the parent of this extension."
+          "description": "Workspace-relative CLEFTS Python project directory. Empty enables automatic parent and mnt/app discovery."
         }
       }
     }
   },
   "scripts": {
     "dev": "code --extensionDevelopmentPath=. --new-window .",
-    "check": "node --check src/extension.js",
-    "package": "npx @vscode/vsce package"
+    "check": "node --check src/extension.js && node --check src/features/cleavage-pattern-set/editor.js",
+    "package": "mkdir -p artifacts && npx @vscode/vsce package --allow-missing-repository --out artifacts/clefts_workbench-${npm_package_version}.vsix"
   },
   "devDependencies": { "@vscode/vsce": "2.15.0" },
   "overrides": { "cheerio": "1.0.0-rc.12" },
