@@ -1244,6 +1244,11 @@ class FragmentTreeTrainingModel(nn.Module):
         loss = edge_total_loss + intensity_loss
         absolute_ranker_metrics = self.absolute_ranker_loss_fn.metrics(output, batch)
         absolute_ranker_metrics.update(self._edge_retain_metrics(output, batch))
+        absolute_ranker_metrics.update(self._selected_peak_metrics(output, batch))
+        if intensity_output is not None:
+            absolute_ranker_metrics.update(
+                self._intensity_similarity_metrics(intensity_output, batch)
+            )
         absolute_ranker_metrics.update({
             "edge_retain_loss": float(selection_loss.detach().cpu().item()),
             "edge_total_loss": float(edge_total_loss.detach().cpu().item()),
@@ -1288,6 +1293,67 @@ class FragmentTreeTrainingModel(nn.Module):
         predicted = logits > 0
         true_positive = int((predicted & truth).sum().item())
         return {
+            "edge_retain_accuracy": float((predicted == truth).float().mean().item()),
             "edge_retain_precision": true_positive / max(int(predicted.sum().item()), 1),
             "edge_retain_recall": true_positive / max(int(truth.sum().item()), 1),
         }
+
+    @staticmethod
+    @torch.no_grad()
+    def _selected_peak_metrics(output, target) -> Dict[str, float]:
+        selected_nodes = {
+            (int(candidate.sample_id), int(candidate.global_node_id))
+            for candidate in output.kept_candidates
+        }
+        target_nodes = set(zip(
+            target.target_sample_index.detach().cpu().long().tolist(),
+            target.target_node_index.detach().cpu().long().tolist(),
+        ))
+        batch = output.sample_tree_batch
+        kept_samples = batch.kept_sample_ids.detach().cpu().long()
+        graph_nodes = batch.batch.detach().cpu().long()
+        global_nodes = batch.node_id_global.detach().cpu().long()
+        universe = {
+            (int(kept_samples[int(graph_id)]), int(node_id))
+            for graph_id, node_id in zip(graph_nodes.tolist(), global_nodes.tolist())
+        }
+        true_positive = len(selected_nodes & target_nodes)
+        true_negative = len(universe - selected_nodes - target_nodes)
+        covered = 0.0
+        total = float(target.sample_peak_intensity.detach().cpu().clamp_min(0).sum().item())
+        sample_ids = target.target_sample_index.detach().cpu().long()
+        peak_ids = target.target_peak_index.detach().cpu().long()
+        node_ids = target.target_node_index.detach().cpu().long()
+        for sample_id in range(int(target.num_samples)):
+            start = int(target.sample_peak_ptr[sample_id])
+            stop = int(target.sample_peak_ptr[sample_id + 1])
+            for peak_id in range(start, stop):
+                rows = (sample_ids == sample_id) & (peak_ids == peak_id)
+                if any(
+                    (sample_id, int(node_id)) in selected_nodes
+                    for node_id in node_ids[rows].tolist()
+                ):
+                    covered += float(target.sample_peak_intensity[peak_id].detach().cpu().clamp_min(0).item())
+        return {
+            "peak_selection_accuracy": (true_positive + true_negative) / max(len(universe), 1),
+            "peak_selection_precision": true_positive / max(len(selected_nodes), 1),
+            "peak_selection_recall": true_positive / max(len(target_nodes), 1),
+            "selected_peak_intensity_coverage": covered / max(total, 1e-12),
+        }
+
+    @staticmethod
+    @torch.no_grad()
+    def _intensity_similarity_metrics(intensity_output, target) -> Dict[str, float]:
+        values: List[float] = []
+        device = intensity_output.logit.device
+        for sample_id in intensity_output.sample_index.detach().cpu().unique(sorted=True).tolist():
+            mask = intensity_output.sample_index == int(sample_id)
+            index = mask.nonzero(as_tuple=False).view(-1)
+            truth = FragmentTreeIntensityTrainingLoss._target_weight_for_predictions(
+                predicted_formula=intensity_output.formula_tensor[index],
+                target=target, sample_id=int(sample_id), device=device,
+            )
+            prediction = intensity_output.logit[index].float().clamp_min(0)
+            if truth.numel() and float(truth.norm().item()) > 0 and float(prediction.norm().item()) > 0:
+                values.append(float(F.cosine_similarity(prediction[None], truth.float()[None]).item()))
+        return {"intensity_cosine_similarity": sum(values) / len(values) if values else 0.0}

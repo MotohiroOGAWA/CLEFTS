@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import shutil
 import math
 import traceback
@@ -73,7 +74,24 @@ METRIC_COLUMNS = (
     "train_pairwise_ranking_accuracy",
     "train_edge_retain_precision",
     "train_edge_retain_recall",
+    "train_edge_retain_accuracy",
     "train_edge_total_loss",
+    "train_selected_peak_intensity_coverage",
+    "train_peak_selection_accuracy",
+    "train_peak_selection_precision",
+    "train_peak_selection_recall",
+    "train_intensity_cosine_similarity",
+    "val_edge_ranking_loss",
+    "val_pairwise_ranking_accuracy",
+    "val_edge_retain_precision",
+    "val_edge_retain_recall",
+    "val_edge_retain_accuracy",
+    "val_edge_total_loss",
+    "val_selected_peak_intensity_coverage",
+    "val_peak_selection_accuracy",
+    "val_peak_selection_precision",
+    "val_peak_selection_recall",
+    "val_intensity_cosine_similarity",
     "lr",
 )
 
@@ -709,6 +727,10 @@ def setup_dataset(
         "num_workers": num_workers,
         "collate_fn": collate_fragment_tree_structure_items,
     }
+    if num_workers > 0:
+        # Keep deserialisation/collation workers alive across epochs and let
+        # them prepare subsequent batches while the GPU handles this one.
+        loader_kwargs.update(persistent_workers=True, prefetch_factor=2)
     train_loader = DataLoader(
         train_dataset,
         shuffle=bool(dataset_info.get("shuffle", True)),
@@ -1242,32 +1264,15 @@ def evaluate_validation_cosine(
                     + [summary[name] for name, _ in PEAK_SELECTION_QUANTILES]
                 )
     if writer is not None and global_step is not None:
-        cosine_summary = np.quantile(scores, [0.0, 0.25, 0.5, 0.75, 1.0])
-        writer.add_scalars(
-            "similarity/validation/cosine_distribution",
-            {
-                "min": float(cosine_summary[0]),
-                "q1": float(cosine_summary[1]),
-                "mean": float(np.mean(scores)),
-                "median": float(cosine_summary[2]),
-                "q3": float(cosine_summary[3]),
-                "max": float(cosine_summary[4]),
-            },
-            int(global_step),
+        writer.add_scalar(
+            "similarity/intensity_prediction_cosine",
+            float(np.mean(scores)), int(global_step),
         )
         for metric_name, summary in selection_summaries.items():
-            finite_statistics = {
-                name: summary[name]
-                for name, _ in PEAK_SELECTION_QUANTILES
-                if math.isfinite(summary[name])
-            }
             if math.isfinite(summary["mean"]):
-                finite_statistics["mean"] = summary["mean"]
-            if finite_statistics:
                 writer.add_scalars(
-                    f"peak_selection/validation/{metric_name}",
-                    finite_statistics,
-                    int(global_step),
+                    f"peak_selection/{metric_name}",
+                    {"validation": summary["mean"]}, int(global_step),
                 )
         log_validation_spectrum_quantiles(
             writer=writer,
@@ -1721,7 +1726,13 @@ def main(
             "pairwise_ranking_accuracy",
             "edge_retain_precision",
             "edge_retain_recall",
+            "edge_retain_accuracy",
             "edge_total_loss",
+            "selected_peak_intensity_coverage",
+            "peak_selection_accuracy",
+            "peak_selection_precision",
+            "peak_selection_recall",
+            "intensity_cosine_similarity",
         )
         metric_row = {
             "event": event,
@@ -1739,6 +1750,12 @@ def main(
             "val_cosine": val_cosine,
             **{
                 f"train_{name}": train_metrics.absolute_ranker_summary.get(
+                    f"{name}_mean", float("nan")
+                )
+                for name in edge_metric_names
+            },
+            **{
+                f"val_{name}": val_metrics.absolute_ranker_summary.get(
                     f"{name}_mean", float("nan")
                 )
                 for name in edge_metric_names
@@ -1785,22 +1802,22 @@ def main(
             add_scalar_if_finite(
                 f"{split}/loss/intensity", metrics.intensity_loss, step_value
             )
-            for name in edge_metric_names:
-                add_scalar_if_finite(
-                    f"{split}/edge/{name}",
-                    metrics.absolute_ranker_summary.get(
+        # One TensorBoard card per metric, with train and validation as series.
+        # Means are sufficient here; distribution quantiles are intentionally
+        # not expanded into dozens of cards.
+        for name in edge_metric_names:
+            add_scalars_if_finite(
+                f"metrics/{name}",
+                {
+                    "train": train_metrics.absolute_ranker_summary.get(
                         f"{name}_mean", float("nan")
                     ),
-                    step_value,
-                )
-        log_distribution_cards(
-            "absolute_ranker",
-            {
-                "train": train_metrics.absolute_ranker_summary,
-                "validation": val_metrics.absolute_ranker_summary,
-            },
-            step_value,
-        )
+                    "validation": val_metrics.absolute_ranker_summary.get(
+                        f"{name}_mean", float("nan")
+                    ),
+                },
+                step_value,
+            )
         writer.add_scalar("training/phase", int(model.training_phase.item()), step_value)
         writer.add_scalar("optimizer/lr", lr, step_value)
         writer.flush()
@@ -2262,6 +2279,7 @@ def run_training(
     model_config_inline: Optional[Dict[str, Any]] = None,
     train_config_inline: Optional[Dict[str, Any]] = None,
     preprocessing_config_path: Optional[str | Path] = None,
+    workbench_config: Optional[Dict[str, Any]] = None,
 ) -> None:
     model_config_resolved = (
         None
@@ -2307,6 +2325,8 @@ def run_training(
             normalize_train_config(project_dir, train_config_inline),
             run_dir / DEFAULT_TRAIN_CONFIG_NAME,
         )
+    if workbench_config is not None:
+        save_config(workbench_config, run_dir / "fragment_tree.pfttrain.json")
 
     _, _, train_loader, val_loader, extra_data = setup_dataset(
         dataset_info,
@@ -2402,7 +2422,7 @@ def parse_args() -> argparse.Namespace:
         required=True,
         help="Output directory for one fragment-tree training project.",
     )
-    parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--num-workers", type=int, default=min(4, os.cpu_count() or 1))
     parser.add_argument("--mol-encoder-checkpoint", required=True)
     parser.add_argument("--condition-adduct-embedding-dim", type=int, default=16)
     parser.add_argument("--condition-ce-feature-dim", type=int, choices=(16,), default=16)
@@ -2493,10 +2513,6 @@ if __name__ == "__main__":
     args = parse_args()
     project_dir = Path(args.output_dir)
     project_dir.mkdir(parents=True, exist_ok=True)
-    save_config(
-        _workbench_training_config(args),
-        project_dir / "fragment_tree.pfttrain.json",
-    )
     train_split_dir = Path(args.train_dir)
     val_split_dir = Path(args.val_dir)
     train_data_dir = train_split_dir / "data" if (train_split_dir / "data").is_dir() else train_split_dir
@@ -2583,4 +2599,5 @@ if __name__ == "__main__":
         model_config_inline=model_config_inline,
         train_config_inline=train_config_inline,
         preprocessing_config_path=preprocessing_config_path,
+        workbench_config=_workbench_training_config(args),
     )
