@@ -116,6 +116,7 @@ PEAK_SELECTION_QUANTILES = (
     ("q3", 0.75),
     ("max", 1.0),
 )
+DEFAULT_ASSIGNMENT_SCORE_THRESHOLD = 0.8
 
 
 DEFAULT_TRAIN_CONFIG_NAME = "train_config.json"
@@ -185,6 +186,31 @@ def nan_loss_metrics() -> EpochLossMetrics:
         intensity_loss=float("nan"),
         samples=0,
         steps=0,
+    )
+
+
+def combine_epoch_metrics(first: EpochLossMetrics, second: EpochLossMetrics) -> EpochLossMetrics:
+    """Combine disjoint validation partitions without evaluating either twice."""
+    total = first.samples + second.samples
+    if total <= 0:
+        return nan_loss_metrics()
+    def weighted(name: str) -> float:
+        values = [(getattr(item, name), item.samples) for item in (first, second) if item.samples]
+        finite = [(value, count) for value, count in values if math.isfinite(value)]
+        return sum(value * count for value, count in finite) / max(sum(count for _, count in finite), 1)
+    summary: Dict[str, float] = {}
+    for key in set(first.absolute_ranker_summary) | set(second.absolute_ranker_summary):
+        # Means are exactly composable. Quantiles are reported per scope below,
+        # rather than pretending that quantiles-of-quantiles are exact.
+        if key.endswith("_mean"):
+            pairs = [(item.absolute_ranker_summary.get(key), item.samples) for item in (first, second)]
+            pairs = [(float(v), n) for v, n in pairs if v is not None and math.isfinite(float(v)) and n]
+            if pairs:
+                summary[key] = sum(v * n for v, n in pairs) / sum(n for _, n in pairs)
+    return EpochLossMetrics(
+        loss=weighted("loss"), selection_loss=weighted("selection_loss"),
+        intensity_loss=weighted("intensity_loss"), samples=total,
+        steps=first.steps + second.steps, absolute_ranker_summary=summary,
     )
 
 
@@ -519,6 +545,11 @@ def normalize_train_config(
     config["validate_at_start"] = bool(config.get("validate_at_start", False))
     config["detect_anomaly"] = bool(config.get("detect_anomaly", False))
     config["profile_performance"] = bool(config.get("profile_performance", False))
+    config["assignment_score_threshold"] = float(
+        config.get("assignment_score_threshold", DEFAULT_ASSIGNMENT_SCORE_THRESHOLD)
+    )
+    if not 0.0 <= config["assignment_score_threshold"] <= 1.0:
+        raise ValueError("assignment_score_threshold must be between 0 and 1.")
 
     return config
 
@@ -546,6 +577,7 @@ def build_train_config(
     detect_anomaly: bool = False,
     profile_performance: bool = False,
     max_samples: int = 100,
+    assignment_score_threshold: float = DEFAULT_ASSIGNMENT_SCORE_THRESHOLD,
 ) -> Dict[str, Any]:
     if max_samples < 1:
         raise ValueError("max_samples must be positive.")
@@ -581,6 +613,7 @@ def build_train_config(
             "detect_anomaly": bool(detect_anomaly),
             "profile_performance": bool(profile_performance),
             "max_samples": int(max_samples),
+            "assignment_score_threshold": float(assignment_score_threshold),
         },
     )
 
@@ -628,6 +661,7 @@ def prepare_train_from_config(
         "detect_anomaly": bool(train_config.get("detect_anomaly", False)),
         "profile_performance": bool(train_config.get("profile_performance", False)),
         "max_samples": int(train_config.get("max_samples", 100)),
+        "assignment_score_threshold": float(train_config["assignment_score_threshold"]),
         "pattern": "*.preft.pt",
     }
 
@@ -711,13 +745,20 @@ def setup_dataset(
     num_workers: int = 0,
 ) -> Tuple[FragmentTreeStructureFileDataset, FragmentTreeStructureFileDataset, DataLoader, DataLoader, Dict[str, Any]]:
     pattern = str(dataset_info.get("pattern", "*.preft.pt"))
+    threshold = float(dataset_info.get("assignment_score_threshold", DEFAULT_ASSIGNMENT_SCORE_THRESHOLD))
+    train_scores = find_assignment_score_file(dataset_info["training_structure_dir"])
+    val_scores = find_assignment_score_file(dataset_info["validation_structure_dir"])
+    train_included, _, train_rows = load_assignment_score_selection(train_scores, threshold)
+    val_included, _, val_rows = load_assignment_score_selection(val_scores, threshold)
     train_dataset = FragmentTreeStructureFileDataset(
         Path(dataset_info["training_structure_dir"]),
         pattern=pattern,
+        included_samples_by_file=train_included,
     )
     val_dataset = FragmentTreeStructureFileDataset(
         Path(dataset_info["validation_structure_dir"]),
         pattern=pattern,
+        included_samples_by_file=val_included,
     )
     if len(train_dataset) == 0:
         raise ValueError("training_structure_dir contains no training structure files.")
@@ -754,8 +795,145 @@ def setup_dataset(
         "validation_interval_steps": dataset_info.get("validation_interval_steps"),
         "train_log_interval_steps": dataset_info.get("train_log_interval_steps"),
         "max_samples": int(dataset_info.get("max_samples", 100)),
+        "assignment_score_threshold": threshold,
+        "training_assignment_score_file": str(train_scores),
+        "validation_assignment_score_file": str(val_scores),
+        "assignment_score_report": {
+            "threshold": threshold,
+            "training": assignment_selection_summary(train_rows, threshold),
+            "validation": assignment_selection_summary(val_rows, threshold),
+        },
     }
     return train_dataset, val_dataset, train_loader, val_loader, extra_data
+
+
+def find_assignment_score_file(structure_dir: str | Path) -> Path:
+    directory = Path(structure_dir)
+    candidates = (directory / "assignment_scores.tsv", directory.parent / "assignment_scores.tsv")
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    raise FileNotFoundError(
+        f"assignment_scores.tsv was not found in {directory} or {directory.parent}"
+    )
+
+
+def load_assignment_score_selection(
+    path: str | Path, threshold: float
+) -> Tuple[Dict[str, set[int]], Dict[str, set[int]], List[float]]:
+    included: Dict[str, set[int]] = {}
+    excluded: Dict[str, set[int]] = {}
+    scores: List[float] = []
+    next_sample: Dict[str, int] = {}
+    with open(path, "r", encoding="utf-8", newline="") as handle:
+        for row in csv.DictReader(handle, delimiter="\t"):
+            filename = str(row.get("structure_file", "")).strip()
+            if not filename:
+                raise ValueError(f"Missing structure_file in {path}")
+            try:
+                score = float(row["assignment_score"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(f"Invalid assignment_score in {path}: {row}") from exc
+            # Rows are emitted in structure/sample order; rejected samples are
+            # absent, so their ordinal is exactly the saved sample index.
+            sample_id = next_sample.get(filename, 0)
+            next_sample[filename] = sample_id + 1
+            destination = included if score >= threshold else excluded
+            destination.setdefault(filename, set()).add(sample_id)
+            scores.append(score)
+    if not included:
+        raise ValueError(f"No samples meet assignment_score_threshold={threshold:g} in {path}")
+    return included, excluded, scores
+
+
+def assignment_selection_summary(scores: Sequence[float], threshold: float) -> Dict[str, Any]:
+    array = np.asarray(scores, dtype=np.float64)
+    finite = array[np.isfinite(array)]
+    distribution = summarize_distribution(finite)
+    return {
+        "total_samples": int(finite.size),
+        "selected_samples": int((finite >= threshold).sum()),
+        "excluded_samples": int((finite < threshold).sum()),
+        "assignment_score": distribution,
+    }
+
+
+def split_validation_records_by_assignment_score(
+    dataset: MSDataset, score_file: str | Path, threshold: float
+) -> Tuple[MSDataset, Optional[MSDataset]]:
+    """Split valid records using their stable source index (SpecID fallback)."""
+    high_indexes: set[str] = set()
+    low_indexes: set[str] = set()
+    high_spec_ids: set[str] = set()
+    low_spec_ids: set[str] = set()
+    with open(score_file, "r", encoding="utf-8", newline="") as handle:
+        for row in csv.DictReader(handle, delimiter="\t"):
+            high = float(row["assignment_score"]) >= threshold
+            (high_indexes if high else low_indexes).add(str(row.get("index", "")))
+            spec_id = str(row.get("SpecID", ""))
+            if spec_id:
+                (high_spec_ids if high else low_spec_ids).add(spec_id)
+    metadata = dataset.metadata
+    index_column = "__fragment_tree_original_index"
+    high_rows: List[int] = []
+    low_rows: List[int] = []
+    for row_index, row in metadata.iterrows():
+        source_index = str(row.get(index_column, row_index))
+        spec_id = str(row.get("SpecID", ""))
+        if source_index in high_indexes or (spec_id and spec_id in high_spec_ids):
+            high_rows.append(int(row_index))
+        elif source_index in low_indexes or (spec_id and spec_id in low_spec_ids):
+            low_rows.append(int(row_index))
+    if not high_rows:
+        raise ValueError("No validation MSDataset records meet the assignment-score threshold.")
+    return dataset[high_rows].copy(), (dataset[low_rows].copy() if low_rows else None)
+
+
+def write_combined_validation_cosine_summary(output_dir: Path, global_step: int) -> Dict[str, float]:
+    """Combine disjoint cached score rows; no spectrum is inferred twice."""
+    values: List[float] = []
+    for scope in ("filtered", "below_threshold"):
+        path = output_dir / scope / "validation_cosine.tsv"
+        if not path.exists():
+            continue
+        with open(path, "r", encoding="utf-8", newline="") as handle:
+            for row in csv.DictReader(handle, delimiter="\t"):
+                if str(row["global_step"]) == str(global_step):
+                    values.append(float(row["cosine_similarity"]))
+    summary = summarize_distribution(np.asarray(values, dtype=np.float64))
+    path = output_dir / "unfiltered_cosine_summary.tsv"
+    write_header = not path.exists()
+    with open(path, "a", encoding="utf-8", newline="") as handle:
+        tsv = csv.writer(handle, delimiter="\t")
+        if write_header:
+            tsv.writerow(["global_step", "mean", "q1", "median", "q3"])
+        tsv.writerow([global_step, *[summary[name] for name in ("mean", "q1", "median", "q3")]])
+    return summary
+
+
+def write_combined_peak_selection_summary(output_dir: Path, global_step: int) -> None:
+    """Summarize cached filtered + below-threshold per-spectrum metrics."""
+    values: Dict[str, List[float]] = {}
+    for scope in ("filtered", "below_threshold"):
+        path = output_dir / scope / "validation_peak_selection.tsv"
+        if not path.exists():
+            continue
+        with open(path, "r", encoding="utf-8", newline="") as handle:
+            for row in csv.DictReader(handle, delimiter="\t"):
+                if str(row["global_step"]) != str(global_step):
+                    continue
+                for name, raw in row.items():
+                    if name not in {"global_step", "spectrum_index"}:
+                        values.setdefault(name, []).append(float(raw))
+    path = output_dir / "unfiltered_peak_selection_summary.tsv"
+    write_header = not path.exists()
+    with open(path, "a", encoding="utf-8", newline="") as handle:
+        tsv = csv.writer(handle, delimiter="\t")
+        if write_header:
+            tsv.writerow(["global_step", "metric", "mean", "q1", "median", "q3"])
+        for name, raw_values in values.items():
+            summary = summarize_distribution(np.asarray(raw_values, dtype=np.float64))
+            tsv.writerow([global_step, name, *[summary[key] for key in ("mean", "q1", "median", "q3")]])
 
 
 def load_or_initialize_state(
@@ -1213,6 +1391,7 @@ def evaluate_validation_cosine(
         return float("nan")
 
     val_cosine = float(scores.mean())
+    cosine_summary = summarize_distribution(np.asarray(scores, dtype=np.float64))
     selection_metrics = calculate_peak_selection_metrics(
         predicted_dataset, target_dataset
     )
@@ -1234,6 +1413,14 @@ def evaluate_validation_cosine(
                 tsv.writerow(["global_step", "spectrum_index", "cosine_similarity"])
             for spectrum_index, score in enumerate(scores.tolist()):
                 tsv.writerow([global_step, spectrum_index, float(score)])
+        cosine_summary_file = output_dir / "validation_cosine_summary.tsv"
+        write_header = not cosine_summary_file.exists()
+        with open(cosine_summary_file, "a", encoding="utf-8", newline="") as f:
+            tsv = csv.writer(f, delimiter="\t")
+            if write_header:
+                tsv.writerow(["global_step", "mean", "q1", "median", "q3"])
+            tsv.writerow([global_step, cosine_summary["mean"], cosine_summary["q1"],
+                          cosine_summary["median"], cosine_summary["q3"]])
         detail_file = output_dir / "validation_peak_selection.tsv"
         write_header = not detail_file.exists()
         with open(detail_file, "a", encoding="utf-8", newline="") as f:
@@ -1267,6 +1454,11 @@ def evaluate_validation_cosine(
         writer.add_scalar(
             "similarity/intensity_prediction_cosine",
             float(np.mean(scores)), int(global_step),
+        )
+        writer.add_scalars(
+            "similarity/intensity_prediction_cosine_distribution",
+            {name: cosine_summary[name] for name in ("q1", "median", "q3")},
+            int(global_step),
         )
         for metric_name, summary in selection_summaries.items():
             if math.isfinite(summary["mean"]):
@@ -1638,6 +1830,28 @@ def main(
             f"[WARN] validation valid-record MSDataset was not found: "
             f"{validation_valid_records_file}"
         )
+    validation_excluded_dataset = None
+    if validation_dataset is not None:
+        validation_dataset, validation_excluded_dataset = split_validation_records_by_assignment_score(
+            validation_dataset,
+            extra_data["validation_assignment_score_file"],
+            float(extra_data["assignment_score_threshold"]),
+        )
+    _, validation_excluded, _ = load_assignment_score_selection(
+        extra_data["validation_assignment_score_file"],
+        float(extra_data["assignment_score_threshold"]),
+    )
+    val_excluded_loader = None
+    if validation_excluded:
+        excluded_dataset = FragmentTreeStructureFileDataset(
+            Path(extra_data["validation_structure_dir"]),
+            pattern=str(extra_data.get("pattern", "*.preft.pt")),
+            included_samples_by_file=validation_excluded,
+        )
+        val_excluded_loader = DataLoader(
+            excluded_dataset, batch_size=batch_size, shuffle=False,
+            collate_fn=collate_fragment_tree_structure_items,
+        )
 
     def add_scalar_if_finite(tag: str, value: float, step: int) -> None:
         if not math.isnan(float(value)):
@@ -1693,6 +1907,37 @@ def main(
                 optimizer=None,
                 desc=desc,
             )
+            excluded_metrics = (
+                run_epoch(
+                    model=model, loader=val_excluded_loader, device=device,
+                    optimizer=None, desc=f"{desc}-below-threshold",
+                )
+                if val_excluded_loader is not None else nan_loss_metrics()
+            )
+            unfiltered_metrics = (
+                combine_epoch_metrics(metrics, excluded_metrics)
+                if excluded_metrics.samples else metrics
+            )
+            add_scalars_if_finite(
+                "validation_scope/loss",
+                {"filtered": metrics.loss, "unfiltered": unfiltered_metrics.loss},
+                step_value,
+            )
+            log_distribution_cards(
+                "validation_scope/absolute_ranker",
+                {"filtered": metrics.absolute_ranker_summary,
+                 "below_threshold": excluded_metrics.absolute_ranker_summary},
+                step_value,
+            )
+            scope_file = run_dir / "validation" / "validation_scope_summary.tsv"
+            scope_file.parent.mkdir(parents=True, exist_ok=True)
+            write_header = not scope_file.exists()
+            with open(scope_file, "a", encoding="utf-8", newline="") as handle:
+                tsv = csv.writer(handle, delimiter="\t")
+                if write_header:
+                    tsv.writerow(["global_step", "scope", "samples", "loss", "selection_loss", "intensity_loss"])
+                for scope, item in (("filtered", metrics), ("below_threshold", excluded_metrics), ("unfiltered", unfiltered_metrics)):
+                    tsv.writerow([step_value, scope, item.samples, item.loss, item.selection_loss, item.intensity_loss])
             cosine = (
                 evaluate_validation_cosine(
                     model=model,
@@ -1700,12 +1945,45 @@ def main(
                     batch_size=batch_size,
                     writer=writer,
                     global_step=step_value,
-                    output_dir=run_dir / "validation",
+                    output_dir=run_dir / "validation" / "filtered",
                     selection_metric_means=selection_metric_means,
                 )
                 if validation_dataset is not None and not model.absolute_ranker_only
                 else float("nan")
             )
+            excluded_peak_means: Dict[str, float] = {}
+            excluded_cosine = (
+                evaluate_validation_cosine(
+                    model=model, dataset=validation_excluded_dataset,
+                    batch_size=batch_size, writer=None, global_step=step_value,
+                    output_dir=run_dir / "validation" / "below_threshold",
+                    selection_metric_means=excluded_peak_means,
+                )
+                if validation_excluded_dataset is not None and not model.absolute_ranker_only
+                else float("nan")
+            )
+            if math.isfinite(cosine) and math.isfinite(excluded_cosine):
+                high_count, low_count = len(validation_dataset), len(validation_excluded_dataset)
+                unfiltered_cosine = (cosine * high_count + excluded_cosine * low_count) / (high_count + low_count)
+            else:
+                unfiltered_cosine = cosine
+            add_scalars_if_finite(
+                "validation_scope/cosine",
+                {"filtered": cosine, "below_threshold": excluded_cosine,
+                 "unfiltered": unfiltered_cosine}, step_value,
+            )
+            if math.isfinite(cosine):
+                combined_cosine = write_combined_validation_cosine_summary(
+                    run_dir / "validation", step_value
+                )
+                add_scalars_if_finite(
+                    "validation_scope/unfiltered_cosine_distribution",
+                    {name: combined_cosine[name] for name in ("q1", "median", "q3")},
+                    step_value,
+                )
+                write_combined_peak_selection_summary(
+                    run_dir / "validation", step_value
+                )
         return metrics, cosine, selection_metric_means
 
     def log_training_metrics(
@@ -2231,6 +2509,7 @@ def run_training_from_config(
         batch_size,
         num_workers=0,
     )
+    save_config(extra_data["assignment_score_report"], run_dir / "assignment_score_report.json")
 
     model_config = load_config(model_config_resolved)
     validate_preprocessing_compatibility(
@@ -2333,6 +2612,7 @@ def run_training(
         batch_size,
         num_workers=num_workers,
     )
+    save_config(extra_data["assignment_score_report"], run_dir / "assignment_score_report.json")
 
     model_config = (
         dict(model_config_inline)
@@ -2447,6 +2727,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--training-edges-per-sample", type=int, default=32)
     parser.add_argument("--training-zero-edge-fraction", type=float, default=0.25)
     parser.add_argument("--max-samples", type=int, default=100)
+    parser.add_argument(
+        "--assignment-score-threshold", type=float,
+        default=DEFAULT_ASSIGNMENT_SCORE_THRESHOLD,
+        help="Use samples whose assignment score is at least this value.",
+    )
     parser.add_argument("--max-edges-per-step", type=int, default=128)
     parser.add_argument("--max-retained-edges", type=int, default=30)
     parser.add_argument("--max-next-cleavage-candidates", type=int, default=3)
@@ -2585,6 +2870,7 @@ if __name__ == "__main__":
         detect_anomaly=args.detect_anomaly,
         profile_performance=args.profile_performance,
         max_samples=args.max_samples,
+        assignment_score_threshold=args.assignment_score_threshold,
     )
     train_config_inline["validation_valid_records_file"] = str(
         val_split_dir / "valid_records.msds"

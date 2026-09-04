@@ -5,6 +5,7 @@ import argparse
 from ...base import CLICommand
 from clefts.ml.training.fragment_tree_training.training_model import (
     DEFAULT_EXPERIMENT_NAME,
+    DEFAULT_ASSIGNMENT_SCORE_THRESHOLD,
     build_model_config_from_pretrained,
     build_train_config,
     load_and_validate_split_preprocessing,
@@ -38,6 +39,11 @@ class FragmentTreeTrainCommand(CLICommand):
         parser.add_argument("--training-edges-per-sample", type=int, default=32)
         parser.add_argument("--training-zero-edge-fraction", type=float, default=0.25)
         parser.add_argument("--max-samples", type=int, default=100)
+        parser.add_argument(
+            "--assignment-score-threshold", type=float,
+            default=DEFAULT_ASSIGNMENT_SCORE_THRESHOLD,
+            help="Minimum assignment_scores.tsv score used for training and filtered validation.",
+        )
         parser.add_argument("--condition-adduct-embedding-dim", type=int, default=16)
         parser.add_argument("--condition-ce-feature-dim", type=int, choices=(16,), default=16)
         parser.add_argument("--condition-ce-fc-dims", default="32")
@@ -171,6 +177,7 @@ class FragmentTreeTrainCommand(CLICommand):
             training_structure_dir=args.training_structure_dir,
             validation_structure_dir=args.validation_structure_dir,
             max_samples=args.max_samples,
+            assignment_score_threshold=args.assignment_score_threshold,
         )
         preprocessing, preprocessing_config_path = load_and_validate_split_preprocessing(
             train_config["training_structure_dir"],

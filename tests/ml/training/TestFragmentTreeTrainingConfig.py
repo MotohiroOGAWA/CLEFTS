@@ -7,6 +7,7 @@ from pathlib import Path
 
 from clefts.ml.training.fragment_tree_training.training_model import (
     build_train_config,
+    load_assignment_score_selection,
     load_and_validate_split_preprocessing,
 )
 
@@ -80,6 +81,24 @@ class TestFragmentTreeTrainingConfig(unittest.TestCase):
         self.assertFalse(default_config["detect_anomaly"])
         self.assertTrue(diagnostic_config["detect_anomaly"])
         self.assertFalse(default_config["profile_performance"])
+
+    def test_assignment_score_threshold_defaults_to_point_eight(self) -> None:
+        config = build_train_config(project_dir=self.root / "project")
+        self.assertEqual(config["assignment_score_threshold"], 0.8)
+
+    def test_assignment_scores_are_partitioned_by_sample_within_each_file(self) -> None:
+        score_file = self.root / "assignment_scores.tsv"
+        score_file.write_text(
+            "structure_file\tassignment_score\n"
+            "one.preft.pt\t0.95\n"
+            "one.preft.pt\t0.20\n"
+            "two.preft.pt\t0.80\n",
+            encoding="utf-8",
+        )
+        included, excluded, scores = load_assignment_score_selection(score_file, 0.8)
+        self.assertEqual(included, {"one.preft.pt": {0}, "two.preft.pt": {0}})
+        self.assertEqual(excluded, {"one.preft.pt": {1}})
+        self.assertEqual(scores, [0.95, 0.2, 0.8])
 
 
 if __name__ == "__main__":

@@ -676,6 +676,7 @@ Constrained choices such as `{16}` and their default are shown together:
 
 | Option | Default | Meaning |
 |---|---:|---|
+| `--assignment-score-threshold` | 0.8 | Minimum `assignment_score` used for training and the filtered validation view; accepted when `score >= threshold` |
 | `--max-samples` | 100 | Workflow sample limit and preflight dimension |
 | `--batch-size` | 1 | Number of structure files per DataLoader batch |
 | `--validation-interval-steps` | 100 | Step-validation interval |
@@ -684,6 +685,56 @@ Constrained choices such as `{16}` and their default are shown together:
 
 `batch-size` counts stored structure files, whereas `max-samples` counts MS/MS
 samples. They are different units.
+
+### Assignment-score filtering and validation scopes
+
+`--assignment-score-threshold FLOAT` controls which spectra provide supervised
+training targets. Its valid range is `0.0` through `1.0`, inclusive, and the
+default is `0.8`. A sample is selected when its `assignment_score` is greater
+than or equal to the threshold. This is a sample-level filter: if one
+`.preft.pt` file contains both accepted and rejected spectra, only the accepted
+samples and their corresponding peak/formula/assignment targets are loaded for
+training.
+
+The trainer requires one `assignment_scores.tsv` for both the training and
+validation split. For a structure directory such as
+`train_structures/data`, it searches in this order:
+
+1. `train_structures/data/assignment_scores.tsv`
+2. `train_structures/assignment_scores.tsv`
+
+The TSV must contain `structure_file` and `assignment_score` columns. Files
+written by the fragment-tree data-preparation command already use this schema.
+Training stops with a clear error if the TSV is missing, a score is invalid, or
+no sample meets the configured threshold.
+
+Validation produces three scopes:
+
+| Scope | Samples | Computation |
+|---|---|---|
+| `filtered` | `assignment_score >= threshold` | Evaluated once; this is the validation value used by training/checkpoint logic |
+| `below_threshold` | `assignment_score < threshold` | Evaluated once as the complementary diagnostic partition |
+| `unfiltered` | All validation samples | Assembled from the two disjoint cached partitions; filtered samples are not inferred again |
+
+Distributional metrics, including cosine similarity, selection precision,
+selection recall, F1, intensity coverage, and top-k recall, are reported with
+`q1`, `median`, and `q3` (and where applicable mean/min/max). Important files in
+each run are:
+
+- `assignment_score_report.json`: threshold, selected/excluded sample counts,
+  and assignment-score distribution.
+- `validation/validation_scope_summary.tsv`: filtered, below-threshold, and
+  unfiltered loss summaries.
+- `validation/filtered/*_summary.tsv` and
+  `validation/below_threshold/*_summary.tsv`: per-partition metric summaries.
+- `validation/unfiltered_cosine_summary.tsv` and
+  `validation/unfiltered_peak_selection_summary.tsv`: exact unfiltered
+  summaries combined from cached per-spectrum results.
+
+The same option is available in the VS Code Workbench as **Assignment score
+threshold** under **Training, optimizer, and checkpoints**. Saved Workbench
+configurations use the `assignmentScoreThreshold` key and pass it to the CLI as
+`--assignment-score-threshold`.
 
 ## Dataset, MolEncoder, and resume configuration
 
@@ -723,9 +774,24 @@ Example `PROJECT_DIR/config/train_config.json`:
   "shuffle": true,
   "validate_at_start": false,
   "max_samples": 100,
+  "assignment_score_threshold": 0.8,
   "early_stopping": {}
 }
 ```
+
+Training and the filtered validation view use only samples with
+`assignment_score >= assignment_score_threshold` from each split's
+`assignment_scores.tsv`. The default threshold is `0.8`; it can be changed with
+`--assignment-score-threshold`. Filtering is sample-level, including when one
+structure file contains a mixture of high- and low-score spectra.
+
+Each run writes `assignment_score_report.json` with selected/excluded counts and
+the assignment-score mean, quartiles, median, and range. Validation evaluates
+the filtered and below-threshold partitions once each. The unfiltered result is
+then assembled from those cached, disjoint results, so filtered spectra are not
+inferred twice. Scope summaries are written below `runs/<timestamp>/validation/`;
+cosine and peak-selection summaries include `q1`, `median`, and `q3` in addition
+to the mean.
 
 For a new run, use `"ckpt_id": null`. To resume, specify a checkpoint ID such
 as `"ckpt_id": "42"`. A branch-node ID resolves to its latest checkpoint;

@@ -5,7 +5,7 @@ import shutil
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Set
 
 import pandas as pd
 import torch
@@ -14,6 +14,7 @@ from tqdm import tqdm
 
 from ...libs.msentity.msentity import MSDataset
 from .fragment_tree_structure import FragmentTreeStructure
+from .training_fragment_tree_structure import TrainingFragmentTreeStructure
 from .training_fragment_tree_structure_builder import TrainingFragmentTreeStructureBuilder
 
 FRAGMENT_TREE_STRUCTURE_SUFFIX = ".preft.pt"
@@ -127,12 +128,18 @@ class FragmentTreeStructureFileDataset(Dataset[FragmentTreeStructureFileItem]):
         pattern: str = "*.preft.pt",
         map_location: str | torch.device = "cpu",
         device: Optional[str | torch.device] = None,
+        included_samples_by_file: Optional[Dict[str, Set[int]]] = None,
     ) -> None:
         self.root_dir = Path(root_dir)
         self.pattern = pattern
         self.map_location = map_location
         self.device = device
-        self.files = sorted(self.root_dir.glob(pattern))
+        self.included_samples_by_file = included_samples_by_file
+        files = sorted(self.root_dir.glob(pattern))
+        self.files = (
+            files if included_samples_by_file is None else
+            [path for path in files if included_samples_by_file.get(path.name)]
+        )
 
         if len(self.files) == 0:
             raise FileNotFoundError(
@@ -143,11 +150,97 @@ class FragmentTreeStructureFileDataset(Dataset[FragmentTreeStructureFileItem]):
         return len(self.files)
 
     def __getitem__(self, index: int) -> FragmentTreeStructureFileItem:
-        return load_fragment_tree_structure_file(
+        item = load_fragment_tree_structure_file(
             self.files[index],
             map_location=self.map_location,
             device=self.device,
         )
+        if self.included_samples_by_file is None:
+            return item
+        sample_ids = sorted(self.included_samples_by_file[item.path.name])
+        structure = subset_training_structure_samples(item.structure, sample_ids)
+        return FragmentTreeStructureFileItem(
+            path=item.path, structure=structure, metadata=item.metadata
+        )
+
+
+def subset_training_structure_samples(
+    structure: FragmentTreeStructure, sample_ids: Sequence[int]
+) -> FragmentTreeStructure:
+    """Keep selected samples and their complete CSR target hierarchy."""
+    if not isinstance(structure, TrainingFragmentTreeStructure):
+        raise TypeError("assignment-score filtering requires TrainingFragmentTreeStructure")
+    selected = sorted(set(int(value) for value in sample_ids))
+    if not selected or selected[0] < 0 or selected[-1] >= structure.num_samples:
+        raise ValueError("sample_ids must select at least one valid sample")
+    device = structure.device
+    sample_map = torch.full((structure.num_samples,), -1, dtype=torch.long, device=device)
+    sample_index = torch.tensor(selected, dtype=torch.long, device=device)
+    sample_map[sample_index] = torch.arange(len(selected), device=device)
+
+    sample_edge_mask = torch.isin(structure.sample_edge_index[0].long(), sample_index)
+    sample_edge_index = structure.sample_edge_index[:, sample_edge_mask].clone()
+    sample_edge_index[0] = sample_map[sample_edge_index[0].long()]
+    precursor_mask = torch.isin(structure.precursor_sample_index.long(), sample_index)
+    precursor_sample_index = sample_map[structure.precursor_sample_index[precursor_mask].long()]
+
+    peak_ids: List[int] = []
+    for sample_id in selected:
+        peak_ids.extend(range(int(structure.sample_peak_ptr[sample_id]), int(structure.sample_peak_ptr[sample_id + 1])))
+    peak_index = torch.tensor(peak_ids, dtype=torch.long, device=device)
+    peak_counts = [int(structure.sample_peak_ptr[i + 1] - structure.sample_peak_ptr[i]) for i in selected]
+    sample_peak_ptr = torch.tensor([0, *torch.tensor(peak_counts).cumsum(0).tolist()], dtype=torch.long, device=device)
+
+    formula_ids: List[int] = []
+    formula_counts: List[int] = []
+    for peak_id in peak_ids:
+        start, stop = int(structure.peak_formula_ptr[peak_id]), int(structure.peak_formula_ptr[peak_id + 1])
+        formula_ids.extend(range(start, stop)); formula_counts.append(stop - start)
+    formula_index = torch.tensor(formula_ids, dtype=torch.long, device=device)
+    peak_formula_ptr = torch.tensor([0, *torch.tensor(formula_counts).cumsum(0).tolist()], dtype=torch.long, device=device)
+
+    assignment_ids: List[int] = []
+    assignment_counts: List[int] = []
+    for formula_id in formula_ids:
+        start, stop = int(structure.formula_assignment_ptr[formula_id]), int(structure.formula_assignment_ptr[formula_id + 1])
+        assignment_ids.extend(range(start, stop)); assignment_counts.append(stop - start)
+    assignment_index = torch.tensor(assignment_ids, dtype=torch.long, device=device)
+    formula_assignment_ptr = torch.tensor([0, *torch.tensor(assignment_counts).cumsum(0).tolist()], dtype=torch.long, device=device)
+
+    def subset_csr(data: torch.Tensor, ptr: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        values: List[torch.Tensor] = []
+        counts: List[int] = []
+        for assignment_id in assignment_ids:
+            start, stop = int(ptr[assignment_id]), int(ptr[assignment_id + 1])
+            values.append(data[start:stop]); counts.append(stop - start)
+        result = torch.cat(values) if values else data[:0]
+        result_ptr = torch.tensor([0, *torch.tensor(counts).cumsum(0).tolist()], dtype=torch.long, device=device)
+        return result, result_ptr
+
+    expand, expand_ptr = subset_csr(structure.target_expand_node_index, structure.terminal_expand_ptr)
+    path, path_ptr = subset_csr(structure.target_path_edge_index, structure.terminal_path_ptr)
+    return TrainingFragmentTreeStructure(
+        **{name: getattr(structure, name) for name in (
+            "node_smiles", "node_graph", "node_graph_offset", "node_formula", "formula_element_order",
+            "edge_index", "cleavage_event_edge_index", "cleavage_event", "cleavage_atom_idxs",
+            "reactant_tuple_length_table", "product_tuple_length_table", "ion_formula_delta",
+            "unsaturation_formula_delta", "radical_formula_delta")},
+        sample_adduct_type_index=structure.sample_adduct_type_index[sample_index],
+        sample_ce_value=structure.sample_ce_value[sample_index], sample_edge_index=sample_edge_index,
+        precursor_edge_index_path=structure.precursor_edge_index_path[precursor_mask],
+        precursor_unsaturation_index=structure.precursor_unsaturation_index[precursor_mask],
+        precursor_radical_index=structure.precursor_radical_index[precursor_mask],
+        precursor_sample_index=precursor_sample_index,
+        sample_peak_mz=structure.sample_peak_mz[peak_index], sample_peak_intensity=structure.sample_peak_intensity[peak_index],
+        sample_peak_ptr=sample_peak_ptr, target_formula=structure.target_formula[formula_index],
+        peak_formula_ptr=peak_formula_ptr, target_terminal_node_index=structure.target_terminal_node_index[assignment_index],
+        target_ion_index=structure.target_ion_index[assignment_index],
+        target_unsaturation_index=structure.target_unsaturation_index[assignment_index],
+        target_radical_index=structure.target_radical_index[assignment_index],
+        formula_assignment_ptr=formula_assignment_ptr, target_expand_node_index=expand,
+        terminal_expand_ptr=expand_ptr, target_peak_depth=structure.target_peak_depth[peak_index],
+        target_path_edge_index=path, terminal_path_ptr=path_ptr,
+    )
 
 
 def collate_fragment_tree_structure_items(
