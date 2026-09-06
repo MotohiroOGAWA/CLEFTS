@@ -6,6 +6,9 @@ from pathlib import Path
 from ...base import CLICommand
 from clefts.ml.data_preparation.fragment_tree.create_fragment_tree_training_data import main as create_main
 from clefts.ml.data_preparation.fragment_tree.create_fragment_tree_training_data import parse_args as create_parse_args
+from clefts.ml.data_preparation.fragment_tree.create_fragment_tree_training_data import (
+    DEFAULT_PREPROCESSING_CONFIG_NAME,
+)
 
 
 class CreateFragmentTreeDataCommand(CLICommand):
@@ -95,7 +98,7 @@ class CreateFragmentTreeDataCommand(CLICommand):
             "--params",
             str(model_config),
             "--preprocessing-config-output",
-            str(project_dir / "config" / "preprocessing_config.json"),
+            str(project_dir / "config" / DEFAULT_PREPROCESSING_CONFIG_NAME),
             "--symbols",
             *[str(symbol) for symbol in args.symbols],
             "--smiles-column",

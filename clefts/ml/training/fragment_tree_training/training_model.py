@@ -10,7 +10,7 @@ import traceback
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -143,7 +143,11 @@ DEFAULT_ASSIGNMENT_SCORE_THRESHOLD = 0.8
 
 DEFAULT_TRAIN_CONFIG_NAME = "train_config.json"
 DEFAULT_PROJECT_MODEL_CONFIG_NAME = "model_config.json"
-DEFAULT_PREPROCESSING_CONFIG_NAME = "preprocessing_config.json"
+DEFAULT_PREPROCESSING_CONFIG_NAME = "preprocessing_config.pftprep.json"
+# Recognized as a fallback when locating a preprocessing config, so structure
+# directories created before the dedicated ``.pftprep.json`` extension was
+# introduced keep loading correctly.
+LEGACY_PREPROCESSING_CONFIG_NAME = "preprocessing_config.json"
 DEFAULT_EXPERIMENT_NAME = "exp_main"
 DEFAULT_OPTIMIZER_INFO = {
     "name": "AdamW",
@@ -390,11 +394,15 @@ def validate_preprocessing_compatibility(
     model_config: Dict[str, Any],
     preprocessing_config_path: Optional[str | Path] = None,
 ) -> None:
-    config_path = (
-        Path(preprocessing_config_path)
-        if preprocessing_config_path is not None
-        else Path(project_dir) / "config" / "preprocessing_config.json"
-    )
+    if preprocessing_config_path is not None:
+        config_path = Path(preprocessing_config_path)
+    else:
+        config_dir = Path(project_dir) / "config"
+        config_path = config_dir / DEFAULT_PREPROCESSING_CONFIG_NAME
+        if not config_path.exists():
+            legacy_path = config_dir / LEGACY_PREPROCESSING_CONFIG_NAME
+            if legacy_path.exists():
+                config_path = legacy_path
     if not config_path.exists():
         raise FileNotFoundError(
             f"Preprocessing config not found: {config_path}. Training requires the "
@@ -1756,17 +1764,27 @@ def evaluate_validation_cosine(
     return val_cosine
 
 
-def find_split_config(split_dir: str | Path, filename: str) -> Path:
-    """Find a config saved in a structure split, accepting split/data paths."""
+def find_split_config(
+    split_dir: str | Path, filename: str | Sequence[str]
+) -> Path:
+    """Find a config saved in a structure split, accepting split/data paths.
+
+    ``filename`` may be a single name or a sequence of names to try in
+    priority order (e.g. a current dedicated extension followed by a legacy
+    plain name), returning the first match found. Directory proximity to
+    ``split_dir`` still takes priority over name order.
+    """
     split_path = Path(split_dir).resolve()
+    filenames = (filename,) if isinstance(filename, str) else tuple(filename)
     candidates = []
     for directory in (split_path, split_path.parent, *split_path.parents):
-        candidates.extend((directory / filename, directory / "config" / filename))
+        for name in filenames:
+            candidates.extend((directory / name, directory / "config" / name))
     for candidate in candidates:
         if candidate.is_file():
             return candidate
     raise FileNotFoundError(
-        f"Could not find {filename} in the structure split: {split_dir}"
+        f"Could not find any of {list(filenames)} in the structure split: {split_dir}"
     )
 
 
@@ -1775,11 +1793,14 @@ def load_and_validate_split_preprocessing(
     val_dir: str | Path,
 ) -> Tuple[Dict[str, Any], Path]:
     """Load immutable preprocessing data and require identical train/val settings."""
+    preprocessing_config_names = (
+        DEFAULT_PREPROCESSING_CONFIG_NAME, LEGACY_PREPROCESSING_CONFIG_NAME
+    )
     train_preprocessing_path = find_split_config(
-        train_dir, DEFAULT_PREPROCESSING_CONFIG_NAME
+        train_dir, preprocessing_config_names
     )
     val_preprocessing_path = find_split_config(
-        val_dir, DEFAULT_PREPROCESSING_CONFIG_NAME
+        val_dir, preprocessing_config_names
     )
     train_preprocessing = load_config(train_preprocessing_path)
     val_preprocessing = load_config(val_preprocessing_path)
@@ -1800,8 +1821,8 @@ def load_and_validate_split_preprocessing(
         )
     if train_fragmenter != dict(train_preprocessing.get("fragmenter_params") or {}):
         raise ValueError(
-            "fragmenter.json does not match preprocessing_config.json in the "
-            "training structure directory."
+            f"fragmenter.json does not match {DEFAULT_PREPROCESSING_CONFIG_NAME} "
+            "in the training structure directory."
         )
     return train_preprocessing, train_preprocessing_path
 

@@ -642,7 +642,7 @@ const HELP = {
   overwrite: 'Overwrite existing .preft.pt structure files.', overwritePreprocessingConfig: 'Overwrite an existing preprocessing configuration without prompting.',
   saveTrainValidRecords: 'Save successfully processed training records as an MSDataset.', saveValidationValidRecords: 'Save successfully processed validation records as an MSDataset.',
   keepParallelTemp: 'Keep temporary parallel-processing files after merging.'
-  ,trainDir: 'Directory containing generated training structures and preprocessing_config.json.',
+  ,trainDir: 'Directory containing generated training structures and preprocessing_config.pftprep.json.',
   valDir: 'Directory containing generated validation structures with compatible preprocessing settings.',
   molEncoderCheckpoint: 'Pretrained molecular encoder checkpoint used by FragmentTreeFeatureModel.',
   conditionAdductEmbeddingDim: 'Width of the learned main-adduct embedding.',

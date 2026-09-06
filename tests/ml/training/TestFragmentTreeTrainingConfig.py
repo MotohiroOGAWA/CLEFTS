@@ -49,6 +49,30 @@ class TestFragmentTreeTrainingConfig(unittest.TestCase):
         self.assertEqual(preprocessing["symbols"], ["C", "H", "N", "O"])
         self.assertEqual(config_path, self.root / "config" / "preprocessing_config.json")
 
+    def test_prefers_dedicated_pftprep_extension_over_legacy_plain_json(self) -> None:
+        # setUp already wrote the legacy plain-named file; also write the
+        # dedicated-extension file with different (but still valid) content
+        # and confirm it is the one actually loaded and returned.
+        dedicated_preprocessing = {
+            "symbols": ["C", "H", "N", "O", "S"],
+            "fragmenter_params": self.fragmenter,
+            "max_node": -1,
+            "max_edge": -1,
+        }
+        (self.root / "config" / "preprocessing_config.pftprep.json").write_text(
+            json.dumps(dedicated_preprocessing), encoding="utf-8"
+        )
+
+        preprocessing, config_path = load_and_validate_split_preprocessing(
+            self.root / "train_structures" / "data",
+            self.root / "validation_structures" / "data",
+        )
+
+        self.assertEqual(preprocessing["symbols"], ["C", "H", "N", "O", "S"])
+        self.assertEqual(
+            config_path, self.root / "config" / "preprocessing_config.pftprep.json"
+        )
+
     def test_rejects_different_validation_fragmenter(self) -> None:
         validation_fragmenter = self.root / "validation_structures" / "fragmenter.json"
         validation_fragmenter.write_text(
