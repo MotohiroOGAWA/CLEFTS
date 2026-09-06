@@ -2059,7 +2059,7 @@ def save_managed_checkpoint(
 
 
 def add_scalar_if_finite(writer, tag: str, value: float, step: int) -> None:
-    if not math.isnan(float(value)):
+    if math.isfinite(float(value)):
         writer.add_scalar(tag, float(value), step)
 
 
@@ -2072,7 +2072,7 @@ def add_scalars_if_finite(
     finite_values = {
         key: float(value)
         for key, value in values.items()
-        if not math.isnan(float(value))
+        if math.isfinite(float(value))
     }
     if finite_values:
         writer.add_scalars(main_tag, finite_values, step)
@@ -2084,7 +2084,7 @@ def log_distribution_cards(
     summaries: Dict[str, Dict[str, float]],
     step: int,
 ) -> None:
-    """Separate processing stages and condition cards; overlay data splits."""
+    """Compare means by stage; give each statistic its own detail card."""
     statistics = ("min", "q1", "mean", "median", "q3", "max")
     grouped: Dict[str, Dict[str, float]] = {}
     for split, summary in summaries.items():
@@ -2095,10 +2095,12 @@ def log_distribution_cards(
                     metric_path = name[: -len(suffix)]
                     metric, _, scope = metric_path.partition("@")
                     card, condition = metric_labels.tensorboard_metric_card(namespace, metric, scope)
-                    series_name = (
-                        f"{split}_{condition}_{statistic}" if condition else f"{split}_{statistic}"
-                    )
-                    grouped.setdefault(card, {})[series_name] = value
+                    series = f"{split}_{condition}" if condition else split
+                    if statistic == "mean":
+                        grouped.setdefault(card, {})[f"{series}_mean"] = value
+                    group, _, metric_card = card.partition("/")
+                    detail_card = f"{group}_statistics/{metric_card}/{statistic}"
+                    grouped.setdefault(detail_card, {})[series] = value
                     break
     for metric, values in grouped.items():
         add_scalars_if_finite(writer, metric, values, step)
@@ -2303,10 +2305,11 @@ def main(
                 combined_cosine = write_combined_validation_cosine_summary(
                     run_dir / "validation", step_value
                 )
-                add_scalars_if_finite(
+                log_distribution_cards(
                     writer,
-                    "intensity/unfiltered_cosine_distribution",
-                    {name: combined_cosine[name] for name in ("q1", "median", "q3")},
+                    "peak_selection",
+                    {"validation": {f"cosine@unfiltered_{name}": value
+                                    for name, value in combined_cosine.items()}},
                     step_value,
                 )
                 write_combined_peak_selection_summary(

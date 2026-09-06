@@ -47,7 +47,7 @@ class TestFragmentTreeValidationMetrics(unittest.TestCase):
         parsed_ce = [20, 30, 40, 25, 10, np.nan, np.nan]
         dataset = _dataset(
             [np.array([[100.0, 1.0], [250.0, 0.5]]) for _ in raw_ce],
-            precursor_mz=[250.0] * len(raw_ce),
+            precursor_mz=["250.0"] * len(raw_ce),
         )
         dataset["AdductType"] = ["[M+H]+"] * len(raw_ce)
         model = SimpleNamespace(
@@ -85,7 +85,7 @@ class TestFragmentTreeValidationMetrics(unittest.TestCase):
         log_distribution_cards(writer, "metrics", {
             split: values for split in ("train", "train_window", "validation")
         }, 10)
-        self.assertEqual(set(writer.calls), {
+        self.assertEqual({tag for tag in writer.calls if not tag.split("/")[0].endswith("_statistics")}, {
             "edge_selection/edge_retain_precision/overall",
             "edge_selection/edge_retain_precision/by_adduct",
             "edge_selection/edge_retain_precision/by_ce_range",
@@ -105,12 +105,32 @@ class TestFragmentTreeValidationMetrics(unittest.TestCase):
             "selection_precision@by_adduct:[M+H]+_mean": 0.7,
             "cosine_mean": 0.95,
         }}, 10)
-        self.assertEqual(set(writer.calls), {
+        self.assertEqual({tag for tag in writer.calls if not tag.split("/")[0].endswith("_statistics")}, {
             "peak_selection/selection_precision/overall",
             "peak_selection/selection_precision/excl_precursor",
             "peak_selection/selection_precision/by_adduct",
             "intensity/cosine/overall",
         })
+
+    def test_mean_comparison_and_individual_statistics_have_separate_groups(self):
+        writer = _FakeWriter()
+        statistics = {"min": 0.1, "q1": 0.2, "mean": 0.4, "median": 0.3, "q3": 0.6, "max": 0.9}
+        log_distribution_cards(writer, "metrics", {
+            split: {f"intensity_cosine_similarity{scope}_{stat}": value
+                    for stat, value in statistics.items()
+                    for scope in ("", "@by_adduct:[M+H]+", "@by_ce_range:min-to-q1")}
+            for split in ("train", "train_window", "validation")
+        }, 10)
+        for scope, condition in (("overall", ""), ("by_adduct", "_[M+H]+"), ("by_ce_range", "_min-to-q1")):
+            card = f"intensity/intensity_cosine_similarity/{scope}"
+            self.assertEqual(writer.calls[card], {
+                f"{split}{condition}_mean": 0.4 for split in ("train", "train_window", "validation")
+            })
+            for statistic, value in statistics.items():
+                self.assertEqual(writer.calls[f"intensity_statistics/intensity_cosine_similarity/{scope}/{statistic}"], {
+                    f"{split}{condition}": value for split in ("train", "train_window", "validation")
+                })
+        self.assertEqual(len(writer.calls), 21)
 
     def test_validation_generates_cosine_and_mirror_images(self):
         from torch.utils.tensorboard import SummaryWriter

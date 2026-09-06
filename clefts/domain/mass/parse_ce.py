@@ -1,15 +1,27 @@
+import math
 import re
 
 charge_factor = {1: 1, 2: 0.9, 3: 0.85, 4: 0.8, 5: 0.75}
 nce_instruments = ["Orbitrap", "LC-ESI-QFT", "LC-APCI-ITFT", "Linear Ion Trap", "LC-ESI-ITFT"] # "Flow-injection QqQ/MS",
 
 def NCE_to_eV(nce, precursor_mz, charge=1):
-    return nce * precursor_mz / 500 * charge_factor[charge]
+    return float(nce) * float(precursor_mz) / 500 * charge_factor[charge]
 
 def parse_ce_to_ev(ce, precursor_mz, instrument=None) -> float | None:
+    """Convert supported CE metadata to eV, returning None on invalid input."""
+    try:
+        value = _parse_ce_to_ev(ce, precursor_mz, instrument)
+        return value if value is not None and math.isfinite(value) else None
+    except (TypeError, ValueError, OverflowError):
+        # Metadata may contain strings, missing values, or invalid precursor
+        # masses. Callers can skip these records or group them as non-finite.
+        return None
+
+
+def _parse_ce_to_ev(ce, precursor_mz, instrument=None) -> float | None:
     try:
         ce = float(ce)
-    except:
+    except (TypeError, ValueError, OverflowError):
         pass
     if type(ce) == float:
         if instrument in nce_instruments:

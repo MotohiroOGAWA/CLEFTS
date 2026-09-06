@@ -552,10 +552,17 @@ intensity/intensity_cosine_similarity/overall
 ```
 
 The `train`, `train_window`, and `validation` series share each applicable card.
-Distribution cards retain min/q1/mean/median/q3/max statistics. Adduct and CE
-cards include the condition label in each series name. Chemical adduct labels
+Comparison cards show **mean only**. Each stage also has a dedicated
+`<stage>_statistics` group, where min/q1/mean/median/q3/max each have a separate
+card. For example, `intensity/intensity_cosine_similarity/overall` compares means,
+while `intensity_statistics/intensity_cosine_similarity/overall/q1` compares only
+q1. The mean also has its own card in this statistics group. Train, train-window,
+and validation remain series on the corresponding card. Adduct and CE cards
+include the condition label in each series name. Chemical adduct labels
 are preserved; slashes in labels are replaced by `∕`. CE bins use quartiles of
-the current population, with non-finite values in a separate bin.
+the current population, with non-finite values in a separate bin. Collision-energy
+conversion accepts numeric precursor-mass strings; invalid CE metadata or failed
+NCE conversion produces a missing value instead of interrupting metric logging.
 Headline loss cards (`loss/total`, `loss/selection`, `loss/intensity`) also overlay
 these three splits. Duplicate split-prefixed loss cards are no longer written.
 Open TensorBoard on the run's log directory including its child directories.
@@ -644,7 +651,9 @@ path_coverage/rollout_final/depth_3/complete_path_recall/overall
 
 Train, train-window, and validation summaries share the corresponding normal
 cards. Rollout cards are validation-only. Per-batch metrics are summarized with
-mean and quantiles (they are not corpus-wide confusion-matrix ratios). All dynamic
+mean and quantiles (they are not corpus-wide confusion-matrix ratios). Mean-only
+comparison cards and the separate `<stage>_statistics` cards use the same layout
+as the other metrics. All dynamic
 metric summaries, including depth diagnostics, are also appended to
 `metric_distributions.tsv` in the run directory, with event, epoch, global step,
 split, metric, and value columns. Rollout evaluation adds inference work to each
