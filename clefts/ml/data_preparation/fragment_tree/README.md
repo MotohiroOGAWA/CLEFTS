@@ -135,3 +135,17 @@ Display all available options with:
 ```bash
 python -m clefts.ml.data_preparation.fragment_tree.create_fragment_tree_training_data --help
 ```
+
+## Restoring settings and inline Fragmenter parameters
+
+Every parent CLI run writes `fragment-tree.pft.json` containing input/output options
+and the complete `fragmenterParams` object. Load it with Workbench's Load Configuration.
+The immutable `config/preprocessing_config.pftprep.json` continues to describe only
+the structure preprocessing settings.
+
+Use `--params-json '{"fragment_ion_tree_builder": ...}'` to pass Fragmenter values
+directly (the value must be a complete valid JSON object). `--params PATH` remains
+available for existing scripts; the two options are mutually exclusive. Parallel
+workers receive the same embedded values via `--params-json`. The
+`clefts train create-fragment-tree-data` command also accepts an inline JSON object
+in its `MODEL_CONFIG` positional argument.

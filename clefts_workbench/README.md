@@ -29,8 +29,8 @@ Set `clefts.pythonPath` when the required Python environment is not available as
 ## Configuration and results
 
 - `Save Configuration` and `Load Configuration` export and import Workbench settings as JSON.
-- Fragmenter parameters have a dedicated JSON editor and separate `Load Fragmenter` and `Save Fragmenter` actions.
-- Every run also writes `fragment-tree.pft.json` to its output directory.
+- Fragmenter parameters use a reusable form component with separate `Load Fragmenter` and `Save Fragmenter` actions. Add/remove AdductType rules, ion shifts, and atoms with the +/− controls. `Edit Cleavage Pattern Set` opens the existing pattern editor; `Apply to Fragmenter` applies its changes.
+- Every run also writes `fragment-tree.pft.json` with input/output settings and embedded `fragmenterParams` to its output directory. Load this file to restore the run. Both Run CLI and Copy Command pass the edited values using `--params-json`; loading a Fragmenter file never makes it an output destination.
 - Every output directory receives a `fragment-tree.pft` result manifest. Opening it in Explorer displays the run status and structure manifests in the CLEFTS result viewer.
 - Select a JSON or TSV entry in the result viewer to open it in the standard VS Code editor.
 - Select an individual `.preft.pt` structure to inspect its fragment-tree drawing,
