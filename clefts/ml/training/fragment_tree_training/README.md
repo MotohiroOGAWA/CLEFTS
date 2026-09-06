@@ -528,170 +528,127 @@ Slot queries are mean-pooled and projected to produce the final edge feature.
 
 ## TensorBoard layout
 
-Autograd anomaly detection is disabled by default because it slows training. For
-diagnosis, enable it with `--detect-anomaly`; programmatic callers can pass
-`detect_anomaly=True` to `main` or `build_train_config`.
+Cards are grouped by the processing stage:
 
-The same metric's training and validation values are placed on one card. They are
-not separated into different cards.
+| Group | Contents |
+| --- | --- |
+| `loss` | Total, selection, intensity, edge-ranking, and precursor keep losses |
+| `edge_absolute_score` | Absolute edge-score/ranking diagnostics |
+| `edge_selection` | Edge retention, coverage, and tree edge budgets |
+| `peak_selection` | Peak precision, recall, counts, and top-k coverage |
+| `precursor_selection` | Precursor selection and detection diagnostics |
+| `intensity` | Intensity errors, coverage, and cosine similarities |
 
-For every metric reported in `absolute_ranker_metrics` (every key returned by
-`PairwiseEdgeIntensityRankingLoss.metrics`, `_edge_retain_metrics`,
-`_selected_peak_metrics`, and `_intensity_similarity_metrics`), the card tag
-is:
-
-```text
-metrics/<metric>
-```
-
-A summary key may carry an optional `@scope` suffix (e.g.
-`edge_retain_recall@by_adduct:[M+H]+`) to report the same metric under a
-different condition — adduct type, CE bucket, excl-precursor, ... — as an
-extra *series* on that metric's existing card instead of opening a new card
-per condition (`log_distribution_cards` in `training_model.py` parses this).
-The by-adduct/by-CE breakdowns described below use this convention, as do the
-validation-time `peak_selection/*` cards further down this page.
-
-Its series include:
+Each metric has separate `overall`, `by_adduct`, and `by_ce_range` cards when
+those breakdowns are available. Precursor-excluded metrics use their own
+`excl_precursor` card. For example:
 
 ```text
-train_min
-train_q1
-train_mean
-train_median
-train_q3
-train_max
-validation_min
-validation_q1
-validation_mean
-validation_median
-validation_q3
-validation_max
+edge_selection/edge_retain_precision/overall
+edge_selection/edge_retain_precision/by_adduct
+edge_selection/edge_retain_precision/by_ce_range
+loss/precursor/keep_loss/overall
+intensity/intensity_cosine_similarity/overall
 ```
 
-The requested minimum, first quartile, mean, third quartile, and maximum are thus
-visible together. Median is retained as an additional useful series.
+The `train`, `train_window`, and `validation` series share each applicable card.
+Distribution cards retain min/q1/mean/median/q3/max statistics. Adduct and CE
+cards include the condition label in each series name. Chemical adduct labels
+are preserved; slashes in labels are replaced by `∕`. CE bins use quartiles of
+the current population, with non-finite values in a separate bin.
+Headline loss cards (`loss/total`, `loss/selection`, `loss/intensity`) also overlay
+these three splits. Duplicate split-prefixed loss cards are no longer written.
+Open TensorBoard on the run's log directory including its child directories.
+Existing event files retain their old tags; new events use this layout.
 
-Loss cards follow the same grouping rule:
+Every validation pass generates spectra from the validation MSDataset and
+compares them against observed spectra. Both assignment-score partitions are
+processed, even when the above-threshold partition is empty. The valid-record
+MSDataset and intensity predictor are required; missing inputs and total
+prediction failures are reported as errors rather than silently skipping this
+comparison.
+
+Up to five representative spectra, ranked from high to low cosine similarity,
+are displayed as mirror plots in TensorBoard Images under
+`validation_spectra/validation` and
+`validation_spectra/validation_below_threshold`. Measured peaks point upward,
+generated peaks downward, and each spectrum is normalized to a maximum intensity
+of one for visibility. Titles show the spectrum index and cosine similarity.
+Images are also saved under
+`validation/{filtered,below_threshold}/spectra/step_XXXXXXXX/level_N.png`.
+Per-spectrum scores and aggregate summaries remain in the validation TSV files.
+
+## Depth diagnostics
+
+Training and validation now report diagnostics for each shortest graph depth.
+Roots have depth 0; an edge from a depth-d source has depth d+1. For a DAG with
+multiple routes to one fragment, this is the shortest reachable depth, not the
+number of expansion iterations. Unreachable components without a root are excluded.
+Precursor pseudo-edges (negative edge IDs) are excluded from cleavage metrics.
+
+| TensorBoard group | What is evaluated |
+| --- | --- |
+| `next_cleavage` | Actual top-K next-cleavage node choices against stored supervised intermediate nodes |
+| `edge_selection` | Conditioned edge scores and survival of assigned target edges at each depth |
+| `fragment_selection` | Actual kept fragment candidates against assigned terminal nodes (node identity, not ion/formula state correctness) |
+| `expanded_edge_selection` | Child edges of the parents actually chosen in a progressive validation step |
+| `path_coverage` | Whether complete stored supervised paths and their constituent edges survived in the candidate graph |
+
+Selection diagnostics include precision, recall, F1, accuracy, candidate coverage,
+conditional recall, TP/FP/FN counts, and target/candidate/selected counts. Undefined
+ratios are NaN, not perfect scores; counts make empty or small populations visible.
+Sample IDs are part of every comparison, so a correct edge for one spectrum does
+not count as correct for a different spectrum of the same compound.
+
+- Edge precision/recall/F1 use `edge_absolute_logit > 0`, matching the existing
+  edge-retention diagnostic. `retained_precision` evaluates all surviving candidate
+  edges regardless of this threshold. `candidate_coverage` measures how many target
+  edges survived; recall includes missing/pruned target edges, whereas
+  `conditional_recall` considers only targets still available. Accuracy is measured
+  over available candidates, not over a huge implicit set of absent true negatives.
+- `target_group_recall` accepts any retained positive edge explaining the same
+  sample/formula group. It supplements strict edge recall when several explanations
+  are valid alternatives.
+- Next-cleavage `hit_at_k` measures the fraction of samples with a positive node
+  among their choices at that depth. `top1_accuracy` evaluates the highest-scored
+  choice at that depth; a missing choice for a positive sample is a miss.
+- Expansion metrics evaluate **all** previously unseen outgoing edges of the
+  chosen parents, including correct children subsequently removed by depth budgets.
+  Targets under unchosen parents are accounted for by the full rollout recall,
+  not by conditional child-edge precision/recall.
+- `complete_path_recall` is the fraction of stored assignment paths whose edges all
+  remain available; `path_edge_coverage` measures coverage of their union. These
+  concern candidate availability, not whether every intermediate is an observed
+  peak or passes the final score threshold. Alternative paths are separate stored
+  assignments here; group recall above supplies the alternative-aware measure.
+
+Normal cards describe the single forward pass used for supervised training/loss
+validation. During validation, an additional inference pass follows the model's
+own top-K node choices and edge budgets on the saved structure DAG, without
+injecting target edges. `rollout_step_0` is the initial depth-1 pass;
+`rollout_step_N` follows N attempted expansion steps. `rollout_final` includes
+unreached deeper targets as misses even when expansion stops early. Next-cleavage
+rollout targets contain only nodes with supervised path edges still pending,
+so selecting a node whose required children are already present is not rewarded.
+This evaluates decisions on the saved candidate graph; the independent spectrum
+validation still rebuilds and generates spectra from the raw validation records.
+
+Example cards:
 
 ```text
-loss/total       -> train, train_window, validation
-loss/selection   -> train, train_window, validation
-loss/intensity   -> train, train_window, validation
+next_cleavage/depth_1/top1_accuracy/overall
+edge_selection/depth_2/recall/overall
+expanded_edge_selection/rollout_step_1/depth_2/conditional_recall/overall
+path_coverage/rollout_final/depth_3/complete_path_recall/overall
 ```
 
-In addition, the headline values are written as ordinary scalar tags in the run's
-root event file every 50 successful training steps and at every epoch end. This
-makes them visible even when TensorBoard is opened directly on one run directory:
-
-```text
-train/loss/total
-train/loss/selection
-train/loss/intensity
-train/edge/edge_ranking_loss
-train/edge/pairwise_ranking_accuracy
-train/edge/edge_retain_precision
-train/edge/edge_retain_recall
-train/edge/edge_total_loss
-```
-
-Equivalent `train_window/...` and `validation/...` tags are emitted when those
-aggregates are available. A failed batch is not counted as a successful training
-step; its exception is printed and no metric is fabricated for it.
-
-### Overall absolute_ranker metrics
-
-`target_edge_recall` / `target_group_recall` / `target_node_recall` /
-`original_edge_count` / `retained_edge_count` / `pruned_fraction` /
-`over_limit` are computed by `FragmentEdgeAbsoluteRankerTrainingLoss.metrics`,
-which is **not currently instantiated** by `FragmentTreeTrainingModel` (see
-"Current absolute_ranker loss" above) and therefore do not appear in
-`metrics/...` cards today. `by_depth/...` breakdowns are likewise only
-implemented on that unwired class.
-
-### Per-tree edge budget metrics
-
-When `max_edges_per_tree` is set (the default), `FragmentTreeTrainingModel`
-reports, per training step:
-
-| Metric | Meaning |
-|---|---|
-| `tree_edge_budget/selected_edge_count` | Edges actually kept for expensive attention encoding, summed over every tree in the batch |
-| `tree_edge_budget/available_edge_count` | Edges referenced by at least one sample before the cap, summed over every tree in the batch (edges no sample references are never candidates) |
-| `tree_edge_budget/target_edge_recall` | Fraction of `target_edge_index` edges that survived the cap (quantifies the risk that a tree's required targets exceed its budget) |
-| `tree_edge_budget/trees_over_budget_fraction` | Fraction of trees in the batch whose available edge count exceeded `max_edges_per_tree` |
-| `tree_edge_budget/mean_samples_per_selected_edge` | How often a selected edge is actually shared by more than one sample of its tree |
-
-These flow through the same generic `metrics/<name>` cards as every other
-metric on this page, with the usual full `train_min...train_max` /
-`validation_min...validation_max` distribution series.
-
-### Training-time metrics by adduct and collision-energy range
-
-`_edge_retain_metrics`, `_selected_peak_metrics`, and
-`_intensity_similarity_metrics` (the metrics actually reported per training
-step) each also report a per-sample breakdown, grouped by adduct type and by
-collision-energy quartile bucket **within the current batch**:
-
-```text
-metrics/edge_retain_recall          -> train_mean, validation_mean, train_by_adduct:[M+H]+_mean, ...
-metrics/peak_selection_precision    -> ..., validation_by_ce_range:q1-to-median_mean, ...
-metrics/intensity_cosine_similarity -> ...
-```
-
-i.e. one card per base metric (`edge_retain_recall`, `peak_selection_precision`,
-`intensity_cosine_similarity`, ...), with every adduct/CE group as an
-additional series on that same card via the `@scope` convention above, rather
-than a separate card per group. Adduct labels use their chemical string
-representation rather than internal names such as `adduct_0`; `/` inside a
-label is replaced with `∕` to avoid conflicting with TensorBoard's tag
-hierarchy, and missing labels are shown as `unknown-<index>`. CE buckets use
-the same readable labels as below. Each grouped series is averaged from the
-per-sample values of that group and, like every other series, gets the full
-`_min..._max` distribution (aggregated across training steps, so the
-distribution reflects step-to-step variation for that group).
-
-### Validation-time metrics by adduct, collision-energy range, and excl-precursor
-
-Independently, `evaluate_validation_cosine` groups the *validation-spectrum*
-cosine similarity and peak-selection metrics by adduct type
-(`target_dataset["AdductType"]`), by CE quartile bucket
-(`target_dataset["CollisionEnergy"]`, quartiles computed over the validation
-split), and by whether the precursor-ion peak was excluded first — all as
-`@scope`-suffixed keys on the same per-metric card, following the exact
-convention described above (`log_distribution_cards` is reused for both the
-training-time and validation-time cards):
-
-```text
-peak_selection/cosine               -> validation_mean, validation_excl_precursor_mean,
-                                        validation_by_adduct:[M+H]+_mean, ...
-peak_selection/selection_precision  -> validation_mean, validation_by_ce_range:q1-to-median_mean, ...
-```
-
-Collision-energy buckets use the same readable labels as the training-time
-section:
-
-```text
-by_ce_range:min-to-q1
-by_ce_range:q1-to-median
-by_ce_range:median-to-q3
-by_ce_range:q3-to-max
-by_ce_range:non-finite
-```
-
-`precursor_detection_*` has no per-spectrum value (it is already a
-corpus-wide confusion-matrix metric), so instead each present group gets its
-own precision/recall/f1/accuracy as a scoped series on the
-`peak_selection/precursor_detection_precision` card (etc.):
-`validation_by_adduct:[M+H]+_mean`, and the spread *across* groups is reported
-as an additional series on the same card,
-`validation_by_adduct_distribution_{min,q1,mean,median,q3,max}`.
-
-There is no separate `similarity/intensity_prediction_cosine*` card family —
-cosine (full and excl-precursor) is folded into the single
-`peak_selection/cosine` card above. The plain headline number remains
-available at the top-level `similarity/validation/cosine` scalar (written by
-`log_training_metrics`, one point per validation, not a distribution).
+Train, train-window, and validation summaries share the corresponding normal
+cards. Rollout cards are validation-only. Per-batch metrics are summarized with
+mean and quantiles (they are not corpus-wide confusion-matrix ratios). All dynamic
+metric summaries, including depth diagnostics, are also appended to
+`metric_distributions.tsv` in the run directory, with event, epoch, global step,
+split, metric, and value columns. Rollout evaluation adds inference work to each
+validation batch.
 
 ## `max_samples` workflow setting
 

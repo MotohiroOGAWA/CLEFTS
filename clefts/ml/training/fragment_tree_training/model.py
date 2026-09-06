@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+
 from typing import Any, Dict, List, Optional, Tuple
 import torch
 import torch.nn as nn
@@ -10,6 +11,7 @@ from ...input.training_fragment_tree_structure import TrainingFragmentTreeStruct
 from ...specgen.fragment_tree_candidate_selector import FragmentTreeCandidateSelectionOutput
 from ...specgen.fragment_tree_formula_intensity_model import FragmentTreeFormulaIntensityPredictor
 from . import metric_labels
+from .depth_metrics import DepthEvaluation
 
 
 class PairwiseEdgeIntensityRankingLoss(nn.Module):
@@ -1399,6 +1401,7 @@ class FragmentTreeTrainingModel(nn.Module):
         absolute_ranker_metrics.update(self._edge_retain_metrics(output, batch))
         absolute_ranker_metrics.update(self._selected_peak_metrics(output, batch))
         absolute_ranker_metrics.update(self._tree_edge_budget_metrics(output, batch))
+        absolute_ranker_metrics.update(DepthEvaluation(batch).evaluate(output))
         if intensity_output is not None:
             absolute_ranker_metrics.update(
                 self._intensity_similarity_metrics(intensity_output, batch)
@@ -1426,6 +1429,33 @@ class FragmentTreeTrainingModel(nn.Module):
             "absolute_ranker_metrics": absolute_ranker_metrics,
         }
 
+    @torch.no_grad()
+    def evaluate_depth_rollout(self, target) -> Dict[str, float]:
+        """Follow model-chosen frontiers on the saved DAG, without target injection."""
+        evaluator = DepthEvaluation(target)
+        metrics = {}
+        previous = None
+
+        def observe(step, output):
+            nonlocal previous
+            metrics.update({f"rollout_step_{step}/{name}": value
+                            for name, value in evaluator.evaluate(output, pending_only=True).items()})
+            if previous is not None:
+                metrics.update({f"rollout_step_{step}/{name}": value
+                                for name, value in evaluator.after_expansion(previous, output).items()})
+            previous = output
+
+        max_depth = min(
+            max(0, int(self.candidate_selector.fragmenter.tree_max_depth) - 1),
+            len(self.candidate_selector.fragment_edge_encoder.max_edges_per_depth) - 1,
+        )
+        final = self.candidate_selector.generate_depth_limited_candidates(
+            target, max_depth=max_depth, on_step=observe,
+        )
+        metrics.update({f"rollout_final/{name}": value
+                        for name, value in evaluator.evaluate(final, pending_only=True).items()})
+        return metrics
+
     def _grouped_metric_means(
         self,
         per_sample_values_by_metric: Dict[str, Dict[int, float]],
@@ -1436,9 +1466,8 @@ class FragmentTreeTrainingModel(nn.Module):
         Returns flat ``<metric>@by_adduct:<label>`` and
         ``<metric>@by_ce_range:<label>`` keys, each the mean of the
         per-sample values whose sample falls in that group. The ``@scope``
-        suffix keeps every variant of one metric on the same TensorBoard
-        card (see ``log_distribution_cards``) instead of opening a new card
-        per adduct/CE group. Grouping is computed once here and shared by
+        suffix separates ordinary, adduct, and CE TensorBoard cards
+        (see ``log_distribution_cards``). Grouping is computed once here and shared by
         every caller's metric.
         """
         if not any(per_sample_values_by_metric.values()):

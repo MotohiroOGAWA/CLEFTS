@@ -42,6 +42,7 @@ from ...specgen.fragment_tree_spectrum_predictor import (
     fragment_spectrum_output_to_msdataset,
 )
 from .model import FragmentTreeTrainingModel
+from ....domain.mass import parse_ce_to_ev
 from ....libs.msentity.msentity import MSDataset
 from ....libs.msentity.msentity.processing.spectrum_similarity import cosine_similarity_pair
 
@@ -1095,6 +1096,8 @@ def run_epoch(
                 with torch.set_grad_enabled(is_train):
                     output = model(structure)
                     loss = output["loss"]
+                    if not is_train:
+                        output["absolute_ranker_metrics"].update(model.evaluate_depth_rollout(structure))
 
                     if is_train:
                         optimizer.zero_grad(set_to_none=True)
@@ -1535,9 +1538,10 @@ def evaluate_validation_cosine(
     global_step: Optional[int] = None,
     output_dir: Optional[Path] = None,
     selection_metric_means: Optional[Dict[str, float]] = None,
+    validation_scope: str = "validation",
 ) -> float:
     if model.intensity_predictor is None:
-        return float("nan")
+        raise ValueError("Spectrum validation requires an intensity predictor.")
 
     device = next(model.parameters()).device
     predicted_dataset, target_dataset = predict_validation_msdataset(
@@ -1547,7 +1551,7 @@ def evaluate_validation_cosine(
         batch_size=batch_size,
     )
     if predicted_dataset is None or target_dataset is None:
-        return float("nan")
+        raise RuntimeError("Validation could not generate any spectra; inspect the prediction warnings above.")
 
     count = min(len(target_dataset), len(predicted_dataset))
     if count <= 0:
@@ -1623,7 +1627,16 @@ def evaluate_validation_cosine(
     # *across* groups is reported as a distribution.
     try:
         adduct_values = np.asarray(target_dataset["AdductType"])[:count]
-        ce_values = np.asarray(target_dataset["CollisionEnergy"], dtype=np.float64)[:count]
+        # Match the parser used by validation structure construction (which
+        # supplies no instrument). Metadata can contain units such as "20 V"
+        # or normalized energies such as "30%" that require precursor m/z.
+        ce_values = np.asarray([
+            parse_ce_to_ev(
+                row["CollisionEnergy"],
+                precursor_mz=row.get(PRECURSOR_MZ_COLUMN, float("nan")),
+            )
+            for _, row in target_dataset.metadata.iloc[:count].iterrows()
+        ], dtype=np.float64)
     except KeyError:
         adduct_values = None
         ce_values = None
@@ -1732,15 +1745,11 @@ def evaluate_validation_cosine(
                 )
     if writer is not None and global_step is not None:
         distribution_stats = ("min", "q1", "mean", "median", "q3", "max")
-        # One card per base metric (cosine, selection_precision, ...): every
-        # scope variant (full spectrum, excl-precursor, by-adduct, by-CE) is
-        # a series on that same card via the "@scope" key convention parsed
-        # by log_distribution_cards, instead of a separate card each.
         log_distribution_cards(
             writer,
             "peak_selection",
             {
-                "validation": {
+                validation_scope: {
                     f"{metric_name}_{stat}": summary[stat]
                     for metric_name, summary in selection_summaries.items()
                     for stat in distribution_stats
@@ -1748,14 +1757,16 @@ def evaluate_validation_cosine(
             },
             int(global_step),
         )
-        log_validation_spectrum_quantiles(
-            writer=writer,
-            predicted_dataset=predicted_dataset,
-            target_dataset=target_dataset,
-            scores=scores,
-            global_step=int(global_step),
-        )
         writer.flush()
+    if writer is not None or output_dir is not None:
+        log_validation_spectrum_quantiles(
+            writer=writer, predicted_dataset=predicted_dataset,
+            target_dataset=target_dataset, scores=scores,
+            global_step=int(global_step or 0), scope=validation_scope,
+            output_dir=output_dir,
+        )
+        if writer is not None:
+            writer.flush()
     with fixed_tqdm(
         total=1, desc="ValCosine", position=1, leave=False
     ) as iterator:
@@ -1829,16 +1840,13 @@ def load_and_validate_split_preprocessing(
 
 def log_validation_spectrum_quantiles(
     *, writer, predicted_dataset: MSDataset, target_dataset: MSDataset,
-    scores: np.ndarray, global_step: int,
+    scores: np.ndarray, global_step: int, scope: str = "validation",
+    output_dir: Optional[Path] = None,
 ) -> None:
     """Show five representative mirror plots from high to low cosine."""
     if scores.size == 0:
         return
-    try:
-        import matplotlib.pyplot as plt
-    except ImportError:
-        print("[WARN] matplotlib is unavailable; spectrum figures were skipped.")
-        return
+    import matplotlib.pyplot as plt
 
     ranked = np.argsort(scores)[::-1]
     positions = np.linspace(0, len(ranked) - 1, num=min(5, len(ranked))).round().astype(int)
@@ -1848,23 +1856,37 @@ def log_validation_spectrum_quantiles(
         target_end = int(target_dataset.peaks.offsets[spectrum_index + 1])
         pred_start = int(predicted_dataset.peaks.offsets[spectrum_index])
         pred_end = int(predicted_dataset.peaks.offsets[spectrum_index + 1])
-        target_peaks = target_dataset.peaks.data[target_start:target_end]
-        predicted_peaks = predicted_dataset.peaks.data[pred_start:pred_end]
+        target_peaks = target_dataset.peaks.data[target_start:target_end].copy()
+        predicted_peaks = predicted_dataset.peaks.data[pred_start:pred_end].copy()
+        for peaks in (target_peaks, predicted_peaks):
+            if len(peaks):
+                peaks[:, 1] = np.nan_to_num(peaks[:, 1], nan=0.0, posinf=0.0, neginf=0.0).clip(min=0)
+                maximum = peaks[:, 1].max()
+                if maximum > 0:
+                    peaks[:, 1] /= maximum
         figure, axis = plt.subplots(figsize=(10, 4))
         if len(target_peaks):
             axis.vlines(target_peaks[:, 0], 0, target_peaks[:, 1], color="black", label="measured")
         if len(predicted_peaks):
             axis.vlines(predicted_peaks[:, 0], 0, -predicted_peaks[:, 1], color="tab:red", label="generated")
         axis.axhline(0, color="gray", linewidth=0.8)
-        axis.set(xlabel="m/z", ylabel="intensity", title=f"cosine={float(scores[spectrum_index]):.4f}")
+        axis.set(xlabel="m/z", ylabel="relative intensity", ylim=(-1.1, 1.1),
+                 title=f"spectrum {spectrum_index} · cosine={float(scores[spectrum_index]):.4f}")
         axis.legend(loc="upper right")
         figure.tight_layout()
-        writer.add_figure(
-            f"validation_spectra/level_{level}_high_to_low",
-            figure,
-            global_step=global_step,
-            close=True,
-        )
+        try:
+            if output_dir is not None:
+                figure_dir = output_dir / "spectra" / f"step_{global_step:08d}"
+                figure_dir.mkdir(parents=True, exist_ok=True)
+                figure.savefig(figure_dir / f"level_{level}.png")
+            if writer is not None:
+                writer.add_figure(
+                    f"validation_spectra/{scope}/level_{level}_high_to_low",
+                    figure, global_step=global_step, close=False,
+                )
+        finally:
+            plt.close(figure)
+
 
 
 def predict_validation_msdataset(
@@ -2062,16 +2084,7 @@ def log_distribution_cards(
     summaries: Dict[str, Dict[str, float]],
     step: int,
 ) -> None:
-    """One card per base metric, containing every split, scope, and statistic.
-
-    A summary key may carry an optional ``@scope`` suffix before its
-    trailing ``_{statistic}`` (e.g. ``selection_precision@by_adduct:[M+H]+_mean``)
-    to report the same metric under a different condition (excl-precursor,
-    by-adduct, by-CE-range, ...) without opening a separate card for it: the
-    part before ``@`` is the card-grouping key, and the scope becomes part of
-    the series name alongside the split (``{split}_{scope}_{statistic}``).
-    Keys without ``@`` keep today's plain ``{split}_{statistic}`` series name.
-    """
+    """Separate processing stages and condition cards; overlay data splits."""
     statistics = ("min", "q1", "mean", "median", "q3", "max")
     grouped: Dict[str, Dict[str, float]] = {}
     for split, summary in summaries.items():
@@ -2081,13 +2094,14 @@ def log_distribution_cards(
                 if name.endswith(suffix):
                     metric_path = name[: -len(suffix)]
                     metric, _, scope = metric_path.partition("@")
+                    card, condition = metric_labels.tensorboard_metric_card(namespace, metric, scope)
                     series_name = (
-                        f"{split}_{scope}_{statistic}" if scope else f"{split}_{statistic}"
+                        f"{split}_{condition}_{statistic}" if condition else f"{split}_{statistic}"
                     )
-                    grouped.setdefault(metric, {})[series_name] = value
+                    grouped.setdefault(card, {})[series_name] = value
                     break
     for metric, values in grouped.items():
-        add_scalars_if_finite(writer, f"{namespace}/{metric}", values, step)
+        add_scalars_if_finite(writer, metric, values, step)
 
 
 def main(
@@ -2175,8 +2189,8 @@ def main(
         else None
     )
     if validation_dataset is None:
-        print(
-            f"[WARN] validation valid-record MSDataset was not found: "
+        raise FileNotFoundError(
+            f"Spectrum validation requires the valid-record MSDataset: "
             f"{validation_valid_records_file}"
         )
     validation_excluded_dataset = None
@@ -2207,8 +2221,6 @@ def main(
         *,
         step_value: int,
     ) -> Tuple[EpochLossMetrics, float, Dict[str, float]]:
-        if val_loader is None or len(val_loader) <= 0:
-            return nan_loss_metrics(), float("nan"), {}
         selection_metric_means: Dict[str, float] = {}
         with torch.no_grad():
             metrics = run_epoch(
@@ -2217,7 +2229,7 @@ def main(
                 device=device,
                 optimizer=None,
                 desc=desc,
-            )
+            ) if val_loader is not None and len(val_loader) > 0 else nan_loss_metrics()
             excluded_metrics = (
                 run_epoch(
                     model=model, loader=val_excluded_loader, device=device,
@@ -2231,7 +2243,7 @@ def main(
             )
             add_scalars_if_finite(
                 writer,
-                "validation_scope/loss",
+                "loss/validation_scope",
                 {"filtered": metrics.loss, "unfiltered": unfiltered_metrics.loss},
                 step_value,
             )
@@ -2261,38 +2273,39 @@ def main(
                     output_dir=run_dir / "validation" / "filtered",
                     selection_metric_means=selection_metric_means,
                 )
-                if validation_dataset is not None and not model.absolute_ranker_only
+                if validation_dataset is not None and len(validation_dataset) > 0
                 else float("nan")
             )
             excluded_peak_means: Dict[str, float] = {}
             excluded_cosine = (
                 evaluate_validation_cosine(
                     model=model, dataset=validation_excluded_dataset,
-                    batch_size=batch_size, writer=None, global_step=step_value,
+                    batch_size=batch_size, writer=writer, global_step=step_value,
+                    validation_scope="validation_below_threshold",
                     output_dir=run_dir / "validation" / "below_threshold",
                     selection_metric_means=excluded_peak_means,
                 )
-                if validation_excluded_dataset is not None and not model.absolute_ranker_only
+                if validation_excluded_dataset is not None and len(validation_excluded_dataset) > 0
                 else float("nan")
             )
             if math.isfinite(cosine) and math.isfinite(excluded_cosine):
                 high_count, low_count = len(validation_dataset), len(validation_excluded_dataset)
                 unfiltered_cosine = (cosine * high_count + excluded_cosine * low_count) / (high_count + low_count)
             else:
-                unfiltered_cosine = cosine
+                unfiltered_cosine = cosine if math.isfinite(cosine) else excluded_cosine
             add_scalars_if_finite(
                 writer,
-                "validation_scope/cosine",
+                "intensity/validation_scope_cosine",
                 {"filtered": cosine, "below_threshold": excluded_cosine,
                  "unfiltered": unfiltered_cosine}, step_value,
             )
-            if math.isfinite(cosine):
+            if math.isfinite(unfiltered_cosine):
                 combined_cosine = write_combined_validation_cosine_summary(
                     run_dir / "validation", step_value
                 )
                 add_scalars_if_finite(
                     writer,
-                    "validation_scope/unfiltered_cosine_distribution",
+                    "intensity/unfiltered_cosine_distribution",
                     {name: combined_cosine[name] for name in ("q1", "median", "q3")},
                     step_value,
                 )
@@ -2369,33 +2382,26 @@ def main(
              "train_window": window_metrics.intensity_loss,
              "validation": val_metrics.intensity_loss}, step_value,
         )
-        add_scalar_if_finite(writer, "similarity/validation/cosine", val_cosine, step_value)
-        # Write the requested headline metrics into the root event file as
-        # ordinary scalars. SummaryWriter.add_scalars stores series in child
-        # event directories, which makes them easy to miss when TensorBoard is
-        # opened on a single run/log directory.
-        for split, metrics in (
-            ("train", train_metrics),
-            ("train_window", window_metrics),
-            ("validation", val_metrics),
-        ):
-            add_scalar_if_finite(writer, f"{split}/loss/total", metrics.loss, step_value)
-            add_scalar_if_finite(
-                writer, f"{split}/loss/selection", metrics.selection_loss, step_value
-            )
-            add_scalar_if_finite(
-                writer, f"{split}/loss/intensity", metrics.intensity_loss, step_value
-            )
-        # One TensorBoard card per metric (including dynamic by_adduct/by_ce_range
-        # keys), with a full min/q1/mean/median/q3/max series for both train and
-        # validation.
+        add_scalar_if_finite(writer, "intensity/generated_spectrum_cosine", val_cosine, step_value)
         log_distribution_cards(
             writer,
             "metrics",
             {"train": train_metrics.absolute_ranker_summary,
+             "train_window": window_metrics.absolute_ranker_summary,
              "validation": val_metrics.absolute_ranker_summary},
             step_value,
         )
+        distribution_file = run_dir / "metric_distributions.tsv"
+        write_header = not distribution_file.exists()
+        with distribution_file.open("a", encoding="utf-8", newline="") as handle:
+            tsv = csv.writer(handle, delimiter="\t")
+            if write_header:
+                tsv.writerow(["event", "epoch", "global_step", "split", "metric", "value"])
+            for split, summary in (("train", train_metrics.absolute_ranker_summary),
+                                   ("train_window", window_metrics.absolute_ranker_summary),
+                                   ("validation", val_metrics.absolute_ranker_summary)):
+                for name, value in sorted(summary.items()):
+                    tsv.writerow([event, epoch_value, step_value, split, name, value])
         writer.add_scalar("training/phase", int(model.training_phase.item()), step_value)
         writer.add_scalar("optimizer/lr", lr, step_value)
         writer.flush()

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from typing import List, Optional, Tuple, Union
+from typing import Callable, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -296,7 +296,7 @@ class FragmentTreeCandidateSelector(nn.Module):
             return None
         return torch.cat(selected_parts).unique(sorted=True)
 
-    def generate_depth_limited_candidates(self, data: Union[FragmentTreeStructure, FragmentTreeFeatures], *, max_depth: int) -> FragmentTreeCandidateSelectionOutput:
+    def generate_depth_limited_candidates(self, data: Union[FragmentTreeStructure, FragmentTreeFeatures], *, max_depth: int, on_step: Optional[Callable[[int, FragmentTreeCandidateSelectionOutput], None]] = None) -> FragmentTreeCandidateSelectionOutput:
         if max_depth < 0:
             raise ValueError("max_depth must be non-negative.")
         # Molecular and cleavage-event encoders are evaluated once.  The much
@@ -309,6 +309,8 @@ class FragmentTreeCandidateSelector(nn.Module):
         features = self.feature_model.build_features(data, selected_edge_index=selected_edge_index)
         features = self._initial_depth_features(features)
         output = self._forward_progressive(features, selected_edge_index=selected_edge_index)
+        if on_step is not None:
+            on_step(0, output)
         for expansion_depth in range(1, max_depth + 1):
             if len(output.next_cleavage_candidates) == 0:
                 break
@@ -316,8 +318,12 @@ class FragmentTreeCandidateSelector(nn.Module):
                 output, expansion_depth=expansion_depth
             )
             if next_features is None:
+                if on_step is not None:
+                    on_step(expansion_depth, output)
                 break
             output = self._forward_progressive(next_features, selected_edge_index=selected_edge_index)
+            if on_step is not None:
+                on_step(expansion_depth, output)
         return output
 
     def _forward_progressive(
