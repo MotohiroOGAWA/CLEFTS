@@ -511,14 +511,16 @@ class FragmentTreeCandidateSelector(nn.Module):
     def _select_fragment_ion_candidates(self, *, features, sample_tree_batch, keep_logit: Tensor, edge_cleave_logit: Tensor, ion_logit: Tensor, unsaturation_logit: Tensor, radical_logit: Tensor) -> List[FragmentIonCandidate]:
         structure = features.structure
         device = keep_logit.device
-        node_is_precursor_root = sample_tree_batch.node_is_precursor_root.to(device).bool()
         kept_sample_ids = sample_tree_batch.kept_sample_ids.to(device).long()
         graph_index_by_node = sample_tree_batch.batch.to(device).long()
         candidates: List[FragmentIonCandidate] = []
 
+        # The precursor-root node competes for keep-probability mass on the
+        # same footing as every fragment node: it is frequently the dominant
+        # peak in the observed spectrum and must remain eligible for
+        # selection here, not just supervised during training.
         for graph_index in range(int(kept_sample_ids.numel())):
             sample_node_index = (graph_index_by_node == graph_index).nonzero(as_tuple=False).view(-1)
-            sample_node_index = sample_node_index[~node_is_precursor_root[sample_node_index]]
             if sample_node_index.numel() == 0:
                 continue
             # All fragment-producing edges in one spectrum compete for a

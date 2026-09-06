@@ -44,6 +44,80 @@ from .model import FragmentTreeTrainingModel
 from ....libs.msentity.msentity import MSDataset
 from ....libs.msentity.msentity.processing.spectrum_similarity import cosine_similarity_pair
 
+PEAK_SELECTION_TOP_K = (5, 10, 20)
+PEAK_SELECTION_MZ_TOLERANCE_DA = 0.01
+PRECURSOR_MZ_COLUMN = "PrecursorMZ"
+
+# Base peak-selection diagnostics, computed both on the full spectrum and
+# (mirrored below) on the spectrum with the precursor-ion peak removed, since
+# the precursor peak tends to dominate spectral similarity and can mask how
+# well the fragment peaks themselves are predicted.
+_PEAK_SELECTION_BASE_METRIC_NAMES = (
+    "selection_precision",
+    "selection_recall",
+    "selection_f1",
+    "predicted_peak_count",
+    "target_peak_count",
+    "matched_peak_count",
+    "selected_intensity_fraction",
+    *(f"top{k}_recall" for k in PEAK_SELECTION_TOP_K),
+    "matched_intensity_mae",
+    "matched_intensity_weighted_mae",
+)
+# Spectrum-level detection of the precursor ion as an observed peak: whether a
+# peak near PrecursorMZ is present in the target and/or predicted spectrum.
+PRECURSOR_DETECTION_METRIC_NAMES = (
+    "precursor_detection_precision",
+    "precursor_detection_recall",
+    "precursor_detection_accuracy",
+    "precursor_detection_f1",
+    "precursor_detection_target_present_fraction",
+    "precursor_detection_predicted_present_fraction",
+)
+PEAK_SELECTION_METRIC_NAMES = (
+    *_PEAK_SELECTION_BASE_METRIC_NAMES,
+    *PRECURSOR_DETECTION_METRIC_NAMES,
+    "cosine_excl_precursor",
+    *(f"excl_precursor_{name}" for name in _PEAK_SELECTION_BASE_METRIC_NAMES),
+)
+PEAK_SELECTION_QUANTILES = (
+    ("min", 0.0),
+    ("q1", 0.25),
+    ("median", 0.5),
+    ("q3", 0.75),
+    ("max", 1.0),
+)
+# Per-batch training-time diagnostics reported by the model (see
+# FragmentTreeTrainingModel._edge_retain_metrics / _selected_peak_metrics /
+# _intensity_similarity_metrics), summarized in run_epoch() and surfaced here
+# as train_*/val_* columns and TensorBoard cards. The "precursor/" entries
+# isolate the same diagnostics for precursor-root candidates.
+EDGE_METRIC_NAMES = (
+    "edge_ranking_loss",
+    "pairwise_ranking_accuracy",
+    "edge_retain_precision",
+    "edge_retain_recall",
+    "edge_retain_accuracy",
+    "edge_total_loss",
+    "selected_peak_intensity_coverage",
+    "peak_selection_accuracy",
+    "peak_selection_precision",
+    "peak_selection_recall",
+    "intensity_cosine_similarity",
+    "precursor/keep_loss",
+    "precursor/peak_selection_accuracy",
+    "precursor/peak_selection_precision",
+    "precursor/peak_selection_recall",
+    "precursor/selected_peak_intensity_coverage",
+)
+
+
+def _edge_metric_column(name: str) -> str:
+    """Flatten a namespaced metric name (e.g. "precursor/keep_loss") into a
+    TSV/CSV-safe column suffix."""
+    return name.replace("/", "_")
+
+
 METRIC_COLUMNS = (
     "event",
     "epoch",
@@ -58,63 +132,10 @@ METRIC_COLUMNS = (
     "val_selection_loss",
     "val_intensity_loss",
     "val_cosine",
-    "val_selection_precision",
-    "val_selection_recall",
-    "val_selection_f1",
-    "val_predicted_peak_count",
-    "val_target_peak_count",
-    "val_matched_peak_count",
-    "val_selected_intensity_fraction",
-    "val_top5_recall",
-    "val_top10_recall",
-    "val_top20_recall",
-    "val_matched_intensity_mae",
-    "val_matched_intensity_weighted_mae",
-    "train_edge_ranking_loss",
-    "train_pairwise_ranking_accuracy",
-    "train_edge_retain_precision",
-    "train_edge_retain_recall",
-    "train_edge_retain_accuracy",
-    "train_edge_total_loss",
-    "train_selected_peak_intensity_coverage",
-    "train_peak_selection_accuracy",
-    "train_peak_selection_precision",
-    "train_peak_selection_recall",
-    "train_intensity_cosine_similarity",
-    "val_edge_ranking_loss",
-    "val_pairwise_ranking_accuracy",
-    "val_edge_retain_precision",
-    "val_edge_retain_recall",
-    "val_edge_retain_accuracy",
-    "val_edge_total_loss",
-    "val_selected_peak_intensity_coverage",
-    "val_peak_selection_accuracy",
-    "val_peak_selection_precision",
-    "val_peak_selection_recall",
-    "val_intensity_cosine_similarity",
+    *(f"val_{name}" for name in PEAK_SELECTION_METRIC_NAMES),
+    *(f"train_{_edge_metric_column(name)}" for name in EDGE_METRIC_NAMES),
+    *(f"val_{_edge_metric_column(name)}" for name in EDGE_METRIC_NAMES),
     "lr",
-)
-
-PEAK_SELECTION_TOP_K = (5, 10, 20)
-PEAK_SELECTION_MZ_TOLERANCE_DA = 0.01
-PEAK_SELECTION_METRIC_NAMES = (
-    "selection_precision",
-    "selection_recall",
-    "selection_f1",
-    "predicted_peak_count",
-    "target_peak_count",
-    "matched_peak_count",
-    "selected_intensity_fraction",
-    *(f"top{k}_recall" for k in PEAK_SELECTION_TOP_K),
-    "matched_intensity_mae",
-    "matched_intensity_weighted_mae",
-)
-PEAK_SELECTION_QUANTILES = (
-    ("min", 0.0),
-    ("q1", 0.25),
-    ("median", 0.5),
-    ("q3", 0.75),
-    ("max", 1.0),
 )
 DEFAULT_ASSIGNMENT_SCORE_THRESHOLD = 0.8
 
@@ -1333,6 +1354,124 @@ def calculate_peak_selection_metrics(
     }
 
 
+def calculate_precursor_detection_metrics(
+    predicted_dataset: MSDataset,
+    target_dataset: MSDataset,
+    *,
+    precursor_mz_column: str = PRECURSOR_MZ_COLUMN,
+    mz_tolerance_da: float = PEAK_SELECTION_MZ_TOLERANCE_DA,
+) -> Dict[str, float]:
+    """Spectrum-level precision/recall/accuracy for detecting the precursor
+    ion as an observed peak in the predicted spectrum.
+
+    The precursor peak tends to dominate spectral similarity, so this is
+    reported separately from (and in addition to) the fragment-peak
+    selection metrics.
+    """
+    count = min(len(target_dataset), len(predicted_dataset))
+    if count <= 0:
+        return {name: float("nan") for name in PRECURSOR_DETECTION_METRIC_NAMES}
+
+    precursor_mz = np.asarray(target_dataset[precursor_mz_column], dtype=np.float64)[:count]
+    target_offsets = target_dataset.peaks.offsets
+    predicted_offsets = predicted_dataset.peaks.offsets
+    target_data = target_dataset.peaks.data
+    predicted_data = predicted_dataset.peaks.data
+
+    target_present = np.zeros(count, dtype=bool)
+    predicted_present = np.zeros(count, dtype=bool)
+    for spectrum_index in range(count):
+        pmz = precursor_mz[spectrum_index]
+        if not np.isfinite(pmz):
+            continue
+        t_start, t_end = int(target_offsets[spectrum_index]), int(target_offsets[spectrum_index + 1])
+        if t_end > t_start:
+            target_present[spectrum_index] = bool(
+                np.any(np.abs(target_data[t_start:t_end, 0] - pmz) <= mz_tolerance_da)
+            )
+        p_start, p_end = int(predicted_offsets[spectrum_index]), int(predicted_offsets[spectrum_index + 1])
+        if p_end > p_start:
+            predicted_present[spectrum_index] = bool(
+                np.any(np.abs(predicted_data[p_start:p_end, 0] - pmz) <= mz_tolerance_da)
+            )
+
+    true_positive = int(np.sum(target_present & predicted_present))
+    false_positive = int(np.sum(~target_present & predicted_present))
+    false_negative = int(np.sum(target_present & ~predicted_present))
+    true_negative = int(np.sum(~target_present & ~predicted_present))
+
+    precision = (
+        true_positive / (true_positive + false_positive)
+        if (true_positive + false_positive) > 0
+        else float("nan")
+    )
+    recall = (
+        true_positive / (true_positive + false_negative)
+        if (true_positive + false_negative) > 0
+        else float("nan")
+    )
+    f1 = (
+        2.0 * precision * recall / (precision + recall)
+        if math.isfinite(precision) and math.isfinite(recall) and (precision + recall) > 0
+        else float("nan")
+    )
+    accuracy = (true_positive + true_negative) / count
+
+    return {
+        "precursor_detection_precision": precision,
+        "precursor_detection_recall": recall,
+        "precursor_detection_accuracy": accuracy,
+        "precursor_detection_f1": f1,
+        "precursor_detection_target_present_fraction": float(target_present.mean()),
+        "precursor_detection_predicted_present_fraction": float(predicted_present.mean()),
+    }
+
+
+def exclude_precursor_peaks(
+    dataset: MSDataset,
+    *,
+    precursor_mz_column: str = PRECURSOR_MZ_COLUMN,
+    mz_tolerance_da: float = PEAK_SELECTION_MZ_TOLERANCE_DA,
+) -> MSDataset:
+    """Return a copy of ``dataset`` with each spectrum's precursor-ion peak(s)
+    (peaks within ``mz_tolerance_da`` of that spectrum's PrecursorMZ) removed.
+
+    Used to evaluate similarity/selection metrics on fragment peaks alone,
+    since a correctly placed precursor peak can inflate whole-spectrum
+    similarity independently of fragment-peak prediction quality.
+    """
+    filtered = dataset.copy()
+    precursor_mz = np.asarray(dataset[precursor_mz_column], dtype=np.float64)
+    offsets = dataset.peaks.offsets
+    data = dataset.peaks.data
+    metadata = dataset.peaks.metadata
+
+    keep_mask = np.ones(len(data), dtype=bool)
+    for spectrum_index in range(len(dataset)):
+        start, end = int(offsets[spectrum_index]), int(offsets[spectrum_index + 1])
+        if start == end:
+            continue
+        pmz = precursor_mz[spectrum_index]
+        if not np.isfinite(pmz):
+            continue
+        keep_mask[start:end] = np.abs(data[start:end, 0] - pmz) > mz_tolerance_da
+
+    lengths = offsets[1:] - offsets[:-1]
+    new_lengths = np.array(
+        [
+            int(keep_mask[int(offsets[i]):int(offsets[i]) + int(lengths[i])].sum())
+            for i in range(len(dataset))
+        ],
+        dtype=np.int64,
+    )
+    new_offsets = np.zeros(len(dataset) + 1, dtype=np.int64)
+    new_offsets[1:] = np.cumsum(new_lengths)
+    new_data = data[keep_mask]
+    new_metadata = metadata.iloc[keep_mask].reset_index(drop=True) if metadata is not None else None
+    filtered.peaks.replace_data(new_data, new_offsets, metadata=new_metadata)
+    return filtered
+
+
 def summarize_distribution(values: np.ndarray) -> Dict[str, float]:
     finite = np.asarray(values, dtype=np.float64)
     finite = finite[np.isfinite(finite)]
@@ -1395,10 +1534,54 @@ def evaluate_validation_cosine(
     selection_metrics = calculate_peak_selection_metrics(
         predicted_dataset, target_dataset
     )
+
+    # Fragment-only diagnostics: recompute cosine similarity and peak
+    # selection metrics after stripping the precursor-ion peak from both the
+    # target and predicted spectra, so a correctly placed precursor peak
+    # cannot mask poor fragment-peak prediction.
+    excl_target_dataset = exclude_precursor_peaks(target_dataset)
+    excl_predicted_dataset = exclude_precursor_peaks(predicted_dataset)
+    excl_scores = cosine_similarity_pair(
+        excl_target_dataset,
+        np.arange(count, dtype=np.int64),
+        excl_predicted_dataset,
+        np.arange(count, dtype=np.int64),
+        show_progress=False,
+    ).astype(np.float64)
+    # A spectrum with no non-precursor peaks in either the target or the
+    # prediction carries no fragment information to compare; leave it out of
+    # the aggregate rather than scoring it as similarity 0.
+    excl_both_empty = (excl_target_dataset.peaks.lengths == 0) & (
+        excl_predicted_dataset.peaks.lengths == 0
+    )
+    excl_scores[excl_both_empty] = float("nan")
+    excl_selection_metrics = calculate_peak_selection_metrics(
+        excl_predicted_dataset, excl_target_dataset
+    )
+    selection_metrics["cosine_excl_precursor"] = excl_scores
+    selection_metrics.update(
+        {f"excl_precursor_{name}": values for name, values in excl_selection_metrics.items()}
+    )
     selection_summaries = {
         name: summarize_distribution(values)
         for name, values in selection_metrics.items()
     }
+
+    # Precursor-ion peak detection (precision/recall/accuracy) is reported
+    # separately: the precursor peak dominates whole-spectrum similarity, so
+    # this isolates how reliably it is placed from how well fragments match.
+    # These are corpus-level aggregates rather than per-spectrum values, so
+    # they are added to the summary only (not the per-spectrum detail file).
+    def _scalar_summary(value: float) -> Dict[str, float]:
+        value = float(value)
+        return {"mean": value, **{name: value for name, _ in PEAK_SELECTION_QUANTILES}}
+
+    precursor_detection = calculate_precursor_detection_metrics(
+        predicted_dataset, target_dataset
+    )
+    for name, value in precursor_detection.items():
+        selection_summaries[name] = _scalar_summary(value)
+
     if selection_metric_means is not None:
         selection_metric_means.update(
             {name: summary["mean"] for name, summary in selection_summaries.items()}
@@ -1460,6 +1643,17 @@ def evaluate_validation_cosine(
             {name: cosine_summary[name] for name in ("q1", "median", "q3")},
             int(global_step),
         )
+        excl_cosine_summary = selection_summaries["cosine_excl_precursor"]
+        if math.isfinite(excl_cosine_summary["mean"]):
+            writer.add_scalar(
+                "similarity/intensity_prediction_cosine_excl_precursor",
+                excl_cosine_summary["mean"], int(global_step),
+            )
+            writer.add_scalars(
+                "similarity/intensity_prediction_cosine_excl_precursor_distribution",
+                {name: excl_cosine_summary[name] for name in ("q1", "median", "q3")},
+                int(global_step),
+            )
         for metric_name, summary in selection_summaries.items():
             if math.isfinite(summary["mean"]):
                 writer.add_scalars(
@@ -1999,19 +2193,7 @@ def main(
     ) -> None:
         lr = float(optimizer.param_groups[0]["lr"])
         window_metrics = train_window_metrics or nan_loss_metrics()
-        edge_metric_names = (
-            "edge_ranking_loss",
-            "pairwise_ranking_accuracy",
-            "edge_retain_precision",
-            "edge_retain_recall",
-            "edge_retain_accuracy",
-            "edge_total_loss",
-            "selected_peak_intensity_coverage",
-            "peak_selection_accuracy",
-            "peak_selection_precision",
-            "peak_selection_recall",
-            "intensity_cosine_similarity",
-        )
+        edge_metric_names = EDGE_METRIC_NAMES
         metric_row = {
             "event": event,
             "epoch": int(epoch_value),
@@ -2027,13 +2209,13 @@ def main(
             "val_intensity_loss": val_metrics.intensity_loss,
             "val_cosine": val_cosine,
             **{
-                f"train_{name}": train_metrics.absolute_ranker_summary.get(
+                f"train_{_edge_metric_column(name)}": train_metrics.absolute_ranker_summary.get(
                     f"{name}_mean", float("nan")
                 )
                 for name in edge_metric_names
             },
             **{
-                f"val_{name}": val_metrics.absolute_ranker_summary.get(
+                f"val_{_edge_metric_column(name)}": val_metrics.absolute_ranker_summary.get(
                     f"{name}_mean", float("nan")
                 )
                 for name in edge_metric_names

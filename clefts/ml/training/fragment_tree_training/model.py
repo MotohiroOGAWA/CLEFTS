@@ -538,9 +538,26 @@ class FragmentTreeSelectionTrainingLoss(nn.Module):
         losses: List[Tensor] = []
 
         if target.target_node_index.numel() > 0:
-            losses.append(self._peak_fragment_loss(output, target, device=device))
+            # Computed once and shared: each is an O(rows) Python loop with
+            # per-row GPU-sync (.item()/.tolist()) calls, so recomputing them
+            # separately in every peak-wise loss below measurably adds up.
+            batch_node_by_sample_node = self._batch_node_by_sample_node(output, device=device)
+            peak_keys = self._target_peak_keys(target, device=device)
+            losses.append(self._peak_fragment_loss(
+                output, target, device=device,
+                peak_keys=peak_keys, batch_node_by_sample_node=batch_node_by_sample_node,
+            ))
             losses.append(self._keep_negative_loss(output, target, device=device))
-            losses.append(self._state_loss(output, target, device=device))
+            losses.append(self._state_loss(
+                output, target, device=device,
+                peak_keys=peak_keys, batch_node_by_sample_node=batch_node_by_sample_node,
+            ))
+            precursor_loss = self._precursor_keep_loss(
+                output, target, device=device,
+                peak_keys=peak_keys, batch_node_by_sample_node=batch_node_by_sample_node,
+            )
+            if precursor_loss is not None:
+                losses.append(precursor_loss)
 
         cleave_target, cleave_mask = self._build_cleave_targets(output, target, device=device)
         if cleave_mask.any():
@@ -589,12 +606,17 @@ class FragmentTreeSelectionTrainingLoss(nn.Module):
         target: TrainingFragmentTreeStructure,
         *,
         device: torch.device,
+        peak_keys: Optional[List[Tuple[int, int]]] = None,
+        batch_node_by_sample_node: Optional[Dict[Tuple[int, int], int]] = None,
     ) -> Tensor:
-        batch_node_by_sample_node = self._batch_node_by_sample_node(output, device=device)
+        if batch_node_by_sample_node is None:
+            batch_node_by_sample_node = self._batch_node_by_sample_node(output, device=device)
+        if peak_keys is None:
+            peak_keys = self._target_peak_keys(target, device=device)
         losses: List[Tensor] = []
         weights: List[Tensor] = []
 
-        for peak_key in self._target_peak_keys(target, device=device):
+        for peak_key in peak_keys:
             row_index = self._target_peak_mask(target, peak_key=peak_key, device=device)
             batch_node_indexes = self._unique_batch_node_indexes(
                 target_sample_index=target.target_sample_index[row_index].to(device),
@@ -619,6 +641,50 @@ class FragmentTreeSelectionTrainingLoss(nn.Module):
         return self.intensity_alpha + (1.0 - self.intensity_alpha) * normalized_intensity.pow(
             self.intensity_gamma
         )
+
+    def _precursor_keep_loss(
+        self,
+        output: FragmentTreeCandidateSelectionOutput,
+        target: TrainingFragmentTreeStructure,
+        *,
+        device: torch.device,
+        peak_keys: Optional[List[Tuple[int, int]]] = None,
+        batch_node_by_sample_node: Optional[Dict[Tuple[int, int], int]] = None,
+    ) -> Optional[Tensor]:
+        """Dedicated keep-loss for precursor-root target peaks.
+
+        The precursor ion is usually the dominant peak in an observed
+        spectrum, yet it is only one of many (sample, peak) rows inside
+        ``_peak_fragment_loss``'s batch-wide weighted mean, so its gradient
+        is diluted by however many fragment peaks the sample also has. This
+        term averages only over precursor peaks so it carries a stable,
+        undiluted share of the training signal regardless of fragment count.
+        """
+        batch = output.sample_tree_batch
+        node_is_precursor_root = batch.node_is_precursor_root.to(device).bool()
+        if batch_node_by_sample_node is None:
+            batch_node_by_sample_node = self._batch_node_by_sample_node(output, device=device)
+        if peak_keys is None:
+            peak_keys = self._target_peak_keys(target, device=device)
+        losses: List[Tensor] = []
+
+        for peak_key in peak_keys:
+            row_index = self._target_peak_mask(target, peak_key=peak_key, device=device)
+            batch_node_indexes = self._unique_batch_node_indexes(
+                target_sample_index=target.target_sample_index[row_index].to(device),
+                target_node_index=target.target_node_index[row_index].to(device),
+                batch_node_by_sample_node=batch_node_by_sample_node,
+            )
+            if batch_node_indexes.numel() == 0:
+                continue
+            precursor_indexes = batch_node_indexes[node_is_precursor_root[batch_node_indexes]]
+            if precursor_indexes.numel() == 0:
+                continue
+            losses.append(F.softplus(-torch.logsumexp(output.keep_logit[precursor_indexes], dim=0)))
+
+        if len(losses) == 0:
+            return None
+        return torch.stack(losses).mean()
 
     def _keep_negative_loss(
         self,
@@ -669,13 +735,18 @@ class FragmentTreeSelectionTrainingLoss(nn.Module):
         target: TrainingFragmentTreeStructure,
         *,
         device: torch.device,
+        peak_keys: Optional[List[Tuple[int, int]]] = None,
+        batch_node_by_sample_node: Optional[Dict[Tuple[int, int], int]] = None,
     ) -> Tensor:
         batch = output.sample_tree_batch
-        batch_node_by_sample_node = self._batch_node_by_sample_node(output, device=device)
+        if batch_node_by_sample_node is None:
+            batch_node_by_sample_node = self._batch_node_by_sample_node(output, device=device)
+        if peak_keys is None:
+            peak_keys = self._target_peak_keys(target, device=device)
         losses: List[Tensor] = []
         weights: List[Tensor] = []
 
-        for peak_key in self._target_peak_keys(target, device=device):
+        for peak_key in peak_keys:
             row_index = self._target_peak_mask(target, peak_key=peak_key, device=device)
             batch_node_indexes = self._unique_batch_node_indexes(
                 target_sample_index=target.target_sample_index[row_index].to(device),
@@ -1253,6 +1324,12 @@ class FragmentTreeTrainingModel(nn.Module):
             "edge_retain_loss": float(selection_loss.detach().cpu().item()),
             "edge_total_loss": float(edge_total_loss.detach().cpu().item()),
         })
+        with torch.no_grad():
+            precursor_keep_loss = self.loss_fn._precursor_keep_loss(output, batch, device=selection_loss.device)
+        if precursor_keep_loss is not None:
+            absolute_ranker_metrics["precursor/keep_loss"] = float(
+                precursor_keep_loss.detach().cpu().item()
+            )
         return {
             "loss": loss,
             "selection_loss": selection_loss,
@@ -1313,14 +1390,26 @@ class FragmentTreeTrainingModel(nn.Module):
         kept_samples = batch.kept_sample_ids.detach().cpu().long()
         graph_nodes = batch.batch.detach().cpu().long()
         global_nodes = batch.node_id_global.detach().cpu().long()
+        node_is_precursor_root = batch.node_is_precursor_root.detach().cpu().bool()
         universe = {
             (int(kept_samples[int(graph_id)]), int(node_id))
             for graph_id, node_id in zip(graph_nodes.tolist(), global_nodes.tolist())
+        }
+        # (sample_id, global_node_id) pairs that represent the precursor ion
+        # itself, so precursor coverage can be isolated from fragment peaks.
+        precursor_pairs = {
+            (int(kept_samples[int(graph_id)]), int(node_id))
+            for graph_id, node_id, is_precursor in zip(
+                graph_nodes.tolist(), global_nodes.tolist(), node_is_precursor_root.tolist()
+            )
+            if is_precursor
         }
         true_positive = len(selected_nodes & target_nodes)
         true_negative = len(universe - selected_nodes - target_nodes)
         covered = 0.0
         total = float(target.sample_peak_intensity.detach().cpu().clamp_min(0).sum().item())
+        precursor_covered = 0.0
+        precursor_total = 0.0
         sample_ids = target.target_sample_index.detach().cpu().long()
         peak_ids = target.target_peak_index.detach().cpu().long()
         node_ids = target.target_node_index.detach().cpu().long()
@@ -1329,17 +1418,54 @@ class FragmentTreeTrainingModel(nn.Module):
             stop = int(target.sample_peak_ptr[sample_id + 1])
             for peak_id in range(start, stop):
                 rows = (sample_ids == sample_id) & (peak_ids == peak_id)
-                if any(
-                    (sample_id, int(node_id)) in selected_nodes
-                    for node_id in node_ids[rows].tolist()
-                ):
-                    covered += float(target.sample_peak_intensity[peak_id].detach().cpu().clamp_min(0).item())
-        return {
+                peak_node_ids = node_ids[rows].tolist()
+                is_precursor_peak = any(
+                    (sample_id, int(node_id)) in precursor_pairs for node_id in peak_node_ids
+                )
+                peak_intensity = float(
+                    target.sample_peak_intensity[peak_id].detach().cpu().clamp_min(0).item()
+                )
+                is_hit = any(
+                    (sample_id, int(node_id)) in selected_nodes for node_id in peak_node_ids
+                )
+                if is_hit:
+                    covered += peak_intensity
+                if is_precursor_peak:
+                    precursor_total += peak_intensity
+                    if is_hit:
+                        precursor_covered += peak_intensity
+
+        precursor_target_nodes = target_nodes & precursor_pairs
+        precursor_selected_nodes = selected_nodes & precursor_pairs
+        precursor_true_positive = len(precursor_selected_nodes & precursor_target_nodes)
+        precursor_true_negative = len(
+            precursor_pairs - precursor_selected_nodes - precursor_target_nodes
+        )
+        metrics = {
             "peak_selection_accuracy": (true_positive + true_negative) / max(len(universe), 1),
             "peak_selection_precision": true_positive / max(len(selected_nodes), 1),
             "peak_selection_recall": true_positive / max(len(target_nodes), 1),
             "selected_peak_intensity_coverage": covered / max(total, 1e-12),
         }
+        if precursor_pairs:
+            precursor_selected_count = len(precursor_selected_nodes)
+            metrics.update({
+                "precursor/peak_selection_accuracy": (
+                    (precursor_true_positive + precursor_true_negative)
+                    / max(len(precursor_pairs), 1)
+                ),
+                "precursor/peak_selection_precision": (
+                    precursor_true_positive / max(precursor_selected_count, 1)
+                    if precursor_selected_count else 1.0 if not precursor_target_nodes else 0.0
+                ),
+                "precursor/peak_selection_recall": (
+                    precursor_true_positive / max(len(precursor_target_nodes), 1)
+                ),
+                "precursor/selected_peak_intensity_coverage": (
+                    precursor_covered / precursor_total if precursor_total > 0 else 1.0
+                ),
+            })
+        return metrics
 
     @staticmethod
     @torch.no_grad()

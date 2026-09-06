@@ -154,6 +154,7 @@ class PaddedGraphBatch:
                 cap=cap,
                 batch=batch,
                 x=x_pad,
+                node_ids=node_ids,
                 node_mask=node_mask,
                 num_nodes=num_nodes,
                 edge_index=edge_index,
