@@ -480,6 +480,7 @@ class TestBuildSampleTreePygBatch(unittest.TestCase):
             unsaturation_formula_delta=torch.tensor([[0.0, -2.0, 0.0]], dtype=torch.float32),
             radical_formula_delta=torch.tensor([[0.0, -1.0, 0.0]], dtype=torch.float32),
             edge_index=edge_index,
+            tree_sample_ptr=torch.tensor([0, 2], dtype=torch.long),
 
             # These fields are not used by _build_sample_tree_pyg_batch,
             # but they are required by FragmentTreeStructure.

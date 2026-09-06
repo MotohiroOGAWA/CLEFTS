@@ -225,6 +225,7 @@ def subset_training_structure_samples(
             "edge_index", "cleavage_event_edge_index", "cleavage_event", "cleavage_atom_idxs",
             "reactant_tuple_length_table", "product_tuple_length_table", "ion_formula_delta",
             "unsaturation_formula_delta", "radical_formula_delta")},
+        tree_sample_ptr=torch.tensor([0, len(selected)], dtype=torch.long, device=device),
         sample_adduct_type_index=structure.sample_adduct_type_index[sample_index],
         sample_ce_value=structure.sample_ce_value[sample_index], sample_edge_index=sample_edge_index,
         precursor_edge_index_path=structure.precursor_edge_index_path[precursor_mask],

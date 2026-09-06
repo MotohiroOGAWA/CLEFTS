@@ -15,6 +15,7 @@ from ...domain.fragment import Fragmenter
 from ...domain.mass import parse_ce_to_ev
 from ...libs.mmkit.mmkit import Adduct
 from ..common.layers.graphormer import GraphormerEncoder
+from ..common.progress import set_edge_progress_phase
 from ..input.fragment_tree_features import FragmentTreeFeatures
 from ..input.fragment_tree_structure import FragmentTreeStructure
 from ..mol import FormulaTensorizer, MolEncoder
@@ -399,8 +400,12 @@ class FragmentTreeFeatureModel(nn.Module):
     def forward(
         self,
         data: Union[FragmentTreeStructure, FragmentTreeFeatures],
+        *,
+        selected_edge_index: Optional[Tensor] = None,
     ) -> FragmentTreeFeatureOutput:
-        ft_features, edge_output = self._build_fragment_tree_features_with_output(data)
+        ft_features, edge_output = self._build_fragment_tree_features_with_output(
+            data, selected_edge_index=selected_edge_index
+        )
         sample_tree_batch = self._encode_sample_tree(ft_features)
         return FragmentTreeFeatureOutput(
             ft_features=ft_features,
@@ -414,9 +419,26 @@ class FragmentTreeFeatureModel(nn.Module):
     def build_features(
         self,
         data: Union[FragmentTreeStructure, FragmentTreeFeatures],
+        *,
+        selected_edge_index: Optional[Tensor] = None,
     ) -> FragmentTreeFeatures:
         """Encode molecules/cleavage events once for staged tree inference."""
-        return self._build_fragment_tree_features(data)
+        return self._build_fragment_tree_features(data, selected_edge_index=selected_edge_index)
+
+    def build_node_features(
+        self,
+        data: "FragmentTreeStructure",
+    ) -> "FragmentTreeFeatures":
+        """Encode only the frozen MolEncoder pass; no edge encoding.
+
+        Used for cheap, no-attention pre-scoring (see
+        ``FragmentTreeCandidateSelector._tree_bounded_edge_selection``) so the
+        MolEncoder forward pass is not duplicated by the real feature build.
+        """
+        set_edge_progress_phase("mol encoder (frozen)")
+        mol_graph = self._mol_encoder(data.node_graph)
+        self._validate_mol_encoder_output(mol_graph, data)
+        return FragmentTreeFeatures.from_structure(data, node_graphs=mol_graph)
 
     def _build_flat_adduct_candidate_table(
         self,
@@ -749,18 +771,24 @@ class FragmentTreeFeatureModel(nn.Module):
     def _build_fragment_tree_features(
         self,
         data: "FragmentTreeStructure | FragmentTreeFeatures",
+        *,
+        selected_edge_index: Optional[Tensor] = None,
     ) -> "FragmentTreeFeatures":
         """Build FragmentTreeFeatures from structure or return given features."""
 
-        features, _ = self._build_fragment_tree_features_with_output(data)
+        features, _ = self._build_fragment_tree_features_with_output(
+            data, selected_edge_index=selected_edge_index
+        )
         return features
 
     def _build_fragment_tree_features_with_output(
         self,
         data: "FragmentTreeStructure | FragmentTreeFeatures",
+        *,
+        selected_edge_index: Optional[Tensor] = None,
     ):
         if isinstance(data, FragmentTreeFeatures):
-            output = self.fragment_edge_encoder(data)
+            output = self.fragment_edge_encoder(data, selected_edge_index=selected_edge_index)
             return data, output
 
         if not isinstance(data, FragmentTreeStructure):
@@ -768,17 +796,14 @@ class FragmentTreeFeatureModel(nn.Module):
                 f"Unsupported data type: {type(data)}"
             )
 
-        mol_graph = self._mol_encoder(data.node_graph)
-        self._validate_mol_encoder_output(mol_graph, data)
+        ft_features = self.build_node_features(data)
+        mol_graph = ft_features.node_graphs
 
-        ft_features = FragmentTreeFeatures.from_structure(
-            data,
-            node_graphs=mol_graph,
-        )
-
-        # Compute the same attention-aware representation for every edge.
-        # The encoder chunks work for memory safety but never prunes candidates.
-        edge_output = self.fragment_edge_encoder(ft_features)
+        # Compute the attention-aware representation for every edge, or only
+        # ``selected_edge_index`` when a caller has already ranked and capped
+        # the edges worth attending to (e.g. a per-tree budget). The encoder
+        # chunks work for memory safety but never otherwise prunes candidates.
+        edge_output = self.fragment_edge_encoder(ft_features, selected_edge_index=selected_edge_index)
         edge_attr = edge_output.edge_attr
 
         if edge_attr.size(0) != data.edge_index.size(1):

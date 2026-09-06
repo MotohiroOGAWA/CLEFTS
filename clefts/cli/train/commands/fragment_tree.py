@@ -59,8 +59,12 @@ class FragmentTreeTrainCommand(CLICommand):
         parser.add_argument("--max-next-cleavage-candidates", type=int, default=3)
         parser.add_argument("--edge-condition-interaction-dim", type=int, default=64)
         parser.add_argument("--ranking-loss-weight", type=float, default=1.0)
-        parser.add_argument("--ranking-pairs-per-edge", type=int, default=4)
+        parser.add_argument("--top-n", type=int, default=10)
+        parser.add_argument("--nearest-lower-partners", type=int, default=1)
+        parser.add_argument("--extended-lower-partners", type=int, default=3)
+        parser.add_argument("--background-partners", type=int, default=10)
         parser.add_argument("--ranking-intensity-threshold", type=float, default=0.05)
+        parser.add_argument("--max-edges-per-tree", type=int, default=256)
         parser.add_argument(
             "--experiment-name",
             default=DEFAULT_EXPERIMENT_NAME,
@@ -213,10 +217,14 @@ class FragmentTreeTrainCommand(CLICommand):
             generator_params={
                 "max_edges_per_step": args.max_edges_per_step,
                 "max_retained_edges": args.max_retained_edges,
+                "max_edges_per_tree": args.max_edges_per_tree,
                 "max_next_cleavage_candidates": args.max_next_cleavage_candidates,
                 "edge_condition_interaction_dim": args.edge_condition_interaction_dim,
                 "ranking_loss_weight": args.ranking_loss_weight,
-                "ranking_pairs_per_edge": args.ranking_pairs_per_edge,
+                "top_n": args.top_n,
+                "nearest_lower_partners": args.nearest_lower_partners,
+                "extended_lower_partners": args.extended_lower_partners,
+                "background_partners": args.background_partners,
                 "ranking_intensity_threshold": args.ranking_intensity_threshold,
             },
         )

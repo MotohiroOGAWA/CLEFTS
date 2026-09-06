@@ -8,6 +8,7 @@ import torch.nn as nn
 from torch import Tensor
 
 from ...libs.mmkit.mmkit import Formula
+from ..common.progress import set_edge_progress_phase
 from ..input.fragment_tree_features import FragmentTreeFeatures
 from ..input.fragment_tree_structure import FragmentTreeStructure
 from .fragment_tree_feature_model import FragmentTreeFeatureModel
@@ -67,6 +68,11 @@ class FragmentTreeCandidateSelectionOutput:
 class FragmentTreeCandidateSelector(nn.Module):
     """Select fragments, ion states, and next cleavage candidates directly."""
 
+    # Large enough to dominate ordinary condition-scored logits, so a
+    # target/positive edge is never dropped by the per-tree budget in favor
+    # of a merely high-scoring non-target edge.
+    _TARGET_EDGE_IMPORTANCE_BONUS = 1e6
+
     def __init__(
         self,
         feature_model: FragmentTreeFeatureModel,
@@ -75,11 +81,15 @@ class FragmentTreeCandidateSelector(nn.Module):
         max_next_cleavage_candidates: int = 3,
         max_edges_per_step: Optional[int] = 128,
         max_retained_edges: Optional[int] = 30,
+        max_edges_per_tree: Optional[int] = 256,
         max_nodes_for_ion_candidates: Optional[int] = None,
         hidden_dim: Optional[int] = None,
         edge_condition_interaction_dim: int = 64,
         ranking_loss_weight: float = 1.0,
-        ranking_pairs_per_edge: int = 4,
+        top_n: int = 10,
+        nearest_lower_partners: int = 1,
+        extended_lower_partners: int = 3,
+        background_partners: int = 10,
         ranking_intensity_threshold: float = 0.05,
     ) -> None:
         super().__init__()
@@ -91,6 +101,8 @@ class FragmentTreeCandidateSelector(nn.Module):
             raise ValueError("max_edges_per_step must be positive or None.")
         if max_retained_edges is not None and max_retained_edges <= 0:
             raise ValueError("max_retained_edges must be positive or None.")
+        if max_edges_per_tree is not None and max_edges_per_tree <= 0:
+            raise ValueError("max_edges_per_tree must be positive or None.")
         if max_nodes_for_ion_candidates is not None and max_nodes_for_ion_candidates <= 0:
             raise ValueError("max_nodes_for_ion_candidates must be positive or None.")
         self.feature_model = feature_model
@@ -101,14 +113,20 @@ class FragmentTreeCandidateSelector(nn.Module):
         self.max_next_cleavage_candidates = int(max_next_cleavage_candidates)
         self.max_edges_per_step = max_edges_per_step
         self.max_retained_edges = max_retained_edges
+        self.max_edges_per_tree = max_edges_per_tree
         self.max_nodes_for_ion_candidates = max_nodes_for_ion_candidates
         self.ranking_loss_weight = float(ranking_loss_weight)
-        self.ranking_pairs_per_edge = int(ranking_pairs_per_edge)
+        self.top_n = int(top_n)
+        self.nearest_lower_partners = int(nearest_lower_partners)
+        self.extended_lower_partners = int(extended_lower_partners)
+        self.background_partners = int(background_partners)
         self.ranking_intensity_threshold = float(ranking_intensity_threshold)
         if self.ranking_loss_weight < 0:
             raise ValueError("ranking_loss_weight must be non-negative.")
-        if self.ranking_pairs_per_edge < 1:
-            raise ValueError("ranking_pairs_per_edge must be positive.")
+        if self.top_n < 1:
+            raise ValueError("top_n must be positive.")
+        if self.nearest_lower_partners < 0 or self.extended_lower_partners < 0 or self.background_partners < 0:
+            raise ValueError("nearest_lower_partners, extended_lower_partners, and background_partners must be non-negative.")
         if self.ranking_intensity_threshold < 0:
             raise ValueError("ranking_intensity_threshold must be non-negative.")
         tree_dim = int(feature_model.tree_encoder.hidden_dim)
@@ -137,8 +155,15 @@ class FragmentTreeCandidateSelector(nn.Module):
         self.unsaturation_head = nn.Sequential(nn.Linear(tree_dim, hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, len(feature_model.unsaturation_flat_candidates)))
         self.radical_head = nn.Sequential(nn.Linear(tree_dim, hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, len(feature_model.radical_flat_candidates)))
 
-    def forward(self, data: Union[FragmentTreeStructure, FragmentTreeFeatures]) -> FragmentTreeCandidateSelectionOutput:
-        feature_output = self.feature_model(data)
+    def forward(
+        self,
+        data: Union[FragmentTreeStructure, FragmentTreeFeatures],
+        *,
+        selected_edge_index: Optional[Tensor] = None,
+    ) -> FragmentTreeCandidateSelectionOutput:
+        if selected_edge_index is None and isinstance(data, FragmentTreeStructure):
+            selected_edge_index = self._tree_bounded_edge_selection(data)
+        feature_output = self.feature_model(data, selected_edge_index=selected_edge_index)
         features = feature_output.ft_features
         sample_tree_batch = feature_output.sample_tree_batch
         keep_logit = self.node_keep_head(sample_tree_batch.x).squeeze(-1)
@@ -192,14 +217,98 @@ class FragmentTreeCandidateSelector(nn.Module):
         )
         return self.edge_cleave_head(edge_repr).squeeze(-1)
 
+    def _tree_bounded_edge_selection(
+        self, structure: FragmentTreeStructure
+    ) -> Optional[Tensor]:
+        """Rank stored edges by summed cross-sample importance per tree.
+
+        Returns a global edge-index tensor capped at ``max_edges_per_tree``
+        edges per stored tree, or ``None`` when the mechanism is disabled
+        (``max_edges_per_tree is None``) or the structure predates
+        ``tree_sample_ptr``. Importance is the condition-scored base logit
+        (cheap, no attention) summed over every sample that references the
+        edge, with a large bonus for edges that are a target/positive edge
+        for at least one such sample, so the budget cannot silently drop
+        edges the model must see to learn from.
+
+        Only edges actually referenced by some sample (``sample_edge_index``)
+        are ever candidates for selection: an edge no sample references has
+        zero importance and would never be worth the attention budget
+        anyway, so the per-tree grouping is derived from ``tree_sample_ptr``
+        (which sample belongs to which tree) rather than needing a separate
+        edge-level tree boundary.
+        """
+        if self.max_edges_per_tree is None:
+            return None
+        if not hasattr(structure, "tree_sample_ptr"):
+            return None
+        set_edge_progress_phase("tree edge importance scoring")
+        device = structure.edge_index.device
+        with torch.no_grad():
+            base_features = self.feature_model.build_node_features(structure)
+            edge_h_base, _ = self.fragment_edge_encoder.encode_base(base_features)
+            condition_h = self.feature_model._condition_encoder(
+                structure.sample_adduct_type_index.to(device).long(),
+                structure.sample_ce_value.to(device),
+            )
+            sample_edge_index = structure.sample_edge_index.to(device).long()
+            valid = sample_edge_index[1] >= 0
+            sample_ids = sample_edge_index[0, valid]
+            edge_ids = sample_edge_index[1, valid]
+            if edge_ids.numel() == 0:
+                return None
+            scores = self.condition_edge_scorer(edge_h_base, condition_h, edge_ids, sample_ids)
+            num_edges = int(structure.num_edges)
+            target_edge_index = getattr(structure, "target_edge_index", None)
+            if target_edge_index is not None and target_edge_index.numel():
+                target_pairs = target_edge_index.to(device).long()
+                key = sample_ids * (num_edges + 1) + edge_ids
+                target_key = target_pairs[0] * (num_edges + 1) + target_pairs[1]
+                is_target = torch.isin(key, target_key)
+                scores = torch.where(
+                    is_target, scores + self._TARGET_EDGE_IMPORTANCE_BONUS, scores
+                )
+            edge_importance = torch.zeros(num_edges, device=device, dtype=scores.dtype)
+            edge_importance.scatter_add_(0, edge_ids, scores)
+
+            # Each referenced edge belongs to exactly one tree, via whichever
+            # sample references it (a sample only ever references edges of
+            # its own stored tree).
+            tree_sample_ptr = structure.tree_sample_ptr.to(device).long()
+            num_trees = int(tree_sample_ptr.numel()) - 1
+            sample_tree_id = torch.zeros(int(structure.num_samples), dtype=torch.long, device=device)
+            for tree_id in range(num_trees):
+                start, end = int(tree_sample_ptr[tree_id]), int(tree_sample_ptr[tree_id + 1])
+                sample_tree_id[start:end] = tree_id
+            edge_to_tree = torch.full((num_edges,), -1, dtype=torch.long, device=device)
+            edge_to_tree[edge_ids] = sample_tree_id[sample_ids]
+            referenced_edges = edge_ids.unique()
+
+            selected_parts: List[Tensor] = []
+            for tree_id in range(num_trees):
+                tree_edges = referenced_edges[edge_to_tree[referenced_edges] == tree_id]
+                if tree_edges.numel() == 0:
+                    continue
+                k = min(int(self.max_edges_per_tree), int(tree_edges.numel()))
+                top_local = torch.topk(edge_importance[tree_edges], k=k).indices
+                selected_parts.append(tree_edges[top_local])
+        if not selected_parts:
+            return None
+        return torch.cat(selected_parts).unique(sorted=True)
+
     def generate_depth_limited_candidates(self, data: Union[FragmentTreeStructure, FragmentTreeFeatures], *, max_depth: int) -> FragmentTreeCandidateSelectionOutput:
         if max_depth < 0:
             raise ValueError("max_depth must be non-negative.")
         # Molecular and cleavage-event encoders are evaluated once.  The much
         # larger sample-tree encoder is then run on bounded edge windows.
-        features = self.feature_model.build_features(data)
+        selected_edge_index = (
+            self._tree_bounded_edge_selection(data)
+            if isinstance(data, FragmentTreeStructure)
+            else None
+        )
+        features = self.feature_model.build_features(data, selected_edge_index=selected_edge_index)
         features = self._initial_depth_features(features)
-        output = self._forward_progressive(features)
+        output = self._forward_progressive(features, selected_edge_index=selected_edge_index)
         for expansion_depth in range(1, max_depth + 1):
             if len(output.next_cleavage_candidates) == 0:
                 break
@@ -208,12 +317,14 @@ class FragmentTreeCandidateSelector(nn.Module):
             )
             if next_features is None:
                 break
-            output = self._forward_progressive(next_features)
+            output = self._forward_progressive(next_features, selected_edge_index=selected_edge_index)
         return output
 
     def _forward_progressive(
         self,
         features: FragmentTreeFeatures,
+        *,
+        selected_edge_index: Optional[Tensor] = None,
     ) -> FragmentTreeCandidateSelectionOutput:
         """Rank arbitrary-size edge sets using ``new window + survivors``.
 
@@ -229,7 +340,7 @@ class FragmentTreeCandidateSelector(nn.Module):
             if int(edge_id) >= 0:
                 by_sample.setdefault(int(sample_id), []).append(int(edge_id))
         if limit is None or all(len(set(v)) <= limit for v in by_sample.values()):
-            return self.forward(features)
+            return self.forward(features, selected_edge_index=selected_edge_index)
 
         survivors: dict[int, List[int]] = {sample_id: [] for sample_id in by_sample}
         offsets = {sample_id: 0 for sample_id in by_sample}
@@ -244,7 +355,7 @@ class FragmentTreeCandidateSelector(nn.Module):
                     window_pairs.append((sample_id, edge_id))
 
             window_features = self._with_sample_edges(features, window_pairs)
-            window_output = self.forward(window_features)
+            window_output = self.forward(window_features, selected_edge_index=selected_edge_index)
             survivors = self._rank_edges(
                 window_output,
                 window_pairs,
@@ -256,7 +367,10 @@ class FragmentTreeCandidateSelector(nn.Module):
             for sample_id, edge_ids in sorted(survivors.items())
             for edge_id in edge_ids
         ]
-        return self.forward(self._with_sample_edges(features, final_pairs))
+        return self.forward(
+            self._with_sample_edges(features, final_pairs),
+            selected_edge_index=selected_edge_index,
+        )
 
     @staticmethod
     def _with_sample_edges(
@@ -414,6 +528,7 @@ class FragmentTreeCandidateSelector(nn.Module):
             node_formula=structure.node_formula,
             formula_element_order=structure.formula_element_order,
             edge_index=structure.edge_index,
+            tree_sample_ptr=structure.tree_sample_ptr,
             cleavage_event_edge_index=structure.cleavage_event_edge_index,
             cleavage_event=structure.cleavage_event,
             cleavage_atom_idxs=structure.cleavage_atom_idxs,

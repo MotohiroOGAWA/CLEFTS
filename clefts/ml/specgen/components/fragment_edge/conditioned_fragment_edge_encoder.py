@@ -10,7 +10,11 @@ from torch import Tensor
 from torch.utils.checkpoint import checkpoint
 
 from clefts.domain.fragment.cleavage import CleavagePatternSet
-from clefts.ml.common.progress import advance_edge_progress, set_edge_progress_total
+from clefts.ml.common.progress import (
+    advance_edge_progress,
+    set_edge_progress_phase,
+    set_edge_progress_total,
+)
 from ....input.fragment_tree_features import FragmentTreeFeatures
 
 
@@ -499,14 +503,17 @@ class StructuralEdgeEncoder(nn.Module):
         *,
         selected_edge_index: Optional[Tensor] = None,
     ) -> FragmentEdgeEncoderOutput:
+        set_edge_progress_phase("edge base logits")
         edge_h, edge_logit = self.encode_base(features)
         if selected_edge_index is not None:
             selected = selected_edge_index.to(edge_h.device).long().unique(sorted=True)
         elif self.training and torch.is_grad_enabled():
+            set_edge_progress_phase("sampling training edges")
             selected = self._sample_training_edges(features.structure, edge_logit)
         else:
             selected = torch.arange(edge_h.size(0), device=edge_h.device)
         set_edge_progress_total(int(selected.numel()))
+        set_edge_progress_phase("attention")
         selected_set = set(int(value) for value in selected.detach().cpu().tolist())
         event_edge = features.structure.cleavage_event_edge_index.long()
         updated_edge_h = []

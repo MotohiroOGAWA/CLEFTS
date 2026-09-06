@@ -170,6 +170,32 @@ def test_edge_retain_metrics_break_down_by_adduct():
     assert metrics["by_adduct/[M+Na]+/edge_retain_accuracy"] == 1.0
 
 
+def test_tree_edge_budget_metrics_reports_recall_and_sharing():
+    # Two trees, one sample each (edge ids are disjoint per tree, matching
+    # how from_structures collates them): tree0 = sample0 -> edges{0,1},
+    # tree1 = sample1 -> edges{2,3}. Both trees exceed the budget of 1.
+    output = SimpleNamespace(selected_edge_index=torch.tensor([0, 1, 3]))
+    target = SimpleNamespace(
+        num_edges=4,
+        num_samples=2,
+        tree_sample_ptr=torch.tensor([0, 1, 2], dtype=torch.long),
+        target_edge_index=torch.tensor([[1], [2]]),
+        sample_edge_index=torch.tensor([[0, 0, 1, 1], [0, 1, 2, 3]]),
+    )
+    selector = SimpleNamespace(max_edges_per_tree=1)
+    model = FragmentTreeTrainingModel.__new__(FragmentTreeTrainingModel)
+    nn.Module.__init__(model)
+    model.candidate_selector = selector
+
+    metrics = model._tree_edge_budget_metrics(output, target)
+
+    assert metrics["tree_edge_budget/selected_edge_count"] == 3.0
+    assert metrics["tree_edge_budget/available_edge_count"] == 4.0
+    assert metrics["tree_edge_budget/target_edge_recall"] == 0.0
+    assert metrics["tree_edge_budget/trees_over_budget_fraction"] == 1.0
+    assert metrics["tree_edge_budget/mean_samples_per_selected_edge"] == 1.0
+
+
 def test_cleave_targets_come_from_stored_expand_paths():
     batch = SimpleNamespace(
         node_is_precursor_root=torch.tensor([True, False, False]),
@@ -216,6 +242,61 @@ def test_next_stage_limits_nodes_not_their_outgoing_edges():
         cleave_logit=torch.tensor([0.0, 5.0, 4.0, 3.0, 2.0, 100.0]),
     )
     assert [item.global_node_id for item in selected] == [1, 2, 3]
+
+
+def test_tree_bounded_edge_selection_respects_tree_boundaries_and_targets():
+    """Two trees, budget=2/tree: each tree's own top-2 by importance is kept,
+    a low-scoring but targeted edge still survives via the bonus, and no
+    edge from one tree is ever selected for the other."""
+    selector = FragmentTreeCandidateSelector.__new__(FragmentTreeCandidateSelector)
+    nn.Module.__init__(selector)
+    selector.max_edges_per_tree = 2
+
+    class _FakeEdgeEncoder:
+        def encode_base(self, features):
+            return torch.zeros((6, 1)), None
+
+    class _FakeConditionEncoder:
+        def __call__(self, adduct_index, ce_value):
+            return torch.zeros((adduct_index.numel(), 1))
+
+    class _FakeFeatureModel:
+        _condition_encoder = _FakeConditionEncoder()
+
+        def build_node_features(self, structure):
+            return SimpleNamespace()
+
+    class _FakeConditionEdgeScorer:
+        def __call__(self, edge_h_base, condition_h, edge_ids, sample_ids):
+            # Deterministic: score equals the edge id, so higher edge id
+            # within a tree wins on raw score alone (before any target bonus).
+            return edge_ids.float()
+
+    selector.feature_model = _FakeFeatureModel()
+    selector.fragment_edge_encoder = _FakeEdgeEncoder()
+    selector.condition_edge_scorer = _FakeConditionEdgeScorer()
+
+    # tree 0 = sample 0, referencing edges 0,1,2 (three candidates for a
+    # budget of two: edge 0 is a low-raw-score target that must survive via
+    # the bonus, edge 1 is the lowest-scoring non-target and must be
+    # excluded, edge 2 is the highest-scoring non-target and survives on
+    # score alone). tree 1 = sample 1, referencing edges 3,4 (both fit under
+    # budget, no exclusion needed). Edge 5 exists in edge_index but is never
+    # referenced by any sample, so it is never even a candidate.
+    structure = SimpleNamespace(
+        edge_index=torch.zeros((2, 6), dtype=torch.long),
+        tree_sample_ptr=torch.tensor([0, 1, 2], dtype=torch.long),
+        num_edges=6,
+        num_samples=2,
+        sample_adduct_type_index=torch.tensor([0, 0]),
+        sample_ce_value=torch.tensor([10.0, 10.0]),
+        sample_edge_index=torch.tensor([[0, 0, 0, 1, 1], [0, 1, 2, 3, 4]]),
+        target_edge_index=torch.tensor([[0], [0]]),
+    )
+
+    selected = selector._tree_bounded_edge_selection(structure)
+
+    assert sorted(selected.tolist()) == [0, 2, 3, 4]
 
 
 def test_depth_budget_uses_the_matching_reaction_depth():

@@ -15,7 +15,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
-from ...common.progress import fixed_tqdm, iteration_edge_progress
+from ...common.progress import fixed_tqdm, iteration_edge_progress, set_edge_progress_phase
 from . import metric_labels
 from .performance_profile import run_training_performance_profile
 from .workflow import run_shape_preflight
@@ -1068,17 +1068,22 @@ def run_epoch(
 
     for batch in iterator:
         try:
-            structure = batch["structure"].to(device)
-            # Target/formula pairs are selected by the edge encoder before its
-            # expensive attention pass. ``max_edges_per_step`` is a hard cap.
-            num_samples = int(structure.num_samples)
-            sample_weight = max(num_samples, 1)
-
-            global_edges = int(structure.edge_index.size(1))
+            # Shape queries against the pre-transfer CPU structure so the
+            # progress bar opens (and shows the transfer itself) before any
+            # device work happens.
+            global_edges = int(batch["structure"].edge_index.size(1))
             with iteration_edge_progress(
                 min(global_edges, int(max_training_edges)),
                 desc=f"edges iter {step_count + 1}",
             ):
+                set_edge_progress_phase("host→device transfer")
+                structure = batch["structure"].to(device)
+                # Target/formula pairs are selected by the edge encoder before
+                # its expensive attention pass. ``max_edges_per_step`` is a
+                # hard cap.
+                num_samples = int(structure.num_samples)
+                sample_weight = max(num_samples, 1)
+
                 with torch.set_grad_enabled(is_train):
                     output = model(structure)
                     loss = output["loss"]
@@ -3012,10 +3017,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--max-edges-per-step", type=int, default=128)
     parser.add_argument("--max-retained-edges", type=int, default=30)
+    parser.add_argument("--max-edges-per-tree", type=int, default=256)
     parser.add_argument("--max-next-cleavage-candidates", type=int, default=3)
     parser.add_argument("--edge-condition-interaction-dim", type=int, default=64)
     parser.add_argument("--ranking-loss-weight", type=float, default=1.0)
-    parser.add_argument("--ranking-pairs-per-edge", type=int, default=4)
+    parser.add_argument("--top-n", type=int, default=10)
+    parser.add_argument("--nearest-lower-partners", type=int, default=1)
+    parser.add_argument("--extended-lower-partners", type=int, default=3)
+    parser.add_argument("--background-partners", type=int, default=10)
     parser.add_argument("--ranking-intensity-threshold", type=float, default=0.05)
     parser.add_argument("--experiment-name", default=DEFAULT_EXPERIMENT_NAME)
     parser.add_argument("--ckpt-id", default=None)
@@ -3113,10 +3122,14 @@ if __name__ == "__main__":
         generator_params={
             "max_edges_per_step": args.max_edges_per_step,
             "max_retained_edges": args.max_retained_edges,
+            "max_edges_per_tree": args.max_edges_per_tree,
             "max_next_cleavage_candidates": args.max_next_cleavage_candidates,
             "edge_condition_interaction_dim": args.edge_condition_interaction_dim,
             "ranking_loss_weight": args.ranking_loss_weight,
-            "ranking_pairs_per_edge": args.ranking_pairs_per_edge,
+            "top_n": args.top_n,
+            "nearest_lower_partners": args.nearest_lower_partners,
+            "extended_lower_partners": args.extended_lower_partners,
+            "background_partners": args.background_partners,
             "ranking_intensity_threshold": args.ranking_intensity_threshold,
         },
     )

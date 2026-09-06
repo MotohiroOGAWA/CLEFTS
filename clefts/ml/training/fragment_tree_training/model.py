@@ -15,30 +15,77 @@ from . import metric_labels
 class PairwiseEdgeIntensityRankingLoss(nn.Module):
     """Rank independently scored edges by observed peak intensity.
 
-    Only adjacent unequal-intensity targets and target-vs-background pairs are
-    used.  This retains RankNet's ordering objective without constructing the
-    quadratic set of every possible pair. Each pair is weighted by a
-    reciprocal-rank weight ``(1/rank_i) / sum(1/rank_n)`` computed over the
-    sample's intensity-sorted groups (rank 1 = most intense), not by the raw
-    intensity value itself; intensity is still used to sort groups and to
-    gate near-equal-intensity pairs via ``intensity_threshold``.
+    For each intensity-sorted anchor (group, in the gradient path; edge, in
+    the diagnostic path), up to ``top_n`` comparison partners are selected in
+    three tiers, filled in order until ``top_n`` is reached:
+
+    1. the ``nearest_lower_partners`` *nearest* lower-intensity partners;
+    2. ``extended_lower_partners`` *more* lower-intensity partners, farther away in the sorted
+       order;
+    3. ``background_partners`` partners with no intensity at all (unassigned/background
+       edges), individually compared against the anchor.
+
+    Tiers 1/2 skip (without consuming budget) any candidate whose
+    ``sqrt(intensity)`` gap to the anchor is ``<= intensity_threshold``.  This
+    retains RankNet's ordering objective without constructing the quadratic
+    set of every possible pair.  Each pair is weighted by a reciprocal-rank
+    weight ``(1/rank_i) / sum(1/rank_n)`` computed over the sample's
+    intensity-sorted groups (rank 1 = most intense), not by the raw intensity
+    value itself; intensity is still used to sort groups and to gate
+    near-equal-intensity pairs.
     """
 
     def __init__(
         self,
-        ranking_pairs_per_edge: int = 4,
+        top_n: int = 10,
+        nearest_lower_partners: int = 1,
+        extended_lower_partners: int = 3,
+        background_partners: int = 10,
         intensity_threshold: float = 0.05,
     ) -> None:
         super().__init__()
-        if ranking_pairs_per_edge < 1:
-            raise ValueError("ranking_pairs_per_edge must be positive.")
+        if top_n < 1:
+            raise ValueError("top_n must be positive.")
+        if nearest_lower_partners < 0 or extended_lower_partners < 0 or background_partners < 0:
+            raise ValueError("nearest_lower_partners, extended_lower_partners, and background_partners must be non-negative.")
         if intensity_threshold < 0:
             raise ValueError("intensity_threshold must be non-negative.")
-        self.ranking_pairs_per_edge = int(ranking_pairs_per_edge)
+        self.top_n = int(top_n)
+        self.nearest_lower_partners = int(nearest_lower_partners)
+        self.extended_lower_partners = int(extended_lower_partners)
+        self.background_partners = int(background_partners)
         self.intensity_threshold = float(intensity_threshold)
 
+    def _select_tiered_partners(
+        self,
+        *,
+        sqrt_values: Tensor,
+        anchor_index: int,
+        remaining_budget: int,
+    ) -> List[int]:
+        """Tier 1+2 offsets ``j > 0`` such that ``sqrt_values[anchor_index + j]``
+        is a selected lower-intensity partner, nearest-first.  ``sqrt_values``
+        must already be sorted descending.  A candidate whose gap to the
+        anchor is ``<= intensity_threshold`` is skipped without consuming
+        budget, so the scan continues past it.
+        """
+        offsets: List[int] = []
+        budget = min(self.nearest_lower_partners + self.extended_lower_partners, max(int(remaining_budget), 0))
+        if budget <= 0:
+            return offsets
+        anchor_value = float(sqrt_values[anchor_index])
+        n = int(sqrt_values.numel())
+        j = 1
+        while len(offsets) < budget and anchor_index + j < n:
+            candidate_value = float(sqrt_values[anchor_index + j])
+            if anchor_value - candidate_value > self.intensity_threshold:
+                offsets.append(j)
+            j += 1
+        return offsets
+
     def build_pairs(self, output, target) -> Tuple[Tensor, Tensor]:
-        """Build bounded pairs within the same sample and source fragment."""
+        """Build tiered pairs within the same sample and source fragment
+        (diagnostic only; mirrors forward()'s tier1/tier2/tier3 selection)."""
         logit = output.edge_absolute_logit
         batch = output.sample_tree_batch
         edge_ids = batch.edge_id_global.to(logit.device).long()
@@ -81,37 +128,43 @@ class PairwiseEdgeIntensityRankingLoss(nn.Module):
                     peak_intensity[formula_peak[int(group_id)]].item()
                 )
             for source_id in source_ids[sample_mask].unique(sorted=True).tolist():
-                local = (sample_mask & (source_ids == int(source_id))).nonzero(as_tuple=False).flatten()
-                local = torch.tensor(
-                    [
-                        int(index)
-                        for index in local.tolist()
-                        if int(index) not in alternative_rows or int(index) in intensity_by_row
-                    ],
-                    dtype=torch.long,
-                    device=logit.device,
+                source_rows = (sample_mask & (source_ids == int(source_id))).nonzero(as_tuple=False).flatten().tolist()
+                real_rows = torch.tensor(
+                    [index for index in source_rows if int(index) in intensity_by_row],
+                    dtype=torch.long, device=logit.device,
                 )
-                if local.numel() < 2:
+                background_rows = torch.tensor(
+                    [index for index in source_rows if int(index) not in alternative_rows],
+                    dtype=torch.long, device=logit.device,
+                )
+                if real_rows.numel() == 0:
                     continue
-                raw = logit.new_tensor([
-                    intensity_by_row.get(int(index), 0.0)
-                    for index in local
-                ])
-                values = torch.sqrt(raw.clamp_min(0.0))
-                order = torch.argsort(values, descending=True, stable=True)
-                ordered_local, ordered_values = local[order], values[order]
-                # At most K lower-intensity partners per edge; no quadratic
-                # materialization and no cross-source/depth comparisons.
-                for high in range(int(ordered_local.numel())):
-                    added = 0
-                    for low in range(high + 1, int(ordered_local.numel())):
-                        if float(ordered_values[high] - ordered_values[low]) <= self.intensity_threshold:
-                            continue
-                        better_rows.append(int(ordered_local[high]))
-                        worse_rows.append(int(ordered_local[low]))
-                        added += 1
-                        if added >= self.ranking_pairs_per_edge:
-                            break
+                sqrt_values = torch.sqrt(
+                    logit.new_tensor([intensity_by_row[int(index)] for index in real_rows]).clamp_min(0.0)
+                )
+                order = torch.argsort(sqrt_values, descending=True, stable=True)
+                ordered_real, ordered_values = real_rows[order], sqrt_values[order]
+                hard_negatives = (
+                    background_rows[
+                        torch.topk(
+                            logit[background_rows], k=min(self.background_partners, int(background_rows.numel()))
+                        ).indices
+                    ]
+                    if background_rows.numel()
+                    else background_rows
+                )
+                for i in range(int(ordered_real.numel())):
+                    offsets = self._select_tiered_partners(
+                        sqrt_values=ordered_values, anchor_index=i, remaining_budget=self.top_n,
+                    )
+                    for j in offsets:
+                        better_rows.append(int(ordered_real[i]))
+                        worse_rows.append(int(ordered_real[i + j]))
+                    remaining_after_12 = self.top_n - len(offsets)
+                    tier3_count = min(self.background_partners, remaining_after_12, int(hard_negatives.numel()))
+                    for k in range(tier3_count):
+                        better_rows.append(int(ordered_real[i]))
+                        worse_rows.append(int(hard_negatives[k]))
         return (
             torch.tensor(better_rows, dtype=torch.long, device=logit.device),
             torch.tensor(worse_rows, dtype=torch.long, device=logit.device),
@@ -158,34 +211,44 @@ class PairwiseEdgeIntensityRankingLoss(nn.Module):
             group_rows.sort(key=lambda item: float(item[1]), reverse=True)
             # Reciprocal-rank weight (1/rank_i) / sum(1/rank_n), normalized
             # within this sample's intensity-sorted groups: rank 1 (the most
-            # intense group) carries the most weight. This replaces the raw
-            # intensity value as the per-pair loss weight below.
+            # intense group) carries the most weight, regardless of which
+            # tier a given partner came from.
             rank_weights = logit.new_empty((0,))
+            sqrt_values = logit.new_empty((0,))
             if group_rows:
                 ranks = torch.arange(
                     1, len(group_rows) + 1, dtype=torch.float32, device=logit.device
                 )
                 reciprocal_ranks = 1.0 / ranks
                 rank_weights = reciprocal_ranks / reciprocal_ranks.sum()
-            for index, (high, low) in enumerate(zip(group_rows, group_rows[1:])):
-                if float(torch.sqrt(high[1]) - torch.sqrt(low[1])) <= self.intensity_threshold:
-                    continue
-                losses.append(F.softplus(-(high[0] - low[0])))
-                weights.append(rank_weights[index])
+                sqrt_values = torch.sqrt(
+                    torch.stack([item[1] for item in group_rows]).clamp_min(0.0)
+                )
             # Observed formula groups also compete against unassigned edges,
             # including edges at the same depth.  Bound this comparison count.
             background = torch.tensor([
                 index for index in (sample_ids == int(sample_id)).nonzero(as_tuple=False).flatten().tolist()
                 if int(index) not in alternatives
             ], dtype=torch.long, device=logit.device)
-            if background.numel() and group_rows:
-                hard = background[torch.topk(logit[background], k=min(self.ranking_pairs_per_edge, int(background.numel()))).indices]
-                background_evidence = torch.logsumexp(logit[hard], dim=0)
-                for index, (evidence, intensity) in enumerate(group_rows[: self.ranking_pairs_per_edge]):
-                    if float(intensity) <= 0:
-                        continue
-                    losses.append(F.softplus(-(evidence - background_evidence)))
-                    weights.append(rank_weights[index])
+            hard_negatives = (
+                background[torch.topk(logit[background], k=min(self.background_partners, int(background.numel()))).indices]
+                if background.numel() and group_rows
+                else background[:0]
+            )
+            for i in range(len(group_rows)):
+                offsets = self._select_tiered_partners(
+                    sqrt_values=sqrt_values, anchor_index=i, remaining_budget=self.top_n,
+                )
+                for j in offsets:
+                    losses.append(F.softplus(-(group_rows[i][0] - group_rows[i + j][0])))
+                    weights.append(rank_weights[i])
+                if float(group_rows[i][1]) <= 0:
+                    continue
+                remaining_after_12 = self.top_n - len(offsets)
+                tier3_count = min(self.background_partners, remaining_after_12, int(hard_negatives.numel()))
+                for k in range(tier3_count):
+                    losses.append(F.softplus(-(group_rows[i][0] - logit[hard_negatives[k]])))
+                    weights.append(rank_weights[i])
         if not losses:
             return logit.sum() * 0.0
         loss_values = torch.stack(losses)
@@ -1298,7 +1361,10 @@ class FragmentTreeTrainingModel(nn.Module):
         }
         self.ranking_loss_weight = float(getattr(candidate_selector, "ranking_loss_weight", 1.0))
         self.absolute_ranker_loss_fn = PairwiseEdgeIntensityRankingLoss(
-            ranking_pairs_per_edge=int(getattr(candidate_selector, "ranking_pairs_per_edge", 4)),
+            top_n=int(getattr(candidate_selector, "top_n", 10)),
+            nearest_lower_partners=int(getattr(candidate_selector, "nearest_lower_partners", 1)),
+            extended_lower_partners=int(getattr(candidate_selector, "extended_lower_partners", 3)),
+            background_partners=int(getattr(candidate_selector, "background_partners", 10)),
             intensity_threshold=float(getattr(candidate_selector, "ranking_intensity_threshold", 0.05)),
         )
         self.register_buffer("training_phase", torch.tensor(1, dtype=torch.long))
@@ -1332,6 +1398,7 @@ class FragmentTreeTrainingModel(nn.Module):
         absolute_ranker_metrics = self.absolute_ranker_loss_fn.metrics(output, batch)
         absolute_ranker_metrics.update(self._edge_retain_metrics(output, batch))
         absolute_ranker_metrics.update(self._selected_peak_metrics(output, batch))
+        absolute_ranker_metrics.update(self._tree_edge_budget_metrics(output, batch))
         if intensity_output is not None:
             absolute_ranker_metrics.update(
                 self._intensity_similarity_metrics(intensity_output, batch)
@@ -1403,6 +1470,79 @@ class FragmentTreeTrainingModel(nn.Module):
             for label, values in by_ce.items():
                 grouped[f"by_ce_range/{label}/{metric_name}"] = sum(values) / len(values)
         return grouped
+
+    @torch.no_grad()
+    def _tree_edge_budget_metrics(self, output, target) -> Dict[str, float]:
+        """Report how the per-tree ``max_edges_per_tree`` cap behaved.
+
+        Empty when the mechanism is disabled (no ``selected_edge_index``) or
+        the structure predates ``tree_sample_ptr``. "Available" edges are
+        counted per tree among edges actually referenced by some sample
+        (``sample_edge_index``) -- edges no sample references have zero
+        importance and are never worth the attention budget regardless of
+        which tree they belong to, so they are not counted here either.
+        """
+        selected_edge_index = getattr(output, "selected_edge_index", None)
+        if selected_edge_index is None or not hasattr(target, "tree_sample_ptr"):
+            return {}
+        device = selected_edge_index.device
+        num_edges = int(target.num_edges)
+        selected = selected_edge_index.to(device).long().unique()
+        selected_mask = torch.zeros(num_edges, dtype=torch.bool, device=device)
+        if selected.numel():
+            selected_mask[selected] = True
+
+        sample_edge_index = target.sample_edge_index.to(device).long()
+        valid = sample_edge_index[1] >= 0
+        sample_ids = sample_edge_index[0, valid]
+        edge_ids = sample_edge_index[1, valid]
+        reference_counts = torch.zeros(num_edges, device=device, dtype=torch.float32)
+        if edge_ids.numel():
+            reference_counts.scatter_add_(0, edge_ids, torch.ones_like(edge_ids, dtype=torch.float32))
+        selected_reference_counts = reference_counts[selected] if selected.numel() else reference_counts[:0]
+
+        max_edges_per_tree = getattr(self.candidate_selector, "max_edges_per_tree", None)
+        tree_sample_ptr = target.tree_sample_ptr.to(device).long()
+        num_trees = int(tree_sample_ptr.numel()) - 1
+        trees_over_budget = 0
+        referenced_edge_count = 0
+        if edge_ids.numel():
+            sample_tree_id = torch.zeros(int(target.num_samples), dtype=torch.long, device=device)
+            for tree_id in range(num_trees):
+                start, end = int(tree_sample_ptr[tree_id]), int(tree_sample_ptr[tree_id + 1])
+                sample_tree_id[start:end] = tree_id
+            edge_to_tree = torch.full((num_edges,), -1, dtype=torch.long, device=device)
+            edge_to_tree[edge_ids] = sample_tree_id[sample_ids]
+            referenced_edges = edge_ids.unique()
+            referenced_edge_count = int(referenced_edges.numel())
+            for tree_id in range(num_trees):
+                tree_size = int((edge_to_tree[referenced_edges] == tree_id).sum().item())
+                if max_edges_per_tree is not None and tree_size > int(max_edges_per_tree):
+                    trees_over_budget += 1
+
+        target_edge_index = getattr(target, "target_edge_index", None)
+        if target_edge_index is not None and target_edge_index.numel():
+            target_edges = target_edge_index[1].to(device).long().unique()
+            target_edges = target_edges[(target_edges >= 0) & (target_edges < num_edges)]
+            target_edge_recall = (
+                float(selected_mask[target_edges].float().mean().item())
+                if target_edges.numel() else 1.0
+            )
+        else:
+            target_edge_recall = 1.0
+
+        return {
+            "tree_edge_budget/selected_edge_count": float(selected.numel()),
+            "tree_edge_budget/available_edge_count": float(referenced_edge_count),
+            "tree_edge_budget/target_edge_recall": target_edge_recall,
+            "tree_edge_budget/trees_over_budget_fraction": (
+                trees_over_budget / max(num_trees, 1)
+            ),
+            "tree_edge_budget/mean_samples_per_selected_edge": (
+                float(selected_reference_counts.mean().item())
+                if selected_reference_counts.numel() else 0.0
+            ),
+        }
 
     @torch.no_grad()
     def _edge_retain_metrics(self, output, target) -> Dict[str, float]:

@@ -198,19 +198,35 @@ evidence is a smooth multiple-instance-learning OR:
 group_evidence = logsumexp(alternative_edge_logits)
 ```
 
-Per sample, groups are sorted by observed peak intensity (descending) and
-compared adjacently (RankNet-style): `softplus(-(higher_evidence -
-lower_evidence))`, skipping pairs whose `sqrt(intensity)` values differ by less
-than `intensity_threshold`. Groups also compete against a bounded set of
-zero-intensity background edges (the top `ranking_pairs_per_edge` hard
-negatives by base score). Each pair's loss term is weighted by a
-reciprocal-rank weight `(1/rank_i) / sum(1/rank_n)`, computed over that
-sample's intensity-sorted groups (rank 1 = most intense group), so a
-comparison involving the most intense group contributes more to the total
-loss than an equally-sized comparison further down the ranking. Intensity
-values are still used to sort groups and to gate near-equal-intensity pairs,
-but no longer serve as the weight magnitude directly. This avoids training
-mutually valid paths against each other.
+Per sample, groups are sorted by observed peak intensity (descending). For
+each group (the "anchor"), up to `top_n` comparison partners are selected in
+three tiers, filled in order until `top_n` is reached:
+
+1. **Tier 1** (`nearest_lower_partners`, default 1): the nearest lower-intensity
+   groups in sorted order.
+2. **Tier 2** (`extended_lower_partners`, default 3): more lower-intensity
+   groups, farther away in the sorted order.
+3. **Tier 3** (`background_partners`, default 10): unassigned/background edges
+   (no observed intensity at all), individually compared against the anchor
+   as separate pairwise terms — not pooled into one aggregated comparison.
+
+Tiers 1 and 2 skip (without consuming budget) any candidate whose
+`sqrt(intensity)` gap to the anchor is `<= intensity_threshold`, so the scan
+continues past near-equal-intensity groups instead of stopping there. Each
+selected pair contributes `softplus(-(anchor_evidence - partner_evidence))` to
+the loss, weighted by a reciprocal-rank weight `(1/rank_i) / sum(1/rank_n)`
+computed over that sample's intensity-sorted groups (rank 1 = most intense
+group), regardless of which tier the partner came from. A comparison
+involving the most intense group therefore contributes more to the total loss
+than an equally-sized comparison further down the ranking. Intensity values
+are still used to sort groups and to gate near-equal-intensity pairs in tiers
+1-2, but no longer serve as the weight magnitude directly. This avoids
+training mutually valid paths against each other.
+
+The diagnostic `pairwise_ranking_accuracy` metric (fed by `build_pairs()`)
+mirrors this same tiered selection, scoped per source fragment node instead of
+per sample; it therefore now also reflects tier-3 target-vs-background
+separation, which it did not before this design was introduced.
 
 A separate, unwired class, `FragmentEdgeAbsoluteRankerTrainingLoss`, implements
 an alternative smooth-OR-plus-BCE design (`group_score = logsumexp(...)`,
@@ -235,11 +251,61 @@ single currently preferred explanation is trained in one step without permanentl
 discarding other explanations. The selected structural edges are shared across
 conditions in the same stored tree.
 
+This sampler only runs when `max_edges_per_tree` (below) is `None`; the
+per-tree budget, when set, replaces it at both training and inference time.
+
 Pairwise ranking terms are weighted by reciprocal rank rather than by raw
 intensity (see "Current absolute_ranker loss" above), so a high-intensity
 target edge's comparisons already carry more weight than a low-intensity
 edge's. Capacity-adjusted recall for trees whose required targets exceed the
 configured budget is not yet implemented. See "Known limitations" below.
+
+### Per-tree expensive-edge budget (`max_edges_per_tree`)
+
+`max_edges_per_tree` (default 256, enabled out of the box) bounds how many
+distinct edges of one *stored tree* ever receive expensive attention-aware
+encoding, **shared across every MS/MS sample that references that tree** —
+unlike every other budget on this page, which is per-sample. A batch holding
+several stored trees (`--batch-size` > 1) gets this budget applied
+independently per tree, so the effective total scales with the number of
+trees in the batch (e.g. 256 x 2 trees ~ 512 edges attended).
+
+Edges are ranked once per forward call by summed cross-sample importance:
+
+```text
+importance(edge) = sum over samples s referencing edge e of
+    [ large constant, if e is a target/positive edge for s
+      else condition_edge_scorer(base_logit_e, condition_h_s) ]
+```
+
+independently within each tree, grouped via `FragmentTreeStructure.tree_sample_ptr`
+(which sample belongs to which stored tree) joined through `sample_edge_index`
+(which edges each sample references) — an edge no sample references has zero
+importance and is never worth the attention budget regardless of which tree
+it structurally belongs to, so only referenced edges are ever candidates; no
+separate edge-level tree boundary is needed. Scoring uses only cheap,
+no-attention primitives (`StructuralEdgeEncoder.encode_base` and
+`ConditionEdgeScorer`, both already used elsewhere in this pipeline). The
+target/positive bonus means a required target edge is never dropped in favor
+of a merely high-scoring non-target edge — though a tree whose target edges
+alone exceed the budget can still lose some; `tree_edge_budget/target_edge_recall`
+(see "TensorBoard layout" below) makes this measurable. Edges shared by many
+samples of the same tree accumulate more combined importance and are
+naturally favored.
+
+This mechanism applies identically to **both** training
+(`FragmentTreeCandidateSelector.forward`, replacing the whole-batch
+`_sample_training_edges` cap above whenever `max_edges_per_tree` is set) and
+inference/validation (`generate_depth_limited_candidates`, replacing today's
+"attend every stored edge" default). Validation-time spectrum generation
+(`predict_validation_msdataset`) already goes through the real,
+budget-respecting `FragmentTreeSpectrumPredictor`/`generate_depth_limited_candidates`
+path rather than a raw training forward pass, so it automatically inherits
+this budget too.
+
+Set `--max-edges-per-tree` to `None`/omit it to fully restore the previous
+behavior (unbounded attention at eval time, the whole-batch stochastic sampler
+at training time).
 
 ## Progressive frontier selection
 
@@ -536,6 +602,23 @@ which is **not currently instantiated** by `FragmentTreeTrainingModel` (see
 `metrics/...` cards today. `by_depth/...` breakdowns are likewise only
 implemented on that unwired class.
 
+### Per-tree edge budget metrics
+
+When `max_edges_per_tree` is set (the default), `FragmentTreeTrainingModel`
+reports, per training step:
+
+| Metric | Meaning |
+|---|---|
+| `tree_edge_budget/selected_edge_count` | Edges actually kept for expensive attention encoding, summed over every tree in the batch |
+| `tree_edge_budget/available_edge_count` | Edges referenced by at least one sample before the cap, summed over every tree in the batch (edges no sample references are never candidates) |
+| `tree_edge_budget/target_edge_recall` | Fraction of `target_edge_index` edges that survived the cap (quantifies the risk that a tree's required targets exceed its budget) |
+| `tree_edge_budget/trees_over_budget_fraction` | Fraction of trees in the batch whose available edge count exceeded `max_edges_per_tree` |
+| `tree_edge_budget/mean_samples_per_selected_edge` | How often a selected edge is actually shared by more than one sample of its tree |
+
+These flow through the same generic `metrics/<name>` cards as every other
+metric on this page, with the usual full `train_min...train_max` /
+`validation_min...validation_max` distribution series.
+
 ### Training-time metrics by adduct and collision-energy range
 
 `_edge_retain_metrics`, `_selected_peak_metrics`, and
@@ -683,6 +766,21 @@ Fragmenter, MolEncoder, shortest-path calculation, attention, and Graphormer.
 node limit is `max_next_cleavage_candidates`. The number of
 `max_edges_per_depth` values must exactly equal `fragmenter.tree_max_depth`; model
 construction raises `ValueError` otherwise.
+
+### Absolute ranker and edge budgets
+
+| Option | Default | Meaning |
+|---|---:|---|
+| `--max-edges-per-step` | 128 | Attention compute-chunk size in `StructuralEdgeEncoder.forward`; does not prune candidates |
+| `--max-retained-edges` | 30 | Per-sample beam width kept between progressive inference stages |
+| `--max-edges-per-tree` | 256 | Per-tree, cross-sample-shared budget on edges receiving expensive attention encoding (see "Per-tree expensive-edge budget" above); set to omit/`None` to disable |
+| `--edge-condition-interaction-dim` | 64 | Projection width for the edge x spectrum-condition dot-product score |
+| `--ranking-loss-weight` | 1.0 | Multiplier applied to the absolute edge-ranking loss inside the total loss |
+| `--top-n` | 10 | Total comparison partners per anchor group, capping tiers 1-3 combined |
+| `--nearest-lower-partners` | 1 | Tier 1: nearest lower-intensity partners always compared |
+| `--extended-lower-partners` | 3 | Tier 2: additional farther lower-intensity partners compared after tier 1 |
+| `--background-partners` | 10 | Tier 3: unassigned/background edges compared after tiers 1-2 |
+| `--ranking-intensity-threshold` | 0.05 | Minimum `sqrt(intensity)` gap required for an ordered tier 1/2 comparison |
 
 ### Condition encoder
 
@@ -960,5 +1058,13 @@ new embedding rows when loading the checkpoint.
 7. A dedicated worst-tree ID report is not yet implemented.
    - Distribution minima are logged, but the corresponding structure path is not
      yet written as TensorBoard text.
+8. `max_edges_per_tree` capacity is not adjusted per tree.
+   - A tree whose target/positive edges alone exceed the budget still loses
+     some of them; `tree_edge_budget/target_edge_recall` quantifies this but
+     nothing yet raises the budget or splits such a tree automatically.
+   - Enabling `max_edges_per_tree` (the default) also disables
+     `_sample_training_edges`'s stochastic exploration (random negatives,
+     softmax-sampled alternative paths) in favor of a deterministic
+     importance top-k; this trade-off has not been evaluated end-to-end.
 
 Keep this README synchronized with algorithm, configuration, and workflow changes.

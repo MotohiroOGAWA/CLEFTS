@@ -679,6 +679,9 @@ class TestFragmentTreeStructure(unittest.TestCase):
                 edge_index,
                 dtype=torch.long,
             ),
+            tree_sample_ptr=torch.tensor(
+                [0, len(sample_adduct_type_index)], dtype=torch.long
+            ),
             cleavage_event_edge_index=torch.tensor(
                 cleavage_event_edge_index,
                 dtype=torch.long,
