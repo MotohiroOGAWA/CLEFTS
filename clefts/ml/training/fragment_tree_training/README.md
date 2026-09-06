@@ -188,21 +188,35 @@ not materialize a `[num_samples, num_edges, hidden_dim]` tensor.
 
 ## Current absolute_ranker loss
 
-`target_edge_group_index` groups alternative edges that can explain the same
-target formula/m/z. These alternatives are not all forced to be positive. The
-group uses a smooth multiple-instance-learning OR:
+The absolute_ranker loss actually wired into training is
+`PairwiseEdgeIntensityRankingLoss` (`model.py`). `target_edge_group_index`
+groups alternative edges that can explain the same target formula/m/z. These
+alternatives are not all forced to be positive; instead their combined
+evidence is a smooth multiple-instance-learning OR:
 
 ```text
-group_score = logsumexp(alternative_edge_logits)
-positive component = mean(softplus(-group_score))
-negative component = BCEWithLogits(negative_logits, 0)
-loss = mean(available components)
+group_evidence = logsumexp(alternative_edge_logits)
 ```
 
-Thus one sufficiently strong explanation can satisfy a measured peak. Pairwise
-intensity ranking likewise uses the currently highest-scoring alternative as a
-latent representative and excludes the other alternatives from zero-intensity
-negative pairs. This avoids training mutually valid paths against each other.
+Per sample, groups are sorted by observed peak intensity (descending) and
+compared adjacently (RankNet-style): `softplus(-(higher_evidence -
+lower_evidence))`, skipping pairs whose `sqrt(intensity)` values differ by less
+than `intensity_threshold`. Groups also compete against a bounded set of
+zero-intensity background edges (the top `ranking_pairs_per_edge` hard
+negatives by base score). Each pair's loss term is weighted by a
+reciprocal-rank weight `(1/rank_i) / sum(1/rank_n)`, computed over that
+sample's intensity-sorted groups (rank 1 = most intense group), so a
+comparison involving the most intense group contributes more to the total
+loss than an equally-sized comparison further down the ranking. Intensity
+values are still used to sort groups and to gate near-equal-intensity pairs,
+but no longer serve as the weight magnitude directly. This avoids training
+mutually valid paths against each other.
+
+A separate, unwired class, `FragmentEdgeAbsoluteRankerTrainingLoss`, implements
+an alternative smooth-OR-plus-BCE design (`group_score = logsumexp(...)`,
+`positive = mean(softplus(-group_score))`, `negative =
+BCEWithLogits(negative_logits, 0)`) but is not instantiated anywhere in
+`FragmentTreeTrainingModel`; it exists only for its own unit test.
 
 ### Training-only influential-edge sampling
 
@@ -221,11 +235,11 @@ single currently preferred explanation is trained in one step without permanentl
 discarding other explanations. The selected structural edges are shared across
 conditions in the same stored tree.
 
-Important current limitation: the positive component is not yet weighted by
-`intensity / max_intensity`. A high-intensity target edge and a low-intensity
-target edge currently receive the same positive-edge weight. Capacity-adjusted
-recall for trees whose required targets exceed the configured budget is also not
-yet implemented. See "Known limitations" below.
+Pairwise ranking terms are weighted by reciprocal rank rather than by raw
+intensity (see "Current absolute_ranker loss" above), so a high-intensity
+target edge's comparisons already carry more weight than a low-intensity
+edge's. Capacity-adjusted recall for trees whose required targets exceed the
+configured budget is not yet implemented. See "Known limitations" below.
 
 ## Progressive frontier selection
 
@@ -455,10 +469,14 @@ diagnosis, enable it with `--detect-anomaly`; programmatic callers can pass
 The same metric's training and validation values are placed on one card. They are
 not separated into different cards.
 
-For every absolute_ranker metric, the card tag is:
+For every metric reported in `absolute_ranker_metrics` (every key returned by
+`PairwiseEdgeIntensityRankingLoss.metrics`, `_edge_retain_metrics`,
+`_selected_peak_metrics`, and `_intensity_similarity_metrics`, including the
+dynamic `by_adduct/...`/`by_ce_range/...` keys described below), the card tag
+is:
 
 ```text
-absolute_ranker/<metric>
+metrics/<metric>
 ```
 
 Its series include:
@@ -510,49 +528,54 @@ step; its exception is printed and no metric is fabricated for it.
 
 ### Overall absolute_ranker metrics
 
-| Metric | Meaning |
-|---|---|
-| `target_edge_recall` | Fraction of required edges retained naturally |
-| `target_group_recall` | Fraction of formula groups with at least one retained edge |
-| `target_node_recall` | Fraction of required target nodes retained naturally |
-| `original_edge_count` | Candidate edge count before selection |
-| `retained_edge_count` | Edge count after selection |
-| `pruned_fraction` | Fraction removed by preselection |
-| `over_limit` | Whether selection removed candidates |
+`target_edge_recall` / `target_group_recall` / `target_node_recall` /
+`original_edge_count` / `retained_edge_count` / `pruned_fraction` /
+`over_limit` are computed by `FragmentEdgeAbsoluteRankerTrainingLoss.metrics`,
+which is **not currently instantiated** by `FragmentTreeTrainingModel` (see
+"Current absolute_ranker loss" above) and therefore do not appear in
+`metrics/...` cards today. `by_depth/...` breakdowns are likewise only
+implemented on that unwired class.
 
-### Metrics by cleavage depth
+### Training-time metrics by adduct and collision-energy range
 
-Root outgoing edges are depth 1. The implementation computes shortest reachable
-node depths from every root and reports edge, group, and node recall for each stage:
+`_edge_retain_metrics`, `_selected_peak_metrics`, and
+`_intensity_similarity_metrics` (the metrics actually reported per training
+step) each also report a per-sample breakdown, grouped by adduct type and by
+collision-energy quartile bucket **within the current batch**:
 
 ```text
-absolute_ranker/by_depth/depth_1/target_edge_recall
-absolute_ranker/by_depth/depth_1/target_group_recall
-absolute_ranker/by_depth/depth_1/target_node_recall
-absolute_ranker/by_depth/depth_2/target_edge_recall
+metrics/by_adduct/[M+H]+/edge_retain_recall
+metrics/by_adduct/[M+H]+/peak_selection_precision
+metrics/by_adduct/[M+H]+/intensity_cosine_similarity
+metrics/by_ce_range/q1-to-median/edge_retain_recall
 ...
 ```
 
-Each depth card contains the same training/validation distribution series. This
-makes it possible to detect good overall recall that hides poor depth-2 or depth-3
-coverage.
+Adduct labels use their chemical string representation rather than internal
+names such as `adduct_0`; `/` inside a label is replaced with `∕` to avoid
+conflicting with TensorBoard's tag hierarchy, and missing labels are shown as
+`unknown-<index>`. CE buckets use the same readable labels as below. Each
+grouped key is averaged from the per-sample values of that group and, like
+every other metric, gets the full `train_min...train_max` /
+`validation_min...validation_max` series described above (aggregated across
+training steps, so the distribution reflects step-to-step variation for that
+group).
 
-### Metrics by adduct
+### Validation-time metrics by adduct and collision-energy range
 
-Adduct labels use their chemical string representation rather than internal names
-such as `adduct_0`:
+Independently, `evaluate_validation_cosine` groups the *validation-spectrum*
+cosine similarity and peak-selection metrics by adduct type
+(`target_dataset["AdductType"]`) and by CE quartile bucket
+(`target_dataset["CollisionEnergy"]`, quartiles computed over the validation
+split), reporting a genuine within-group distribution across spectra:
 
 ```text
-absolute_ranker/by_adduct/[M+H]+/target_edge_recall
+peak_selection/by_adduct/[M+H]+/cosine
+peak_selection/by_adduct/[M+H]+/selection_precision
+peak_selection/by_ce_range/q1-to-median/selection_recall
 ```
 
-`/` inside a label is replaced with `∕` to avoid conflicting with TensorBoard's
-tag hierarchy. Missing labels are shown as `unknown-<index>`.
-
-### Metrics by collision-energy range
-
-Finite CE values in an evaluation batch are divided using q1, median, and q3. Tags
-use readable labels:
+Collision-energy buckets use:
 
 ```text
 by_ce_range/min-to-q1
@@ -561,6 +584,13 @@ by_ce_range/median-to-q3
 by_ce_range/q3-to-max
 by_ce_range/non-finite
 ```
+
+`precursor_detection_*` has no per-spectrum value (it is already a
+corpus-wide confusion-matrix metric), so instead each present group gets its
+own precision/recall/f1/accuracy
+(`peak_selection/precursor_detection/by_adduct/[M+H]+/precision`), and the
+spread *across* groups is reported as a distribution
+(`peak_selection/precursor_detection/by_adduct_distribution/precision`).
 
 ## `max_samples` workflow setting
 
@@ -909,28 +939,25 @@ new embedding rows when loading the checkpoint.
 
 ## Known limitations and planned work
 
-1. Intensity weighting is not yet applied to absolute_ranker positives.
-   - `intensity / max_intensity` should weight edge and group losses.
-   - A small floor should preserve gradients for low-intensity targets.
-2. Continuation recall is not yet capacity-adjusted.
+1. Continuation recall is not yet capacity-adjusted.
    - Raw recall can be below one when more than three path nodes must continue
      fragmenting for one sample and depth, even under an oracle ranking.
    - Raw, weighted, oracle-at-budget, and capacity-adjusted recall should be logged
      separately and per depth.
-3. Fragmenter is not yet fully lazy.
+2. Fragmenter is not yet fully lazy.
    - Expensive model computation is frontier-limited, but stored candidate trees are
      currently materialized before model selection.
-4. `max_samples` is not yet connected to automatic structure slicing.
+3. `max_samples` is not yet connected to automatic structure slicing.
    - Pointer and sample-index remapping are required in the DataLoader path.
-5. Phase rollback is not implemented.
+4. Phase rollback is not implemented.
    - The current adaptive transition only moves from phase 0 to phase 1.
-6. Shortest-path calculation currently uses Python BFS.
+5. Shortest-path calculation currently uses Python BFS.
    - Distance-matrix caching or a batched implementation may be needed for large
      molecules and many events.
-7. CE ranges are batch-relative quartiles.
+6. CE ranges are batch-relative (training-batch or validation-split) quartiles.
    - Fixed physical CE boundaries should be configurable when cross-run comparison
      is required.
-8. A dedicated worst-tree ID report is not yet implemented.
+7. A dedicated worst-tree ID report is not yet implemented.
    - Distribution minima are logged, but the corresponding structure path is not
      yet written as TensorBoard text.
 

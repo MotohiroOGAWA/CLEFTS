@@ -16,6 +16,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 from ...common.progress import fixed_tqdm, iteration_edge_progress
+from . import metric_labels
 from .performance_profile import run_training_performance_profile
 from .workflow import run_shape_preflight
 
@@ -1061,10 +1062,8 @@ def run_epoch(
     def summarize_ranker(values_by_name: Dict[str, List[float]]) -> Dict[str, float]:
         summary: Dict[str, float] = {}
         for name, values in values_by_name.items():
-            array = np.asarray(values, dtype=np.float64)
-            summary[f"{name}_mean"] = float(array.mean())
-            for label, quantile in PEAK_SELECTION_QUANTILES:
-                summary[f"{name}_{label}"] = float(np.quantile(array, quantile))
+            for statistic, value in summarize_distribution(np.asarray(values)).items():
+                summary[f"{name}_{statistic}"] = value
         return summary
 
     for batch in iterator:
@@ -1360,13 +1359,17 @@ def calculate_precursor_detection_metrics(
     *,
     precursor_mz_column: str = PRECURSOR_MZ_COLUMN,
     mz_tolerance_da: float = PEAK_SELECTION_MZ_TOLERANCE_DA,
+    spectrum_indexes: Optional[np.ndarray] = None,
 ) -> Dict[str, float]:
     """Spectrum-level precision/recall/accuracy for detecting the precursor
     ion as an observed peak in the predicted spectrum.
 
     The precursor peak tends to dominate spectral similarity, so this is
     reported separately from (and in addition to) the fragment-peak
-    selection metrics.
+    selection metrics. ``spectrum_indexes`` restricts the confusion matrix to
+    a subset of spectra (e.g. spectra sharing an adduct type or a
+    collision-energy bucket); by default every spectrum is used, reproducing
+    the corpus-wide metric.
     """
     count = min(len(target_dataset), len(predicted_dataset))
     if count <= 0:
@@ -1394,6 +1397,14 @@ def calculate_precursor_detection_metrics(
             predicted_present[spectrum_index] = bool(
                 np.any(np.abs(predicted_data[p_start:p_end, 0] - pmz) <= mz_tolerance_da)
             )
+
+    if spectrum_indexes is not None:
+        subset = np.asarray(spectrum_indexes, dtype=np.int64)
+        target_present = target_present[subset]
+        predicted_present = predicted_present[subset]
+        count = int(subset.size)
+    if count <= 0:
+        return {name: float("nan") for name in PRECURSOR_DETECTION_METRIC_NAMES}
 
     true_positive = int(np.sum(target_present & predicted_present))
     false_positive = int(np.sum(~target_present & predicted_present))
@@ -1473,6 +1484,13 @@ def exclude_precursor_peaks(
 
 
 def summarize_distribution(values: np.ndarray) -> Dict[str, float]:
+    """Summarize a distribution as mean/min/q1/median/q3/max.
+
+    ``min``/``max`` are boxplot whiskers (the most extreme values still inside
+    ``[q1 - 1.5*iqr, q3 + 1.5*iqr]``), not the true extremes, so a handful of
+    outlier samples cannot dominate the reported range. ``q1``/``median``/``q3``
+    remain the plain quantiles.
+    """
     finite = np.asarray(values, dtype=np.float64)
     finite = finite[np.isfinite(finite)]
     if finite.size == 0:
@@ -1480,15 +1498,18 @@ def summarize_distribution(values: np.ndarray) -> Dict[str, float]:
             "mean": float("nan"),
             **{name: float("nan") for name, _ in PEAK_SELECTION_QUANTILES},
         }
-    quantiles = np.quantile(
-        finite, [quantile for _, quantile in PEAK_SELECTION_QUANTILES]
-    )
+    q1, median, q3 = np.quantile(finite, [0.25, 0.5, 0.75])
+    iqr = q3 - q1
+    inliers = finite[(finite >= q1 - 1.5 * iqr) & (finite <= q3 + 1.5 * iqr)]
+    min_value = float(inliers.min()) if inliers.size else float(q1)
+    max_value = float(inliers.max()) if inliers.size else float(q3)
     return {
         "mean": float(finite.mean()),
-        **{
-            name: float(quantiles[index])
-            for index, (name, _) in enumerate(PEAK_SELECTION_QUANTILES)
-        },
+        "min": min_value,
+        "q1": float(q1),
+        "median": float(median),
+        "q3": float(q3),
+        "max": max_value,
     }
 
 
@@ -1582,6 +1603,71 @@ def evaluate_validation_cosine(
     for name, value in precursor_detection.items():
         selection_summaries[name] = _scalar_summary(value)
 
+    # Adduct-type and collision-energy breakdown: every per-spectrum metric
+    # (cosine, peak-selection) gets a genuine within-group distribution;
+    # precursor detection has no per-spectrum value, so instead each group
+    # gets its own corpus-style precision/recall/f1/accuracy, and the spread
+    # *across* groups is reported as a distribution.
+    try:
+        adduct_values = np.asarray(target_dataset["AdductType"])[:count]
+        ce_values = np.asarray(target_dataset["CollisionEnergy"], dtype=np.float64)[:count]
+    except KeyError:
+        adduct_values = None
+        ce_values = None
+    if adduct_values is not None and ce_values is not None:
+        adduct_labels = np.asarray(
+            [metric_labels.tensorboard_label(str(value)) for value in adduct_values]
+        )
+        finite_ce = ce_values[np.isfinite(ce_values)]
+        if finite_ce.size:
+            ce_q1, ce_median, ce_q3 = np.quantile(finite_ce, [0.25, 0.5, 0.75])
+        else:
+            ce_q1 = ce_median = ce_q3 = 0.0
+        ce_labels = np.asarray([
+            metric_labels.ce_range_label(value, q1=ce_q1, median=ce_median, q3=ce_q3)
+            for value in ce_values
+        ])
+        groupings = {
+            "by_adduct": {
+                label: np.flatnonzero(adduct_labels == label)
+                for label in np.unique(adduct_labels)
+            },
+            "by_ce_range": {
+                label: np.flatnonzero(ce_labels == label)
+                for label in np.unique(ce_labels)
+            },
+        }
+        for group_kind, groups in groupings.items():
+            group_precursor_values: Dict[str, List[float]] = {
+                name: [] for name in PRECURSOR_DETECTION_METRIC_NAMES
+            }
+            for label, indexes in groups.items():
+                if indexes.size == 0:
+                    continue
+                selection_summaries[f"{group_kind}/{label}/cosine"] = summarize_distribution(
+                    scores[indexes]
+                )
+                for metric_name, values in selection_metrics.items():
+                    selection_summaries[
+                        f"{group_kind}/{label}/{metric_name}"
+                    ] = summarize_distribution(values[indexes])
+                group_precursor = calculate_precursor_detection_metrics(
+                    predicted_dataset, target_dataset, spectrum_indexes=indexes,
+                )
+                for name, value in group_precursor.items():
+                    short_name = name[len("precursor_detection_"):]
+                    selection_summaries[
+                        f"precursor_detection/{group_kind}/{label}/{short_name}"
+                    ] = _scalar_summary(value)
+                    group_precursor_values[name].append(value)
+            for name, collected in group_precursor_values.items():
+                if not collected:
+                    continue
+                short_name = name[len("precursor_detection_"):]
+                selection_summaries[
+                    f"precursor_detection/{group_kind}_distribution/{short_name}"
+                ] = summarize_distribution(np.asarray(collected))
+
     if selection_metric_means is not None:
         selection_metric_means.update(
             {name: summary["mean"] for name, summary in selection_summaries.items()}
@@ -1634,13 +1720,15 @@ def evaluate_validation_cosine(
                     + [summary[name] for name, _ in PEAK_SELECTION_QUANTILES]
                 )
     if writer is not None and global_step is not None:
+        distribution_stats = ("min", "q1", "mean", "median", "q3", "max")
         writer.add_scalar(
             "similarity/intensity_prediction_cosine",
             float(np.mean(scores)), int(global_step),
         )
-        writer.add_scalars(
+        add_scalars_if_finite(
+            writer,
             "similarity/intensity_prediction_cosine_distribution",
-            {name: cosine_summary[name] for name in ("q1", "median", "q3")},
+            {stat: cosine_summary[stat] for stat in distribution_stats},
             int(global_step),
         )
         excl_cosine_summary = selection_summaries["cosine_excl_precursor"]
@@ -1649,17 +1737,19 @@ def evaluate_validation_cosine(
                 "similarity/intensity_prediction_cosine_excl_precursor",
                 excl_cosine_summary["mean"], int(global_step),
             )
-            writer.add_scalars(
+            add_scalars_if_finite(
+                writer,
                 "similarity/intensity_prediction_cosine_excl_precursor_distribution",
-                {name: excl_cosine_summary[name] for name in ("q1", "median", "q3")},
+                {stat: excl_cosine_summary[stat] for stat in distribution_stats},
                 int(global_step),
             )
         for metric_name, summary in selection_summaries.items():
-            if math.isfinite(summary["mean"]):
-                writer.add_scalars(
-                    f"peak_selection/{metric_name}",
-                    {"validation": summary["mean"]}, int(global_step),
-                )
+            add_scalars_if_finite(
+                writer,
+                f"peak_selection/{metric_name}",
+                {f"validation_{stat}": summary[stat] for stat in distribution_stats},
+                int(global_step),
+            )
         log_validation_spectrum_quantiles(
             writer=writer,
             predicted_dataset=predicted_dataset,
@@ -1935,6 +2025,49 @@ def save_managed_checkpoint(
     ckpt_manager.update()
 
 
+def add_scalar_if_finite(writer, tag: str, value: float, step: int) -> None:
+    if not math.isnan(float(value)):
+        writer.add_scalar(tag, float(value), step)
+
+
+def add_scalars_if_finite(
+    writer,
+    main_tag: str,
+    values: Dict[str, float],
+    step: int,
+) -> None:
+    finite_values = {
+        key: float(value)
+        for key, value in values.items()
+        if not math.isnan(float(value))
+    }
+    if finite_values:
+        writer.add_scalars(main_tag, finite_values, step)
+
+
+def log_distribution_cards(
+    writer,
+    namespace: str,
+    summaries: Dict[str, Dict[str, float]],
+    step: int,
+) -> None:
+    """One card per metric, containing every split and statistic."""
+    statistics = ("min", "q1", "mean", "median", "q3", "max")
+    grouped: Dict[str, Dict[str, float]] = {}
+    for split, summary in summaries.items():
+        for name, value in summary.items():
+            for statistic in statistics:
+                suffix = f"_{statistic}"
+                if name.endswith(suffix):
+                    metric = name[: -len(suffix)]
+                    grouped.setdefault(metric, {})[
+                        f"{split}_{statistic}"
+                    ] = value
+                    break
+    for metric, values in grouped.items():
+        add_scalars_if_finite(writer, f"{namespace}/{metric}", values, step)
+
+
 def main(
     *,
     model_config: Dict[str, Any],
@@ -2047,44 +2180,6 @@ def main(
             collate_fn=collate_fragment_tree_structure_items,
         )
 
-    def add_scalar_if_finite(tag: str, value: float, step: int) -> None:
-        if not math.isnan(float(value)):
-            writer.add_scalar(tag, float(value), step)
-
-    def add_scalars_if_finite(
-        main_tag: str,
-        values: Dict[str, float],
-        step: int,
-    ) -> None:
-        finite_values = {
-            key: float(value)
-            for key, value in values.items()
-            if not math.isnan(float(value))
-        }
-        if finite_values:
-            writer.add_scalars(main_tag, finite_values, step)
-
-    def log_distribution_cards(
-        namespace: str,
-        summaries: Dict[str, Dict[str, float]],
-        step: int,
-    ) -> None:
-        """One card per metric, containing every split and statistic."""
-        statistics = ("min", "q1", "mean", "median", "q3", "max")
-        grouped: Dict[str, Dict[str, float]] = {}
-        for split, summary in summaries.items():
-            for name, value in summary.items():
-                for statistic in statistics:
-                    suffix = f"_{statistic}"
-                    if name.endswith(suffix):
-                        metric = name[: -len(suffix)]
-                        grouped.setdefault(metric, {})[
-                            f"{split}_{statistic}"
-                        ] = value
-                        break
-        for metric, values in grouped.items():
-            add_scalars_if_finite(f"{namespace}/{metric}", values, step)
-
     def evaluate_current_validation(
         desc: str,
         *,
@@ -2113,11 +2208,13 @@ def main(
                 if excluded_metrics.samples else metrics
             )
             add_scalars_if_finite(
+                writer,
                 "validation_scope/loss",
                 {"filtered": metrics.loss, "unfiltered": unfiltered_metrics.loss},
                 step_value,
             )
             log_distribution_cards(
+                writer,
                 "validation_scope/absolute_ranker",
                 {"filtered": metrics.absolute_ranker_summary,
                  "below_threshold": excluded_metrics.absolute_ranker_summary},
@@ -2162,6 +2259,7 @@ def main(
             else:
                 unfiltered_cosine = cosine
             add_scalars_if_finite(
+                writer,
                 "validation_scope/cosine",
                 {"filtered": cosine, "below_threshold": excluded_cosine,
                  "unfiltered": unfiltered_cosine}, step_value,
@@ -2171,6 +2269,7 @@ def main(
                     run_dir / "validation", step_value
                 )
                 add_scalars_if_finite(
+                    writer,
                     "validation_scope/unfiltered_cosine_distribution",
                     {name: combined_cosine[name] for name in ("q1", "median", "q3")},
                     step_value,
@@ -2229,23 +2328,26 @@ def main(
         ckpt_manager.log_metrics(**metric_row)
         ckpt_manager.flush_metrics(flush_dir=str(run_dir))
         add_scalars_if_finite(
+            writer,
             "loss/total",
             {"train": train_metrics.loss, "train_window": window_metrics.loss,
              "validation": val_metrics.loss}, step_value,
         )
         add_scalars_if_finite(
+            writer,
             "loss/selection",
             {"train": train_metrics.selection_loss,
              "train_window": window_metrics.selection_loss,
              "validation": val_metrics.selection_loss}, step_value,
         )
         add_scalars_if_finite(
+            writer,
             "loss/intensity",
             {"train": train_metrics.intensity_loss,
              "train_window": window_metrics.intensity_loss,
              "validation": val_metrics.intensity_loss}, step_value,
         )
-        add_scalar_if_finite("similarity/validation/cosine", val_cosine, step_value)
+        add_scalar_if_finite(writer, "similarity/validation/cosine", val_cosine, step_value)
         # Write the requested headline metrics into the root event file as
         # ordinary scalars. SummaryWriter.add_scalars stores series in child
         # event directories, which makes them easy to miss when TensorBoard is
@@ -2255,29 +2357,23 @@ def main(
             ("train_window", window_metrics),
             ("validation", val_metrics),
         ):
-            add_scalar_if_finite(f"{split}/loss/total", metrics.loss, step_value)
+            add_scalar_if_finite(writer, f"{split}/loss/total", metrics.loss, step_value)
             add_scalar_if_finite(
-                f"{split}/loss/selection", metrics.selection_loss, step_value
+                writer, f"{split}/loss/selection", metrics.selection_loss, step_value
             )
             add_scalar_if_finite(
-                f"{split}/loss/intensity", metrics.intensity_loss, step_value
+                writer, f"{split}/loss/intensity", metrics.intensity_loss, step_value
             )
-        # One TensorBoard card per metric, with train and validation as series.
-        # Means are sufficient here; distribution quantiles are intentionally
-        # not expanded into dozens of cards.
-        for name in edge_metric_names:
-            add_scalars_if_finite(
-                f"metrics/{name}",
-                {
-                    "train": train_metrics.absolute_ranker_summary.get(
-                        f"{name}_mean", float("nan")
-                    ),
-                    "validation": val_metrics.absolute_ranker_summary.get(
-                        f"{name}_mean", float("nan")
-                    ),
-                },
-                step_value,
-            )
+        # One TensorBoard card per metric (including dynamic by_adduct/by_ce_range
+        # keys), with a full min/q1/mean/median/q3/max series for both train and
+        # validation.
+        log_distribution_cards(
+            writer,
+            "metrics",
+            {"train": train_metrics.absolute_ranker_summary,
+             "validation": val_metrics.absolute_ranker_summary},
+            step_value,
+        )
         writer.add_scalar("training/phase", int(model.training_phase.item()), step_value)
         writer.add_scalar("optimizer/lr", lr, step_value)
         writer.flush()

@@ -83,6 +83,53 @@ class TestFragmentTreeValidationMetrics(unittest.TestCase):
         self.assertAlmostEqual(metrics["precursor_detection_accuracy"], 0.5)
         self.assertAlmostEqual(metrics["precursor_detection_f1"], 2 / 3)
 
+    def test_precursor_detection_metrics_spectrum_indexes_matches_manual_subset(self):
+        target = _dataset(
+            [
+                np.array([[100.0, 10.0], [101.0, 5.0], [300.0, 1.0]]),
+                np.array([[300.0, 8.0]]),
+                np.array([[300.0, 8.0]]),
+            ],
+            precursor_mz=[300.0, 300.0, 300.0],
+        )
+        predicted = _dataset(
+            [
+                np.array([[100.005, 1.0], [300.001, 0.5], [110.0, 0.2]]),
+                np.array([[301.0, 1.0]]),
+                np.array([[300.0, 1.0]]),
+            ],
+            precursor_mz=[300.0, 300.0, 300.0],
+        )
+
+        # Omitting spectrum_indexes reproduces the full corpus-wide result.
+        full = calculate_precursor_detection_metrics(predicted, target)
+        full_manual = calculate_precursor_detection_metrics(
+            predicted, target, spectrum_indexes=np.array([0, 1, 2])
+        )
+        for name in full:
+            self.assertAlmostEqual(full[name], full_manual[name])
+
+        # A subset (spectra 0 and 2: both true positives) should reproduce
+        # what manually pre-filtering the datasets to that subset would give.
+        subset_metrics = calculate_precursor_detection_metrics(
+            predicted, target, spectrum_indexes=np.array([0, 2])
+        )
+        self.assertAlmostEqual(subset_metrics["precursor_detection_precision"], 1.0)
+        self.assertAlmostEqual(subset_metrics["precursor_detection_recall"], 1.0)
+        self.assertAlmostEqual(subset_metrics["precursor_detection_accuracy"], 1.0)
+
+    def test_summarize_distribution_excludes_outliers_from_min_max(self):
+        values = np.array([1.0, 2.0, 3.0, 4.0, 5.0, 100.0])
+        summary = summarize_distribution(values)
+
+        # q1=2.25, q3=4.75, iqr=2.5 -> fence = [-1.5, 8.5]; 100.0 is an
+        # outlier and must not become the reported max.
+        self.assertAlmostEqual(summary["q3"], 4.75)
+        self.assertLess(summary["max"], 100.0)
+        self.assertAlmostEqual(summary["max"], 5.0)
+        self.assertAlmostEqual(summary["min"], 1.0)
+        self.assertAlmostEqual(summary["mean"], values.mean())
+
     def test_exclude_precursor_peaks_removes_only_matching_peaks(self):
         dataset = _dataset(
             [

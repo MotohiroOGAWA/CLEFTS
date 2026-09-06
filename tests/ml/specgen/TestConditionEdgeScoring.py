@@ -77,6 +77,44 @@ def test_ranking_threshold_ignores_nearly_equal_intensities():
     assert better.numel() == worse.numel() == 0
 
 
+def _three_group_ranking_fixture(logits):
+    """One sample, three intensity-ordered groups (rank1 > rank2 > rank3),
+    each explained by exactly one edge, and no unassigned background edges."""
+    batch = SimpleNamespace(
+        edge_id_global=torch.tensor([10, 11, 12]),
+        edge_index=torch.tensor([[0, 0, 0], [1, 2, 3]]),
+        batch=torch.tensor([0, 0, 0, 0]),
+        kept_sample_ids=torch.tensor([0]),
+    )
+    output = SimpleNamespace(
+        edge_absolute_logit=torch.tensor(logits), sample_tree_batch=batch
+    )
+    target = SimpleNamespace(
+        target_edge_index=torch.tensor([[0, 0, 0], [10, 11, 12]]),
+        target_edge_group_index=torch.tensor([0, 1, 2]),
+        formula_peak_index=torch.tensor([0, 1, 2]),
+        sample_peak_intensity=torch.tensor([3.0, 2.0, 1.0]),
+    )
+    return output, target
+
+
+def test_ranking_weight_favors_higher_intensity_rank_over_raw_intensity():
+    """A rank-1-vs-rank-2 inversion must outweigh an equally-sized
+    rank-2-vs-rank-3 inversion, since the loss is now weighted by
+    (1/rank)/sum(1/rank) rather than by the raw intensity value."""
+    loss_fn = PairwiseEdgeIntensityRankingLoss()
+
+    # rank1 loses to rank2 (bad); rank2 clearly beats rank3 (fine).
+    high_rank_inversion, target_a = _three_group_ranking_fixture([-1.0, 1.0, -5.0])
+    # rank1 clearly beats rank2 (fine); rank2 loses to rank3 (bad), same gap.
+    low_rank_inversion, target_b = _three_group_ranking_fixture([5.0, -1.0, 1.0])
+
+    loss_high_rank = loss_fn(high_rank_inversion, target_a)
+    loss_low_rank = loss_fn(low_rank_inversion, target_b)
+
+    assert loss_high_rank > loss_low_rank
+
+
 class _Selector(nn.Module):
     def __init__(self, output):
         super().__init__()
@@ -98,6 +136,38 @@ def test_zero_ranking_weight_removes_ranking_from_total_loss():
     model = FragmentTreeTrainingModel(_Selector(output), loss_fn=_ConstantLoss())
     result = model(target)
     assert torch.allclose(result["edge_total_loss"], result["edge_retain_loss"])
+
+
+def test_edge_retain_metrics_break_down_by_adduct():
+    batch = SimpleNamespace(
+        edge_id_global=torch.tensor([100, 101, 102, 103]),
+        edge_index=torch.tensor([[0, 0, 2, 2], [1, 1, 3, 3]]),
+        batch=torch.tensor([0, 0, 1, 1]),
+        kept_sample_ids=torch.tensor([0, 1]),
+    )
+    # sample 0: neither edge is correctly predicted (miss + false positive).
+    # sample 1: both edges are correctly predicted.
+    output = SimpleNamespace(
+        edge_absolute_logit=torch.tensor([-1.0, 1.0, 1.0, 1.0]), sample_tree_batch=batch
+    )
+    target = SimpleNamespace(
+        target_edge_index=torch.tensor([[0, 1, 1], [100, 102, 103]]),
+        sample_adduct_type_index=torch.tensor([0, 1]),
+        sample_ce_value=torch.tensor([10.0, 20.0]),
+    )
+    selector = _Selector(output)
+    selector.feature_model.main_adduct_types = {0: "[M+H]+", 1: "[M+Na]+"}
+    model = FragmentTreeTrainingModel(selector, loss_fn=_ConstantLoss())
+
+    metrics = model._edge_retain_metrics(output, target)
+
+    assert metrics["edge_retain_recall"] == 2 / 3
+    assert metrics["by_adduct/[M+H]+/edge_retain_recall"] == 0.0
+    assert metrics["by_adduct/[M+Na]+/edge_retain_recall"] == 1.0
+    assert metrics["by_adduct/[M+H]+/edge_retain_precision"] == 0.0
+    assert metrics["by_adduct/[M+Na]+/edge_retain_precision"] == 1.0
+    assert metrics["by_adduct/[M+H]+/edge_retain_accuracy"] == 0.0
+    assert metrics["by_adduct/[M+Na]+/edge_retain_accuracy"] == 1.0
 
 
 def test_cleave_targets_come_from_stored_expand_paths():

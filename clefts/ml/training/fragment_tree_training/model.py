@@ -9,6 +9,7 @@ from torch import Tensor
 from ...input.training_fragment_tree_structure import TrainingFragmentTreeStructure
 from ...specgen.fragment_tree_candidate_selector import FragmentTreeCandidateSelectionOutput
 from ...specgen.fragment_tree_formula_intensity_model import FragmentTreeFormulaIntensityPredictor
+from . import metric_labels
 
 
 class PairwiseEdgeIntensityRankingLoss(nn.Module):
@@ -16,7 +17,11 @@ class PairwiseEdgeIntensityRankingLoss(nn.Module):
 
     Only adjacent unequal-intensity targets and target-vs-background pairs are
     used.  This retains RankNet's ordering objective without constructing the
-    quadratic set of every possible pair.
+    quadratic set of every possible pair. Each pair is weighted by a
+    reciprocal-rank weight ``(1/rank_i) / sum(1/rank_n)`` computed over the
+    sample's intensity-sorted groups (rank 1 = most intense), not by the raw
+    intensity value itself; intensity is still used to sort groups and to
+    gate near-equal-intensity pairs via ``intensity_threshold``.
     """
 
     def __init__(
@@ -151,11 +156,22 @@ class PairwiseEdgeIntensityRankingLoss(nn.Module):
                 intensity = intensities[formula_peak[int(group_id)]]
                 group_rows.append((evidence, intensity))
             group_rows.sort(key=lambda item: float(item[1]), reverse=True)
-            for high, low in zip(group_rows, group_rows[1:]):
+            # Reciprocal-rank weight (1/rank_i) / sum(1/rank_n), normalized
+            # within this sample's intensity-sorted groups: rank 1 (the most
+            # intense group) carries the most weight. This replaces the raw
+            # intensity value as the per-pair loss weight below.
+            rank_weights = logit.new_empty((0,))
+            if group_rows:
+                ranks = torch.arange(
+                    1, len(group_rows) + 1, dtype=torch.float32, device=logit.device
+                )
+                reciprocal_ranks = 1.0 / ranks
+                rank_weights = reciprocal_ranks / reciprocal_ranks.sum()
+            for index, (high, low) in enumerate(zip(group_rows, group_rows[1:])):
                 if float(torch.sqrt(high[1]) - torch.sqrt(low[1])) <= self.intensity_threshold:
                     continue
                 losses.append(F.softplus(-(high[0] - low[0])))
-                weights.append(high[1].clamp_min(1e-12))
+                weights.append(rank_weights[index])
             # Observed formula groups also compete against unassigned edges,
             # including edges at the same depth.  Bound this comparison count.
             background = torch.tensor([
@@ -165,11 +181,11 @@ class PairwiseEdgeIntensityRankingLoss(nn.Module):
             if background.numel() and group_rows:
                 hard = background[torch.topk(logit[background], k=min(self.ranking_pairs_per_edge, int(background.numel()))).indices]
                 background_evidence = torch.logsumexp(logit[hard], dim=0)
-                for evidence, intensity in group_rows[: self.ranking_pairs_per_edge]:
+                for index, (evidence, intensity) in enumerate(group_rows[: self.ranking_pairs_per_edge]):
                     if float(intensity) <= 0:
                         continue
                     losses.append(F.softplus(-(evidence - background_evidence)))
-                    weights.append(intensity.clamp_min(1e-12))
+                    weights.append(rank_weights[index])
         if not losses:
             return logit.sum() * 0.0
         loss_values = torch.stack(losses)
@@ -1276,7 +1292,7 @@ class FragmentTreeTrainingModel(nn.Module):
         )
         self._checkpoint_model_config: Dict[str, Any] = {}
         feature_model = candidate_selector.feature_model
-        adduct_labels = {
+        self.adduct_labels = {
             int(index): str(adduct)
             for index, adduct in feature_model.main_adduct_types.items()
         }
@@ -1343,9 +1359,53 @@ class FragmentTreeTrainingModel(nn.Module):
             "absolute_ranker_metrics": absolute_ranker_metrics,
         }
 
-    @staticmethod
+    def _grouped_metric_means(
+        self,
+        per_sample_values_by_metric: Dict[str, Dict[int, float]],
+        target,
+    ) -> Dict[str, float]:
+        """Group per-sample metric values by adduct type and CE bucket.
+
+        Returns flat ``by_adduct/<label>/<metric>`` and
+        ``by_ce_range/<label>/<metric>`` keys, each the mean of the
+        per-sample values whose sample falls in that group. Grouping is
+        computed once here and shared by every caller's metric.
+        """
+        if not any(per_sample_values_by_metric.values()):
+            return {}
+        if not hasattr(target, "sample_adduct_type_index") or not hasattr(target, "sample_ce_value"):
+            return {}
+        adduct_index = target.sample_adduct_type_index.detach().cpu().long()
+        ce_values = target.sample_ce_value.detach().cpu().float()
+        finite_ce = ce_values[torch.isfinite(ce_values)]
+        if finite_ce.numel():
+            ce_q1, ce_median, ce_q3 = torch.quantile(
+                finite_ce, torch.tensor([0.25, 0.5, 0.75])
+            ).tolist()
+        else:
+            ce_q1 = ce_median = ce_q3 = 0.0
+        grouped: Dict[str, float] = {}
+        for metric_name, values_by_sample in per_sample_values_by_metric.items():
+            by_adduct: Dict[str, List[float]] = {}
+            by_ce: Dict[str, List[float]] = {}
+            for sample_id, value in values_by_sample.items():
+                adduct = int(adduct_index[sample_id].item())
+                adduct_label = metric_labels.tensorboard_label(
+                    self.adduct_labels.get(adduct, f"unknown-{adduct}")
+                )
+                by_adduct.setdefault(adduct_label, []).append(value)
+                ce_label = metric_labels.ce_range_label(
+                    float(ce_values[sample_id].item()), q1=ce_q1, median=ce_median, q3=ce_q3
+                )
+                by_ce.setdefault(ce_label, []).append(value)
+            for label, values in by_adduct.items():
+                grouped[f"by_adduct/{label}/{metric_name}"] = sum(values) / len(values)
+            for label, values in by_ce.items():
+                grouped[f"by_ce_range/{label}/{metric_name}"] = sum(values) / len(values)
+        return grouped
+
     @torch.no_grad()
-    def _edge_retain_metrics(output, target) -> Dict[str, float]:
+    def _edge_retain_metrics(self, output, target) -> Dict[str, float]:
         logits = output.edge_absolute_logit
         sample_tree_batch = output.sample_tree_batch
         if logits.numel() == 0:
@@ -1369,15 +1429,35 @@ class FragmentTreeTrainingModel(nn.Module):
         )
         predicted = logits > 0
         true_positive = int((predicted & truth).sum().item())
-        return {
+        metrics = {
             "edge_retain_accuracy": float((predicted == truth).float().mean().item()),
             "edge_retain_precision": true_positive / max(int(predicted.sum().item()), 1),
             "edge_retain_recall": true_positive / max(int(truth.sum().item()), 1),
         }
+        per_sample: Dict[str, Dict[int, float]] = {
+            "edge_retain_accuracy": {},
+            "edge_retain_precision": {},
+            "edge_retain_recall": {},
+        }
+        for sample_id in sample_ids.unique(sorted=True).tolist():
+            sample_mask = sample_ids == int(sample_id)
+            sample_predicted = predicted[sample_mask]
+            sample_truth = truth[sample_mask]
+            sample_true_positive = int((sample_predicted & sample_truth).sum().item())
+            per_sample["edge_retain_accuracy"][int(sample_id)] = float(
+                (sample_predicted == sample_truth).float().mean().item()
+            )
+            per_sample["edge_retain_precision"][int(sample_id)] = sample_true_positive / max(
+                int(sample_predicted.sum().item()), 1
+            )
+            per_sample["edge_retain_recall"][int(sample_id)] = sample_true_positive / max(
+                int(sample_truth.sum().item()), 1
+            )
+        metrics.update(self._grouped_metric_means(per_sample, target))
+        return metrics
 
-    @staticmethod
     @torch.no_grad()
-    def _selected_peak_metrics(output, target) -> Dict[str, float]:
+    def _selected_peak_metrics(self, output, target) -> Dict[str, float]:
         selected_nodes = {
             (int(candidate.sample_id), int(candidate.global_node_id))
             for candidate in output.kept_candidates
@@ -1410,6 +1490,10 @@ class FragmentTreeTrainingModel(nn.Module):
         total = float(target.sample_peak_intensity.detach().cpu().clamp_min(0).sum().item())
         precursor_covered = 0.0
         precursor_total = 0.0
+        sample_covered: Dict[int, float] = {}
+        sample_total: Dict[int, float] = {}
+        sample_precursor_covered: Dict[int, float] = {}
+        sample_precursor_total: Dict[int, float] = {}
         sample_ids = target.target_sample_index.detach().cpu().long()
         peak_ids = target.target_peak_index.detach().cpu().long()
         node_ids = target.target_node_index.detach().cpu().long()
@@ -1428,12 +1512,20 @@ class FragmentTreeTrainingModel(nn.Module):
                 is_hit = any(
                     (sample_id, int(node_id)) in selected_nodes for node_id in peak_node_ids
                 )
+                sample_total[sample_id] = sample_total.get(sample_id, 0.0) + peak_intensity
                 if is_hit:
                     covered += peak_intensity
+                    sample_covered[sample_id] = sample_covered.get(sample_id, 0.0) + peak_intensity
                 if is_precursor_peak:
                     precursor_total += peak_intensity
+                    sample_precursor_total[sample_id] = (
+                        sample_precursor_total.get(sample_id, 0.0) + peak_intensity
+                    )
                     if is_hit:
                         precursor_covered += peak_intensity
+                        sample_precursor_covered[sample_id] = (
+                            sample_precursor_covered.get(sample_id, 0.0) + peak_intensity
+                        )
 
         precursor_target_nodes = target_nodes & precursor_pairs
         precursor_selected_nodes = selected_nodes & precursor_pairs
@@ -1465,12 +1557,88 @@ class FragmentTreeTrainingModel(nn.Module):
                     precursor_covered / precursor_total if precursor_total > 0 else 1.0
                 ),
             })
+
+        # Per-sample breakdown, grouped by adduct type and CE bucket. Node
+        # sets are partitioned by sample once, rather than rescanning each
+        # full set per sample.
+        universe_by_sample: Dict[int, set] = {}
+        selected_by_sample: Dict[int, set] = {}
+        target_by_sample: Dict[int, set] = {}
+        precursor_by_sample: Dict[int, set] = {}
+        precursor_target_by_sample: Dict[int, set] = {}
+        precursor_selected_by_sample: Dict[int, set] = {}
+        for pair in universe:
+            universe_by_sample.setdefault(pair[0], set()).add(pair)
+        for pair in selected_nodes:
+            selected_by_sample.setdefault(pair[0], set()).add(pair)
+        for pair in target_nodes:
+            target_by_sample.setdefault(pair[0], set()).add(pair)
+        for pair in precursor_pairs:
+            precursor_by_sample.setdefault(pair[0], set()).add(pair)
+        for pair in precursor_target_nodes:
+            precursor_target_by_sample.setdefault(pair[0], set()).add(pair)
+        for pair in precursor_selected_nodes:
+            precursor_selected_by_sample.setdefault(pair[0], set()).add(pair)
+
+        per_sample: Dict[str, Dict[int, float]] = {
+            "peak_selection_accuracy": {},
+            "peak_selection_precision": {},
+            "peak_selection_recall": {},
+            "selected_peak_intensity_coverage": {},
+            "precursor/peak_selection_accuracy": {},
+            "precursor/peak_selection_precision": {},
+            "precursor/peak_selection_recall": {},
+            "precursor/selected_peak_intensity_coverage": {},
+        }
+        for sample_id, sample_universe in universe_by_sample.items():
+            sample_selected = selected_by_sample.get(sample_id, set())
+            sample_target = target_by_sample.get(sample_id, set())
+            sample_tp = len(sample_selected & sample_target)
+            sample_tn = len(sample_universe - sample_selected - sample_target)
+            per_sample["peak_selection_accuracy"][sample_id] = (
+                (sample_tp + sample_tn) / max(len(sample_universe), 1)
+            )
+            per_sample["peak_selection_precision"][sample_id] = sample_tp / max(
+                len(sample_selected), 1
+            )
+            per_sample["peak_selection_recall"][sample_id] = sample_tp / max(
+                len(sample_target), 1
+            )
+        for sample_id, total_intensity in sample_total.items():
+            per_sample["selected_peak_intensity_coverage"][sample_id] = (
+                sample_covered.get(sample_id, 0.0) / max(total_intensity, 1e-12)
+            )
+        for sample_id, sample_precursor_pairs in precursor_by_sample.items():
+            sample_precursor_selected = precursor_selected_by_sample.get(sample_id, set())
+            sample_precursor_target = precursor_target_by_sample.get(sample_id, set())
+            sample_precursor_tp = len(sample_precursor_selected & sample_precursor_target)
+            sample_precursor_tn = len(
+                sample_precursor_pairs - sample_precursor_selected - sample_precursor_target
+            )
+            per_sample["precursor/peak_selection_accuracy"][sample_id] = (
+                (sample_precursor_tp + sample_precursor_tn) / max(len(sample_precursor_pairs), 1)
+            )
+            per_sample["precursor/peak_selection_precision"][sample_id] = (
+                sample_precursor_tp / max(len(sample_precursor_selected), 1)
+                if sample_precursor_selected
+                else (1.0 if not sample_precursor_target else 0.0)
+            )
+            per_sample["precursor/peak_selection_recall"][sample_id] = sample_precursor_tp / max(
+                len(sample_precursor_target), 1
+            )
+            precursor_total_intensity = sample_precursor_total.get(sample_id, 0.0)
+            per_sample["precursor/selected_peak_intensity_coverage"][sample_id] = (
+                sample_precursor_covered.get(sample_id, 0.0) / precursor_total_intensity
+                if precursor_total_intensity > 0
+                else 1.0
+            )
+        metrics.update(self._grouped_metric_means(per_sample, target))
         return metrics
 
-    @staticmethod
     @torch.no_grad()
-    def _intensity_similarity_metrics(intensity_output, target) -> Dict[str, float]:
+    def _intensity_similarity_metrics(self, intensity_output, target) -> Dict[str, float]:
         values: List[float] = []
+        values_by_sample: Dict[int, float] = {}
         device = intensity_output.logit.device
         for sample_id in intensity_output.sample_index.detach().cpu().unique(sorted=True).tolist():
             mask = intensity_output.sample_index == int(sample_id)
@@ -1481,5 +1649,13 @@ class FragmentTreeTrainingModel(nn.Module):
             )
             prediction = intensity_output.logit[index].float().clamp_min(0)
             if truth.numel() and float(truth.norm().item()) > 0 and float(prediction.norm().item()) > 0:
-                values.append(float(F.cosine_similarity(prediction[None], truth.float()[None]).item()))
-        return {"intensity_cosine_similarity": sum(values) / len(values) if values else 0.0}
+                value = float(F.cosine_similarity(prediction[None], truth.float()[None]).item())
+                values.append(value)
+                values_by_sample[int(sample_id)] = value
+        metrics = {"intensity_cosine_similarity": sum(values) / len(values) if values else 0.0}
+        metrics.update(
+            self._grouped_metric_means(
+                {"intensity_cosine_similarity": values_by_sample}, target
+            )
+        )
+        return metrics
