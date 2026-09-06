@@ -38,16 +38,25 @@ dimensions, layer counts, and dropout are not preprocessing inputs.
 Both `--train-input` and `--output-dir` are required. Reusing the same output directory without `--overwrite` resumes training: existing SMILES structure files are skipped and missing ones are built. Validation sampling starts only after this training pass has completed, and its maximum Tanimoto values are calculated against the SMILES in the completed files under `train_structures/data`.
 
 The immutable preprocessing settings are saved in
-`config/preprocessing_config.json`. They contain `symbols`, normalized
+`config/preprocessing_config.pftprep.json`. They contain `symbols`, normalized
 `fragmenter_params`, `max_node`, and `max_edge`; they do not contain neural-network
 dimensions, layer counts, or dropout. Training validates the model's symbols and
 fragmenter definitions against this file before constructing the model.
+
+The `.pftprep.json` double extension is CLEFTS's dedicated marker for this file
+kind (matching `.pft.json`/`.pfttrain.json`/`.clevageset.json` elsewhere in the
+Workbench), not just a plain `.json`. Structure directories created before this
+convention was introduced still load correctly: every reader
+(`find_previous_preprocessing_config`, `load_and_validate_split_preprocessing`,
+`validate_preprocessing_compatibility`, and the Workbench's fragment-tree-result
+inspector) falls back to the legacy plain `preprocessing_config.json` name when
+the dedicated one is absent. New runs always write the dedicated name.
 
 ## Main output files
 
 ```text
 OUTPUT_DIR/
-├── config/preprocessing_config.json
+├── config/preprocessing_config.pftprep.json
 ├── statistics/
 │   ├── train_assigned_cleavage_events.tsv
 │   ├── train_assigned_cleavage_events_by_sample.tsv
@@ -112,7 +121,7 @@ The compact label uses the actual atom and bond types at the matched reactant at
 
 - `--max-node`, `--max-edge`: Fragment tree size limits. Use `-1` for no limit.
 - `--num-workers`: Use two or more subprocess workers to process SMILES groups in parallel. SMARTS statistics are calculated once per split by the parent process.
-- `--chunk-size`: Number of SMILES groups assigned to each parallel chunk.
+- `--chunk-size`: Number of SMILES groups assigned to each parallel chunk. When `num_workers * chunk_size` exceeds the split's unique SMILES count, it is automatically reduced to `max(1, unique_smiles_count // num_workers)`. Training and validation are adjusted independently.
 - `--smiles-column`: Name of the SMILES metadata column. The default is `SMILES`.
 - `--symbols`: Element symbols that define the atom-feature columns. This is required and immutable for generated data.
 - `--validation-smiles-ratio`: Target validation count divided by unique training SMILES count. The unit is SMILES, not spectrum records.
@@ -126,3 +135,17 @@ Display all available options with:
 ```bash
 python -m clefts.ml.data_preparation.fragment_tree.create_fragment_tree_training_data --help
 ```
+
+## Restoring settings and inline Fragmenter parameters
+
+Every parent CLI run writes `fragment-tree.pft.json` containing input/output options
+and the complete `fragmenterParams` object. Load it with Workbench's Load Configuration.
+The immutable `config/preprocessing_config.pftprep.json` continues to describe only
+the structure preprocessing settings.
+
+Use `--params-json '{"fragment_ion_tree_builder": ...}'` to pass Fragmenter values
+directly (the value must be a complete valid JSON object). `--params PATH` remains
+available for existing scripts; the two options are mutually exclusive. Parallel
+workers receive the same embedded values via `--params-json`. The
+`clefts train create-fragment-tree-data` command also accepts an inline JSON object
+in its `MODEL_CONFIG` positional argument.

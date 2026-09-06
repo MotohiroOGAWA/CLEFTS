@@ -5,6 +5,7 @@ import argparse
 from ...base import CLICommand
 from clefts.ml.training.fragment_tree_training.training_model import (
     DEFAULT_EXPERIMENT_NAME,
+    DEFAULT_ASSIGNMENT_SCORE_THRESHOLD,
     build_model_config_from_pretrained,
     build_train_config,
     load_and_validate_split_preprocessing,
@@ -38,6 +39,11 @@ class FragmentTreeTrainCommand(CLICommand):
         parser.add_argument("--training-edges-per-sample", type=int, default=32)
         parser.add_argument("--training-zero-edge-fraction", type=float, default=0.25)
         parser.add_argument("--max-samples", type=int, default=100)
+        parser.add_argument(
+            "--assignment-score-threshold", type=float,
+            default=DEFAULT_ASSIGNMENT_SCORE_THRESHOLD,
+            help="Minimum assignment_scores.tsv score used for training and filtered validation.",
+        )
         parser.add_argument("--condition-adduct-embedding-dim", type=int, default=16)
         parser.add_argument("--condition-ce-feature-dim", type=int, choices=(16,), default=16)
         parser.add_argument("--condition-ce-fc-dims", default="32")
@@ -53,8 +59,12 @@ class FragmentTreeTrainCommand(CLICommand):
         parser.add_argument("--max-next-cleavage-candidates", type=int, default=3)
         parser.add_argument("--edge-condition-interaction-dim", type=int, default=64)
         parser.add_argument("--ranking-loss-weight", type=float, default=1.0)
-        parser.add_argument("--ranking-pairs-per-edge", type=int, default=4)
+        parser.add_argument("--top-n", type=int, default=10)
+        parser.add_argument("--nearest-lower-partners", type=int, default=1)
+        parser.add_argument("--extended-lower-partners", type=int, default=3)
+        parser.add_argument("--background-partners", type=int, default=10)
         parser.add_argument("--ranking-intensity-threshold", type=float, default=0.05)
+        parser.add_argument("--max-edges-per-tree", type=int, default=256)
         parser.add_argument(
             "--experiment-name",
             default=DEFAULT_EXPERIMENT_NAME,
@@ -171,6 +181,7 @@ class FragmentTreeTrainCommand(CLICommand):
             training_structure_dir=args.training_structure_dir,
             validation_structure_dir=args.validation_structure_dir,
             max_samples=args.max_samples,
+            assignment_score_threshold=args.assignment_score_threshold,
         )
         preprocessing, preprocessing_config_path = load_and_validate_split_preprocessing(
             train_config["training_structure_dir"],
@@ -206,10 +217,14 @@ class FragmentTreeTrainCommand(CLICommand):
             generator_params={
                 "max_edges_per_step": args.max_edges_per_step,
                 "max_retained_edges": args.max_retained_edges,
+                "max_edges_per_tree": args.max_edges_per_tree,
                 "max_next_cleavage_candidates": args.max_next_cleavage_candidates,
                 "edge_condition_interaction_dim": args.edge_condition_interaction_dim,
                 "ranking_loss_weight": args.ranking_loss_weight,
-                "ranking_pairs_per_edge": args.ranking_pairs_per_edge,
+                "top_n": args.top_n,
+                "nearest_lower_partners": args.nearest_lower_partners,
+                "extended_lower_partners": args.extended_lower_partners,
+                "background_partners": args.background_partners,
                 "ranking_intensity_threshold": args.ranking_intensity_threshold,
             },
         )

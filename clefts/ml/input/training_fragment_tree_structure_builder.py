@@ -496,6 +496,7 @@ class TrainingFragmentTreeStructureBuilder(SingleFragmentTreeStructureBuilder):
             node_formula=structure.node_formula,
             formula_element_order=structure.formula_element_order,
             edge_index=structure.edge_index,
+            tree_sample_ptr=structure.tree_sample_ptr,
             cleavage_event_edge_index=structure.cleavage_event_edge_index,
             cleavage_event=structure.cleavage_event,
             cleavage_atom_idxs=structure.cleavage_atom_idxs,

@@ -25,7 +25,11 @@ from clefts.utils.parallel_subprocess import run_parallel_subprocesses
 
 ORIGINAL_INDEX_COLUMN = "__fragment_tree_original_index"
 STRUCTURE_DATA_DIR_NAME = "data"
-DEFAULT_PREPROCESSING_CONFIG_NAME = "preprocessing_config.json"
+DEFAULT_PREPROCESSING_CONFIG_NAME = "preprocessing_config.pftprep.json"
+# Recognized when locating a previously written preprocessing config, so
+# structure directories created before the dedicated ``.pftprep.json``
+# extension was introduced keep loading correctly.
+LEGACY_PREPROCESSING_CONFIG_NAME = "preprocessing_config.json"
 DEFAULT_FRAGMENTER_CONFIG_NAME = "fragmenter.json"
 from clefts.ml.input.fragment_tree_training_data import (
     FRAGMENT_TREE_STRUCTURE_GLOBS,
@@ -108,9 +112,10 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
             "validation_structures/data when --validation-input is provided."
         ),
     )
-    parser.add_argument(
+    params_group = parser.add_mutually_exclusive_group(required=True)
+    params_group.add_argument("--params-json", type=json.loads, help="Inline Fragmenter parameter JSON object.")
+    params_group.add_argument(
         "--params",
-        required=True,
         help="Fragmenter parameter JSON used for preprocessing.",
     )
     parser.add_argument("--symbols", nargs="+", required=True)
@@ -120,7 +125,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         default=None,
         help=(
             "Path for immutable preprocessing settings. Defaults to "
-            "OUTPUT_DIR/config/preprocessing_config.json."
+            f"OUTPUT_DIR/config/{DEFAULT_PREPROCESSING_CONFIG_NAME}."
         ),
     )
     parser.add_argument(
@@ -193,7 +198,10 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         "--chunk-size",
         type=int,
         default=32,
-        help="Number of SMILES groups per parallel chunk.",
+        help=(
+            "Number of SMILES groups per parallel chunk. Automatically reduced "
+            "when num_workers * chunk_size exceeds the number of SMILES groups."
+        ),
     )
     parser.add_argument(
         "--parallel-temp-dir",
@@ -247,10 +255,22 @@ def load_fragmenter_params(params_path: str | Path) -> dict:
     return params
 
 
+def resolve_fragmenter_params(args: argparse.Namespace) -> dict:
+    value = getattr(args, "params_json", None)
+    if value is None:
+        return load_fragmenter_params(args.params)
+    if not isinstance(value, dict):
+        raise ValueError("--params-json must contain a JSON object.")
+    if "probability_model_params" in value:
+        value = value["probability_model_params"]
+    return dict(value.get("fragmenter_params", value))
+
+
+
 def load_preprocessing_context(args: argparse.Namespace) -> FragmentTreePreprocessingContext:
     return FragmentTreePreprocessingContext(
         symbols=args.symbols,
-        fragmenter_params=load_fragmenter_params(args.params),
+        fragmenter_params=resolve_fragmenter_params(args),
         max_node=args.max_node,
         max_edge=args.max_edge,
     )
@@ -283,10 +303,11 @@ def resolve_structure_input_data_dir(path: str | Path) -> Path:
 
 def find_previous_preprocessing_config(structure_input_dir: str | Path) -> Path | None:
     data_dir = resolve_structure_input_data_dir(structure_input_dir)
+    directories = [data_dir.parent.parent, data_dir.parent, data_dir]
     candidates = [
-        data_dir.parent.parent / "config" / DEFAULT_PREPROCESSING_CONFIG_NAME,
-        data_dir.parent / "config" / DEFAULT_PREPROCESSING_CONFIG_NAME,
-        data_dir / "config" / DEFAULT_PREPROCESSING_CONFIG_NAME,
+        directory / "config" / name
+        for directory in directories
+        for name in (DEFAULT_PREPROCESSING_CONFIG_NAME, LEGACY_PREPROCESSING_CONFIG_NAME)
     ]
     for candidate in candidates:
         if candidate.exists():
@@ -655,11 +676,22 @@ def make_smiles_chunks(
     *,
     smiles_column: str,
     chunk_size: int,
+    num_workers: int = 1,
 ) -> list[list[int]]:
     if chunk_size <= 0:
         raise ValueError("chunk_size must be positive.")
+    if num_workers <= 0:
+        raise ValueError("num_workers must be positive.")
     groups = group_record_indexes_by_smiles(dataset, smiles_column=smiles_column)
     items = list(groups.items())
+    if items and num_workers * chunk_size > len(items):
+        adjusted_chunk_size = max(1, len(items) // num_workers)
+        if adjusted_chunk_size != chunk_size:
+            print(
+                f"Adjusted chunk size: {chunk_size} -> {adjusted_chunk_size} "
+                f"({len(items)} SMILES groups, {num_workers} workers)."
+            )
+        chunk_size = adjusted_chunk_size
     chunks: list[list[int]] = []
     for start in range(0, len(items), chunk_size):
         chunk_items = items[start : start + chunk_size]
@@ -795,6 +827,7 @@ def run_parallel_for_input(
         dataset,
         smiles_column=args.smiles_column,
         chunk_size=args.chunk_size,
+        num_workers=args.num_workers,
     )
     if not chunks:
         raise RuntimeError(f"No SMILES groups were found for {split_name}.")
@@ -803,8 +836,7 @@ def run_parallel_for_input(
     temp_root.mkdir(parents=True, exist_ok=True)
 
     print(
-        f"{split_name}: split into {len(chunks)} chunks "
-        f"({args.chunk_size} SMILES groups per chunk)."
+        f"{split_name}: split into {len(chunks)} chunks."
     )
 
     commands: list[list[str]] = []
@@ -836,8 +868,8 @@ def run_parallel_for_input(
             str(args.output_dir),
             "--structure-output-dir",
             str(structure_output_dir),
-            "--params",
-            str(args.params),
+            "--params-json",
+            json.dumps(resolve_fragmenter_params(args)),
             "--symbols",
             *[str(symbol) for symbol in args.symbols],
             "--smiles-column",
@@ -1069,6 +1101,24 @@ def main(args: Optional[argparse.Namespace] = None) -> None:
             assigned_cleavage_event_output=args.assigned_cleavage_event_output,
         )
         return
+
+    if args.structure_output_dir is None:
+        output_root.mkdir(parents=True, exist_ok=True)
+        def camel_case(key):
+            head, *tail = key.split("_")
+            return head + "".join(part.title() for part in tail)
+        config = {
+            camel_case(key): value for key, value in vars(args).items()
+            if key not in {"params", "params_json", "structure_output_dir", "manifest_file",
+                           "valid_records_output", "assignment_score_output",
+                           "assigned_cleavage_event_output", "save_valid_records"}
+        }
+        config.update(application="fragment-tree-data-preparation",
+                      fragmenterParams=resolve_fragmenter_params(args))
+        (output_root / "fragment-tree.pft.json").write_text(
+            json.dumps(config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        )
+
 
     train_structure_dir = output_root / "train_structures"
     validation_structure_dir = output_root / "validation_structures"

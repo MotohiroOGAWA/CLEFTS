@@ -247,10 +247,14 @@ class FragmentSpectrumGenerator(ModelBase):
         max_peaks_per_sample: Optional[int] = None,
         max_edges_per_step: Optional[int] = 128,
         max_retained_edges: Optional[int] = 30,
+        max_edges_per_tree: Optional[int] = 256,
         max_next_cleavage_candidates: int = 3,
         edge_condition_interaction_dim: int = 64,
         ranking_loss_weight: float = 1.0,
-        ranking_pairs_per_edge: int = 4,
+        top_n: int = 10,
+        nearest_lower_partners: int = 1,
+        extended_lower_partners: int = 3,
+        background_partners: int = 10,
         ranking_intensity_threshold: float = 0.05,
         mol_encoder_checkpoint: Optional[str] = None,
         freeze_mol_encoder: bool = True,
@@ -272,6 +276,8 @@ class FragmentSpectrumGenerator(ModelBase):
             raise ValueError("max_edges_per_step must be positive or None.")
         if max_retained_edges is not None and max_retained_edges <= 0:
             raise ValueError("max_retained_edges must be positive or None.")
+        if max_edges_per_tree is not None and max_edges_per_tree <= 0:
+            raise ValueError("max_edges_per_tree must be positive or None.")
         if max_next_cleavage_candidates <= 0:
             raise ValueError("max_next_cleavage_candidates must be positive.")
 
@@ -286,9 +292,13 @@ class FragmentSpectrumGenerator(ModelBase):
             max_next_cleavage_candidates=max_next_cleavage_candidates,
             max_edges_per_step=max_edges_per_step,
             max_retained_edges=max_retained_edges,
+            max_edges_per_tree=max_edges_per_tree,
             edge_condition_interaction_dim=edge_condition_interaction_dim,
             ranking_loss_weight=ranking_loss_weight,
-            ranking_pairs_per_edge=ranking_pairs_per_edge,
+            top_n=top_n,
+            nearest_lower_partners=nearest_lower_partners,
+            extended_lower_partners=extended_lower_partners,
+            background_partners=background_partners,
             ranking_intensity_threshold=ranking_intensity_threshold,
         )
         self.formula_intensity_predictor = FragmentTreeFormulaIntensityPredictor(

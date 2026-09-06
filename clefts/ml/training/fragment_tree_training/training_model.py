@@ -3,18 +3,20 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import shutil
 import math
 import traceback
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
-from ...common.progress import fixed_tqdm, iteration_edge_progress
+from ...common.progress import fixed_tqdm, iteration_edge_progress, set_edge_progress_phase
+from . import metric_labels
 from .performance_profile import run_training_performance_profile
 from .workflow import run_shape_preflight
 
@@ -43,6 +45,80 @@ from .model import FragmentTreeTrainingModel
 from ....libs.msentity.msentity import MSDataset
 from ....libs.msentity.msentity.processing.spectrum_similarity import cosine_similarity_pair
 
+PEAK_SELECTION_TOP_K = (5, 10, 20)
+PEAK_SELECTION_MZ_TOLERANCE_DA = 0.01
+PRECURSOR_MZ_COLUMN = "PrecursorMZ"
+
+# Base peak-selection diagnostics, computed both on the full spectrum and
+# (mirrored below) on the spectrum with the precursor-ion peak removed, since
+# the precursor peak tends to dominate spectral similarity and can mask how
+# well the fragment peaks themselves are predicted.
+_PEAK_SELECTION_BASE_METRIC_NAMES = (
+    "selection_precision",
+    "selection_recall",
+    "selection_f1",
+    "predicted_peak_count",
+    "target_peak_count",
+    "matched_peak_count",
+    "selected_intensity_fraction",
+    *(f"top{k}_recall" for k in PEAK_SELECTION_TOP_K),
+    "matched_intensity_mae",
+    "matched_intensity_weighted_mae",
+)
+# Spectrum-level detection of the precursor ion as an observed peak: whether a
+# peak near PrecursorMZ is present in the target and/or predicted spectrum.
+PRECURSOR_DETECTION_METRIC_NAMES = (
+    "precursor_detection_precision",
+    "precursor_detection_recall",
+    "precursor_detection_accuracy",
+    "precursor_detection_f1",
+    "precursor_detection_target_present_fraction",
+    "precursor_detection_predicted_present_fraction",
+)
+PEAK_SELECTION_METRIC_NAMES = (
+    *_PEAK_SELECTION_BASE_METRIC_NAMES,
+    *PRECURSOR_DETECTION_METRIC_NAMES,
+    "cosine@excl_precursor",
+    *(f"{name}@excl_precursor" for name in _PEAK_SELECTION_BASE_METRIC_NAMES),
+)
+PEAK_SELECTION_QUANTILES = (
+    ("min", 0.0),
+    ("q1", 0.25),
+    ("median", 0.5),
+    ("q3", 0.75),
+    ("max", 1.0),
+)
+# Per-batch training-time diagnostics reported by the model (see
+# FragmentTreeTrainingModel._edge_retain_metrics / _selected_peak_metrics /
+# _intensity_similarity_metrics), summarized in run_epoch() and surfaced here
+# as train_*/val_* columns and TensorBoard cards. The "precursor/" entries
+# isolate the same diagnostics for precursor-root candidates.
+EDGE_METRIC_NAMES = (
+    "edge_ranking_loss",
+    "pairwise_ranking_accuracy",
+    "edge_retain_precision",
+    "edge_retain_recall",
+    "edge_retain_accuracy",
+    "edge_total_loss",
+    "selected_peak_intensity_coverage",
+    "peak_selection_accuracy",
+    "peak_selection_precision",
+    "peak_selection_recall",
+    "intensity_cosine_similarity",
+    "precursor/keep_loss",
+    "precursor/peak_selection_accuracy",
+    "precursor/peak_selection_precision",
+    "precursor/peak_selection_recall",
+    "precursor/selected_peak_intensity_coverage",
+)
+
+
+def _edge_metric_column(name: str) -> str:
+    """Flatten a namespaced metric name (e.g. "precursor/keep_loss") into a
+    TSV/CSV-safe column suffix."""
+    return name.replace("/", "_")
+
+
 METRIC_COLUMNS = (
     "event",
     "epoch",
@@ -57,47 +133,21 @@ METRIC_COLUMNS = (
     "val_selection_loss",
     "val_intensity_loss",
     "val_cosine",
-    "val_selection_precision",
-    "val_selection_recall",
-    "val_selection_f1",
-    "val_predicted_peak_count",
-    "val_target_peak_count",
-    "val_matched_peak_count",
-    "val_selected_intensity_fraction",
-    "val_top5_recall",
-    "val_top10_recall",
-    "val_top20_recall",
-    "val_matched_intensity_mae",
-    "val_matched_intensity_weighted_mae",
+    *(f"val_{name}" for name in PEAK_SELECTION_METRIC_NAMES),
+    *(f"train_{_edge_metric_column(name)}" for name in EDGE_METRIC_NAMES),
+    *(f"val_{_edge_metric_column(name)}" for name in EDGE_METRIC_NAMES),
     "lr",
 )
-
-PEAK_SELECTION_TOP_K = (5, 10, 20)
-PEAK_SELECTION_MZ_TOLERANCE_DA = 0.01
-PEAK_SELECTION_METRIC_NAMES = (
-    "selection_precision",
-    "selection_recall",
-    "selection_f1",
-    "predicted_peak_count",
-    "target_peak_count",
-    "matched_peak_count",
-    "selected_intensity_fraction",
-    *(f"top{k}_recall" for k in PEAK_SELECTION_TOP_K),
-    "matched_intensity_mae",
-    "matched_intensity_weighted_mae",
-)
-PEAK_SELECTION_QUANTILES = (
-    ("min", 0.0),
-    ("q1", 0.25),
-    ("median", 0.5),
-    ("q3", 0.75),
-    ("max", 1.0),
-)
+DEFAULT_ASSIGNMENT_SCORE_THRESHOLD = 0.8
 
 
 DEFAULT_TRAIN_CONFIG_NAME = "train_config.json"
 DEFAULT_PROJECT_MODEL_CONFIG_NAME = "model_config.json"
-DEFAULT_PREPROCESSING_CONFIG_NAME = "preprocessing_config.json"
+DEFAULT_PREPROCESSING_CONFIG_NAME = "preprocessing_config.pftprep.json"
+# Recognized as a fallback when locating a preprocessing config, so structure
+# directories created before the dedicated ``.pftprep.json`` extension was
+# introduced keep loading correctly.
+LEGACY_PREPROCESSING_CONFIG_NAME = "preprocessing_config.json"
 DEFAULT_EXPERIMENT_NAME = "exp_main"
 DEFAULT_OPTIMIZER_INFO = {
     "name": "AdamW",
@@ -162,6 +212,31 @@ def nan_loss_metrics() -> EpochLossMetrics:
         intensity_loss=float("nan"),
         samples=0,
         steps=0,
+    )
+
+
+def combine_epoch_metrics(first: EpochLossMetrics, second: EpochLossMetrics) -> EpochLossMetrics:
+    """Combine disjoint validation partitions without evaluating either twice."""
+    total = first.samples + second.samples
+    if total <= 0:
+        return nan_loss_metrics()
+    def weighted(name: str) -> float:
+        values = [(getattr(item, name), item.samples) for item in (first, second) if item.samples]
+        finite = [(value, count) for value, count in values if math.isfinite(value)]
+        return sum(value * count for value, count in finite) / max(sum(count for _, count in finite), 1)
+    summary: Dict[str, float] = {}
+    for key in set(first.absolute_ranker_summary) | set(second.absolute_ranker_summary):
+        # Means are exactly composable. Quantiles are reported per scope below,
+        # rather than pretending that quantiles-of-quantiles are exact.
+        if key.endswith("_mean"):
+            pairs = [(item.absolute_ranker_summary.get(key), item.samples) for item in (first, second)]
+            pairs = [(float(v), n) for v, n in pairs if v is not None and math.isfinite(float(v)) and n]
+            if pairs:
+                summary[key] = sum(v * n for v, n in pairs) / sum(n for _, n in pairs)
+    return EpochLossMetrics(
+        loss=weighted("loss"), selection_loss=weighted("selection_loss"),
+        intensity_loss=weighted("intensity_loss"), samples=total,
+        steps=first.steps + second.steps, absolute_ranker_summary=summary,
     )
 
 
@@ -319,11 +394,15 @@ def validate_preprocessing_compatibility(
     model_config: Dict[str, Any],
     preprocessing_config_path: Optional[str | Path] = None,
 ) -> None:
-    config_path = (
-        Path(preprocessing_config_path)
-        if preprocessing_config_path is not None
-        else Path(project_dir) / "config" / "preprocessing_config.json"
-    )
+    if preprocessing_config_path is not None:
+        config_path = Path(preprocessing_config_path)
+    else:
+        config_dir = Path(project_dir) / "config"
+        config_path = config_dir / DEFAULT_PREPROCESSING_CONFIG_NAME
+        if not config_path.exists():
+            legacy_path = config_dir / LEGACY_PREPROCESSING_CONFIG_NAME
+            if legacy_path.exists():
+                config_path = legacy_path
     if not config_path.exists():
         raise FileNotFoundError(
             f"Preprocessing config not found: {config_path}. Training requires the "
@@ -496,6 +575,11 @@ def normalize_train_config(
     config["validate_at_start"] = bool(config.get("validate_at_start", False))
     config["detect_anomaly"] = bool(config.get("detect_anomaly", False))
     config["profile_performance"] = bool(config.get("profile_performance", False))
+    config["assignment_score_threshold"] = float(
+        config.get("assignment_score_threshold", DEFAULT_ASSIGNMENT_SCORE_THRESHOLD)
+    )
+    if not 0.0 <= config["assignment_score_threshold"] <= 1.0:
+        raise ValueError("assignment_score_threshold must be between 0 and 1.")
 
     return config
 
@@ -523,6 +607,7 @@ def build_train_config(
     detect_anomaly: bool = False,
     profile_performance: bool = False,
     max_samples: int = 100,
+    assignment_score_threshold: float = DEFAULT_ASSIGNMENT_SCORE_THRESHOLD,
 ) -> Dict[str, Any]:
     if max_samples < 1:
         raise ValueError("max_samples must be positive.")
@@ -558,6 +643,7 @@ def build_train_config(
             "detect_anomaly": bool(detect_anomaly),
             "profile_performance": bool(profile_performance),
             "max_samples": int(max_samples),
+            "assignment_score_threshold": float(assignment_score_threshold),
         },
     )
 
@@ -605,6 +691,7 @@ def prepare_train_from_config(
         "detect_anomaly": bool(train_config.get("detect_anomaly", False)),
         "profile_performance": bool(train_config.get("profile_performance", False)),
         "max_samples": int(train_config.get("max_samples", 100)),
+        "assignment_score_threshold": float(train_config["assignment_score_threshold"]),
         "pattern": "*.preft.pt",
     }
 
@@ -688,13 +775,20 @@ def setup_dataset(
     num_workers: int = 0,
 ) -> Tuple[FragmentTreeStructureFileDataset, FragmentTreeStructureFileDataset, DataLoader, DataLoader, Dict[str, Any]]:
     pattern = str(dataset_info.get("pattern", "*.preft.pt"))
+    threshold = float(dataset_info.get("assignment_score_threshold", DEFAULT_ASSIGNMENT_SCORE_THRESHOLD))
+    train_scores = find_assignment_score_file(dataset_info["training_structure_dir"])
+    val_scores = find_assignment_score_file(dataset_info["validation_structure_dir"])
+    train_included, _, train_rows = load_assignment_score_selection(train_scores, threshold)
+    val_included, _, val_rows = load_assignment_score_selection(val_scores, threshold)
     train_dataset = FragmentTreeStructureFileDataset(
         Path(dataset_info["training_structure_dir"]),
         pattern=pattern,
+        included_samples_by_file=train_included,
     )
     val_dataset = FragmentTreeStructureFileDataset(
         Path(dataset_info["validation_structure_dir"]),
         pattern=pattern,
+        included_samples_by_file=val_included,
     )
     if len(train_dataset) == 0:
         raise ValueError("training_structure_dir contains no training structure files.")
@@ -704,6 +798,10 @@ def setup_dataset(
         "num_workers": num_workers,
         "collate_fn": collate_fragment_tree_structure_items,
     }
+    if num_workers > 0:
+        # Keep deserialisation/collation workers alive across epochs and let
+        # them prepare subsequent batches while the GPU handles this one.
+        loader_kwargs.update(persistent_workers=True, prefetch_factor=2)
     train_loader = DataLoader(
         train_dataset,
         shuffle=bool(dataset_info.get("shuffle", True)),
@@ -727,8 +825,145 @@ def setup_dataset(
         "validation_interval_steps": dataset_info.get("validation_interval_steps"),
         "train_log_interval_steps": dataset_info.get("train_log_interval_steps"),
         "max_samples": int(dataset_info.get("max_samples", 100)),
+        "assignment_score_threshold": threshold,
+        "training_assignment_score_file": str(train_scores),
+        "validation_assignment_score_file": str(val_scores),
+        "assignment_score_report": {
+            "threshold": threshold,
+            "training": assignment_selection_summary(train_rows, threshold),
+            "validation": assignment_selection_summary(val_rows, threshold),
+        },
     }
     return train_dataset, val_dataset, train_loader, val_loader, extra_data
+
+
+def find_assignment_score_file(structure_dir: str | Path) -> Path:
+    directory = Path(structure_dir)
+    candidates = (directory / "assignment_scores.tsv", directory.parent / "assignment_scores.tsv")
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    raise FileNotFoundError(
+        f"assignment_scores.tsv was not found in {directory} or {directory.parent}"
+    )
+
+
+def load_assignment_score_selection(
+    path: str | Path, threshold: float
+) -> Tuple[Dict[str, set[int]], Dict[str, set[int]], List[float]]:
+    included: Dict[str, set[int]] = {}
+    excluded: Dict[str, set[int]] = {}
+    scores: List[float] = []
+    next_sample: Dict[str, int] = {}
+    with open(path, "r", encoding="utf-8", newline="") as handle:
+        for row in csv.DictReader(handle, delimiter="\t"):
+            filename = str(row.get("structure_file", "")).strip()
+            if not filename:
+                raise ValueError(f"Missing structure_file in {path}")
+            try:
+                score = float(row["assignment_score"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(f"Invalid assignment_score in {path}: {row}") from exc
+            # Rows are emitted in structure/sample order; rejected samples are
+            # absent, so their ordinal is exactly the saved sample index.
+            sample_id = next_sample.get(filename, 0)
+            next_sample[filename] = sample_id + 1
+            destination = included if score >= threshold else excluded
+            destination.setdefault(filename, set()).add(sample_id)
+            scores.append(score)
+    if not included:
+        raise ValueError(f"No samples meet assignment_score_threshold={threshold:g} in {path}")
+    return included, excluded, scores
+
+
+def assignment_selection_summary(scores: Sequence[float], threshold: float) -> Dict[str, Any]:
+    array = np.asarray(scores, dtype=np.float64)
+    finite = array[np.isfinite(array)]
+    distribution = summarize_distribution(finite)
+    return {
+        "total_samples": int(finite.size),
+        "selected_samples": int((finite >= threshold).sum()),
+        "excluded_samples": int((finite < threshold).sum()),
+        "assignment_score": distribution,
+    }
+
+
+def split_validation_records_by_assignment_score(
+    dataset: MSDataset, score_file: str | Path, threshold: float
+) -> Tuple[MSDataset, Optional[MSDataset]]:
+    """Split valid records using their stable source index (SpecID fallback)."""
+    high_indexes: set[str] = set()
+    low_indexes: set[str] = set()
+    high_spec_ids: set[str] = set()
+    low_spec_ids: set[str] = set()
+    with open(score_file, "r", encoding="utf-8", newline="") as handle:
+        for row in csv.DictReader(handle, delimiter="\t"):
+            high = float(row["assignment_score"]) >= threshold
+            (high_indexes if high else low_indexes).add(str(row.get("index", "")))
+            spec_id = str(row.get("SpecID", ""))
+            if spec_id:
+                (high_spec_ids if high else low_spec_ids).add(spec_id)
+    metadata = dataset.metadata
+    index_column = "__fragment_tree_original_index"
+    high_rows: List[int] = []
+    low_rows: List[int] = []
+    for row_index, row in metadata.iterrows():
+        source_index = str(row.get(index_column, row_index))
+        spec_id = str(row.get("SpecID", ""))
+        if source_index in high_indexes or (spec_id and spec_id in high_spec_ids):
+            high_rows.append(int(row_index))
+        elif source_index in low_indexes or (spec_id and spec_id in low_spec_ids):
+            low_rows.append(int(row_index))
+    if not high_rows:
+        raise ValueError("No validation MSDataset records meet the assignment-score threshold.")
+    return dataset[high_rows].copy(), (dataset[low_rows].copy() if low_rows else None)
+
+
+def write_combined_validation_cosine_summary(output_dir: Path, global_step: int) -> Dict[str, float]:
+    """Combine disjoint cached score rows; no spectrum is inferred twice."""
+    values: List[float] = []
+    for scope in ("filtered", "below_threshold"):
+        path = output_dir / scope / "validation_cosine.tsv"
+        if not path.exists():
+            continue
+        with open(path, "r", encoding="utf-8", newline="") as handle:
+            for row in csv.DictReader(handle, delimiter="\t"):
+                if str(row["global_step"]) == str(global_step):
+                    values.append(float(row["cosine_similarity"]))
+    summary = summarize_distribution(np.asarray(values, dtype=np.float64))
+    path = output_dir / "unfiltered_cosine_summary.tsv"
+    write_header = not path.exists()
+    with open(path, "a", encoding="utf-8", newline="") as handle:
+        tsv = csv.writer(handle, delimiter="\t")
+        if write_header:
+            tsv.writerow(["global_step", "mean", "q1", "median", "q3"])
+        tsv.writerow([global_step, *[summary[name] for name in ("mean", "q1", "median", "q3")]])
+    return summary
+
+
+def write_combined_peak_selection_summary(output_dir: Path, global_step: int) -> None:
+    """Summarize cached filtered + below-threshold per-spectrum metrics."""
+    values: Dict[str, List[float]] = {}
+    for scope in ("filtered", "below_threshold"):
+        path = output_dir / scope / "validation_peak_selection.tsv"
+        if not path.exists():
+            continue
+        with open(path, "r", encoding="utf-8", newline="") as handle:
+            for row in csv.DictReader(handle, delimiter="\t"):
+                if str(row["global_step"]) != str(global_step):
+                    continue
+                for name, raw in row.items():
+                    if name not in {"global_step", "spectrum_index"}:
+                        values.setdefault(name, []).append(float(raw))
+    path = output_dir / "unfiltered_peak_selection_summary.tsv"
+    write_header = not path.exists()
+    with open(path, "a", encoding="utf-8", newline="") as handle:
+        tsv = csv.writer(handle, delimiter="\t")
+        if write_header:
+            tsv.writerow(["global_step", "metric", "mean", "q1", "median", "q3"])
+        for name, raw_values in values.items():
+            summary = summarize_distribution(np.asarray(raw_values, dtype=np.float64))
+            tsv.writerow([global_step, name, *[summary[key] for key in ("mean", "q1", "median", "q3")]])
 
 
 def load_or_initialize_state(
@@ -835,31 +1070,28 @@ def run_epoch(
     def summarize_ranker(values_by_name: Dict[str, List[float]]) -> Dict[str, float]:
         summary: Dict[str, float] = {}
         for name, values in values_by_name.items():
-            array = np.asarray(values, dtype=np.float64)
-            summary[f"{name}_mean"] = float(array.mean())
-            for label, quantile in PEAK_SELECTION_QUANTILES:
-                summary[f"{name}_{label}"] = float(np.quantile(array, quantile))
+            for statistic, value in summarize_distribution(np.asarray(values)).items():
+                summary[f"{name}_{statistic}"] = value
         return summary
 
     for batch in iterator:
         try:
-            structure = batch["structure"].to(device)
-            # Do not sample or drop edges. Memory is bounded inside the edge
-            # encoder by max_edges_per_step, so training and validation see the
-            # same complete candidate population.
-            num_samples = int(structure.num_samples)
-            sample_weight = max(num_samples, 1)
-
-            global_edges = int(structure.edge_index.size(1))
-            sample_edges = int(
-                (structure.sample_edge_index[1] >= 0).sum().item()
-                if structure.sample_edge_index.numel()
-                else 0
-            )
+            # Shape queries against the pre-transfer CPU structure so the
+            # progress bar opens (and shows the transfer itself) before any
+            # device work happens.
+            global_edges = int(batch["structure"].edge_index.size(1))
             with iteration_edge_progress(
-                global_edges + sample_edges,
+                min(global_edges, int(max_training_edges)),
                 desc=f"edges iter {step_count + 1}",
             ):
+                set_edge_progress_phase("host→device transfer")
+                structure = batch["structure"].to(device)
+                # Target/formula pairs are selected by the edge encoder before
+                # its expensive attention pass. ``max_edges_per_step`` is a
+                # hard cap.
+                num_samples = int(structure.num_samples)
+                sample_weight = max(num_samples, 1)
+
                 with torch.set_grad_enabled(is_train):
                     output = model(structure)
                     loss = output["loss"]
@@ -945,10 +1177,6 @@ def run_epoch(
                 and on_validation_step is not None
                 and global_step % validation_interval_steps == 0
             )
-            if validation_due:
-                on_validation_step(global_step, cumulative_metrics, window_metrics)
-                model.train(is_train)
-
             train_log_due = (
                 is_train
                 and train_log_interval_steps is not None
@@ -958,6 +1186,13 @@ def run_epoch(
             )
             if train_log_due:
                 on_train_log_step(global_step, cumulative_metrics, window_metrics)
+
+            # Persist and flush the cheap training metrics before starting a
+            # potentially long validation pass at the same step. This keeps
+            # TensorBoard live at exactly train_log_interval_steps.
+            if validation_due:
+                on_validation_step(global_step, cumulative_metrics, window_metrics)
+                model.train(is_train)
 
             if validation_due or train_log_due:
                 window_loss = 0.0
@@ -1131,7 +1366,144 @@ def calculate_peak_selection_metrics(
     }
 
 
+def calculate_precursor_detection_metrics(
+    predicted_dataset: MSDataset,
+    target_dataset: MSDataset,
+    *,
+    precursor_mz_column: str = PRECURSOR_MZ_COLUMN,
+    mz_tolerance_da: float = PEAK_SELECTION_MZ_TOLERANCE_DA,
+    spectrum_indexes: Optional[np.ndarray] = None,
+) -> Dict[str, float]:
+    """Spectrum-level precision/recall/accuracy for detecting the precursor
+    ion as an observed peak in the predicted spectrum.
+
+    The precursor peak tends to dominate spectral similarity, so this is
+    reported separately from (and in addition to) the fragment-peak
+    selection metrics. ``spectrum_indexes`` restricts the confusion matrix to
+    a subset of spectra (e.g. spectra sharing an adduct type or a
+    collision-energy bucket); by default every spectrum is used, reproducing
+    the corpus-wide metric.
+    """
+    count = min(len(target_dataset), len(predicted_dataset))
+    if count <= 0:
+        return {name: float("nan") for name in PRECURSOR_DETECTION_METRIC_NAMES}
+
+    precursor_mz = np.asarray(target_dataset[precursor_mz_column], dtype=np.float64)[:count]
+    target_offsets = target_dataset.peaks.offsets
+    predicted_offsets = predicted_dataset.peaks.offsets
+    target_data = target_dataset.peaks.data
+    predicted_data = predicted_dataset.peaks.data
+
+    target_present = np.zeros(count, dtype=bool)
+    predicted_present = np.zeros(count, dtype=bool)
+    for spectrum_index in range(count):
+        pmz = precursor_mz[spectrum_index]
+        if not np.isfinite(pmz):
+            continue
+        t_start, t_end = int(target_offsets[spectrum_index]), int(target_offsets[spectrum_index + 1])
+        if t_end > t_start:
+            target_present[spectrum_index] = bool(
+                np.any(np.abs(target_data[t_start:t_end, 0] - pmz) <= mz_tolerance_da)
+            )
+        p_start, p_end = int(predicted_offsets[spectrum_index]), int(predicted_offsets[spectrum_index + 1])
+        if p_end > p_start:
+            predicted_present[spectrum_index] = bool(
+                np.any(np.abs(predicted_data[p_start:p_end, 0] - pmz) <= mz_tolerance_da)
+            )
+
+    if spectrum_indexes is not None:
+        subset = np.asarray(spectrum_indexes, dtype=np.int64)
+        target_present = target_present[subset]
+        predicted_present = predicted_present[subset]
+        count = int(subset.size)
+    if count <= 0:
+        return {name: float("nan") for name in PRECURSOR_DETECTION_METRIC_NAMES}
+
+    true_positive = int(np.sum(target_present & predicted_present))
+    false_positive = int(np.sum(~target_present & predicted_present))
+    false_negative = int(np.sum(target_present & ~predicted_present))
+    true_negative = int(np.sum(~target_present & ~predicted_present))
+
+    precision = (
+        true_positive / (true_positive + false_positive)
+        if (true_positive + false_positive) > 0
+        else float("nan")
+    )
+    recall = (
+        true_positive / (true_positive + false_negative)
+        if (true_positive + false_negative) > 0
+        else float("nan")
+    )
+    f1 = (
+        2.0 * precision * recall / (precision + recall)
+        if math.isfinite(precision) and math.isfinite(recall) and (precision + recall) > 0
+        else float("nan")
+    )
+    accuracy = (true_positive + true_negative) / count
+
+    return {
+        "precursor_detection_precision": precision,
+        "precursor_detection_recall": recall,
+        "precursor_detection_accuracy": accuracy,
+        "precursor_detection_f1": f1,
+        "precursor_detection_target_present_fraction": float(target_present.mean()),
+        "precursor_detection_predicted_present_fraction": float(predicted_present.mean()),
+    }
+
+
+def exclude_precursor_peaks(
+    dataset: MSDataset,
+    *,
+    precursor_mz_column: str = PRECURSOR_MZ_COLUMN,
+    mz_tolerance_da: float = PEAK_SELECTION_MZ_TOLERANCE_DA,
+) -> MSDataset:
+    """Return a copy of ``dataset`` with each spectrum's precursor-ion peak(s)
+    (peaks within ``mz_tolerance_da`` of that spectrum's PrecursorMZ) removed.
+
+    Used to evaluate similarity/selection metrics on fragment peaks alone,
+    since a correctly placed precursor peak can inflate whole-spectrum
+    similarity independently of fragment-peak prediction quality.
+    """
+    filtered = dataset.copy()
+    precursor_mz = np.asarray(dataset[precursor_mz_column], dtype=np.float64)
+    offsets = dataset.peaks.offsets
+    data = dataset.peaks.data
+    metadata = dataset.peaks.metadata
+
+    keep_mask = np.ones(len(data), dtype=bool)
+    for spectrum_index in range(len(dataset)):
+        start, end = int(offsets[spectrum_index]), int(offsets[spectrum_index + 1])
+        if start == end:
+            continue
+        pmz = precursor_mz[spectrum_index]
+        if not np.isfinite(pmz):
+            continue
+        keep_mask[start:end] = np.abs(data[start:end, 0] - pmz) > mz_tolerance_da
+
+    lengths = offsets[1:] - offsets[:-1]
+    new_lengths = np.array(
+        [
+            int(keep_mask[int(offsets[i]):int(offsets[i]) + int(lengths[i])].sum())
+            for i in range(len(dataset))
+        ],
+        dtype=np.int64,
+    )
+    new_offsets = np.zeros(len(dataset) + 1, dtype=np.int64)
+    new_offsets[1:] = np.cumsum(new_lengths)
+    new_data = data[keep_mask]
+    new_metadata = metadata.iloc[keep_mask].reset_index(drop=True) if metadata is not None else None
+    filtered.peaks.replace_data(new_data, new_offsets, metadata=new_metadata)
+    return filtered
+
+
 def summarize_distribution(values: np.ndarray) -> Dict[str, float]:
+    """Summarize a distribution as mean/min/q1/median/q3/max.
+
+    ``min``/``max`` are boxplot whiskers (the most extreme values still inside
+    ``[q1 - 1.5*iqr, q3 + 1.5*iqr]``), not the true extremes, so a handful of
+    outlier samples cannot dominate the reported range. ``q1``/``median``/``q3``
+    remain the plain quantiles.
+    """
     finite = np.asarray(values, dtype=np.float64)
     finite = finite[np.isfinite(finite)]
     if finite.size == 0:
@@ -1139,15 +1511,18 @@ def summarize_distribution(values: np.ndarray) -> Dict[str, float]:
             "mean": float("nan"),
             **{name: float("nan") for name, _ in PEAK_SELECTION_QUANTILES},
         }
-    quantiles = np.quantile(
-        finite, [quantile for _, quantile in PEAK_SELECTION_QUANTILES]
-    )
+    q1, median, q3 = np.quantile(finite, [0.25, 0.5, 0.75])
+    iqr = q3 - q1
+    inliers = finite[(finite >= q1 - 1.5 * iqr) & (finite <= q3 + 1.5 * iqr)]
+    min_value = float(inliers.min()) if inliers.size else float(q1)
+    max_value = float(inliers.max()) if inliers.size else float(q3)
     return {
         "mean": float(finite.mean()),
-        **{
-            name: float(quantiles[index])
-            for index, (name, _) in enumerate(PEAK_SELECTION_QUANTILES)
-        },
+        "min": min_value,
+        "q1": float(q1),
+        "median": float(median),
+        "q3": float(q3),
+        "max": max_value,
     }
 
 
@@ -1189,13 +1564,121 @@ def evaluate_validation_cosine(
         return float("nan")
 
     val_cosine = float(scores.mean())
+    cosine_summary = summarize_distribution(np.asarray(scores, dtype=np.float64))
     selection_metrics = calculate_peak_selection_metrics(
         predicted_dataset, target_dataset
+    )
+
+    # Fragment-only diagnostics: recompute cosine similarity and peak
+    # selection metrics after stripping the precursor-ion peak from both the
+    # target and predicted spectra, so a correctly placed precursor peak
+    # cannot mask poor fragment-peak prediction.
+    excl_target_dataset = exclude_precursor_peaks(target_dataset)
+    excl_predicted_dataset = exclude_precursor_peaks(predicted_dataset)
+    excl_scores = cosine_similarity_pair(
+        excl_target_dataset,
+        np.arange(count, dtype=np.int64),
+        excl_predicted_dataset,
+        np.arange(count, dtype=np.int64),
+        show_progress=False,
+    ).astype(np.float64)
+    # A spectrum with no non-precursor peaks in either the target or the
+    # prediction carries no fragment information to compare; leave it out of
+    # the aggregate rather than scoring it as similarity 0.
+    excl_both_empty = (excl_target_dataset.peaks.lengths == 0) & (
+        excl_predicted_dataset.peaks.lengths == 0
+    )
+    excl_scores[excl_both_empty] = float("nan")
+    excl_selection_metrics = calculate_peak_selection_metrics(
+        excl_predicted_dataset, excl_target_dataset
+    )
+    selection_metrics["cosine@excl_precursor"] = excl_scores
+    selection_metrics.update(
+        {f"{name}@excl_precursor": values for name, values in excl_selection_metrics.items()}
     )
     selection_summaries = {
         name: summarize_distribution(values)
         for name, values in selection_metrics.items()
     }
+
+    # Precursor-ion peak detection (precision/recall/accuracy) is reported
+    # separately: the precursor peak dominates whole-spectrum similarity, so
+    # this isolates how reliably it is placed from how well fragments match.
+    # These are corpus-level aggregates rather than per-spectrum values, so
+    # they are added to the summary only (not the per-spectrum detail file).
+    def _scalar_summary(value: float) -> Dict[str, float]:
+        value = float(value)
+        return {"mean": value, **{name: value for name, _ in PEAK_SELECTION_QUANTILES}}
+
+    precursor_detection = calculate_precursor_detection_metrics(
+        predicted_dataset, target_dataset
+    )
+    for name, value in precursor_detection.items():
+        selection_summaries[name] = _scalar_summary(value)
+
+    # Adduct-type and collision-energy breakdown: every per-spectrum metric
+    # (cosine, peak-selection) gets a genuine within-group distribution;
+    # precursor detection has no per-spectrum value, so instead each group
+    # gets its own corpus-style precision/recall/f1/accuracy, and the spread
+    # *across* groups is reported as a distribution.
+    try:
+        adduct_values = np.asarray(target_dataset["AdductType"])[:count]
+        ce_values = np.asarray(target_dataset["CollisionEnergy"], dtype=np.float64)[:count]
+    except KeyError:
+        adduct_values = None
+        ce_values = None
+    if adduct_values is not None and ce_values is not None:
+        adduct_labels = np.asarray(
+            [metric_labels.tensorboard_label(str(value)) for value in adduct_values]
+        )
+        finite_ce = ce_values[np.isfinite(ce_values)]
+        if finite_ce.size:
+            ce_q1, ce_median, ce_q3 = np.quantile(finite_ce, [0.25, 0.5, 0.75])
+        else:
+            ce_q1 = ce_median = ce_q3 = 0.0
+        ce_labels = np.asarray([
+            metric_labels.ce_range_label(value, q1=ce_q1, median=ce_median, q3=ce_q3)
+            for value in ce_values
+        ])
+        groupings = {
+            "by_adduct": {
+                label: np.flatnonzero(adduct_labels == label)
+                for label in np.unique(adduct_labels)
+            },
+            "by_ce_range": {
+                label: np.flatnonzero(ce_labels == label)
+                for label in np.unique(ce_labels)
+            },
+        }
+        for group_kind, groups in groupings.items():
+            group_precursor_values: Dict[str, List[float]] = {
+                name: [] for name in PRECURSOR_DETECTION_METRIC_NAMES
+            }
+            for label, indexes in groups.items():
+                if indexes.size == 0:
+                    continue
+                selection_summaries[f"cosine@{group_kind}:{label}"] = summarize_distribution(
+                    scores[indexes]
+                )
+                for metric_name, values in selection_metrics.items():
+                    selection_summaries[
+                        f"{metric_name}@{group_kind}:{label}"
+                    ] = summarize_distribution(values[indexes])
+                group_precursor = calculate_precursor_detection_metrics(
+                    predicted_dataset, target_dataset, spectrum_indexes=indexes,
+                )
+                for name, value in group_precursor.items():
+                    selection_summaries[
+                        f"{name}@{group_kind}:{label}"
+                    ] = _scalar_summary(value)
+                    group_precursor_values[name].append(value)
+            for name, collected in group_precursor_values.items():
+                if not collected:
+                    continue
+                selection_summaries[
+                    f"{name}@{group_kind}_distribution"
+                ] = summarize_distribution(np.asarray(collected))
+
     if selection_metric_means is not None:
         selection_metric_means.update(
             {name: summary["mean"] for name, summary in selection_summaries.items()}
@@ -1210,6 +1693,14 @@ def evaluate_validation_cosine(
                 tsv.writerow(["global_step", "spectrum_index", "cosine_similarity"])
             for spectrum_index, score in enumerate(scores.tolist()):
                 tsv.writerow([global_step, spectrum_index, float(score)])
+        cosine_summary_file = output_dir / "validation_cosine_summary.tsv"
+        write_header = not cosine_summary_file.exists()
+        with open(cosine_summary_file, "a", encoding="utf-8", newline="") as f:
+            tsv = csv.writer(f, delimiter="\t")
+            if write_header:
+                tsv.writerow(["global_step", "mean", "q1", "median", "q3"])
+            tsv.writerow([global_step, cosine_summary["mean"], cosine_summary["q1"],
+                          cosine_summary["median"], cosine_summary["q3"]])
         detail_file = output_dir / "validation_peak_selection.tsv"
         write_header = not detail_file.exists()
         with open(detail_file, "a", encoding="utf-8", newline="") as f:
@@ -1240,33 +1731,23 @@ def evaluate_validation_cosine(
                     + [summary[name] for name, _ in PEAK_SELECTION_QUANTILES]
                 )
     if writer is not None and global_step is not None:
-        cosine_summary = np.quantile(scores, [0.0, 0.25, 0.5, 0.75, 1.0])
-        writer.add_scalars(
-            "similarity/validation/cosine_distribution",
+        distribution_stats = ("min", "q1", "mean", "median", "q3", "max")
+        # One card per base metric (cosine, selection_precision, ...): every
+        # scope variant (full spectrum, excl-precursor, by-adduct, by-CE) is
+        # a series on that same card via the "@scope" key convention parsed
+        # by log_distribution_cards, instead of a separate card each.
+        log_distribution_cards(
+            writer,
+            "peak_selection",
             {
-                "min": float(cosine_summary[0]),
-                "q1": float(cosine_summary[1]),
-                "mean": float(np.mean(scores)),
-                "median": float(cosine_summary[2]),
-                "q3": float(cosine_summary[3]),
-                "max": float(cosine_summary[4]),
+                "validation": {
+                    f"{metric_name}_{stat}": summary[stat]
+                    for metric_name, summary in selection_summaries.items()
+                    for stat in distribution_stats
+                }
             },
             int(global_step),
         )
-        for metric_name, summary in selection_summaries.items():
-            finite_statistics = {
-                name: summary[name]
-                for name, _ in PEAK_SELECTION_QUANTILES
-                if math.isfinite(summary[name])
-            }
-            if math.isfinite(summary["mean"]):
-                finite_statistics["mean"] = summary["mean"]
-            if finite_statistics:
-                writer.add_scalars(
-                    f"peak_selection/validation/{metric_name}",
-                    finite_statistics,
-                    int(global_step),
-                )
         log_validation_spectrum_quantiles(
             writer=writer,
             predicted_dataset=predicted_dataset,
@@ -1283,17 +1764,27 @@ def evaluate_validation_cosine(
     return val_cosine
 
 
-def find_split_config(split_dir: str | Path, filename: str) -> Path:
-    """Find a config saved in a structure split, accepting split/data paths."""
+def find_split_config(
+    split_dir: str | Path, filename: str | Sequence[str]
+) -> Path:
+    """Find a config saved in a structure split, accepting split/data paths.
+
+    ``filename`` may be a single name or a sequence of names to try in
+    priority order (e.g. a current dedicated extension followed by a legacy
+    plain name), returning the first match found. Directory proximity to
+    ``split_dir`` still takes priority over name order.
+    """
     split_path = Path(split_dir).resolve()
+    filenames = (filename,) if isinstance(filename, str) else tuple(filename)
     candidates = []
     for directory in (split_path, split_path.parent, *split_path.parents):
-        candidates.extend((directory / filename, directory / "config" / filename))
+        for name in filenames:
+            candidates.extend((directory / name, directory / "config" / name))
     for candidate in candidates:
         if candidate.is_file():
             return candidate
     raise FileNotFoundError(
-        f"Could not find {filename} in the structure split: {split_dir}"
+        f"Could not find any of {list(filenames)} in the structure split: {split_dir}"
     )
 
 
@@ -1302,11 +1793,14 @@ def load_and_validate_split_preprocessing(
     val_dir: str | Path,
 ) -> Tuple[Dict[str, Any], Path]:
     """Load immutable preprocessing data and require identical train/val settings."""
+    preprocessing_config_names = (
+        DEFAULT_PREPROCESSING_CONFIG_NAME, LEGACY_PREPROCESSING_CONFIG_NAME
+    )
     train_preprocessing_path = find_split_config(
-        train_dir, DEFAULT_PREPROCESSING_CONFIG_NAME
+        train_dir, preprocessing_config_names
     )
     val_preprocessing_path = find_split_config(
-        val_dir, DEFAULT_PREPROCESSING_CONFIG_NAME
+        val_dir, preprocessing_config_names
     )
     train_preprocessing = load_config(train_preprocessing_path)
     val_preprocessing = load_config(val_preprocessing_path)
@@ -1327,8 +1821,8 @@ def load_and_validate_split_preprocessing(
         )
     if train_fragmenter != dict(train_preprocessing.get("fragmenter_params") or {}):
         raise ValueError(
-            "fragmenter.json does not match preprocessing_config.json in the "
-            "training structure directory."
+            f"fragmenter.json does not match {DEFAULT_PREPROCESSING_CONFIG_NAME} "
+            "in the training structure directory."
         )
     return train_preprocessing, train_preprocessing_path
 
@@ -1542,6 +2036,60 @@ def save_managed_checkpoint(
     ckpt_manager.update()
 
 
+def add_scalar_if_finite(writer, tag: str, value: float, step: int) -> None:
+    if not math.isnan(float(value)):
+        writer.add_scalar(tag, float(value), step)
+
+
+def add_scalars_if_finite(
+    writer,
+    main_tag: str,
+    values: Dict[str, float],
+    step: int,
+) -> None:
+    finite_values = {
+        key: float(value)
+        for key, value in values.items()
+        if not math.isnan(float(value))
+    }
+    if finite_values:
+        writer.add_scalars(main_tag, finite_values, step)
+
+
+def log_distribution_cards(
+    writer,
+    namespace: str,
+    summaries: Dict[str, Dict[str, float]],
+    step: int,
+) -> None:
+    """One card per base metric, containing every split, scope, and statistic.
+
+    A summary key may carry an optional ``@scope`` suffix before its
+    trailing ``_{statistic}`` (e.g. ``selection_precision@by_adduct:[M+H]+_mean``)
+    to report the same metric under a different condition (excl-precursor,
+    by-adduct, by-CE-range, ...) without opening a separate card for it: the
+    part before ``@`` is the card-grouping key, and the scope becomes part of
+    the series name alongside the split (``{split}_{scope}_{statistic}``).
+    Keys without ``@`` keep today's plain ``{split}_{statistic}`` series name.
+    """
+    statistics = ("min", "q1", "mean", "median", "q3", "max")
+    grouped: Dict[str, Dict[str, float]] = {}
+    for split, summary in summaries.items():
+        for name, value in summary.items():
+            for statistic in statistics:
+                suffix = f"_{statistic}"
+                if name.endswith(suffix):
+                    metric_path = name[: -len(suffix)]
+                    metric, _, scope = metric_path.partition("@")
+                    series_name = (
+                        f"{split}_{scope}_{statistic}" if scope else f"{split}_{statistic}"
+                    )
+                    grouped.setdefault(metric, {})[series_name] = value
+                    break
+    for metric, values in grouped.items():
+        add_scalars_if_finite(writer, f"{namespace}/{metric}", values, step)
+
+
 def main(
     *,
     model_config: Dict[str, Any],
@@ -1631,44 +2179,28 @@ def main(
             f"[WARN] validation valid-record MSDataset was not found: "
             f"{validation_valid_records_file}"
         )
-
-    def add_scalar_if_finite(tag: str, value: float, step: int) -> None:
-        if not math.isnan(float(value)):
-            writer.add_scalar(tag, float(value), step)
-
-    def add_scalars_if_finite(
-        main_tag: str,
-        values: Dict[str, float],
-        step: int,
-    ) -> None:
-        finite_values = {
-            key: float(value)
-            for key, value in values.items()
-            if not math.isnan(float(value))
-        }
-        if finite_values:
-            writer.add_scalars(main_tag, finite_values, step)
-
-    def log_distribution_cards(
-        namespace: str,
-        summaries: Dict[str, Dict[str, float]],
-        step: int,
-    ) -> None:
-        """One card per metric, containing every split and statistic."""
-        statistics = ("min", "q1", "mean", "median", "q3", "max")
-        grouped: Dict[str, Dict[str, float]] = {}
-        for split, summary in summaries.items():
-            for name, value in summary.items():
-                for statistic in statistics:
-                    suffix = f"_{statistic}"
-                    if name.endswith(suffix):
-                        metric = name[: -len(suffix)]
-                        grouped.setdefault(metric, {})[
-                            f"{split}_{statistic}"
-                        ] = value
-                        break
-        for metric, values in grouped.items():
-            add_scalars_if_finite(f"{namespace}/{metric}", values, step)
+    validation_excluded_dataset = None
+    if validation_dataset is not None:
+        validation_dataset, validation_excluded_dataset = split_validation_records_by_assignment_score(
+            validation_dataset,
+            extra_data["validation_assignment_score_file"],
+            float(extra_data["assignment_score_threshold"]),
+        )
+    _, validation_excluded, _ = load_assignment_score_selection(
+        extra_data["validation_assignment_score_file"],
+        float(extra_data["assignment_score_threshold"]),
+    )
+    val_excluded_loader = None
+    if validation_excluded:
+        excluded_dataset = FragmentTreeStructureFileDataset(
+            Path(extra_data["validation_structure_dir"]),
+            pattern=str(extra_data.get("pattern", "*.preft.pt")),
+            included_samples_by_file=validation_excluded,
+        )
+        val_excluded_loader = DataLoader(
+            excluded_dataset, batch_size=batch_size, shuffle=False,
+            collate_fn=collate_fragment_tree_structure_items,
+        )
 
     def evaluate_current_validation(
         desc: str,
@@ -1686,6 +2218,39 @@ def main(
                 optimizer=None,
                 desc=desc,
             )
+            excluded_metrics = (
+                run_epoch(
+                    model=model, loader=val_excluded_loader, device=device,
+                    optimizer=None, desc=f"{desc}-below-threshold",
+                )
+                if val_excluded_loader is not None else nan_loss_metrics()
+            )
+            unfiltered_metrics = (
+                combine_epoch_metrics(metrics, excluded_metrics)
+                if excluded_metrics.samples else metrics
+            )
+            add_scalars_if_finite(
+                writer,
+                "validation_scope/loss",
+                {"filtered": metrics.loss, "unfiltered": unfiltered_metrics.loss},
+                step_value,
+            )
+            log_distribution_cards(
+                writer,
+                "validation_scope/absolute_ranker",
+                {"filtered": metrics.absolute_ranker_summary,
+                 "below_threshold": excluded_metrics.absolute_ranker_summary},
+                step_value,
+            )
+            scope_file = run_dir / "validation" / "validation_scope_summary.tsv"
+            scope_file.parent.mkdir(parents=True, exist_ok=True)
+            write_header = not scope_file.exists()
+            with open(scope_file, "a", encoding="utf-8", newline="") as handle:
+                tsv = csv.writer(handle, delimiter="\t")
+                if write_header:
+                    tsv.writerow(["global_step", "scope", "samples", "loss", "selection_loss", "intensity_loss"])
+                for scope, item in (("filtered", metrics), ("below_threshold", excluded_metrics), ("unfiltered", unfiltered_metrics)):
+                    tsv.writerow([step_value, scope, item.samples, item.loss, item.selection_loss, item.intensity_loss])
             cosine = (
                 evaluate_validation_cosine(
                     model=model,
@@ -1693,12 +2258,47 @@ def main(
                     batch_size=batch_size,
                     writer=writer,
                     global_step=step_value,
-                    output_dir=run_dir / "validation",
+                    output_dir=run_dir / "validation" / "filtered",
                     selection_metric_means=selection_metric_means,
                 )
                 if validation_dataset is not None and not model.absolute_ranker_only
                 else float("nan")
             )
+            excluded_peak_means: Dict[str, float] = {}
+            excluded_cosine = (
+                evaluate_validation_cosine(
+                    model=model, dataset=validation_excluded_dataset,
+                    batch_size=batch_size, writer=None, global_step=step_value,
+                    output_dir=run_dir / "validation" / "below_threshold",
+                    selection_metric_means=excluded_peak_means,
+                )
+                if validation_excluded_dataset is not None and not model.absolute_ranker_only
+                else float("nan")
+            )
+            if math.isfinite(cosine) and math.isfinite(excluded_cosine):
+                high_count, low_count = len(validation_dataset), len(validation_excluded_dataset)
+                unfiltered_cosine = (cosine * high_count + excluded_cosine * low_count) / (high_count + low_count)
+            else:
+                unfiltered_cosine = cosine
+            add_scalars_if_finite(
+                writer,
+                "validation_scope/cosine",
+                {"filtered": cosine, "below_threshold": excluded_cosine,
+                 "unfiltered": unfiltered_cosine}, step_value,
+            )
+            if math.isfinite(cosine):
+                combined_cosine = write_combined_validation_cosine_summary(
+                    run_dir / "validation", step_value
+                )
+                add_scalars_if_finite(
+                    writer,
+                    "validation_scope/unfiltered_cosine_distribution",
+                    {name: combined_cosine[name] for name in ("q1", "median", "q3")},
+                    step_value,
+                )
+                write_combined_peak_selection_summary(
+                    run_dir / "validation", step_value
+                )
         return metrics, cosine, selection_metric_means
 
     def log_training_metrics(
@@ -1714,13 +2314,7 @@ def main(
     ) -> None:
         lr = float(optimizer.param_groups[0]["lr"])
         window_metrics = train_window_metrics or nan_loss_metrics()
-        edge_metric_names = (
-            "edge_ranking_loss",
-            "pairwise_ranking_accuracy",
-            "edge_retain_precision",
-            "edge_retain_recall",
-            "edge_total_loss",
-        )
+        edge_metric_names = EDGE_METRIC_NAMES
         metric_row = {
             "event": event,
             "epoch": int(epoch_value),
@@ -1736,7 +2330,13 @@ def main(
             "val_intensity_loss": val_metrics.intensity_loss,
             "val_cosine": val_cosine,
             **{
-                f"train_{name}": train_metrics.absolute_ranker_summary.get(
+                f"train_{_edge_metric_column(name)}": train_metrics.absolute_ranker_summary.get(
+                    f"{name}_mean", float("nan")
+                )
+                for name in edge_metric_names
+            },
+            **{
+                f"val_{_edge_metric_column(name)}": val_metrics.absolute_ranker_summary.get(
                     f"{name}_mean", float("nan")
                 )
                 for name in edge_metric_names
@@ -1750,23 +2350,26 @@ def main(
         ckpt_manager.log_metrics(**metric_row)
         ckpt_manager.flush_metrics(flush_dir=str(run_dir))
         add_scalars_if_finite(
+            writer,
             "loss/total",
             {"train": train_metrics.loss, "train_window": window_metrics.loss,
              "validation": val_metrics.loss}, step_value,
         )
         add_scalars_if_finite(
+            writer,
             "loss/selection",
             {"train": train_metrics.selection_loss,
              "train_window": window_metrics.selection_loss,
              "validation": val_metrics.selection_loss}, step_value,
         )
         add_scalars_if_finite(
+            writer,
             "loss/intensity",
             {"train": train_metrics.intensity_loss,
              "train_window": window_metrics.intensity_loss,
              "validation": val_metrics.intensity_loss}, step_value,
         )
-        add_scalar_if_finite("similarity/validation/cosine", val_cosine, step_value)
+        add_scalar_if_finite(writer, "similarity/validation/cosine", val_cosine, step_value)
         # Write the requested headline metrics into the root event file as
         # ordinary scalars. SummaryWriter.add_scalars stores series in child
         # event directories, which makes them easy to miss when TensorBoard is
@@ -1776,27 +2379,21 @@ def main(
             ("train_window", window_metrics),
             ("validation", val_metrics),
         ):
-            add_scalar_if_finite(f"{split}/loss/total", metrics.loss, step_value)
+            add_scalar_if_finite(writer, f"{split}/loss/total", metrics.loss, step_value)
             add_scalar_if_finite(
-                f"{split}/loss/selection", metrics.selection_loss, step_value
+                writer, f"{split}/loss/selection", metrics.selection_loss, step_value
             )
             add_scalar_if_finite(
-                f"{split}/loss/intensity", metrics.intensity_loss, step_value
+                writer, f"{split}/loss/intensity", metrics.intensity_loss, step_value
             )
-            for name in edge_metric_names:
-                add_scalar_if_finite(
-                    f"{split}/edge/{name}",
-                    metrics.absolute_ranker_summary.get(
-                        f"{name}_mean", float("nan")
-                    ),
-                    step_value,
-                )
+        # One TensorBoard card per metric (including dynamic by_adduct/by_ce_range
+        # keys), with a full min/q1/mean/median/q3/max series for both train and
+        # validation.
         log_distribution_cards(
-            "absolute_ranker",
-            {
-                "train": train_metrics.absolute_ranker_summary,
-                "validation": val_metrics.absolute_ranker_summary,
-            },
+            writer,
+            "metrics",
+            {"train": train_metrics.absolute_ranker_summary,
+             "validation": val_metrics.absolute_ranker_summary},
             step_value,
         )
         writer.add_scalar("training/phase", int(model.training_phase.item()), step_value)
@@ -1944,13 +2541,6 @@ def main(
             train_epoch_metrics: EpochLossMetrics,
             train_window_metrics: EpochLossMetrics,
         ) -> None:
-            # Validation at the same step already includes all train metrics.
-            if (
-                validation_interval_steps is not None
-                and validation_interval_steps > 0
-                and step_value % validation_interval_steps == 0
-            ):
-                return
             log_training_metrics(
                 event="train_step",
                 epoch_value=epoch_index,
@@ -2219,6 +2809,7 @@ def run_training_from_config(
         batch_size,
         num_workers=0,
     )
+    save_config(extra_data["assignment_score_report"], run_dir / "assignment_score_report.json")
 
     model_config = load_config(model_config_resolved)
     validate_preprocessing_compatibility(
@@ -2267,6 +2858,7 @@ def run_training(
     model_config_inline: Optional[Dict[str, Any]] = None,
     train_config_inline: Optional[Dict[str, Any]] = None,
     preprocessing_config_path: Optional[str | Path] = None,
+    workbench_config: Optional[Dict[str, Any]] = None,
 ) -> None:
     model_config_resolved = (
         None
@@ -2312,12 +2904,15 @@ def run_training(
             normalize_train_config(project_dir, train_config_inline),
             run_dir / DEFAULT_TRAIN_CONFIG_NAME,
         )
+    if workbench_config is not None:
+        save_config(workbench_config, run_dir / "fragment_tree.pfttrain.json")
 
     _, _, train_loader, val_loader, extra_data = setup_dataset(
         dataset_info,
         batch_size,
         num_workers=num_workers,
     )
+    save_config(extra_data["assignment_score_report"], run_dir / "assignment_score_report.json")
 
     model_config = (
         dict(model_config_inline)
@@ -2407,7 +3002,7 @@ def parse_args() -> argparse.Namespace:
         required=True,
         help="Output directory for one fragment-tree training project.",
     )
-    parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--num-workers", type=int, default=min(4, os.cpu_count() or 1))
     parser.add_argument("--mol-encoder-checkpoint", required=True)
     parser.add_argument("--condition-adduct-embedding-dim", type=int, default=16)
     parser.add_argument("--condition-ce-feature-dim", type=int, choices=(16,), default=16)
@@ -2418,7 +3013,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tree-num-layers", type=int, default=2)
     parser.add_argument("--tree-num-heads", type=int, default=8)
     parser.add_argument("--tree-max-degree", type=int, default=16)
-    parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument(
+        "--dropout", type=float, default=0.5,
+        help="Global dropout used throughout the constructed fragment-tree model.",
+    )
     parser.add_argument("--edge-feature-dim", type=int, default=256)
     parser.add_argument("--edge-category-dim", type=int, default=32)
     parser.add_argument("--edge-attention-heads", type=int, default=8)
@@ -2429,12 +3027,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--training-edges-per-sample", type=int, default=32)
     parser.add_argument("--training-zero-edge-fraction", type=float, default=0.25)
     parser.add_argument("--max-samples", type=int, default=100)
+    parser.add_argument(
+        "--assignment-score-threshold", type=float,
+        default=DEFAULT_ASSIGNMENT_SCORE_THRESHOLD,
+        help="Use samples whose assignment score is at least this value.",
+    )
     parser.add_argument("--max-edges-per-step", type=int, default=128)
     parser.add_argument("--max-retained-edges", type=int, default=30)
+    parser.add_argument("--max-edges-per-tree", type=int, default=256)
     parser.add_argument("--max-next-cleavage-candidates", type=int, default=3)
     parser.add_argument("--edge-condition-interaction-dim", type=int, default=64)
     parser.add_argument("--ranking-loss-weight", type=float, default=1.0)
-    parser.add_argument("--ranking-pairs-per-edge", type=int, default=4)
+    parser.add_argument("--top-n", type=int, default=10)
+    parser.add_argument("--nearest-lower-partners", type=int, default=1)
+    parser.add_argument("--extended-lower-partners", type=int, default=3)
+    parser.add_argument("--background-partners", type=int, default=10)
     parser.add_argument("--ranking-intensity-threshold", type=float, default=0.05)
     parser.add_argument("--experiment-name", default=DEFAULT_EXPERIMENT_NAME)
     parser.add_argument("--ckpt-id", default=None)
@@ -2481,9 +3088,20 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
+def _workbench_training_config(args: argparse.Namespace) -> Dict[str, Any]:
+    """Return a training configuration that the VS Code Workbench can reload."""
+    config: Dict[str, Any] = {"application": "fragment-tree-training"}
+    for key, value in vars(args).items():
+        parts = key.split("_")
+        workbench_key = parts[0] + "".join(part.title() for part in parts[1:])
+        config[workbench_key] = value
+    return config
+
+
 if __name__ == "__main__":
     args = parse_args()
-    project_dir = args.output_dir
+    project_dir = Path(args.output_dir)
+    project_dir.mkdir(parents=True, exist_ok=True)
     train_split_dir = Path(args.train_dir)
     val_split_dir = Path(args.val_dir)
     train_data_dir = train_split_dir / "data" if (train_split_dir / "data").is_dir() else train_split_dir
@@ -2521,10 +3139,14 @@ if __name__ == "__main__":
         generator_params={
             "max_edges_per_step": args.max_edges_per_step,
             "max_retained_edges": args.max_retained_edges,
+            "max_edges_per_tree": args.max_edges_per_tree,
             "max_next_cleavage_candidates": args.max_next_cleavage_candidates,
             "edge_condition_interaction_dim": args.edge_condition_interaction_dim,
             "ranking_loss_weight": args.ranking_loss_weight,
-            "ranking_pairs_per_edge": args.ranking_pairs_per_edge,
+            "top_n": args.top_n,
+            "nearest_lower_partners": args.nearest_lower_partners,
+            "extended_lower_partners": args.extended_lower_partners,
+            "background_partners": args.background_partners,
             "ranking_intensity_threshold": args.ranking_intensity_threshold,
         },
     )
@@ -2556,6 +3178,7 @@ if __name__ == "__main__":
         detect_anomaly=args.detect_anomaly,
         profile_performance=args.profile_performance,
         max_samples=args.max_samples,
+        assignment_score_threshold=args.assignment_score_threshold,
     )
     train_config_inline["validation_valid_records_file"] = str(
         val_split_dir / "valid_records.msds"
@@ -2570,4 +3193,5 @@ if __name__ == "__main__":
         model_config_inline=model_config_inline,
         train_config_inline=train_config_inline,
         preprocessing_config_path=preprocessing_config_path,
+        workbench_config=_workbench_training_config(args),
     )

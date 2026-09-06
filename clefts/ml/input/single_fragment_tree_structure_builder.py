@@ -512,6 +512,9 @@ class SingleFragmentTreeStructureBuilder:
             node_formula=node_formula,
             formula_element_order=formula_tensorizer.element_order,
             edge_index=edge_index,
+            tree_sample_ptr=torch.tensor(
+                [0, int(sample_adduct_type_index.numel())], dtype=torch.long
+            ),
             cleavage_event_edge_index=cleavage_event_edge_index,
             cleavage_event=cleavage_event,
             cleavage_atom_idxs=cleavage_atom_idxs,

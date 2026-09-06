@@ -48,6 +48,17 @@ class FragmentTreeStructure:
     # edge_index[1, e] = target fragment node index
 
     # -------------------------
+    # Tree-batch boundaries
+    # -------------------------
+    tree_sample_ptr: Tensor
+    # [T + 1] Prefix-sum sample offsets identifying which contiguous sample
+    # range came from which constituent structure ("tree") before
+    # from_structures() concatenated them.
+    #
+    # Samples of tree t are range(tree_sample_ptr[t], tree_sample_ptr[t + 1]).
+    # A single (non-collated) structure has tree_sample_ptr == [0, num_samples].
+
+    # -------------------------
     # Cleavage events
     # -------------------------
     cleavage_event_edge_index: Tensor
@@ -186,6 +197,22 @@ class FragmentTreeStructure:
     def __post_init__(self) -> None:
         num_precursor_paths = int(self.precursor_edge_index_path.size(0))
 
+        for ptr_name, ptr, expected_end in (
+            ("tree_sample_ptr", self.tree_sample_ptr, self.num_samples),
+        ):
+            if ptr.dim() != 1 or ptr.numel() < 2:
+                raise ValueError(
+                    f"{ptr_name} must be 1D with at least 2 entries, "
+                    f"got shape {tuple(ptr.shape)}."
+                )
+            if int(ptr[0].item()) != 0 or int(ptr[-1].item()) != int(expected_end):
+                raise ValueError(
+                    f"{ptr_name} must span [0, {expected_end}], "
+                    f"got [{int(ptr[0].item())}, {int(ptr[-1].item())}]."
+                )
+            if bool((ptr[1:] < ptr[:-1]).any().item()):
+                raise ValueError(f"{ptr_name} must be non-decreasing.")
+
         if self.node_formula.dim() != 2:
             raise ValueError(
                 "node_formula must be 2D, "
@@ -289,6 +316,10 @@ class FragmentTreeStructure:
         return int(self.sample_adduct_type_index.numel())
 
     @property
+    def num_trees(self) -> int:
+        return int(self.tree_sample_ptr.numel()) - 1
+
+    @property
     def cleavage_pattern_ids(self) -> Tensor:
         return self.cleavage_event[:, 0]  # [M]
 
@@ -327,6 +358,7 @@ class FragmentTreeStructure:
             node_formula=self.node_formula.to(device),
             formula_element_order=self.formula_element_order,
             edge_index=self.edge_index.to(device),
+            tree_sample_ptr=self.tree_sample_ptr.to(device),
             cleavage_event_edge_index=self.cleavage_event_edge_index.to(device),
             cleavage_event=self.cleavage_event.to(device),
             cleavage_atom_idxs={
@@ -705,6 +737,18 @@ class FragmentTreeStructure:
             dim=0,
         )
 
+        # -------------------------
+        # tree_sample_ptr
+        # -------------------------
+        tree_sample_ptr_values = [0]
+        tree_sample_offset = 0
+        for structure in structures:
+            tree_sample_offset += structure.num_samples
+            tree_sample_ptr_values.append(tree_sample_offset)
+        tree_sample_ptr = torch.tensor(
+            tree_sample_ptr_values, dtype=torch.long, device=tensor_device
+        )
+
         return cls(
             node_smiles=node_smiles,
             node_graph=node_graph,
@@ -712,6 +756,7 @@ class FragmentTreeStructure:
             node_formula=node_formula,
             formula_element_order=formula_element_order,
             edge_index=edge_index,
+            tree_sample_ptr=tree_sample_ptr,
             cleavage_event_edge_index=cleavage_event_edge_index,
             cleavage_event=cleavage_event,
             cleavage_atom_idxs=cleavage_atom_idxs,

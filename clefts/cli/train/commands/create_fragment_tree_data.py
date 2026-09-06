@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 
 from ...base import CLICommand
 from clefts.ml.data_preparation.fragment_tree.create_fragment_tree_training_data import main as create_main
 from clefts.ml.data_preparation.fragment_tree.create_fragment_tree_training_data import parse_args as create_parse_args
+from clefts.ml.data_preparation.fragment_tree.create_fragment_tree_training_data import (
+    DEFAULT_PREPROCESSING_CONFIG_NAME,
+)
 
 
 class CreateFragmentTreeDataCommand(CLICommand):
@@ -25,7 +29,7 @@ class CreateFragmentTreeDataCommand(CLICommand):
         parser.add_argument(
             "model_config",
             metavar="MODEL_CONFIG",
-            help="Fragmenter parameter JSON path or name under PROJECT_DIR/config.",
+            help="Inline Fragmenter JSON object, or a legacy JSON path/name under PROJECT_DIR/config.",
         )
         parser.add_argument(
             "train_input",
@@ -80,22 +84,26 @@ class CreateFragmentTreeDataCommand(CLICommand):
 
     def run(self, args: argparse.Namespace) -> None:
         project_dir = Path(args.project_dir)
-        model_config = Path(args.model_config)
-        if not model_config.exists() and not model_config.is_absolute():
-            candidate = project_dir / "config" / model_config
-            if candidate.suffix == "":
-                candidate = candidate.with_suffix(".json")
-            model_config = candidate
+        if args.model_config.lstrip().startswith("{"):
+            fragmenter_params = json.loads(args.model_config)
+        else:
+            model_config = Path(args.model_config)
+            if not model_config.exists() and not model_config.is_absolute():
+                candidate = project_dir / "config" / model_config
+                if candidate.suffix == "":
+                    candidate = candidate.with_suffix(".json")
+                model_config = candidate
+            fragmenter_params = json.loads(model_config.read_text(encoding="utf-8"))
 
         argv = [
             "--train-input",
             str(args.train_input),
             "--output-dir",
             str(project_dir),
-            "--params",
-            str(model_config),
+            "--params-json",
+            json.dumps(fragmenter_params),
             "--preprocessing-config-output",
-            str(project_dir / "config" / "preprocessing_config.json"),
+            str(project_dir / "config" / DEFAULT_PREPROCESSING_CONFIG_NAME),
             "--symbols",
             *[str(symbol) for symbol in args.symbols],
             "--smiles-column",
@@ -106,8 +114,6 @@ class CreateFragmentTreeDataCommand(CLICommand):
             str(args.adduct_type_column),
             "--collision-energy-column",
             str(args.collision_energy_column),
-            "--device",
-            str(args.device),
             "--max-node",
             str(args.max_node),
             "--max-edge",

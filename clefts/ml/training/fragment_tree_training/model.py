@@ -9,31 +9,83 @@ from torch import Tensor
 from ...input.training_fragment_tree_structure import TrainingFragmentTreeStructure
 from ...specgen.fragment_tree_candidate_selector import FragmentTreeCandidateSelectionOutput
 from ...specgen.fragment_tree_formula_intensity_model import FragmentTreeFormulaIntensityPredictor
+from . import metric_labels
 
 
 class PairwiseEdgeIntensityRankingLoss(nn.Module):
     """Rank independently scored edges by observed peak intensity.
 
-    Only adjacent unequal-intensity targets and target-vs-background pairs are
-    used.  This retains RankNet's ordering objective without constructing the
-    quadratic set of every possible pair.
+    For each intensity-sorted anchor (group, in the gradient path; edge, in
+    the diagnostic path), up to ``top_n`` comparison partners are selected in
+    three tiers, filled in order until ``top_n`` is reached:
+
+    1. the ``nearest_lower_partners`` *nearest* lower-intensity partners;
+    2. ``extended_lower_partners`` *more* lower-intensity partners, farther away in the sorted
+       order;
+    3. ``background_partners`` partners with no intensity at all (unassigned/background
+       edges), individually compared against the anchor.
+
+    Tiers 1/2 skip (without consuming budget) any candidate whose
+    ``sqrt(intensity)`` gap to the anchor is ``<= intensity_threshold``.  This
+    retains RankNet's ordering objective without constructing the quadratic
+    set of every possible pair.  Each pair is weighted by a reciprocal-rank
+    weight ``(1/rank_i) / sum(1/rank_n)`` computed over the sample's
+    intensity-sorted groups (rank 1 = most intense), not by the raw intensity
+    value itself; intensity is still used to sort groups and to gate
+    near-equal-intensity pairs.
     """
 
     def __init__(
         self,
-        ranking_pairs_per_edge: int = 4,
+        top_n: int = 10,
+        nearest_lower_partners: int = 1,
+        extended_lower_partners: int = 3,
+        background_partners: int = 10,
         intensity_threshold: float = 0.05,
     ) -> None:
         super().__init__()
-        if ranking_pairs_per_edge < 1:
-            raise ValueError("ranking_pairs_per_edge must be positive.")
+        if top_n < 1:
+            raise ValueError("top_n must be positive.")
+        if nearest_lower_partners < 0 or extended_lower_partners < 0 or background_partners < 0:
+            raise ValueError("nearest_lower_partners, extended_lower_partners, and background_partners must be non-negative.")
         if intensity_threshold < 0:
             raise ValueError("intensity_threshold must be non-negative.")
-        self.ranking_pairs_per_edge = int(ranking_pairs_per_edge)
+        self.top_n = int(top_n)
+        self.nearest_lower_partners = int(nearest_lower_partners)
+        self.extended_lower_partners = int(extended_lower_partners)
+        self.background_partners = int(background_partners)
         self.intensity_threshold = float(intensity_threshold)
 
+    def _select_tiered_partners(
+        self,
+        *,
+        sqrt_values: Tensor,
+        anchor_index: int,
+        remaining_budget: int,
+    ) -> List[int]:
+        """Tier 1+2 offsets ``j > 0`` such that ``sqrt_values[anchor_index + j]``
+        is a selected lower-intensity partner, nearest-first.  ``sqrt_values``
+        must already be sorted descending.  A candidate whose gap to the
+        anchor is ``<= intensity_threshold`` is skipped without consuming
+        budget, so the scan continues past it.
+        """
+        offsets: List[int] = []
+        budget = min(self.nearest_lower_partners + self.extended_lower_partners, max(int(remaining_budget), 0))
+        if budget <= 0:
+            return offsets
+        anchor_value = float(sqrt_values[anchor_index])
+        n = int(sqrt_values.numel())
+        j = 1
+        while len(offsets) < budget and anchor_index + j < n:
+            candidate_value = float(sqrt_values[anchor_index + j])
+            if anchor_value - candidate_value > self.intensity_threshold:
+                offsets.append(j)
+            j += 1
+        return offsets
+
     def build_pairs(self, output, target) -> Tuple[Tensor, Tensor]:
-        """Build bounded pairs within the same sample and source fragment."""
+        """Build tiered pairs within the same sample and source fragment
+        (diagnostic only; mirrors forward()'s tier1/tier2/tier3 selection)."""
         logit = output.edge_absolute_logit
         batch = output.sample_tree_batch
         edge_ids = batch.edge_id_global.to(logit.device).long()
@@ -76,37 +128,43 @@ class PairwiseEdgeIntensityRankingLoss(nn.Module):
                     peak_intensity[formula_peak[int(group_id)]].item()
                 )
             for source_id in source_ids[sample_mask].unique(sorted=True).tolist():
-                local = (sample_mask & (source_ids == int(source_id))).nonzero(as_tuple=False).flatten()
-                local = torch.tensor(
-                    [
-                        int(index)
-                        for index in local.tolist()
-                        if int(index) not in alternative_rows or int(index) in intensity_by_row
-                    ],
-                    dtype=torch.long,
-                    device=logit.device,
+                source_rows = (sample_mask & (source_ids == int(source_id))).nonzero(as_tuple=False).flatten().tolist()
+                real_rows = torch.tensor(
+                    [index for index in source_rows if int(index) in intensity_by_row],
+                    dtype=torch.long, device=logit.device,
                 )
-                if local.numel() < 2:
+                background_rows = torch.tensor(
+                    [index for index in source_rows if int(index) not in alternative_rows],
+                    dtype=torch.long, device=logit.device,
+                )
+                if real_rows.numel() == 0:
                     continue
-                raw = logit.new_tensor([
-                    intensity_by_row.get(int(index), 0.0)
-                    for index in local
-                ])
-                values = torch.sqrt(raw.clamp_min(0.0))
-                order = torch.argsort(values, descending=True, stable=True)
-                ordered_local, ordered_values = local[order], values[order]
-                # At most K lower-intensity partners per edge; no quadratic
-                # materialization and no cross-source/depth comparisons.
-                for high in range(int(ordered_local.numel())):
-                    added = 0
-                    for low in range(high + 1, int(ordered_local.numel())):
-                        if float(ordered_values[high] - ordered_values[low]) <= self.intensity_threshold:
-                            continue
-                        better_rows.append(int(ordered_local[high]))
-                        worse_rows.append(int(ordered_local[low]))
-                        added += 1
-                        if added >= self.ranking_pairs_per_edge:
-                            break
+                sqrt_values = torch.sqrt(
+                    logit.new_tensor([intensity_by_row[int(index)] for index in real_rows]).clamp_min(0.0)
+                )
+                order = torch.argsort(sqrt_values, descending=True, stable=True)
+                ordered_real, ordered_values = real_rows[order], sqrt_values[order]
+                hard_negatives = (
+                    background_rows[
+                        torch.topk(
+                            logit[background_rows], k=min(self.background_partners, int(background_rows.numel()))
+                        ).indices
+                    ]
+                    if background_rows.numel()
+                    else background_rows
+                )
+                for i in range(int(ordered_real.numel())):
+                    offsets = self._select_tiered_partners(
+                        sqrt_values=ordered_values, anchor_index=i, remaining_budget=self.top_n,
+                    )
+                    for j in offsets:
+                        better_rows.append(int(ordered_real[i]))
+                        worse_rows.append(int(ordered_real[i + j]))
+                    remaining_after_12 = self.top_n - len(offsets)
+                    tier3_count = min(self.background_partners, remaining_after_12, int(hard_negatives.numel()))
+                    for k in range(tier3_count):
+                        better_rows.append(int(ordered_real[i]))
+                        worse_rows.append(int(hard_negatives[k]))
         return (
             torch.tensor(better_rows, dtype=torch.long, device=logit.device),
             torch.tensor(worse_rows, dtype=torch.long, device=logit.device),
@@ -151,25 +209,46 @@ class PairwiseEdgeIntensityRankingLoss(nn.Module):
                 intensity = intensities[formula_peak[int(group_id)]]
                 group_rows.append((evidence, intensity))
             group_rows.sort(key=lambda item: float(item[1]), reverse=True)
-            for high, low in zip(group_rows, group_rows[1:]):
-                if float(torch.sqrt(high[1]) - torch.sqrt(low[1])) <= self.intensity_threshold:
-                    continue
-                losses.append(F.softplus(-(high[0] - low[0])))
-                weights.append(high[1].clamp_min(1e-12))
+            # Reciprocal-rank weight (1/rank_i) / sum(1/rank_n), normalized
+            # within this sample's intensity-sorted groups: rank 1 (the most
+            # intense group) carries the most weight, regardless of which
+            # tier a given partner came from.
+            rank_weights = logit.new_empty((0,))
+            sqrt_values = logit.new_empty((0,))
+            if group_rows:
+                ranks = torch.arange(
+                    1, len(group_rows) + 1, dtype=torch.float32, device=logit.device
+                )
+                reciprocal_ranks = 1.0 / ranks
+                rank_weights = reciprocal_ranks / reciprocal_ranks.sum()
+                sqrt_values = torch.sqrt(
+                    torch.stack([item[1] for item in group_rows]).clamp_min(0.0)
+                )
             # Observed formula groups also compete against unassigned edges,
             # including edges at the same depth.  Bound this comparison count.
             background = torch.tensor([
                 index for index in (sample_ids == int(sample_id)).nonzero(as_tuple=False).flatten().tolist()
                 if int(index) not in alternatives
             ], dtype=torch.long, device=logit.device)
-            if background.numel() and group_rows:
-                hard = background[torch.topk(logit[background], k=min(self.ranking_pairs_per_edge, int(background.numel()))).indices]
-                background_evidence = torch.logsumexp(logit[hard], dim=0)
-                for evidence, intensity in group_rows[: self.ranking_pairs_per_edge]:
-                    if float(intensity) <= 0:
-                        continue
-                    losses.append(F.softplus(-(evidence - background_evidence)))
-                    weights.append(intensity.clamp_min(1e-12))
+            hard_negatives = (
+                background[torch.topk(logit[background], k=min(self.background_partners, int(background.numel()))).indices]
+                if background.numel() and group_rows
+                else background[:0]
+            )
+            for i in range(len(group_rows)):
+                offsets = self._select_tiered_partners(
+                    sqrt_values=sqrt_values, anchor_index=i, remaining_budget=self.top_n,
+                )
+                for j in offsets:
+                    losses.append(F.softplus(-(group_rows[i][0] - group_rows[i + j][0])))
+                    weights.append(rank_weights[i])
+                if float(group_rows[i][1]) <= 0:
+                    continue
+                remaining_after_12 = self.top_n - len(offsets)
+                tier3_count = min(self.background_partners, remaining_after_12, int(hard_negatives.numel()))
+                for k in range(tier3_count):
+                    losses.append(F.softplus(-(group_rows[i][0] - logit[hard_negatives[k]])))
+                    weights.append(rank_weights[i])
         if not losses:
             return logit.sum() * 0.0
         loss_values = torch.stack(losses)
@@ -538,9 +617,26 @@ class FragmentTreeSelectionTrainingLoss(nn.Module):
         losses: List[Tensor] = []
 
         if target.target_node_index.numel() > 0:
-            losses.append(self._peak_fragment_loss(output, target, device=device))
+            # Computed once and shared: each is an O(rows) Python loop with
+            # per-row GPU-sync (.item()/.tolist()) calls, so recomputing them
+            # separately in every peak-wise loss below measurably adds up.
+            batch_node_by_sample_node = self._batch_node_by_sample_node(output, device=device)
+            peak_keys = self._target_peak_keys(target, device=device)
+            losses.append(self._peak_fragment_loss(
+                output, target, device=device,
+                peak_keys=peak_keys, batch_node_by_sample_node=batch_node_by_sample_node,
+            ))
             losses.append(self._keep_negative_loss(output, target, device=device))
-            losses.append(self._state_loss(output, target, device=device))
+            losses.append(self._state_loss(
+                output, target, device=device,
+                peak_keys=peak_keys, batch_node_by_sample_node=batch_node_by_sample_node,
+            ))
+            precursor_loss = self._precursor_keep_loss(
+                output, target, device=device,
+                peak_keys=peak_keys, batch_node_by_sample_node=batch_node_by_sample_node,
+            )
+            if precursor_loss is not None:
+                losses.append(precursor_loss)
 
         cleave_target, cleave_mask = self._build_cleave_targets(output, target, device=device)
         if cleave_mask.any():
@@ -589,12 +685,17 @@ class FragmentTreeSelectionTrainingLoss(nn.Module):
         target: TrainingFragmentTreeStructure,
         *,
         device: torch.device,
+        peak_keys: Optional[List[Tuple[int, int]]] = None,
+        batch_node_by_sample_node: Optional[Dict[Tuple[int, int], int]] = None,
     ) -> Tensor:
-        batch_node_by_sample_node = self._batch_node_by_sample_node(output, device=device)
+        if batch_node_by_sample_node is None:
+            batch_node_by_sample_node = self._batch_node_by_sample_node(output, device=device)
+        if peak_keys is None:
+            peak_keys = self._target_peak_keys(target, device=device)
         losses: List[Tensor] = []
         weights: List[Tensor] = []
 
-        for peak_key in self._target_peak_keys(target, device=device):
+        for peak_key in peak_keys:
             row_index = self._target_peak_mask(target, peak_key=peak_key, device=device)
             batch_node_indexes = self._unique_batch_node_indexes(
                 target_sample_index=target.target_sample_index[row_index].to(device),
@@ -619,6 +720,50 @@ class FragmentTreeSelectionTrainingLoss(nn.Module):
         return self.intensity_alpha + (1.0 - self.intensity_alpha) * normalized_intensity.pow(
             self.intensity_gamma
         )
+
+    def _precursor_keep_loss(
+        self,
+        output: FragmentTreeCandidateSelectionOutput,
+        target: TrainingFragmentTreeStructure,
+        *,
+        device: torch.device,
+        peak_keys: Optional[List[Tuple[int, int]]] = None,
+        batch_node_by_sample_node: Optional[Dict[Tuple[int, int], int]] = None,
+    ) -> Optional[Tensor]:
+        """Dedicated keep-loss for precursor-root target peaks.
+
+        The precursor ion is usually the dominant peak in an observed
+        spectrum, yet it is only one of many (sample, peak) rows inside
+        ``_peak_fragment_loss``'s batch-wide weighted mean, so its gradient
+        is diluted by however many fragment peaks the sample also has. This
+        term averages only over precursor peaks so it carries a stable,
+        undiluted share of the training signal regardless of fragment count.
+        """
+        batch = output.sample_tree_batch
+        node_is_precursor_root = batch.node_is_precursor_root.to(device).bool()
+        if batch_node_by_sample_node is None:
+            batch_node_by_sample_node = self._batch_node_by_sample_node(output, device=device)
+        if peak_keys is None:
+            peak_keys = self._target_peak_keys(target, device=device)
+        losses: List[Tensor] = []
+
+        for peak_key in peak_keys:
+            row_index = self._target_peak_mask(target, peak_key=peak_key, device=device)
+            batch_node_indexes = self._unique_batch_node_indexes(
+                target_sample_index=target.target_sample_index[row_index].to(device),
+                target_node_index=target.target_node_index[row_index].to(device),
+                batch_node_by_sample_node=batch_node_by_sample_node,
+            )
+            if batch_node_indexes.numel() == 0:
+                continue
+            precursor_indexes = batch_node_indexes[node_is_precursor_root[batch_node_indexes]]
+            if precursor_indexes.numel() == 0:
+                continue
+            losses.append(F.softplus(-torch.logsumexp(output.keep_logit[precursor_indexes], dim=0)))
+
+        if len(losses) == 0:
+            return None
+        return torch.stack(losses).mean()
 
     def _keep_negative_loss(
         self,
@@ -669,13 +814,18 @@ class FragmentTreeSelectionTrainingLoss(nn.Module):
         target: TrainingFragmentTreeStructure,
         *,
         device: torch.device,
+        peak_keys: Optional[List[Tuple[int, int]]] = None,
+        batch_node_by_sample_node: Optional[Dict[Tuple[int, int], int]] = None,
     ) -> Tensor:
         batch = output.sample_tree_batch
-        batch_node_by_sample_node = self._batch_node_by_sample_node(output, device=device)
+        if batch_node_by_sample_node is None:
+            batch_node_by_sample_node = self._batch_node_by_sample_node(output, device=device)
+        if peak_keys is None:
+            peak_keys = self._target_peak_keys(target, device=device)
         losses: List[Tensor] = []
         weights: List[Tensor] = []
 
-        for peak_key in self._target_peak_keys(target, device=device):
+        for peak_key in peak_keys:
             row_index = self._target_peak_mask(target, peak_key=peak_key, device=device)
             batch_node_indexes = self._unique_batch_node_indexes(
                 target_sample_index=target.target_sample_index[row_index].to(device),
@@ -1205,13 +1355,16 @@ class FragmentTreeTrainingModel(nn.Module):
         )
         self._checkpoint_model_config: Dict[str, Any] = {}
         feature_model = candidate_selector.feature_model
-        adduct_labels = {
+        self.adduct_labels = {
             int(index): str(adduct)
             for index, adduct in feature_model.main_adduct_types.items()
         }
         self.ranking_loss_weight = float(getattr(candidate_selector, "ranking_loss_weight", 1.0))
         self.absolute_ranker_loss_fn = PairwiseEdgeIntensityRankingLoss(
-            ranking_pairs_per_edge=int(getattr(candidate_selector, "ranking_pairs_per_edge", 4)),
+            top_n=int(getattr(candidate_selector, "top_n", 10)),
+            nearest_lower_partners=int(getattr(candidate_selector, "nearest_lower_partners", 1)),
+            extended_lower_partners=int(getattr(candidate_selector, "extended_lower_partners", 3)),
+            background_partners=int(getattr(candidate_selector, "background_partners", 10)),
             intensity_threshold=float(getattr(candidate_selector, "ranking_intensity_threshold", 0.05)),
         )
         self.register_buffer("training_phase", torch.tensor(1, dtype=torch.long))
@@ -1244,10 +1397,22 @@ class FragmentTreeTrainingModel(nn.Module):
         loss = edge_total_loss + intensity_loss
         absolute_ranker_metrics = self.absolute_ranker_loss_fn.metrics(output, batch)
         absolute_ranker_metrics.update(self._edge_retain_metrics(output, batch))
+        absolute_ranker_metrics.update(self._selected_peak_metrics(output, batch))
+        absolute_ranker_metrics.update(self._tree_edge_budget_metrics(output, batch))
+        if intensity_output is not None:
+            absolute_ranker_metrics.update(
+                self._intensity_similarity_metrics(intensity_output, batch)
+            )
         absolute_ranker_metrics.update({
             "edge_retain_loss": float(selection_loss.detach().cpu().item()),
             "edge_total_loss": float(edge_total_loss.detach().cpu().item()),
         })
+        with torch.no_grad():
+            precursor_keep_loss = self.loss_fn._precursor_keep_loss(output, batch, device=selection_loss.device)
+        if precursor_keep_loss is not None:
+            absolute_ranker_metrics["precursor/keep_loss"] = float(
+                precursor_keep_loss.detach().cpu().item()
+            )
         return {
             "loss": loss,
             "selection_loss": selection_loss,
@@ -1261,9 +1426,129 @@ class FragmentTreeTrainingModel(nn.Module):
             "absolute_ranker_metrics": absolute_ranker_metrics,
         }
 
-    @staticmethod
+    def _grouped_metric_means(
+        self,
+        per_sample_values_by_metric: Dict[str, Dict[int, float]],
+        target,
+    ) -> Dict[str, float]:
+        """Group per-sample metric values by adduct type and CE bucket.
+
+        Returns flat ``<metric>@by_adduct:<label>`` and
+        ``<metric>@by_ce_range:<label>`` keys, each the mean of the
+        per-sample values whose sample falls in that group. The ``@scope``
+        suffix keeps every variant of one metric on the same TensorBoard
+        card (see ``log_distribution_cards``) instead of opening a new card
+        per adduct/CE group. Grouping is computed once here and shared by
+        every caller's metric.
+        """
+        if not any(per_sample_values_by_metric.values()):
+            return {}
+        if not hasattr(target, "sample_adduct_type_index") or not hasattr(target, "sample_ce_value"):
+            return {}
+        adduct_index = target.sample_adduct_type_index.detach().cpu().long()
+        ce_values = target.sample_ce_value.detach().cpu().float()
+        finite_ce = ce_values[torch.isfinite(ce_values)]
+        if finite_ce.numel():
+            ce_q1, ce_median, ce_q3 = torch.quantile(
+                finite_ce, torch.tensor([0.25, 0.5, 0.75])
+            ).tolist()
+        else:
+            ce_q1 = ce_median = ce_q3 = 0.0
+        grouped: Dict[str, float] = {}
+        for metric_name, values_by_sample in per_sample_values_by_metric.items():
+            by_adduct: Dict[str, List[float]] = {}
+            by_ce: Dict[str, List[float]] = {}
+            for sample_id, value in values_by_sample.items():
+                adduct = int(adduct_index[sample_id].item())
+                adduct_label = metric_labels.tensorboard_label(
+                    self.adduct_labels.get(adduct, f"unknown-{adduct}")
+                )
+                by_adduct.setdefault(adduct_label, []).append(value)
+                ce_label = metric_labels.ce_range_label(
+                    float(ce_values[sample_id].item()), q1=ce_q1, median=ce_median, q3=ce_q3
+                )
+                by_ce.setdefault(ce_label, []).append(value)
+            for label, values in by_adduct.items():
+                grouped[f"{metric_name}@by_adduct:{label}"] = sum(values) / len(values)
+            for label, values in by_ce.items():
+                grouped[f"{metric_name}@by_ce_range:{label}"] = sum(values) / len(values)
+        return grouped
+
     @torch.no_grad()
-    def _edge_retain_metrics(output, target) -> Dict[str, float]:
+    def _tree_edge_budget_metrics(self, output, target) -> Dict[str, float]:
+        """Report how the per-tree ``max_edges_per_tree`` cap behaved.
+
+        Empty when the mechanism is disabled (no ``selected_edge_index``) or
+        the structure predates ``tree_sample_ptr``. "Available" edges are
+        counted per tree among edges actually referenced by some sample
+        (``sample_edge_index``) -- edges no sample references have zero
+        importance and are never worth the attention budget regardless of
+        which tree they belong to, so they are not counted here either.
+        """
+        selected_edge_index = getattr(output, "selected_edge_index", None)
+        if selected_edge_index is None or not hasattr(target, "tree_sample_ptr"):
+            return {}
+        device = selected_edge_index.device
+        num_edges = int(target.num_edges)
+        selected = selected_edge_index.to(device).long().unique()
+        selected_mask = torch.zeros(num_edges, dtype=torch.bool, device=device)
+        if selected.numel():
+            selected_mask[selected] = True
+
+        sample_edge_index = target.sample_edge_index.to(device).long()
+        valid = sample_edge_index[1] >= 0
+        sample_ids = sample_edge_index[0, valid]
+        edge_ids = sample_edge_index[1, valid]
+        reference_counts = torch.zeros(num_edges, device=device, dtype=torch.float32)
+        if edge_ids.numel():
+            reference_counts.scatter_add_(0, edge_ids, torch.ones_like(edge_ids, dtype=torch.float32))
+        selected_reference_counts = reference_counts[selected] if selected.numel() else reference_counts[:0]
+
+        max_edges_per_tree = getattr(self.candidate_selector, "max_edges_per_tree", None)
+        tree_sample_ptr = target.tree_sample_ptr.to(device).long()
+        num_trees = int(tree_sample_ptr.numel()) - 1
+        trees_over_budget = 0
+        referenced_edge_count = 0
+        if edge_ids.numel():
+            sample_tree_id = torch.zeros(int(target.num_samples), dtype=torch.long, device=device)
+            for tree_id in range(num_trees):
+                start, end = int(tree_sample_ptr[tree_id]), int(tree_sample_ptr[tree_id + 1])
+                sample_tree_id[start:end] = tree_id
+            edge_to_tree = torch.full((num_edges,), -1, dtype=torch.long, device=device)
+            edge_to_tree[edge_ids] = sample_tree_id[sample_ids]
+            referenced_edges = edge_ids.unique()
+            referenced_edge_count = int(referenced_edges.numel())
+            for tree_id in range(num_trees):
+                tree_size = int((edge_to_tree[referenced_edges] == tree_id).sum().item())
+                if max_edges_per_tree is not None and tree_size > int(max_edges_per_tree):
+                    trees_over_budget += 1
+
+        target_edge_index = getattr(target, "target_edge_index", None)
+        if target_edge_index is not None and target_edge_index.numel():
+            target_edges = target_edge_index[1].to(device).long().unique()
+            target_edges = target_edges[(target_edges >= 0) & (target_edges < num_edges)]
+            target_edge_recall = (
+                float(selected_mask[target_edges].float().mean().item())
+                if target_edges.numel() else 1.0
+            )
+        else:
+            target_edge_recall = 1.0
+
+        return {
+            "tree_edge_budget/selected_edge_count": float(selected.numel()),
+            "tree_edge_budget/available_edge_count": float(referenced_edge_count),
+            "tree_edge_budget/target_edge_recall": target_edge_recall,
+            "tree_edge_budget/trees_over_budget_fraction": (
+                trees_over_budget / max(num_trees, 1)
+            ),
+            "tree_edge_budget/mean_samples_per_selected_edge": (
+                float(selected_reference_counts.mean().item())
+                if selected_reference_counts.numel() else 0.0
+            ),
+        }
+
+    @torch.no_grad()
+    def _edge_retain_metrics(self, output, target) -> Dict[str, float]:
         logits = output.edge_absolute_logit
         sample_tree_batch = output.sample_tree_batch
         if logits.numel() == 0:
@@ -1287,7 +1572,233 @@ class FragmentTreeTrainingModel(nn.Module):
         )
         predicted = logits > 0
         true_positive = int((predicted & truth).sum().item())
-        return {
+        metrics = {
+            "edge_retain_accuracy": float((predicted == truth).float().mean().item()),
             "edge_retain_precision": true_positive / max(int(predicted.sum().item()), 1),
             "edge_retain_recall": true_positive / max(int(truth.sum().item()), 1),
         }
+        per_sample: Dict[str, Dict[int, float]] = {
+            "edge_retain_accuracy": {},
+            "edge_retain_precision": {},
+            "edge_retain_recall": {},
+        }
+        for sample_id in sample_ids.unique(sorted=True).tolist():
+            sample_mask = sample_ids == int(sample_id)
+            sample_predicted = predicted[sample_mask]
+            sample_truth = truth[sample_mask]
+            sample_true_positive = int((sample_predicted & sample_truth).sum().item())
+            per_sample["edge_retain_accuracy"][int(sample_id)] = float(
+                (sample_predicted == sample_truth).float().mean().item()
+            )
+            per_sample["edge_retain_precision"][int(sample_id)] = sample_true_positive / max(
+                int(sample_predicted.sum().item()), 1
+            )
+            per_sample["edge_retain_recall"][int(sample_id)] = sample_true_positive / max(
+                int(sample_truth.sum().item()), 1
+            )
+        metrics.update(self._grouped_metric_means(per_sample, target))
+        return metrics
+
+    @torch.no_grad()
+    def _selected_peak_metrics(self, output, target) -> Dict[str, float]:
+        selected_nodes = {
+            (int(candidate.sample_id), int(candidate.global_node_id))
+            for candidate in output.kept_candidates
+        }
+        target_nodes = set(zip(
+            target.target_sample_index.detach().cpu().long().tolist(),
+            target.target_node_index.detach().cpu().long().tolist(),
+        ))
+        batch = output.sample_tree_batch
+        kept_samples = batch.kept_sample_ids.detach().cpu().long()
+        graph_nodes = batch.batch.detach().cpu().long()
+        global_nodes = batch.node_id_global.detach().cpu().long()
+        node_is_precursor_root = batch.node_is_precursor_root.detach().cpu().bool()
+        universe = {
+            (int(kept_samples[int(graph_id)]), int(node_id))
+            for graph_id, node_id in zip(graph_nodes.tolist(), global_nodes.tolist())
+        }
+        # (sample_id, global_node_id) pairs that represent the precursor ion
+        # itself, so precursor coverage can be isolated from fragment peaks.
+        precursor_pairs = {
+            (int(kept_samples[int(graph_id)]), int(node_id))
+            for graph_id, node_id, is_precursor in zip(
+                graph_nodes.tolist(), global_nodes.tolist(), node_is_precursor_root.tolist()
+            )
+            if is_precursor
+        }
+        true_positive = len(selected_nodes & target_nodes)
+        true_negative = len(universe - selected_nodes - target_nodes)
+        covered = 0.0
+        total = float(target.sample_peak_intensity.detach().cpu().clamp_min(0).sum().item())
+        precursor_covered = 0.0
+        precursor_total = 0.0
+        sample_covered: Dict[int, float] = {}
+        sample_total: Dict[int, float] = {}
+        sample_precursor_covered: Dict[int, float] = {}
+        sample_precursor_total: Dict[int, float] = {}
+        sample_ids = target.target_sample_index.detach().cpu().long()
+        peak_ids = target.target_peak_index.detach().cpu().long()
+        node_ids = target.target_node_index.detach().cpu().long()
+        for sample_id in range(int(target.num_samples)):
+            start = int(target.sample_peak_ptr[sample_id])
+            stop = int(target.sample_peak_ptr[sample_id + 1])
+            for peak_id in range(start, stop):
+                rows = (sample_ids == sample_id) & (peak_ids == peak_id)
+                peak_node_ids = node_ids[rows].tolist()
+                is_precursor_peak = any(
+                    (sample_id, int(node_id)) in precursor_pairs for node_id in peak_node_ids
+                )
+                peak_intensity = float(
+                    target.sample_peak_intensity[peak_id].detach().cpu().clamp_min(0).item()
+                )
+                is_hit = any(
+                    (sample_id, int(node_id)) in selected_nodes for node_id in peak_node_ids
+                )
+                sample_total[sample_id] = sample_total.get(sample_id, 0.0) + peak_intensity
+                if is_hit:
+                    covered += peak_intensity
+                    sample_covered[sample_id] = sample_covered.get(sample_id, 0.0) + peak_intensity
+                if is_precursor_peak:
+                    precursor_total += peak_intensity
+                    sample_precursor_total[sample_id] = (
+                        sample_precursor_total.get(sample_id, 0.0) + peak_intensity
+                    )
+                    if is_hit:
+                        precursor_covered += peak_intensity
+                        sample_precursor_covered[sample_id] = (
+                            sample_precursor_covered.get(sample_id, 0.0) + peak_intensity
+                        )
+
+        precursor_target_nodes = target_nodes & precursor_pairs
+        precursor_selected_nodes = selected_nodes & precursor_pairs
+        precursor_true_positive = len(precursor_selected_nodes & precursor_target_nodes)
+        precursor_true_negative = len(
+            precursor_pairs - precursor_selected_nodes - precursor_target_nodes
+        )
+        metrics = {
+            "peak_selection_accuracy": (true_positive + true_negative) / max(len(universe), 1),
+            "peak_selection_precision": true_positive / max(len(selected_nodes), 1),
+            "peak_selection_recall": true_positive / max(len(target_nodes), 1),
+            "selected_peak_intensity_coverage": covered / max(total, 1e-12),
+        }
+        if precursor_pairs:
+            precursor_selected_count = len(precursor_selected_nodes)
+            metrics.update({
+                "precursor/peak_selection_accuracy": (
+                    (precursor_true_positive + precursor_true_negative)
+                    / max(len(precursor_pairs), 1)
+                ),
+                "precursor/peak_selection_precision": (
+                    precursor_true_positive / max(precursor_selected_count, 1)
+                    if precursor_selected_count else 1.0 if not precursor_target_nodes else 0.0
+                ),
+                "precursor/peak_selection_recall": (
+                    precursor_true_positive / max(len(precursor_target_nodes), 1)
+                ),
+                "precursor/selected_peak_intensity_coverage": (
+                    precursor_covered / precursor_total if precursor_total > 0 else 1.0
+                ),
+            })
+
+        # Per-sample breakdown, grouped by adduct type and CE bucket. Node
+        # sets are partitioned by sample once, rather than rescanning each
+        # full set per sample.
+        universe_by_sample: Dict[int, set] = {}
+        selected_by_sample: Dict[int, set] = {}
+        target_by_sample: Dict[int, set] = {}
+        precursor_by_sample: Dict[int, set] = {}
+        precursor_target_by_sample: Dict[int, set] = {}
+        precursor_selected_by_sample: Dict[int, set] = {}
+        for pair in universe:
+            universe_by_sample.setdefault(pair[0], set()).add(pair)
+        for pair in selected_nodes:
+            selected_by_sample.setdefault(pair[0], set()).add(pair)
+        for pair in target_nodes:
+            target_by_sample.setdefault(pair[0], set()).add(pair)
+        for pair in precursor_pairs:
+            precursor_by_sample.setdefault(pair[0], set()).add(pair)
+        for pair in precursor_target_nodes:
+            precursor_target_by_sample.setdefault(pair[0], set()).add(pair)
+        for pair in precursor_selected_nodes:
+            precursor_selected_by_sample.setdefault(pair[0], set()).add(pair)
+
+        per_sample: Dict[str, Dict[int, float]] = {
+            "peak_selection_accuracy": {},
+            "peak_selection_precision": {},
+            "peak_selection_recall": {},
+            "selected_peak_intensity_coverage": {},
+            "precursor/peak_selection_accuracy": {},
+            "precursor/peak_selection_precision": {},
+            "precursor/peak_selection_recall": {},
+            "precursor/selected_peak_intensity_coverage": {},
+        }
+        for sample_id, sample_universe in universe_by_sample.items():
+            sample_selected = selected_by_sample.get(sample_id, set())
+            sample_target = target_by_sample.get(sample_id, set())
+            sample_tp = len(sample_selected & sample_target)
+            sample_tn = len(sample_universe - sample_selected - sample_target)
+            per_sample["peak_selection_accuracy"][sample_id] = (
+                (sample_tp + sample_tn) / max(len(sample_universe), 1)
+            )
+            per_sample["peak_selection_precision"][sample_id] = sample_tp / max(
+                len(sample_selected), 1
+            )
+            per_sample["peak_selection_recall"][sample_id] = sample_tp / max(
+                len(sample_target), 1
+            )
+        for sample_id, total_intensity in sample_total.items():
+            per_sample["selected_peak_intensity_coverage"][sample_id] = (
+                sample_covered.get(sample_id, 0.0) / max(total_intensity, 1e-12)
+            )
+        for sample_id, sample_precursor_pairs in precursor_by_sample.items():
+            sample_precursor_selected = precursor_selected_by_sample.get(sample_id, set())
+            sample_precursor_target = precursor_target_by_sample.get(sample_id, set())
+            sample_precursor_tp = len(sample_precursor_selected & sample_precursor_target)
+            sample_precursor_tn = len(
+                sample_precursor_pairs - sample_precursor_selected - sample_precursor_target
+            )
+            per_sample["precursor/peak_selection_accuracy"][sample_id] = (
+                (sample_precursor_tp + sample_precursor_tn) / max(len(sample_precursor_pairs), 1)
+            )
+            per_sample["precursor/peak_selection_precision"][sample_id] = (
+                sample_precursor_tp / max(len(sample_precursor_selected), 1)
+                if sample_precursor_selected
+                else (1.0 if not sample_precursor_target else 0.0)
+            )
+            per_sample["precursor/peak_selection_recall"][sample_id] = sample_precursor_tp / max(
+                len(sample_precursor_target), 1
+            )
+            precursor_total_intensity = sample_precursor_total.get(sample_id, 0.0)
+            per_sample["precursor/selected_peak_intensity_coverage"][sample_id] = (
+                sample_precursor_covered.get(sample_id, 0.0) / precursor_total_intensity
+                if precursor_total_intensity > 0
+                else 1.0
+            )
+        metrics.update(self._grouped_metric_means(per_sample, target))
+        return metrics
+
+    @torch.no_grad()
+    def _intensity_similarity_metrics(self, intensity_output, target) -> Dict[str, float]:
+        values: List[float] = []
+        values_by_sample: Dict[int, float] = {}
+        device = intensity_output.logit.device
+        for sample_id in intensity_output.sample_index.detach().cpu().unique(sorted=True).tolist():
+            mask = intensity_output.sample_index == int(sample_id)
+            index = mask.nonzero(as_tuple=False).view(-1)
+            truth = FragmentTreeIntensityTrainingLoss._target_weight_for_predictions(
+                predicted_formula=intensity_output.formula_tensor[index],
+                target=target, sample_id=int(sample_id), device=device,
+            )
+            prediction = intensity_output.logit[index].float().clamp_min(0)
+            if truth.numel() and float(truth.norm().item()) > 0 and float(prediction.norm().item()) > 0:
+                value = float(F.cosine_similarity(prediction[None], truth.float()[None]).item())
+                values.append(value)
+                values_by_sample[int(sample_id)] = value
+        metrics = {"intensity_cosine_similarity": sum(values) / len(values) if values else 0.0}
+        metrics.update(
+            self._grouped_metric_means(
+                {"intensity_cosine_similarity": values_by_sample}, target
+            )
+        )
+        return metrics

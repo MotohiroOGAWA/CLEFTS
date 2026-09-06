@@ -188,21 +188,51 @@ not materialize a `[num_samples, num_edges, hidden_dim]` tensor.
 
 ## Current absolute_ranker loss
 
-`target_edge_group_index` groups alternative edges that can explain the same
-target formula/m/z. These alternatives are not all forced to be positive. The
-group uses a smooth multiple-instance-learning OR:
+The absolute_ranker loss actually wired into training is
+`PairwiseEdgeIntensityRankingLoss` (`model.py`). `target_edge_group_index`
+groups alternative edges that can explain the same target formula/m/z. These
+alternatives are not all forced to be positive; instead their combined
+evidence is a smooth multiple-instance-learning OR:
 
 ```text
-group_score = logsumexp(alternative_edge_logits)
-positive component = mean(softplus(-group_score))
-negative component = BCEWithLogits(negative_logits, 0)
-loss = mean(available components)
+group_evidence = logsumexp(alternative_edge_logits)
 ```
 
-Thus one sufficiently strong explanation can satisfy a measured peak. Pairwise
-intensity ranking likewise uses the currently highest-scoring alternative as a
-latent representative and excludes the other alternatives from zero-intensity
-negative pairs. This avoids training mutually valid paths against each other.
+Per sample, groups are sorted by observed peak intensity (descending). For
+each group (the "anchor"), up to `top_n` comparison partners are selected in
+three tiers, filled in order until `top_n` is reached:
+
+1. **Tier 1** (`nearest_lower_partners`, default 1): the nearest lower-intensity
+   groups in sorted order.
+2. **Tier 2** (`extended_lower_partners`, default 3): more lower-intensity
+   groups, farther away in the sorted order.
+3. **Tier 3** (`background_partners`, default 10): unassigned/background edges
+   (no observed intensity at all), individually compared against the anchor
+   as separate pairwise terms — not pooled into one aggregated comparison.
+
+Tiers 1 and 2 skip (without consuming budget) any candidate whose
+`sqrt(intensity)` gap to the anchor is `<= intensity_threshold`, so the scan
+continues past near-equal-intensity groups instead of stopping there. Each
+selected pair contributes `softplus(-(anchor_evidence - partner_evidence))` to
+the loss, weighted by a reciprocal-rank weight `(1/rank_i) / sum(1/rank_n)`
+computed over that sample's intensity-sorted groups (rank 1 = most intense
+group), regardless of which tier the partner came from. A comparison
+involving the most intense group therefore contributes more to the total loss
+than an equally-sized comparison further down the ranking. Intensity values
+are still used to sort groups and to gate near-equal-intensity pairs in tiers
+1-2, but no longer serve as the weight magnitude directly. This avoids
+training mutually valid paths against each other.
+
+The diagnostic `pairwise_ranking_accuracy` metric (fed by `build_pairs()`)
+mirrors this same tiered selection, scoped per source fragment node instead of
+per sample; it therefore now also reflects tier-3 target-vs-background
+separation, which it did not before this design was introduced.
+
+A separate, unwired class, `FragmentEdgeAbsoluteRankerTrainingLoss`, implements
+an alternative smooth-OR-plus-BCE design (`group_score = logsumexp(...)`,
+`positive = mean(softplus(-group_score))`, `negative =
+BCEWithLogits(negative_logits, 0)`) but is not instantiated anywhere in
+`FragmentTreeTrainingModel`; it exists only for its own unit test.
 
 ### Training-only influential-edge sampling
 
@@ -221,11 +251,61 @@ single currently preferred explanation is trained in one step without permanentl
 discarding other explanations. The selected structural edges are shared across
 conditions in the same stored tree.
 
-Important current limitation: the positive component is not yet weighted by
-`intensity / max_intensity`. A high-intensity target edge and a low-intensity
-target edge currently receive the same positive-edge weight. Capacity-adjusted
-recall for trees whose required targets exceed the configured budget is also not
-yet implemented. See "Known limitations" below.
+This sampler only runs when `max_edges_per_tree` (below) is `None`; the
+per-tree budget, when set, replaces it at both training and inference time.
+
+Pairwise ranking terms are weighted by reciprocal rank rather than by raw
+intensity (see "Current absolute_ranker loss" above), so a high-intensity
+target edge's comparisons already carry more weight than a low-intensity
+edge's. Capacity-adjusted recall for trees whose required targets exceed the
+configured budget is not yet implemented. See "Known limitations" below.
+
+### Per-tree expensive-edge budget (`max_edges_per_tree`)
+
+`max_edges_per_tree` (default 256, enabled out of the box) bounds how many
+distinct edges of one *stored tree* ever receive expensive attention-aware
+encoding, **shared across every MS/MS sample that references that tree** —
+unlike every other budget on this page, which is per-sample. A batch holding
+several stored trees (`--batch-size` > 1) gets this budget applied
+independently per tree, so the effective total scales with the number of
+trees in the batch (e.g. 256 x 2 trees ~ 512 edges attended).
+
+Edges are ranked once per forward call by summed cross-sample importance:
+
+```text
+importance(edge) = sum over samples s referencing edge e of
+    [ large constant, if e is a target/positive edge for s
+      else condition_edge_scorer(base_logit_e, condition_h_s) ]
+```
+
+independently within each tree, grouped via `FragmentTreeStructure.tree_sample_ptr`
+(which sample belongs to which stored tree) joined through `sample_edge_index`
+(which edges each sample references) — an edge no sample references has zero
+importance and is never worth the attention budget regardless of which tree
+it structurally belongs to, so only referenced edges are ever candidates; no
+separate edge-level tree boundary is needed. Scoring uses only cheap,
+no-attention primitives (`StructuralEdgeEncoder.encode_base` and
+`ConditionEdgeScorer`, both already used elsewhere in this pipeline). The
+target/positive bonus means a required target edge is never dropped in favor
+of a merely high-scoring non-target edge — though a tree whose target edges
+alone exceed the budget can still lose some; `tree_edge_budget/target_edge_recall`
+(see "TensorBoard layout" below) makes this measurable. Edges shared by many
+samples of the same tree accumulate more combined importance and are
+naturally favored.
+
+This mechanism applies identically to **both** training
+(`FragmentTreeCandidateSelector.forward`, replacing the whole-batch
+`_sample_training_edges` cap above whenever `max_edges_per_tree` is set) and
+inference/validation (`generate_depth_limited_candidates`, replacing today's
+"attend every stored edge" default). Validation-time spectrum generation
+(`predict_validation_msdataset`) already goes through the real,
+budget-respecting `FragmentTreeSpectrumPredictor`/`generate_depth_limited_candidates`
+path rather than a raw training forward pass, so it automatically inherits
+this budget too.
+
+Set `--max-edges-per-tree` to `None`/omit it to fully restore the previous
+behavior (unbounded attention at eval time, the whole-batch stochastic sampler
+at training time).
 
 ## Progressive frontier selection
 
@@ -455,11 +535,22 @@ diagnosis, enable it with `--detect-anomaly`; programmatic callers can pass
 The same metric's training and validation values are placed on one card. They are
 not separated into different cards.
 
-For every absolute_ranker metric, the card tag is:
+For every metric reported in `absolute_ranker_metrics` (every key returned by
+`PairwiseEdgeIntensityRankingLoss.metrics`, `_edge_retain_metrics`,
+`_selected_peak_metrics`, and `_intensity_similarity_metrics`), the card tag
+is:
 
 ```text
-absolute_ranker/<metric>
+metrics/<metric>
 ```
+
+A summary key may carry an optional `@scope` suffix (e.g.
+`edge_retain_recall@by_adduct:[M+H]+`) to report the same metric under a
+different condition — adduct type, CE bucket, excl-precursor, ... — as an
+extra *series* on that metric's existing card instead of opening a new card
+per condition (`log_distribution_cards` in `training_model.py` parses this).
+The by-adduct/by-CE breakdowns described below use this convention, as do the
+validation-time `peak_selection/*` cards further down this page.
 
 Its series include:
 
@@ -510,57 +601,97 @@ step; its exception is printed and no metric is fabricated for it.
 
 ### Overall absolute_ranker metrics
 
+`target_edge_recall` / `target_group_recall` / `target_node_recall` /
+`original_edge_count` / `retained_edge_count` / `pruned_fraction` /
+`over_limit` are computed by `FragmentEdgeAbsoluteRankerTrainingLoss.metrics`,
+which is **not currently instantiated** by `FragmentTreeTrainingModel` (see
+"Current absolute_ranker loss" above) and therefore do not appear in
+`metrics/...` cards today. `by_depth/...` breakdowns are likewise only
+implemented on that unwired class.
+
+### Per-tree edge budget metrics
+
+When `max_edges_per_tree` is set (the default), `FragmentTreeTrainingModel`
+reports, per training step:
+
 | Metric | Meaning |
 |---|---|
-| `target_edge_recall` | Fraction of required edges retained naturally |
-| `target_group_recall` | Fraction of formula groups with at least one retained edge |
-| `target_node_recall` | Fraction of required target nodes retained naturally |
-| `original_edge_count` | Candidate edge count before selection |
-| `retained_edge_count` | Edge count after selection |
-| `pruned_fraction` | Fraction removed by preselection |
-| `over_limit` | Whether selection removed candidates |
+| `tree_edge_budget/selected_edge_count` | Edges actually kept for expensive attention encoding, summed over every tree in the batch |
+| `tree_edge_budget/available_edge_count` | Edges referenced by at least one sample before the cap, summed over every tree in the batch (edges no sample references are never candidates) |
+| `tree_edge_budget/target_edge_recall` | Fraction of `target_edge_index` edges that survived the cap (quantifies the risk that a tree's required targets exceed its budget) |
+| `tree_edge_budget/trees_over_budget_fraction` | Fraction of trees in the batch whose available edge count exceeded `max_edges_per_tree` |
+| `tree_edge_budget/mean_samples_per_selected_edge` | How often a selected edge is actually shared by more than one sample of its tree |
 
-### Metrics by cleavage depth
+These flow through the same generic `metrics/<name>` cards as every other
+metric on this page, with the usual full `train_min...train_max` /
+`validation_min...validation_max` distribution series.
 
-Root outgoing edges are depth 1. The implementation computes shortest reachable
-node depths from every root and reports edge, group, and node recall for each stage:
+### Training-time metrics by adduct and collision-energy range
 
-```text
-absolute_ranker/by_depth/depth_1/target_edge_recall
-absolute_ranker/by_depth/depth_1/target_group_recall
-absolute_ranker/by_depth/depth_1/target_node_recall
-absolute_ranker/by_depth/depth_2/target_edge_recall
-...
-```
-
-Each depth card contains the same training/validation distribution series. This
-makes it possible to detect good overall recall that hides poor depth-2 or depth-3
-coverage.
-
-### Metrics by adduct
-
-Adduct labels use their chemical string representation rather than internal names
-such as `adduct_0`:
+`_edge_retain_metrics`, `_selected_peak_metrics`, and
+`_intensity_similarity_metrics` (the metrics actually reported per training
+step) each also report a per-sample breakdown, grouped by adduct type and by
+collision-energy quartile bucket **within the current batch**:
 
 ```text
-absolute_ranker/by_adduct/[M+H]+/target_edge_recall
+metrics/edge_retain_recall          -> train_mean, validation_mean, train_by_adduct:[M+H]+_mean, ...
+metrics/peak_selection_precision    -> ..., validation_by_ce_range:q1-to-median_mean, ...
+metrics/intensity_cosine_similarity -> ...
 ```
 
-`/` inside a label is replaced with `∕` to avoid conflicting with TensorBoard's
-tag hierarchy. Missing labels are shown as `unknown-<index>`.
+i.e. one card per base metric (`edge_retain_recall`, `peak_selection_precision`,
+`intensity_cosine_similarity`, ...), with every adduct/CE group as an
+additional series on that same card via the `@scope` convention above, rather
+than a separate card per group. Adduct labels use their chemical string
+representation rather than internal names such as `adduct_0`; `/` inside a
+label is replaced with `∕` to avoid conflicting with TensorBoard's tag
+hierarchy, and missing labels are shown as `unknown-<index>`. CE buckets use
+the same readable labels as below. Each grouped series is averaged from the
+per-sample values of that group and, like every other series, gets the full
+`_min..._max` distribution (aggregated across training steps, so the
+distribution reflects step-to-step variation for that group).
 
-### Metrics by collision-energy range
+### Validation-time metrics by adduct, collision-energy range, and excl-precursor
 
-Finite CE values in an evaluation batch are divided using q1, median, and q3. Tags
-use readable labels:
+Independently, `evaluate_validation_cosine` groups the *validation-spectrum*
+cosine similarity and peak-selection metrics by adduct type
+(`target_dataset["AdductType"]`), by CE quartile bucket
+(`target_dataset["CollisionEnergy"]`, quartiles computed over the validation
+split), and by whether the precursor-ion peak was excluded first — all as
+`@scope`-suffixed keys on the same per-metric card, following the exact
+convention described above (`log_distribution_cards` is reused for both the
+training-time and validation-time cards):
 
 ```text
-by_ce_range/min-to-q1
-by_ce_range/q1-to-median
-by_ce_range/median-to-q3
-by_ce_range/q3-to-max
-by_ce_range/non-finite
+peak_selection/cosine               -> validation_mean, validation_excl_precursor_mean,
+                                        validation_by_adduct:[M+H]+_mean, ...
+peak_selection/selection_precision  -> validation_mean, validation_by_ce_range:q1-to-median_mean, ...
 ```
+
+Collision-energy buckets use the same readable labels as the training-time
+section:
+
+```text
+by_ce_range:min-to-q1
+by_ce_range:q1-to-median
+by_ce_range:median-to-q3
+by_ce_range:q3-to-max
+by_ce_range:non-finite
+```
+
+`precursor_detection_*` has no per-spectrum value (it is already a
+corpus-wide confusion-matrix metric), so instead each present group gets its
+own precision/recall/f1/accuracy as a scoped series on the
+`peak_selection/precursor_detection_precision` card (etc.):
+`validation_by_adduct:[M+H]+_mean`, and the spread *across* groups is reported
+as an additional series on the same card,
+`validation_by_adduct_distribution_{min,q1,mean,median,q3,max}`.
+
+There is no separate `similarity/intensity_prediction_cosine*` card family —
+cosine (full and excl-precursor) is folded into the single
+`peak_selection/cosine` card above. The plain headline number remains
+available at the top-level `similarity/validation/cosine` scalar (written by
+`log_training_metrics`, one point per validation, not a distribution).
 
 ## `max_samples` workflow setting
 
@@ -654,6 +785,21 @@ node limit is `max_next_cleavage_candidates`. The number of
 `max_edges_per_depth` values must exactly equal `fragmenter.tree_max_depth`; model
 construction raises `ValueError` otherwise.
 
+### Absolute ranker and edge budgets
+
+| Option | Default | Meaning |
+|---|---:|---|
+| `--max-edges-per-step` | 128 | Attention compute-chunk size in `StructuralEdgeEncoder.forward`; does not prune candidates |
+| `--max-retained-edges` | 30 | Per-sample beam width kept between progressive inference stages |
+| `--max-edges-per-tree` | 256 | Per-tree, cross-sample-shared budget on edges receiving expensive attention encoding (see "Per-tree expensive-edge budget" above); set to omit/`None` to disable |
+| `--edge-condition-interaction-dim` | 64 | Projection width for the edge x spectrum-condition dot-product score |
+| `--ranking-loss-weight` | 1.0 | Multiplier applied to the absolute edge-ranking loss inside the total loss |
+| `--top-n` | 10 | Total comparison partners per anchor group, capping tiers 1-3 combined |
+| `--nearest-lower-partners` | 1 | Tier 1: nearest lower-intensity partners always compared |
+| `--extended-lower-partners` | 3 | Tier 2: additional farther lower-intensity partners compared after tier 1 |
+| `--background-partners` | 10 | Tier 3: unassigned/background edges compared after tiers 1-2 |
+| `--ranking-intensity-threshold` | 0.05 | Minimum `sqrt(intensity)` gap required for an ordered tier 1/2 comparison |
+
 ### Condition encoder
 
 | Option | Default | Meaning |
@@ -676,6 +822,7 @@ Constrained choices such as `{16}` and their default are shown together:
 
 | Option | Default | Meaning |
 |---|---:|---|
+| `--assignment-score-threshold` | 0.8 | Minimum `assignment_score` used for training and the filtered validation view; accepted when `score >= threshold` |
 | `--max-samples` | 100 | Workflow sample limit and preflight dimension |
 | `--batch-size` | 1 | Number of structure files per DataLoader batch |
 | `--validation-interval-steps` | 100 | Step-validation interval |
@@ -684,6 +831,56 @@ Constrained choices such as `{16}` and their default are shown together:
 
 `batch-size` counts stored structure files, whereas `max-samples` counts MS/MS
 samples. They are different units.
+
+### Assignment-score filtering and validation scopes
+
+`--assignment-score-threshold FLOAT` controls which spectra provide supervised
+training targets. Its valid range is `0.0` through `1.0`, inclusive, and the
+default is `0.8`. A sample is selected when its `assignment_score` is greater
+than or equal to the threshold. This is a sample-level filter: if one
+`.preft.pt` file contains both accepted and rejected spectra, only the accepted
+samples and their corresponding peak/formula/assignment targets are loaded for
+training.
+
+The trainer requires one `assignment_scores.tsv` for both the training and
+validation split. For a structure directory such as
+`train_structures/data`, it searches in this order:
+
+1. `train_structures/data/assignment_scores.tsv`
+2. `train_structures/assignment_scores.tsv`
+
+The TSV must contain `structure_file` and `assignment_score` columns. Files
+written by the fragment-tree data-preparation command already use this schema.
+Training stops with a clear error if the TSV is missing, a score is invalid, or
+no sample meets the configured threshold.
+
+Validation produces three scopes:
+
+| Scope | Samples | Computation |
+|---|---|---|
+| `filtered` | `assignment_score >= threshold` | Evaluated once; this is the validation value used by training/checkpoint logic |
+| `below_threshold` | `assignment_score < threshold` | Evaluated once as the complementary diagnostic partition |
+| `unfiltered` | All validation samples | Assembled from the two disjoint cached partitions; filtered samples are not inferred again |
+
+Distributional metrics, including cosine similarity, selection precision,
+selection recall, F1, intensity coverage, and top-k recall, are reported with
+`q1`, `median`, and `q3` (and where applicable mean/min/max). Important files in
+each run are:
+
+- `assignment_score_report.json`: threshold, selected/excluded sample counts,
+  and assignment-score distribution.
+- `validation/validation_scope_summary.tsv`: filtered, below-threshold, and
+  unfiltered loss summaries.
+- `validation/filtered/*_summary.tsv` and
+  `validation/below_threshold/*_summary.tsv`: per-partition metric summaries.
+- `validation/unfiltered_cosine_summary.tsv` and
+  `validation/unfiltered_peak_selection_summary.tsv`: exact unfiltered
+  summaries combined from cached per-spectrum results.
+
+The same option is available in the VS Code Workbench as **Assignment score
+threshold** under **Training, optimizer, and checkpoints**. Saved Workbench
+configurations use the `assignmentScoreThreshold` key and pass it to the CLI as
+`--assignment-score-threshold`.
 
 ## Dataset, MolEncoder, and resume configuration
 
@@ -723,9 +920,24 @@ Example `PROJECT_DIR/config/train_config.json`:
   "shuffle": true,
   "validate_at_start": false,
   "max_samples": 100,
+  "assignment_score_threshold": 0.8,
   "early_stopping": {}
 }
 ```
+
+Training and the filtered validation view use only samples with
+`assignment_score >= assignment_score_threshold` from each split's
+`assignment_scores.tsv`. The default threshold is `0.8`; it can be changed with
+`--assignment-score-threshold`. Filtering is sample-level, including when one
+structure file contains a mixture of high- and low-score spectra.
+
+Each run writes `assignment_score_report.json` with selected/excluded counts and
+the assignment-score mean, quartiles, median, and range. Validation evaluates
+the filtered and below-threshold partitions once each. The unfiltered result is
+then assembled from those cached, disjoint results, so filtered spectra are not
+inferred twice. Scope summaries are written below `runs/<timestamp>/validation/`;
+cosine and peak-selection summaries include `q1`, `median`, and `q3` in addition
+to the mean.
 
 For a new run, use `"ckpt_id": null`. To resume, specify a checkpoint ID such
 as `"ckpt_id": "42"`. A branch-node ID resolves to its latest checkpoint;
@@ -843,29 +1055,34 @@ new embedding rows when loading the checkpoint.
 
 ## Known limitations and planned work
 
-1. Intensity weighting is not yet applied to absolute_ranker positives.
-   - `intensity / max_intensity` should weight edge and group losses.
-   - A small floor should preserve gradients for low-intensity targets.
-2. Continuation recall is not yet capacity-adjusted.
+1. Continuation recall is not yet capacity-adjusted.
    - Raw recall can be below one when more than three path nodes must continue
      fragmenting for one sample and depth, even under an oracle ranking.
    - Raw, weighted, oracle-at-budget, and capacity-adjusted recall should be logged
      separately and per depth.
-3. Fragmenter is not yet fully lazy.
+2. Fragmenter is not yet fully lazy.
    - Expensive model computation is frontier-limited, but stored candidate trees are
      currently materialized before model selection.
-4. `max_samples` is not yet connected to automatic structure slicing.
+3. `max_samples` is not yet connected to automatic structure slicing.
    - Pointer and sample-index remapping are required in the DataLoader path.
-5. Phase rollback is not implemented.
+4. Phase rollback is not implemented.
    - The current adaptive transition only moves from phase 0 to phase 1.
-6. Shortest-path calculation currently uses Python BFS.
+5. Shortest-path calculation currently uses Python BFS.
    - Distance-matrix caching or a batched implementation may be needed for large
      molecules and many events.
-7. CE ranges are batch-relative quartiles.
+6. CE ranges are batch-relative (training-batch or validation-split) quartiles.
    - Fixed physical CE boundaries should be configurable when cross-run comparison
      is required.
-8. A dedicated worst-tree ID report is not yet implemented.
+7. A dedicated worst-tree ID report is not yet implemented.
    - Distribution minima are logged, but the corresponding structure path is not
      yet written as TensorBoard text.
+8. `max_edges_per_tree` capacity is not adjusted per tree.
+   - A tree whose target/positive edges alone exceed the budget still loses
+     some of them; `tree_edge_budget/target_edge_recall` quantifies this but
+     nothing yet raises the budget or splits such a tree automatically.
+   - Enabling `max_edges_per_tree` (the default) also disables
+     `_sample_training_edges`'s stochastic exploration (random negatives,
+     softmax-sampled alternative paths) in favor of a deterministic
+     importance top-k; this trade-off has not been evaluated end-to-end.
 
 Keep this README synchronized with algorithm, configuration, and workflow changes.

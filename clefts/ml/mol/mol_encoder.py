@@ -1,3 +1,4 @@
+from copy import copy
 from typing import List, Tuple, Optional
 
 import torch
@@ -89,15 +90,19 @@ class MolEncoder(nn.Module):
 
     def forward(self, batch: Batch) -> Batch:
         """
-        Forward for a PyG Batch.
+        Return embeddings without replacing the input Batch's atom features.
         """
         node_h, graph_h = self.encoder(batch)
 
-        batch.x = node_h
+        # PyG's shallow copy gives the result its own attribute storage while
+        # sharing unchanged topology tensors. The raw features must survive
+        # repeated training/inference passes over the same structure.
+        encoded_batch = copy(batch)
+        encoded_batch.x = node_h
         if graph_h is not None:
-            batch.embeddings = graph_h  # [G, graph_dim]
+            encoded_batch.embeddings = graph_h  # [G, graph_dim]
 
-        return batch
+        return encoded_batch
 
     def _make_empty_data(self, compound: Compound, *, device: torch.device) -> Data:
         """Create an empty graph that will not affect training."""

@@ -7,6 +7,10 @@ from pathlib import Path
 
 import torch
 from clefts.libs.mmkit.mmkit import Formula
+from clefts.ml.data_preparation.fragment_tree.create_fragment_tree_training_data import (
+    DEFAULT_PREPROCESSING_CONFIG_NAME,
+    LEGACY_PREPROCESSING_CONFIG_NAME,
+)
 from clefts.ml.input.fragment_tree_preprocessing_context import FragmentTreePreprocessingContext
 
 
@@ -18,15 +22,15 @@ def _formula(row, elements):
 
 def _preprocessing_context(file_path: Path):
     for parent in file_path.parents:
-        config_file = parent / "config" / "preprocessing_config.json"
-        if not config_file.exists():
-            continue
-        try:
-            config = json.loads(config_file.read_text())
-            return FragmentTreePreprocessingContext(**config)
-        except (KeyError, TypeError, ValueError, OSError):
-            return None
-        break
+        for name in (DEFAULT_PREPROCESSING_CONFIG_NAME, LEGACY_PREPROCESSING_CONFIG_NAME):
+            config_file = parent / "config" / name
+            if not config_file.exists():
+                continue
+            try:
+                config = json.loads(config_file.read_text())
+                return FragmentTreePreprocessingContext(**config)
+            except (KeyError, TypeError, ValueError, OSError):
+                return None
     return None
 
 
