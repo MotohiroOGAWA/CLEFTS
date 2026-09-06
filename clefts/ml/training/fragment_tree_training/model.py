@@ -1433,10 +1433,13 @@ class FragmentTreeTrainingModel(nn.Module):
     ) -> Dict[str, float]:
         """Group per-sample metric values by adduct type and CE bucket.
 
-        Returns flat ``by_adduct/<label>/<metric>`` and
-        ``by_ce_range/<label>/<metric>`` keys, each the mean of the
-        per-sample values whose sample falls in that group. Grouping is
-        computed once here and shared by every caller's metric.
+        Returns flat ``<metric>@by_adduct:<label>`` and
+        ``<metric>@by_ce_range:<label>`` keys, each the mean of the
+        per-sample values whose sample falls in that group. The ``@scope``
+        suffix keeps every variant of one metric on the same TensorBoard
+        card (see ``log_distribution_cards``) instead of opening a new card
+        per adduct/CE group. Grouping is computed once here and shared by
+        every caller's metric.
         """
         if not any(per_sample_values_by_metric.values()):
             return {}
@@ -1466,9 +1469,9 @@ class FragmentTreeTrainingModel(nn.Module):
                 )
                 by_ce.setdefault(ce_label, []).append(value)
             for label, values in by_adduct.items():
-                grouped[f"by_adduct/{label}/{metric_name}"] = sum(values) / len(values)
+                grouped[f"{metric_name}@by_adduct:{label}"] = sum(values) / len(values)
             for label, values in by_ce.items():
-                grouped[f"by_ce_range/{label}/{metric_name}"] = sum(values) / len(values)
+                grouped[f"{metric_name}@by_ce_range:{label}"] = sum(values) / len(values)
         return grouped
 
     @torch.no_grad()

@@ -537,13 +537,20 @@ not separated into different cards.
 
 For every metric reported in `absolute_ranker_metrics` (every key returned by
 `PairwiseEdgeIntensityRankingLoss.metrics`, `_edge_retain_metrics`,
-`_selected_peak_metrics`, and `_intensity_similarity_metrics`, including the
-dynamic `by_adduct/...`/`by_ce_range/...` keys described below), the card tag
+`_selected_peak_metrics`, and `_intensity_similarity_metrics`), the card tag
 is:
 
 ```text
 metrics/<metric>
 ```
+
+A summary key may carry an optional `@scope` suffix (e.g.
+`edge_retain_recall@by_adduct:[M+H]+`) to report the same metric under a
+different condition — adduct type, CE bucket, excl-precursor, ... — as an
+extra *series* on that metric's existing card instead of opening a new card
+per condition (`log_distribution_cards` in `training_model.py` parses this).
+The by-adduct/by-CE breakdowns described below use this convention, as do the
+validation-time `peak_selection/*` cards further down this page.
 
 Its series include:
 
@@ -627,53 +634,64 @@ step) each also report a per-sample breakdown, grouped by adduct type and by
 collision-energy quartile bucket **within the current batch**:
 
 ```text
-metrics/by_adduct/[M+H]+/edge_retain_recall
-metrics/by_adduct/[M+H]+/peak_selection_precision
-metrics/by_adduct/[M+H]+/intensity_cosine_similarity
-metrics/by_ce_range/q1-to-median/edge_retain_recall
-...
+metrics/edge_retain_recall          -> train_mean, validation_mean, train_by_adduct:[M+H]+_mean, ...
+metrics/peak_selection_precision    -> ..., validation_by_ce_range:q1-to-median_mean, ...
+metrics/intensity_cosine_similarity -> ...
 ```
 
-Adduct labels use their chemical string representation rather than internal
-names such as `adduct_0`; `/` inside a label is replaced with `∕` to avoid
-conflicting with TensorBoard's tag hierarchy, and missing labels are shown as
-`unknown-<index>`. CE buckets use the same readable labels as below. Each
-grouped key is averaged from the per-sample values of that group and, like
-every other metric, gets the full `train_min...train_max` /
-`validation_min...validation_max` series described above (aggregated across
-training steps, so the distribution reflects step-to-step variation for that
-group).
+i.e. one card per base metric (`edge_retain_recall`, `peak_selection_precision`,
+`intensity_cosine_similarity`, ...), with every adduct/CE group as an
+additional series on that same card via the `@scope` convention above, rather
+than a separate card per group. Adduct labels use their chemical string
+representation rather than internal names such as `adduct_0`; `/` inside a
+label is replaced with `∕` to avoid conflicting with TensorBoard's tag
+hierarchy, and missing labels are shown as `unknown-<index>`. CE buckets use
+the same readable labels as below. Each grouped series is averaged from the
+per-sample values of that group and, like every other series, gets the full
+`_min..._max` distribution (aggregated across training steps, so the
+distribution reflects step-to-step variation for that group).
 
-### Validation-time metrics by adduct and collision-energy range
+### Validation-time metrics by adduct, collision-energy range, and excl-precursor
 
 Independently, `evaluate_validation_cosine` groups the *validation-spectrum*
 cosine similarity and peak-selection metrics by adduct type
-(`target_dataset["AdductType"]`) and by CE quartile bucket
+(`target_dataset["AdductType"]`), by CE quartile bucket
 (`target_dataset["CollisionEnergy"]`, quartiles computed over the validation
-split), reporting a genuine within-group distribution across spectra:
+split), and by whether the precursor-ion peak was excluded first — all as
+`@scope`-suffixed keys on the same per-metric card, following the exact
+convention described above (`log_distribution_cards` is reused for both the
+training-time and validation-time cards):
 
 ```text
-peak_selection/by_adduct/[M+H]+/cosine
-peak_selection/by_adduct/[M+H]+/selection_precision
-peak_selection/by_ce_range/q1-to-median/selection_recall
+peak_selection/cosine               -> validation_mean, validation_excl_precursor_mean,
+                                        validation_by_adduct:[M+H]+_mean, ...
+peak_selection/selection_precision  -> validation_mean, validation_by_ce_range:q1-to-median_mean, ...
 ```
 
-Collision-energy buckets use:
+Collision-energy buckets use the same readable labels as the training-time
+section:
 
 ```text
-by_ce_range/min-to-q1
-by_ce_range/q1-to-median
-by_ce_range/median-to-q3
-by_ce_range/q3-to-max
-by_ce_range/non-finite
+by_ce_range:min-to-q1
+by_ce_range:q1-to-median
+by_ce_range:median-to-q3
+by_ce_range:q3-to-max
+by_ce_range:non-finite
 ```
 
 `precursor_detection_*` has no per-spectrum value (it is already a
 corpus-wide confusion-matrix metric), so instead each present group gets its
-own precision/recall/f1/accuracy
-(`peak_selection/precursor_detection/by_adduct/[M+H]+/precision`), and the
-spread *across* groups is reported as a distribution
-(`peak_selection/precursor_detection/by_adduct_distribution/precision`).
+own precision/recall/f1/accuracy as a scoped series on the
+`peak_selection/precursor_detection_precision` card (etc.):
+`validation_by_adduct:[M+H]+_mean`, and the spread *across* groups is reported
+as an additional series on the same card,
+`validation_by_adduct_distribution_{min,q1,mean,median,q3,max}`.
+
+There is no separate `similarity/intensity_prediction_cosine*` card family —
+cosine (full and excl-precursor) is folded into the single
+`peak_selection/cosine` card above. The plain headline number remains
+available at the top-level `similarity/validation/cosine` scalar (written by
+`log_training_metrics`, one point per validation, not a distribution).
 
 ## `max_samples` workflow setting
 

@@ -78,8 +78,8 @@ PRECURSOR_DETECTION_METRIC_NAMES = (
 PEAK_SELECTION_METRIC_NAMES = (
     *_PEAK_SELECTION_BASE_METRIC_NAMES,
     *PRECURSOR_DETECTION_METRIC_NAMES,
-    "cosine_excl_precursor",
-    *(f"excl_precursor_{name}" for name in _PEAK_SELECTION_BASE_METRIC_NAMES),
+    "cosine@excl_precursor",
+    *(f"{name}@excl_precursor" for name in _PEAK_SELECTION_BASE_METRIC_NAMES),
 )
 PEAK_SELECTION_QUANTILES = (
     ("min", 0.0),
@@ -1584,9 +1584,9 @@ def evaluate_validation_cosine(
     excl_selection_metrics = calculate_peak_selection_metrics(
         excl_predicted_dataset, excl_target_dataset
     )
-    selection_metrics["cosine_excl_precursor"] = excl_scores
+    selection_metrics["cosine@excl_precursor"] = excl_scores
     selection_metrics.update(
-        {f"excl_precursor_{name}": values for name, values in excl_selection_metrics.items()}
+        {f"{name}@excl_precursor": values for name, values in excl_selection_metrics.items()}
     )
     selection_summaries = {
         name: summarize_distribution(values)
@@ -1649,28 +1649,26 @@ def evaluate_validation_cosine(
             for label, indexes in groups.items():
                 if indexes.size == 0:
                     continue
-                selection_summaries[f"{group_kind}/{label}/cosine"] = summarize_distribution(
+                selection_summaries[f"cosine@{group_kind}:{label}"] = summarize_distribution(
                     scores[indexes]
                 )
                 for metric_name, values in selection_metrics.items():
                     selection_summaries[
-                        f"{group_kind}/{label}/{metric_name}"
+                        f"{metric_name}@{group_kind}:{label}"
                     ] = summarize_distribution(values[indexes])
                 group_precursor = calculate_precursor_detection_metrics(
                     predicted_dataset, target_dataset, spectrum_indexes=indexes,
                 )
                 for name, value in group_precursor.items():
-                    short_name = name[len("precursor_detection_"):]
                     selection_summaries[
-                        f"precursor_detection/{group_kind}/{label}/{short_name}"
+                        f"{name}@{group_kind}:{label}"
                     ] = _scalar_summary(value)
                     group_precursor_values[name].append(value)
             for name, collected in group_precursor_values.items():
                 if not collected:
                     continue
-                short_name = name[len("precursor_detection_"):]
                 selection_summaries[
-                    f"precursor_detection/{group_kind}_distribution/{short_name}"
+                    f"{name}@{group_kind}_distribution"
                 ] = summarize_distribution(np.asarray(collected))
 
     if selection_metric_means is not None:
@@ -1726,35 +1724,22 @@ def evaluate_validation_cosine(
                 )
     if writer is not None and global_step is not None:
         distribution_stats = ("min", "q1", "mean", "median", "q3", "max")
-        writer.add_scalar(
-            "similarity/intensity_prediction_cosine",
-            float(np.mean(scores)), int(global_step),
-        )
-        add_scalars_if_finite(
+        # One card per base metric (cosine, selection_precision, ...): every
+        # scope variant (full spectrum, excl-precursor, by-adduct, by-CE) is
+        # a series on that same card via the "@scope" key convention parsed
+        # by log_distribution_cards, instead of a separate card each.
+        log_distribution_cards(
             writer,
-            "similarity/intensity_prediction_cosine_distribution",
-            {stat: cosine_summary[stat] for stat in distribution_stats},
+            "peak_selection",
+            {
+                "validation": {
+                    f"{metric_name}_{stat}": summary[stat]
+                    for metric_name, summary in selection_summaries.items()
+                    for stat in distribution_stats
+                }
+            },
             int(global_step),
         )
-        excl_cosine_summary = selection_summaries["cosine_excl_precursor"]
-        if math.isfinite(excl_cosine_summary["mean"]):
-            writer.add_scalar(
-                "similarity/intensity_prediction_cosine_excl_precursor",
-                excl_cosine_summary["mean"], int(global_step),
-            )
-            add_scalars_if_finite(
-                writer,
-                "similarity/intensity_prediction_cosine_excl_precursor_distribution",
-                {stat: excl_cosine_summary[stat] for stat in distribution_stats},
-                int(global_step),
-            )
-        for metric_name, summary in selection_summaries.items():
-            add_scalars_if_finite(
-                writer,
-                f"peak_selection/{metric_name}",
-                {f"validation_{stat}": summary[stat] for stat in distribution_stats},
-                int(global_step),
-            )
         log_validation_spectrum_quantiles(
             writer=writer,
             predicted_dataset=predicted_dataset,
@@ -2056,7 +2041,16 @@ def log_distribution_cards(
     summaries: Dict[str, Dict[str, float]],
     step: int,
 ) -> None:
-    """One card per metric, containing every split and statistic."""
+    """One card per base metric, containing every split, scope, and statistic.
+
+    A summary key may carry an optional ``@scope`` suffix before its
+    trailing ``_{statistic}`` (e.g. ``selection_precision@by_adduct:[M+H]+_mean``)
+    to report the same metric under a different condition (excl-precursor,
+    by-adduct, by-CE-range, ...) without opening a separate card for it: the
+    part before ``@`` is the card-grouping key, and the scope becomes part of
+    the series name alongside the split (``{split}_{scope}_{statistic}``).
+    Keys without ``@`` keep today's plain ``{split}_{statistic}`` series name.
+    """
     statistics = ("min", "q1", "mean", "median", "q3", "max")
     grouped: Dict[str, Dict[str, float]] = {}
     for split, summary in summaries.items():
@@ -2064,10 +2058,12 @@ def log_distribution_cards(
             for statistic in statistics:
                 suffix = f"_{statistic}"
                 if name.endswith(suffix):
-                    metric = name[: -len(suffix)]
-                    grouped.setdefault(metric, {})[
-                        f"{split}_{statistic}"
-                    ] = value
+                    metric_path = name[: -len(suffix)]
+                    metric, _, scope = metric_path.partition("@")
+                    series_name = (
+                        f"{split}_{scope}_{statistic}" if scope else f"{split}_{statistic}"
+                    )
+                    grouped.setdefault(metric, {})[series_name] = value
                     break
     for metric, values in grouped.items():
         add_scalars_if_finite(writer, f"{namespace}/{metric}", values, step)

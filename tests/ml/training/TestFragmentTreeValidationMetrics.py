@@ -9,8 +9,17 @@ from clefts.ml.training.fragment_tree_training.training_model import (
     calculate_peak_selection_metrics,
     calculate_precursor_detection_metrics,
     exclude_precursor_peaks,
+    log_distribution_cards,
     summarize_distribution,
 )
+
+
+class _FakeWriter:
+    def __init__(self):
+        self.calls = {}
+
+    def add_scalars(self, tag, values, step):
+        self.calls[tag] = dict(values)
 
 
 def _dataset(spectra, precursor_mz=None):
@@ -27,6 +36,32 @@ def _dataset(spectra, precursor_mz=None):
 
 
 class TestFragmentTreeValidationMetrics(unittest.TestCase):
+    def test_log_distribution_cards_groups_scoped_variants_onto_one_card(self):
+        writer = _FakeWriter()
+        summaries = {
+            "validation": {
+                "selection_precision_mean": 0.9,
+                "selection_precision_min": 0.5,
+                "selection_precision@excl_precursor_mean": 0.8,
+                "selection_precision@by_adduct:[M+H]+_mean": 0.7,
+                "cosine_mean": 0.95,
+            }
+        }
+
+        log_distribution_cards(writer, "peak_selection", summaries, 10)
+
+        # One card per base metric, not one per scope variant.
+        self.assertEqual(set(writer.calls.keys()), {
+            "peak_selection/selection_precision",
+            "peak_selection/cosine",
+        })
+        precision_card = writer.calls["peak_selection/selection_precision"]
+        self.assertEqual(precision_card["validation_mean"], 0.9)
+        self.assertEqual(precision_card["validation_min"], 0.5)
+        self.assertEqual(precision_card["validation_excl_precursor_mean"], 0.8)
+        self.assertEqual(precision_card["validation_by_adduct:[M+H]+_mean"], 0.7)
+        self.assertEqual(writer.calls["peak_selection/cosine"]["validation_mean"], 0.95)
+
     def test_selection_coverage_rank_and_matched_intensity(self):
         target = _dataset(
             [np.array([[100.0, 10.0], [101.0, 5.0], [102.0, 1.0]])]

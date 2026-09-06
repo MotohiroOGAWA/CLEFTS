@@ -162,12 +162,12 @@ def test_edge_retain_metrics_break_down_by_adduct():
     metrics = model._edge_retain_metrics(output, target)
 
     assert metrics["edge_retain_recall"] == 2 / 3
-    assert metrics["by_adduct/[M+H]+/edge_retain_recall"] == 0.0
-    assert metrics["by_adduct/[M+Na]+/edge_retain_recall"] == 1.0
-    assert metrics["by_adduct/[M+H]+/edge_retain_precision"] == 0.0
-    assert metrics["by_adduct/[M+Na]+/edge_retain_precision"] == 1.0
-    assert metrics["by_adduct/[M+H]+/edge_retain_accuracy"] == 0.0
-    assert metrics["by_adduct/[M+Na]+/edge_retain_accuracy"] == 1.0
+    assert metrics["edge_retain_recall@by_adduct:[M+H]+"] == 0.0
+    assert metrics["edge_retain_recall@by_adduct:[M+Na]+"] == 1.0
+    assert metrics["edge_retain_precision@by_adduct:[M+H]+"] == 0.0
+    assert metrics["edge_retain_precision@by_adduct:[M+Na]+"] == 1.0
+    assert metrics["edge_retain_accuracy@by_adduct:[M+H]+"] == 0.0
+    assert metrics["edge_retain_accuracy@by_adduct:[M+Na]+"] == 1.0
 
 
 def test_tree_edge_budget_metrics_reports_recall_and_sharing():
