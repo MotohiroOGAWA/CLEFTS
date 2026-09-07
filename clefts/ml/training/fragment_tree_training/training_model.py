@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import csv
 import json
 import os
@@ -14,7 +15,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from ...common.progress import fixed_tqdm, iteration_edge_progress, set_edge_progress_phase
 from . import metric_labels
 from .performance_profile import run_training_performance_profile
@@ -491,6 +492,69 @@ def step_scheduler(
         scheduler.step()
 
 
+def validation_fraction(value: Any) -> float:
+    fraction = float(value)
+    if not 0.0 < fraction <= 1.0:
+        raise ValueError("step_validation_fraction must be greater than 0 and at most 1.")
+    return fraction
+
+
+def make_step_validation_subset(
+    *, val_loader, val_excluded_loader, validation_dataset,
+    validation_excluded_dataset, score_file: str | Path, fraction: float,
+):
+    """Select a fixed, compound-level subset shared by loss and spectrum passes.
+
+    Hash order avoids input-order bias without changing training's random state.
+    Every measurement of a selected SMILES stays in its original score partition.
+    """
+    fraction = validation_fraction(fraction)
+    full = (val_loader, val_excluded_loader, validation_dataset, validation_excluded_dataset)
+    if fraction == 1.0:
+        return full, {"fraction": fraction, "selection": "all"}
+    files_by_smiles: Dict[str, set[str]] = {}
+    with open(score_file, encoding="utf-8", newline="") as handle:
+        for row in csv.DictReader(handle, delimiter="\t"):
+            smiles = str(row.get("smiles", "")).strip()
+            filename = str(row.get("structure_file", "")).strip()
+            if not smiles or not filename:
+                raise ValueError("Step validation subsets require smiles and structure_file in assignment_scores.tsv.")
+            files_by_smiles.setdefault(smiles, set()).add(filename)
+    if not files_by_smiles:
+        raise ValueError("Cannot select a step validation subset from an empty score file.")
+    ordered = sorted(files_by_smiles, key=lambda s: (hashlib.sha256(s.encode()).digest(), s))
+    count = max(1, math.ceil(len(ordered) * fraction))
+    selected_smiles = set(ordered[:count])
+    selected_files = set().union(*(files_by_smiles[s] for s in selected_smiles))
+
+    def subset_loader(loader):
+        if loader is None:
+            return None
+        indexes = [i for i, path in enumerate(loader.dataset.files) if path.name in selected_files]
+        if not indexes:
+            return None
+        kwargs = dict(batch_size=loader.batch_size, shuffle=False,
+                      num_workers=loader.num_workers, collate_fn=loader.collate_fn,
+                      pin_memory=loader.pin_memory)
+        if loader.num_workers:
+            kwargs.update(persistent_workers=loader.persistent_workers,
+                          prefetch_factor=loader.prefetch_factor)
+        return DataLoader(Subset(loader.dataset, indexes), **kwargs)
+
+    def subset_records(dataset):
+        if dataset is None:
+            return None
+        indexes = [i for i, smiles in enumerate(dataset.metadata["SMILES"].tolist())
+                   if str(smiles).strip() in selected_smiles]
+        return dataset[indexes].copy() if indexes else None
+
+    subset = (subset_loader(val_loader), subset_loader(val_excluded_loader),
+              subset_records(validation_dataset), subset_records(validation_excluded_dataset))
+    return subset, {"fraction": fraction, "total_compounds": len(ordered),
+                    "selected_compounds": count, "smiles": sorted(selected_smiles),
+                    "structure_files": sorted(selected_files)}
+
+
 def normalize_train_config(
     project_dir: str | Path,
     train_config: Dict[str, Any],
@@ -507,6 +571,7 @@ def normalize_train_config(
     if config["max_samples"] < 1:
         raise ValueError("max_samples must be positive.")
 
+    config["step_validation_fraction"] = validation_fraction(config.get("step_validation_fraction", 1.0))
     validation_interval_steps = config.get("validation_interval_steps", 100)
     config["validation_interval_steps"] = (
         None
@@ -594,6 +659,7 @@ def build_train_config(
     device: str = "cpu",
     epoch: int = 10,
     validation_interval_steps: Optional[int] = 100,
+    step_validation_fraction: float = 1.0,
     train_log_interval_steps: Optional[int] = 50,
     save_interval: int = 1,
     save_interval_steps: Optional[int] = 100,
@@ -629,6 +695,7 @@ def build_train_config(
             "device": device,
             "epoch": int(epoch),
             "validation_interval_steps": validation_interval_steps,
+            "step_validation_fraction": step_validation_fraction,
             "train_log_interval_steps": train_log_interval_steps,
             "save_interval": int(save_interval),
             "save_interval_steps": save_interval_steps,
@@ -687,6 +754,7 @@ def prepare_train_from_config(
         "validation_valid_records_file": str(train_config["validation_valid_records_file"]),
         "shuffle": bool(train_config.get("shuffle", True)),
         "validation_interval_steps": validation_interval_steps,
+        "step_validation_fraction": train_config["step_validation_fraction"],
         "train_log_interval_steps": train_config.get("train_log_interval_steps"),
         "validate_at_start": bool(train_config.get("validate_at_start", False)),
         "detect_anomaly": bool(train_config.get("detect_anomaly", False)),
@@ -824,6 +892,7 @@ def setup_dataset(
         "train_size": len(train_dataset),
         "val_size": len(val_dataset),
         "validation_interval_steps": dataset_info.get("validation_interval_steps"),
+        "step_validation_fraction": float(dataset_info.get("step_validation_fraction", 1.0)),
         "train_log_interval_steps": dataset_info.get("train_log_interval_steps"),
         "max_samples": int(dataset_info.get("max_samples", 100)),
         "assignment_score_threshold": threshold,
@@ -2229,26 +2298,46 @@ def main(
             collate_fn=collate_fragment_tree_structure_items,
         )
 
+    step_validation_inputs, step_validation_report = make_step_validation_subset(
+        val_loader=val_loader, val_excluded_loader=val_excluded_loader,
+        validation_dataset=validation_dataset,
+        validation_excluded_dataset=validation_excluded_dataset,
+        score_file=extra_data["validation_assignment_score_file"],
+        fraction=extra_data.get("step_validation_fraction", 1.0),
+    )
+    save_config(step_validation_report, run_dir / "step_validation_subset.json")
+    if step_validation_report["fraction"] < 1.0:
+        print(f"[INFO] Step validation: {step_validation_report['selected_compounds']}/"
+              f"{step_validation_report['total_compounds']} compounds; epoch-end validation: all.")
+
     def evaluate_current_validation(
         desc: str,
         *,
         step_value: int,
+        step_subset: bool = False,
     ) -> Tuple[EpochLossMetrics, float, Dict[str, float]]:
+        active_loader, active_excluded_loader, active_dataset, active_excluded_dataset = (
+            step_validation_inputs if step_subset else
+            (val_loader, val_excluded_loader, validation_dataset, validation_excluded_dataset)
+        )
+        evaluation_dir = run_dir / "validation"
+        if step_subset:
+            evaluation_dir = evaluation_dir / "step"
         selection_metric_means: Dict[str, float] = {}
         with torch.no_grad():
             metrics = run_epoch(
                 model=model,
-                loader=val_loader,
+                loader=active_loader,
                 device=device,
                 optimizer=None,
                 desc=desc,
-            ) if val_loader is not None and len(val_loader) > 0 else nan_loss_metrics()
+            ) if active_loader is not None and len(active_loader) > 0 else nan_loss_metrics()
             excluded_metrics = (
                 run_epoch(
-                    model=model, loader=val_excluded_loader, device=device,
+                    model=model, loader=active_excluded_loader, device=device,
                     optimizer=None, desc=f"{desc}-below-threshold",
                 )
-                if val_excluded_loader is not None else nan_loss_metrics()
+                if active_excluded_loader is not None else nan_loss_metrics()
             )
             unfiltered_metrics = (
                 combine_epoch_metrics(metrics, excluded_metrics)
@@ -2267,7 +2356,7 @@ def main(
                  "below_threshold": excluded_metrics.absolute_ranker_summary},
                 step_value,
             )
-            scope_file = run_dir / "validation" / "validation_scope_summary.tsv"
+            scope_file = evaluation_dir / "validation_scope_summary.tsv"
             scope_file.parent.mkdir(parents=True, exist_ok=True)
             write_header = not scope_file.exists()
             with open(scope_file, "a", encoding="utf-8", newline="") as handle:
@@ -2279,30 +2368,30 @@ def main(
             cosine = (
                 evaluate_validation_cosine(
                     model=model,
-                    dataset=validation_dataset,
+                    dataset=active_dataset,
                     batch_size=batch_size,
                     writer=writer,
                     global_step=step_value,
-                    output_dir=run_dir / "validation" / "filtered",
+                    output_dir=evaluation_dir / "filtered",
                     selection_metric_means=selection_metric_means,
                 )
-                if validation_dataset is not None and len(validation_dataset) > 0
+                if active_dataset is not None and len(active_dataset) > 0
                 else float("nan")
             )
             excluded_peak_means: Dict[str, float] = {}
             excluded_cosine = (
                 evaluate_validation_cosine(
-                    model=model, dataset=validation_excluded_dataset,
+                    model=model, dataset=active_excluded_dataset,
                     batch_size=batch_size, writer=writer, global_step=step_value,
                     validation_scope="validation_below_threshold",
-                    output_dir=run_dir / "validation" / "below_threshold",
+                    output_dir=evaluation_dir / "below_threshold",
                     selection_metric_means=excluded_peak_means,
                 )
-                if validation_excluded_dataset is not None and len(validation_excluded_dataset) > 0
+                if active_excluded_dataset is not None and len(active_excluded_dataset) > 0
                 else float("nan")
             )
             if math.isfinite(cosine) and math.isfinite(excluded_cosine):
-                high_count, low_count = len(validation_dataset), len(validation_excluded_dataset)
+                high_count, low_count = len(active_dataset), len(active_excluded_dataset)
                 unfiltered_cosine = (cosine * high_count + excluded_cosine * low_count) / (high_count + low_count)
             else:
                 unfiltered_cosine = cosine if math.isfinite(cosine) else excluded_cosine
@@ -2314,7 +2403,7 @@ def main(
             )
             if math.isfinite(unfiltered_cosine):
                 combined_cosine = write_combined_validation_cosine_summary(
-                    run_dir / "validation", step_value
+                    evaluation_dir, step_value
                 )
                 log_distribution_cards(
                     writer,
@@ -2324,7 +2413,7 @@ def main(
                     step_value,
                 )
                 write_combined_peak_selection_summary(
-                    run_dir / "validation", step_value
+                    evaluation_dir, step_value
                 )
         return metrics, cosine, selection_metric_means
 
@@ -2449,7 +2538,7 @@ def main(
         epoch_iterator.set_description_str(f"epoch {epoch_index}/{max_epoch}")
         validation_epoch = epoch_index - 1
         should_validate_at_epoch_start = (
-            epoch_index > state.initial_epoch or validate_at_start
+            epoch_index == state.initial_epoch and validate_at_start
         )
         if should_validate_at_epoch_start:
             val_metrics, val_cosine, val_peak_metrics = evaluate_current_validation(
@@ -2486,36 +2575,6 @@ def main(
                     "conditioned edge and spectrum training."
                 )
 
-        if validation_epoch >= state.initial_epoch and should_validate_at_epoch_start:
-            val_loss = val_metrics.loss
-            step_scheduler(scheduler, val_loss)
-            improved = val_loss < best_val_loss - min_delta
-            if improved:
-                best_val_loss = val_loss
-                bad_epochs = 0
-                ckpt_manager.update_topk(
-                    score=val_loss,
-                    epoch=validation_epoch,
-                    iter=global_step,
-                    model=model,
-                    optimizer=optimizer,
-                    scheduler=scheduler,
-                    optimizer_info=optimizer_config_for_torch(optimizer_info),
-                    extra_data={
-                        **extra_data,
-                        "best_val_loss": float(best_val_loss),
-                        "optimizer_info": dict(optimizer_info),
-                    },
-                    topk=topk,
-                    comment="best_val_loss",
-                )
-            else:
-                bad_epochs += 1
-
-            if patience is not None and bad_epochs >= patience:
-                print(f"Early stopping before epoch {epoch_index}.")
-                break
-
         def on_validation_step(
             step_value: int,
             train_epoch_metrics: EpochLossMetrics,
@@ -2524,6 +2583,7 @@ def main(
             step_val_metrics, step_val_cosine, step_peak_metrics = evaluate_current_validation(
                 desc=f"ValStep({step_value})",
                 step_value=step_value,
+                step_subset=True,
             )
             log_training_metrics(
                 event="step",
@@ -2629,24 +2689,8 @@ def main(
             val_cosine=float("nan"),
         )
 
-        should_save = save_interval > 0 and epoch_index % save_interval == 0
-        if should_save:
-            save_managed_checkpoint(
-                ckpt_manager=ckpt_manager,
-                model=model,
-                optimizer=optimizer,
-                scheduler=scheduler,
-                epoch=epoch_index,
-                global_step=global_step,
-                best_val_loss=best_val_loss,
-                optimizer_info=optimizer_info,
-                extra_data=extra_data,
-                comment="interval",
-            )
-
-    if last_epoch_index >= state.initial_epoch:
         val_metrics, val_cosine, val_peak_metrics = evaluate_current_validation(
-            desc=f"ValFinal({last_epoch_index})",
+            desc=f"ValEpochEnd({last_epoch_index})",
             step_value=global_step,
         )
         log_training_metrics(
@@ -2682,6 +2726,7 @@ def main(
         improved = val_loss < best_val_loss - min_delta
         if improved:
             best_val_loss = val_loss
+            bad_epochs = 0
             ckpt_manager.update_topk(
                 score=val_loss,
                 epoch=last_epoch_index,
@@ -2698,6 +2743,28 @@ def main(
                 topk=topk,
                 comment="best_val_loss",
             )
+        else:
+            bad_epochs += 1
+
+        should_save = save_interval > 0 and epoch_index % save_interval == 0
+        if should_save:
+            save_managed_checkpoint(
+                ckpt_manager=ckpt_manager,
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                epoch=epoch_index,
+                global_step=global_step,
+                best_val_loss=best_val_loss,
+                optimizer_info=optimizer_info,
+                extra_data=extra_data,
+                comment="interval",
+            )
+
+        if patience is not None and bad_epochs >= patience:
+            print(f"Early stopping after epoch {epoch_index}.")
+            break
+
 
     save_managed_checkpoint(
         ckpt_manager=ckpt_manager,
@@ -3070,6 +3137,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", "--epoch", dest="epochs", type=int, default=10)
     parser.add_argument("--validation-interval-steps", type=int, default=100)
     parser.add_argument(
+        "--step-validation-fraction", type=validation_fraction, default=1.0,
+        help="Fraction of validation compounds used at step intervals (0 < value <= 1). "
+             "Uses a fixed subset, rounded up; epoch-end validation always uses all compounds.",
+    )
+    parser.add_argument(
         "--train-log-interval-steps",
         type=int,
         default=50,
@@ -3180,6 +3252,7 @@ if __name__ == "__main__":
         validation_interval_steps=(
             args.validation_interval_steps if args.validation_interval_steps > 0 else None
         ),
+        step_validation_fraction=args.step_validation_fraction,
         train_log_interval_steps=(
             args.train_log_interval_steps if args.train_log_interval_steps > 0 else None
         ),

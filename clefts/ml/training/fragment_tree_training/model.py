@@ -1516,18 +1516,31 @@ class FragmentTreeTrainingModel(nn.Module):
             return float(formula.exact_mass) / max(abs(int(formula.charge)), 1)
         batch = output.sample_tree_batch
         precursor_mz = {}
-        roots = batch.node_is_precursor_root.nonzero(as_tuple=False).flatten().tolist()
-        for root in roots:
-            node = int(batch.node_id_global[root])
-            sample = int(batch.kept_sample_ids[int(batch.batch[root])])
-            ion = int(batch.node_precursor_ion_flat_index[root])
-            unsaturation = int(batch.node_precursor_unsaturation_flat_index[root])
-            radical = int(batch.node_precursor_radical_flat_index[root])
-            if min(ion, unsaturation, radical) < 0:
-                raise ValueError("Precursor state is missing for fragment-only intensity supervision.")
-            formula = (target.node_formula[node] + target.ion_formula_delta[ion]
-                       + target.unsaturation_formula_delta[unsaturation] + target.radical_formula_delta[radical])
-            precursor_mz.setdefault(sample, []).append(mz(formula))
+        # Precursor states belong to the TERMINAL node of each precursor
+        # pathway. Its root can be a different molecule (e.g. after a neutral
+        # loss) and intentionally has no assigned precursor state.
+        states = torch.stack((batch.node_precursor_ion_flat_index,
+                              batch.node_precursor_unsaturation_flat_index,
+                              batch.node_precursor_radical_flat_index), dim=1)
+        known = states >= 0
+        if bool((known.any(dim=1) & ~known.all(dim=1)).any()):
+            raise ValueError("Incomplete precursor terminal state for fragment-only intensity supervision.")
+        terminals = known.all(dim=1).nonzero(as_tuple=False).flatten()
+        terminal_states = states[terminals]
+        nodes = batch.node_id_global[terminals].long()
+        samples = batch.kept_sample_ids[batch.batch[terminals].long()]
+        formula = (target.node_formula[nodes]
+                   + target.ion_formula_delta[terminal_states[:, 0]]
+                   + target.unsaturation_formula_delta[terminal_states[:, 1]]
+                   + target.radical_formula_delta[terminal_states[:, 2]])
+        for sample, row in zip(samples.detach().cpu().tolist(), formula.detach().cpu()):
+            precursor_mz.setdefault(int(sample), []).append(mz(row))
+        missing = set(batch.kept_sample_ids.detach().cpu().tolist()) - precursor_mz.keys()
+        if missing:
+            raise ValueError(
+                "Precursor terminal state is missing for fragment-only intensity "
+                f"supervision in sample_ids={sorted(missing)}."
+            )
         predicted_mz = torch.tensor([mz(row) for row in intensity_output.formula_tensor.detach().cpu()],
                                     dtype=torch.float64, device=intensity_output.logit.device)
         return precursor_mz, predicted_mz

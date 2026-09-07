@@ -72,6 +72,7 @@ class FragmentTreeCandidateSelector(nn.Module):
     # target/positive edge is never dropped by the per-tree budget in favor
     # of a merely high-scoring non-target edge.
     _TARGET_EDGE_IMPORTANCE_BONUS = 1e6
+    _ION_CANDIDATE_SCORE_BLOCK_ELEMENTS = 262144
 
     def __init__(
         self,
@@ -629,61 +630,138 @@ class FragmentTreeCandidateSelector(nn.Module):
             selected.extend((sample_id, edge_id) for _, edge_id in rows[:max_per_sample])
         return selected
 
+    @staticmethod
+    def _grouped_topk(values: Tensor, groups: Tensor, k: int, num_groups: int) -> Tensor:
+        """Return score-ordered top-k rows per group, without a Python group loop.
+
+        Stable sorting gives tied scores a deterministic input-row order.
+        """
+        order = torch.argsort(values, descending=True, stable=True)
+        order = order[torch.argsort(groups[order], stable=True)]
+        counts = torch.bincount(groups, minlength=num_groups)
+        starts = counts.cumsum(0) - counts
+        rank = torch.arange(order.numel(), device=order.device) - starts[groups[order]]
+        return order[rank < k]
+
     def _select_fragment_ion_candidates(self, *, features, sample_tree_batch, keep_logit: Tensor, edge_cleave_logit: Tensor, ion_logit: Tensor, unsaturation_logit: Tensor, radical_logit: Tensor) -> List[FragmentIonCandidate]:
         structure = features.structure
         device = keep_logit.device
+        num_nodes = keep_logit.numel()
+        if num_nodes == 0:
+            return []
         kept_sample_ids = sample_tree_batch.kept_sample_ids.to(device).long()
-        graph_index_by_node = sample_tree_batch.batch.to(device).long()
-        candidates: List[FragmentIonCandidate] = []
+        num_graphs = kept_sample_ids.numel()
+        graph_index = sample_tree_batch.batch.to(device).long()
 
-        # The precursor-root node competes for keep-probability mass on the
-        # same footing as every fragment node: it is frequently the dominant
-        # peak in the observed spectrum and must remain eligible for
-        # selection here, not just supervised during training.
-        for graph_index in range(int(kept_sample_ids.numel())):
-            sample_node_index = (graph_index_by_node == graph_index).nonzero(as_tuple=False).view(-1)
-            if sample_node_index.numel() == 0:
+        # Segmented logsumexp of incoming edges, including shared destinations.
+        # Detaching the stabilizing maximum preserves logsumexp's derivative.
+        edge_dst = sample_tree_batch.edge_index[1].to(device).long()
+        edge_max = edge_cleave_logit.new_full((num_nodes,), -torch.inf)
+        edge_max.scatter_reduce_(0, edge_dst, edge_cleave_logit.detach(), reduce="amax", include_self=True)
+        edge_sum = edge_cleave_logit.new_zeros(num_nodes).scatter_add(
+            0, edge_dst, (edge_cleave_logit - edge_max[edge_dst]).exp()
+        )
+        has_incoming = torch.bincount(edge_dst, minlength=num_nodes) > 0
+        # Roots have an additive edge contribution of zero, not -inf.
+        incoming_score = torch.where(has_incoming, edge_max, 0) + torch.where(
+            has_incoming, edge_sum, 1
+        ).log()
+        node_score = keep_logit + incoming_score
+        graph_max = node_score.new_full((num_graphs,), -torch.inf)
+        graph_max.scatter_reduce_(0, graph_index, node_score.detach(), reduce="amax", include_self=True)
+        node_exp = (node_score - graph_max[graph_index]).exp()
+        node_sum = node_exp.new_zeros(num_graphs).scatter_add(0, graph_index, node_exp)
+        node_probability = node_exp / node_sum[graph_index]
+
+        # Normalize over ALL nodes before applying the optional node budget.
+        node_order = self._grouped_topk(
+            node_score, graph_index, self.max_nodes_for_ion_candidates or num_nodes, num_graphs
+        )
+        roles = (~sample_tree_batch.node_is_precursor_root.to(device).bool()).long()
+        adducts = sample_tree_batch.node_main_adduct_type_index.to(device).long()
+        masks = [mask.to(device).bool() for mask in (
+            self.feature_model.ion_candidate_valid_mask_by_role_adduct,
+            self.feature_model.unsaturation_candidate_valid_mask_by_role_adduct,
+            self.feature_model.radical_candidate_valid_mask_by_role_adduct,
+        )]
+        num_adducts = masks[0].size(1)
+        if bool(((adducts[node_order] < 0) | (adducts[node_order] >= num_adducts)).any()):
+            raise IndexError("main_adduct_index is out of range for candidate masks.")
+        node_groups = roles[node_order] * num_adducts + adducts[node_order]
+        row_nodes, row_states, row_logits, row_adduct_probs, row_probs = [], [], [], [], []
+
+        # Nodes sharing a role/adduct have the same valid state combinations.
+        # Only this small categorical loop remains; each block evaluates many
+        # nodes and all their valid states together. Formula vectors are NOT
+        # expanded here, keeping temporary memory proportional to nodes*states.
+        for group in range(2 * num_adducts):
+            nodes = node_order[node_groups == group]
+            if nodes.numel() == 0:
                 continue
-            # All fragment-producing edges in one spectrum compete for a
-            # finite probability mass.  The destination node keep score and
-            # its incoming cleavage-edge score jointly define that mass.
-            node_score = keep_logit[sample_node_index].clone()
-            if sample_tree_batch.edge_index.numel() > 0:
-                edge_dst = sample_tree_batch.edge_index[1].to(device).long()
-                for local_index, batch_node_index in enumerate(sample_node_index):
-                    incoming = (edge_dst == batch_node_index).nonzero(as_tuple=False).view(-1)
-                    if incoming.numel() > 0:
-                        node_score[local_index] = node_score[local_index] + torch.logsumexp(
-                            edge_cleave_logit[incoming], dim=0
-                        )
-            node_probability = torch.softmax(node_score, dim=0)
-            k = int(node_score.numel())
-            if self.max_nodes_for_ion_candidates is not None:
-                k = min(int(self.max_nodes_for_ion_candidates), k)
-            node_order = sample_node_index[torch.topk(node_score, k=k).indices]
-            sample_candidates: List[FragmentIonCandidate] = []
-            for batch_node_index_tensor in node_order:
-                batch_node_index = int(batch_node_index_tensor.detach().cpu().item())
-                sample_candidates.extend(
-                    self._score_joint_ion_candidates_for_node(
-                        structure=structure,
-                        sample_tree_batch=sample_tree_batch,
-                        batch_node_index=batch_node_index,
-                        global_node_id=int(sample_tree_batch.node_id_global[batch_node_index].detach().cpu().item()),
-                        sample_id=int(kept_sample_ids[graph_index].detach().cpu().item()),
-                        keep_logit=keep_logit,
-                        ion_logit=ion_logit,
-                        unsaturation_logit=unsaturation_logit,
-                        radical_logit=radical_logit,
-                        edge_probability=node_probability[
-                            (sample_node_index == batch_node_index).nonzero(as_tuple=False).view(-1)[0]
-                        ],
-                    )
-                )
-            sample_candidates.sort(key=lambda item: item.score, reverse=True)
-            candidates.extend(sample_candidates[: self.max_fragment_ion_candidates])
+            role, adduct = divmod(group, num_adducts)
+            indices = [mask[role, adduct].nonzero(as_tuple=False).flatten() for mask in masks]
+            if any(index.numel() == 0 for index in indices):
+                continue
+            states = torch.cartesian_prod(*indices).reshape(-1, 3)
+            per_node = min(self.max_fragment_ion_candidates, states.size(0))
+            # Bound each dense score block, even for large structure batches.
+            nodes_per_block = max(1, self._ION_CANDIDATE_SCORE_BLOCK_ELEMENTS // states.size(0))
+            for block in nodes.split(nodes_per_block):
+                logits = (ion_logit[block[:, None], states[:, 0]]
+                          + unsaturation_logit[block[:, None], states[:, 1]]
+                          + radical_logit[block[:, None], states[:, 2]])
+                adduct_probability = torch.softmax(logits, dim=1)
+                probability = node_probability[block, None] * adduct_probability
+                top = torch.topk(probability, k=per_node, dim=1)
+                row_nodes.append(block[:, None].expand(-1, per_node).reshape(-1))
+                row_states.append(states[top.indices].reshape(-1, 3))
+                row_logits.append(logits.gather(1, top.indices).reshape(-1))
+                row_adduct_probs.append(adduct_probability.gather(1, top.indices).reshape(-1))
+                row_probs.append(top.values.reshape(-1))
+        if not row_nodes:
+            return []
+        nodes = torch.cat(row_nodes)
+        states = torch.cat(row_states)
+        logits = torch.cat(row_logits)
+        adduct_probability = torch.cat(row_adduct_probs)
+        probability = torch.cat(row_probs)
+        scores = probability.clamp_min(1e-12).log()
 
-        return candidates
+        # Restore node-score order before the stable per-spectrum ranking.
+        node_rank = node_order.new_empty(num_nodes)
+        node_rank[node_order] = torch.arange(node_order.numel(), device=device)
+        order = torch.argsort(node_rank[nodes], stable=True)
+        selected = order[self._grouped_topk(
+            scores[order], graph_index[nodes[order]], self.max_fragment_ion_candidates, num_graphs
+        )]
+        nodes = nodes[selected]
+        states = states[selected]
+        global_nodes = sample_tree_batch.node_id_global.to(device).long()[nodes]
+        final_formula = (structure.node_formula.to(device)[global_nodes].float()
+                         + (structure.ion_formula_delta.to(device)[states[:, 0]].float()
+                            + structure.unsaturation_formula_delta.to(device)[states[:, 1]].float()
+                            + structure.radical_formula_delta.to(device)[states[:, 2]].float()))
+
+        # Only final survivors cross to the CPU. Retain the differentiable GPU
+        # values for downstream intensity training; Python objects are the
+        # existing public interface and require this final materialization.
+        metadata = torch.cat((kept_sample_ids[graph_index[nodes], None], nodes[:, None],
+                              global_nodes[:, None], states), dim=1).detach().cpu().tolist()
+        values = torch.stack((scores[selected], keep_logit[nodes], logits[selected],
+                              probability[selected], node_probability[nodes],
+                              adduct_probability[selected]), dim=1).detach().cpu().tolist()
+        formulas = final_formula.detach().cpu()
+        score_tensors = scores[selected].unbind()
+        probability_tensors = probability[selected].unbind()
+        tensorizer = self.feature_model.formula_tensorizer
+        return [FragmentIonCandidate(
+            sample_id=meta[0], batch_node_index=meta[1], global_node_id=meta[2],
+            ion_index=meta[3], unsaturation_index=meta[4], radical_index=meta[5],
+            formula=tensorizer.tensor_to_formula(formulas[i]), formula_tensor=formulas[i],
+            score=value[0], keep_logit=value[1], candidate_logit=value[2], probability=value[3],
+            score_tensor=score_tensors[i], edge_probability=value[4], adduct_probability=value[5],
+            probability_tensor=probability_tensors[i],
+        ) for i, (meta, value) in enumerate(zip(metadata, values))]
 
     def _score_joint_ion_candidates_for_node(self, *, structure: FragmentTreeStructure, sample_tree_batch, batch_node_index: int, global_node_id: int, sample_id: int, keep_logit: Tensor, ion_logit: Tensor, unsaturation_logit: Tensor, radical_logit: Tensor, edge_probability: Tensor) -> List[FragmentIonCandidate]:
         device = keep_logit.device

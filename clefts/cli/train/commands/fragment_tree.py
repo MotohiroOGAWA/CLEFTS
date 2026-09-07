@@ -10,6 +10,7 @@ from clefts.ml.training.fragment_tree_training.training_model import (
     build_train_config,
     load_and_validate_split_preprocessing,
     run_training,
+    validation_fraction,
 )
 
 
@@ -95,6 +96,11 @@ class FragmentTreeTrainCommand(CLICommand):
             help="Run validation every N successful training steps. Use 0 to disable.",
         )
         parser.add_argument(
+            "--step-validation-fraction", type=validation_fraction, default=1.0,
+            help="Fraction of validation compounds at step intervals (0 < value <= 1). "
+                 "Epoch-end validation always uses all compounds.",
+        )
+        parser.add_argument(
             "--train-log-interval-steps",
             type=int,
             default=50,
@@ -163,6 +169,7 @@ class FragmentTreeTrainCommand(CLICommand):
                 or args.validation_interval_steps <= 0
                 else args.validation_interval_steps
             ),
+            step_validation_fraction=args.step_validation_fraction,
             train_log_interval_steps=(
                 None
                 if args.train_log_interval_steps is None

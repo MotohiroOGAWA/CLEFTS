@@ -568,6 +568,29 @@ these three splits. Duplicate split-prefixed loss cards are no longer written.
 Open TensorBoard on the run's log directory including its child directories.
 Existing event files retain their old tags; new events use this layout.
 
+### Smaller validation at step intervals
+
+Use `--step-validation-fraction 0.1` together with
+`--validation-interval-steps 100` to evaluate 10% of validation compounds at
+step intervals. The option is available in both the training module CLI and
+`clefts train fragment-tree`, and as **Step validation fraction** in Workbench.
+The saved training-config key is `step_validation_fraction`; Workbench uses
+`stepValidationFraction`.
+
+The default is `1.0` (all compounds); valid values satisfy `0 < fraction <= 1`.
+Selection is by unique SMILES, not spectrum or batch count. Counts are rounded
+up to at least one compound. A fixed hash-ordered subset is shared by the loss
+and generated-spectrum evaluations and both assignment-score partitions.
+Every measurement of a selected compound stays in its original partition.
+The selected compounds are recorded in `step_validation_subset.json` in the run.
+
+Every epoch ends with full validation, regardless of the step fraction.
+Learning-rate scheduling, best-checkpoint selection, and early stopping use
+these full epoch results. Optional validation at training start is also full.
+Step-validation artifacts are stored under `validation/step/`; full-validation
+artifacts remain under `validation/` so coincident step/epoch evaluations do
+not mix their score rows.
+
 Every validation pass generates spectra from the validation MSDataset and
 compares them against observed spectra. Both assignment-score partitions are
 processed, even when the above-threshold partition is empty. The valid-record

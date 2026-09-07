@@ -71,3 +71,50 @@ def test_sample_with_no_predicted_candidates_is_not_reported_as_perfect():
     result = objective(prediction, fixture(), precursor_mz={0: [100.]}, predicted_mz=torch.empty(0))
     assert torch.isfinite(result) and result >= 1
     result.backward()
+
+
+def precursor_context_fixture(states):
+    from clefts.ml.training.fragment_tree_training.model import FragmentTreeTrainingModel
+    model = FragmentTreeTrainingModel.__new__(FragmentTreeTrainingModel)
+    torch.nn.Module.__init__(model)
+    model.candidate_selector = SimpleNamespace(feature_model=SimpleNamespace(
+        formula_tensorizer=SimpleNamespace(tensor_to_formula=lambda row: SimpleNamespace(
+            exact_mass=float(row[0]), charge=int(row[1])))))
+    batch = SimpleNamespace(
+        node_is_precursor_root=torch.tensor([True, False, True]),
+        node_id_global=torch.tensor([0, 1, 2]),
+        kept_sample_ids=torch.tensor([4, 8]), batch=torch.tensor([0, 0, 1]),
+        node_precursor_ion_flat_index=torch.tensor(states),
+        node_precursor_unsaturation_flat_index=torch.tensor(states),
+        node_precursor_radical_flat_index=torch.tensor(states))
+    target = SimpleNamespace(node_formula=torch.tensor([[200., 0.], [100., 0.], [300., 0.]]),
+        ion_formula_delta=torch.tensor([[1., 1.]]),
+        unsaturation_formula_delta=torch.tensor([[0., 0.]]),
+        radical_formula_delta=torch.tensor([[0., 0.]]))
+    intensity = SimpleNamespace(formula_tensor=torch.tensor([[101., 1.], [602., 2.]]),
+                                logit=torch.ones(2))
+    return model, SimpleNamespace(sample_tree_batch=batch), intensity, target
+
+
+def test_precursor_context_uses_path_terminal_not_root():
+    # Sample 4: root -> precursor ion; sample 8: edge-less precursor.
+    model, output, intensity, target = precursor_context_fixture([-1, 0, 0])
+    precursor, predicted = model._intensity_precursor_context(output, intensity, target)
+    assert precursor == {4: [101.], 8: [301.]}
+    torch.testing.assert_close(predicted, torch.tensor([101., 301.], dtype=torch.float64))
+
+
+def test_precursor_context_retains_multiple_terminal_states():
+    model, output, intensity, target = precursor_context_fixture([0, 0, 0])
+    precursor, _ = model._intensity_precursor_context(output, intensity, target)
+    assert precursor == {4: [201., 101.], 8: [301.]}
+
+
+def test_precursor_context_rejects_missing_or_partial_terminal_states():
+    import pytest
+    model, output, intensity, target = precursor_context_fixture([-1, -1, 0])
+    with pytest.raises(ValueError, match=r'sample_ids=\[4\]'):
+        model._intensity_precursor_context(output, intensity, target)
+    output.sample_tree_batch.node_precursor_ion_flat_index[1] = 0
+    with pytest.raises(ValueError, match='Incomplete precursor terminal state'):
+        model._intensity_precursor_context(output, intensity, target)
