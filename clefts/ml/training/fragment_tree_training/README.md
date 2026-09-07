@@ -1127,3 +1127,34 @@ python -m pytest tests/ml/training/test_fragment_tree_finetune.py -q
 These tests cover ID remapping, exact preservation of frozen weights under
 AdamW, updates to new rows/attention adapters, inference reload without the base
 file, CLI dry-run, and a one-epoch CLI run on a small generated training tree.
+
+## Fragment-only intensity supervision
+
+Both regular training and frozen-base fine-tuning now add a fragment-only term
+to the existing whole-spectrum Huber, cosine, and presence losses. Its default
+weight is 1.0. It consists of Huber plus cosine on fragment intensities, with
+prediction and target independently normalized over fragments. Thus a dominant
+precursor does not reduce the importance of fragment-relative intensity errors.
+
+Precursor m/z values are reconstructed from precursor-root nodes and their ion,
+unsaturation and radical states; no preprocessing schema change is required.
+Both predicted and target peaks within 0.01 Da are excluded, matching the window
+width of the existing precursor-excluded spectrum evaluation. Training uses
+reconstructed theoretical precursor m/z; evaluation uses measured `PrecursorMZ`.
+
+The auxiliary comparison uses the union of predicted and assigned target
+formulas. Missing predicted formulas receive zero intensity and false-positive
+predicted formulas receive zero target intensity. Candidate/coverage losses
+remain necessary to generate missing candidates; this intensity loss cannot
+create a gradient for a candidate that was never generated. Repeated assignments
+of the same formula to the same peak count once. Samples with no positive
+assigned fragment intensity do not contribute the auxiliary term.
+
+`intensity/fragment_loss` is included in the training metrics. The existing
+best-checkpoint selection uses validation loss, which now includes this term;
+`cosine@excl_precursor` remains available to evaluate actual fragment spectra.
+Compare old and new runs on the same held-out molecules, collision energies and
+adducts. Loss values from the previous and current objectives are not directly
+comparable; use a new training/fine-tuning experiment for that comparison.
+
+Tests: `python -m pytest tests/ml/training/test_fragment_intensity_loss.py -q`.

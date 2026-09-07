@@ -1245,25 +1245,35 @@ class FragmentTreeSelectionTrainingLoss(nn.Module):
 
 
 class FragmentTreeIntensityTrainingLoss(nn.Module):
-    """Formula-level Huber, spectrum cosine, and balanced presence losses."""
+    """Whole-spectrum losses plus independently normalized fragment-only losses."""
 
-    def __init__(self, huber_weight: float = 1.0, cosine_weight: float = 1.0, presence_weight: float = 1.0) -> None:
+    def __init__(self, huber_weight: float = 1.0, cosine_weight: float = 1.0, presence_weight: float = 1.0, fragment_weight: float = 1.0) -> None:
         super().__init__()
         self.huber_weight = float(huber_weight)
         self.cosine_weight = float(cosine_weight)
         self.presence_weight = float(presence_weight)
+        self.fragment_weight = float(fragment_weight)
+        self.last_fragment_loss = 0.0
 
     def forward(
         self,
         intensity_output,
         target: TrainingFragmentTreeStructure,
+        *,
+        precursor_mz: Optional[Dict[int, List[float]]] = None,
+        predicted_mz: Optional[Tensor] = None,
     ) -> Tensor:
-        if intensity_output.logit.numel() == 0:
+        self.last_fragment_loss = 0.0
+        fragment_losses = []
+        if intensity_output.logit.numel() == 0 and precursor_mz is None:
             return target.target_intensity.sum() * 0.0
 
         device = intensity_output.logit.device
         losses: List[Tensor] = []
-        for sample_id in intensity_output.sample_index.detach().cpu().unique(sorted=True).tolist():
+        sample_ids = set(intensity_output.sample_index.detach().cpu().tolist())
+        if precursor_mz is not None:
+            sample_ids.update(target.peak_sample_index.detach().cpu().tolist())
+        for sample_id in sorted(sample_ids):
             sample_id = int(sample_id)
             pred_mask = intensity_output.sample_index == sample_id
             pred_index = pred_mask.nonzero(as_tuple=False).view(-1)
@@ -1275,20 +1285,83 @@ class FragmentTreeIntensityTrainingLoss(nn.Module):
             )
             target_intensity = target_weight / target_weight.sum().clamp_min(1e-12)
             predicted_intensity = intensity_output.logit[pred_index]
-            huber_loss = F.smooth_l1_loss(predicted_intensity, target_intensity)
-            cosine_loss = self.cosine_loss(predicted_intensity, target_intensity)
+            huber_loss = (F.smooth_l1_loss(predicted_intensity, target_intensity)
+                          if pred_index.numel() else predicted_intensity.sum() * 0.0)
+            cosine_loss = (self.cosine_loss(predicted_intensity, target_intensity)
+                           if pred_index.numel() else predicted_intensity.sum() * 0.0)
             sample_loss = self.huber_weight * huber_loss + self.cosine_weight * cosine_loss
             presence_logit = getattr(intensity_output, "presence_logit", None)
-            if presence_logit is not None:
+            if presence_logit is not None and pred_index.numel():
                 presence_target = (target_weight > 0).to(presence_logit.dtype)
                 sample_loss = sample_loss + self.presence_weight * self.balanced_presence_loss(
                     presence_logit[pred_index], presence_target
                 )
+            if precursor_mz is not None and predicted_mz is not None:
+                fragment_loss = self.fragment_loss(
+                    predicted_intensity, intensity_output.formula_tensor[pred_index],
+                    predicted_mz[pred_index], target, sample_id, precursor_mz.get(sample_id, []))
+                sample_loss = sample_loss + self.fragment_weight * fragment_loss
+                fragment_losses.append(fragment_loss.detach())
             losses.append(sample_loss)
 
         if len(losses) == 0:
             return intensity_output.logit.sum() * 0.0
+        if fragment_losses:
+            self.last_fragment_loss = float(torch.stack(fragment_losses).mean().cpu())
         return torch.stack(losses).mean()
+
+    def fragment_loss(self, predicted, formulas, predicted_mz, target, sample_id, precursor_mz):
+        """Fragment-only loss on the union of predicted and assigned target formulas.
+
+        Use the same 0.01 Da precursor window as spectrum validation. Missing
+        candidates contribute zeros; candidate coverage losses still provide
+        the gradients needed to generate them.
+        """
+        def is_fragment(mz):
+            mask = torch.ones_like(mz, dtype=torch.bool)
+            for value in precursor_mz:
+                mask &= (mz.double() - value).abs() > 0.01
+            return mask
+
+        pred_keep = is_fragment(predicted_mz).detach().cpu().tolist()
+        peak_ids = target.formula_peak_index.to(predicted.device).long()
+        sample_ids = target.peak_sample_index.to(predicted.device).long()[peak_ids]
+        keep = (sample_ids == sample_id) & is_fragment(target.sample_peak_mz.to(predicted.device)[peak_ids])
+        target_formulas = target.target_formula.to(predicted.device)[keep]
+        target_peaks = peak_ids[keep]
+        # A formula can have multiple assignments. Count each observed peak once
+        # per distinct formula, rather than once per path/terminal assignment.
+        target_by_formula = {}
+        peak_intensities = target.sample_peak_intensity.detach().cpu().tolist()
+        seen = set()
+        for formula, peak in zip(target_formulas.detach().cpu().tolist(), target_peaks.detach().cpu().tolist()):
+            key = tuple(formula)
+            if (key, peak) in seen:
+                continue
+            seen.add((key, peak))
+            target_by_formula[key] = target_by_formula.get(key, 0.0) + float(peak_intensities[peak])
+        if not target_by_formula or sum(target_by_formula.values()) <= 0:
+            # Without fragment supervision do not suppress legitimate predictions.
+            return predicted.sum() * 0.0
+        keys = list(target_by_formula)
+        index = {key: i for i, key in enumerate(keys)}
+        pred_indexes, destinations = [], []
+        for i, formula in enumerate(formulas.detach().cpu().tolist()):
+            if not bool(pred_keep[i]):
+                continue
+            key = tuple(formula)
+            if key not in index:
+                index[key] = len(keys); keys.append(key)
+            pred_indexes.append(i); destinations.append(index[key])
+        prediction = predicted.new_zeros(len(keys))
+        if pred_indexes:
+            prediction = prediction.index_add(0, torch.tensor(destinations, device=predicted.device), predicted[pred_indexes])
+        else:
+            prediction = prediction + predicted.sum() * 0.0
+        truth = predicted.new_tensor([target_by_formula.get(key, 0.0) for key in keys])
+        truth = truth / truth.sum().clamp_min(1e-12)
+        prediction = prediction / prediction.sum().clamp_min(1e-8)
+        return self.huber_weight * F.smooth_l1_loss(prediction, truth) + self.cosine_weight * self.cosine_loss(prediction, truth)
 
     @staticmethod
     def cosine_loss(predicted: Tensor, target: Tensor, eps: float = 1e-8) -> Tensor:
@@ -1394,7 +1467,11 @@ class FragmentTreeTrainingModel(nn.Module):
             intensity_loss = selection_loss.detach() * 0.0
         else:
             intensity_output = self.intensity_predictor.forward_candidate_output(output)
-            intensity_loss = self.intensity_loss_fn(intensity_output, batch)
+            if isinstance(self.intensity_loss_fn, FragmentTreeIntensityTrainingLoss):
+                precursor_mz, predicted_mz = self._intensity_precursor_context(output, intensity_output, batch)
+                intensity_loss = self.intensity_loss_fn(intensity_output, batch, precursor_mz=precursor_mz, predicted_mz=predicted_mz)
+            else:
+                intensity_loss = self.intensity_loss_fn(intensity_output, batch)
         edge_total_loss = selection_loss + self.ranking_loss_weight * absolute_ranker_loss
         loss = edge_total_loss + intensity_loss
         absolute_ranker_metrics = self.absolute_ranker_loss_fn.metrics(output, batch)
@@ -1406,6 +1483,8 @@ class FragmentTreeTrainingModel(nn.Module):
             absolute_ranker_metrics.update(
                 self._intensity_similarity_metrics(intensity_output, batch)
             )
+        if isinstance(self.intensity_loss_fn, FragmentTreeIntensityTrainingLoss):
+            absolute_ranker_metrics["intensity/fragment_loss"] = self.intensity_loss_fn.last_fragment_loss
         absolute_ranker_metrics.update({
             "edge_retain_loss": float(selection_loss.detach().cpu().item()),
             "edge_total_loss": float(edge_total_loss.detach().cpu().item()),
@@ -1428,6 +1507,30 @@ class FragmentTreeTrainingModel(nn.Module):
             "intensity_output": intensity_output,
             "absolute_ranker_metrics": absolute_ranker_metrics,
         }
+
+    @torch.no_grad()
+    def _intensity_precursor_context(self, output, intensity_output, target):
+        tensorizer = self.candidate_selector.feature_model.formula_tensorizer
+        def mz(row):
+            formula = tensorizer.tensor_to_formula(row.detach().cpu())
+            return float(formula.exact_mass) / max(abs(int(formula.charge)), 1)
+        batch = output.sample_tree_batch
+        precursor_mz = {}
+        roots = batch.node_is_precursor_root.nonzero(as_tuple=False).flatten().tolist()
+        for root in roots:
+            node = int(batch.node_id_global[root])
+            sample = int(batch.kept_sample_ids[int(batch.batch[root])])
+            ion = int(batch.node_precursor_ion_flat_index[root])
+            unsaturation = int(batch.node_precursor_unsaturation_flat_index[root])
+            radical = int(batch.node_precursor_radical_flat_index[root])
+            if min(ion, unsaturation, radical) < 0:
+                raise ValueError("Precursor state is missing for fragment-only intensity supervision.")
+            formula = (target.node_formula[node] + target.ion_formula_delta[ion]
+                       + target.unsaturation_formula_delta[unsaturation] + target.radical_formula_delta[radical])
+            precursor_mz.setdefault(sample, []).append(mz(formula))
+        predicted_mz = torch.tensor([mz(row) for row in intensity_output.formula_tensor.detach().cpu()],
+                                    dtype=torch.float64, device=intensity_output.logit.device)
+        return precursor_mz, predicted_mz
 
     @torch.no_grad()
     def evaluate_depth_rollout(self, target) -> Dict[str, float]:
