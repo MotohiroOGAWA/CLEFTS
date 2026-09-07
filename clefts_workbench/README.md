@@ -153,3 +153,21 @@ SMILES text filtering. Missing and invalid SMILES remain excluded from both list
 Workbench runs and copied commands include `--include-compounds`. This CLI flag
 adds a `compounds` array to the JSON result; each entry contains `smiles`,
 `matched`, and `records`. Without the flag, CLI output remains summary-only.
+
+Use **Add reactant SMARTS** / **Remove** to edit multiple queries (at least one
+is required). The summary compares every query with **Any reactant SMARTS (OR)**,
+for both record counts/percentages and unique-molecule counts/percentages. The OR
+row counts each record or molecule only once even when multiple queries match.
+All rows use the same valid-SMILES denominators. Select **Compound lists for** to
+inspect the detected/undetected lists for the union or an individual query.
+
+Repeat `--smarts` when using the CLI:
+
+```bash
+python -m clefts.cli molecule smarts-search --input data.msds --smarts O --smarts N --include-compounds
+```
+
+Top-level JSON counts describe the OR union. `patterns` contains each query's
+counts, percentages and zero-based `index`. Compound entries include
+`matchedPatterns` (matching query indices); `matched` indicates any query match.
+The file is loaded once and each distinct input SMILES is parsed once per run.

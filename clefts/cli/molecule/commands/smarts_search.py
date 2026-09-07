@@ -14,7 +14,7 @@ class SmartsSearchCommand(CLICommand):
 
     def configure(self, parser):
         parser.add_argument("--input", required=True, help="Input .msds file.")
-        parser.add_argument("--smarts", required=True, help="SMARTS substructure query.")
+        parser.add_argument("--smarts", required=True, action="append", help="Reactant SMARTS query. Repeat for multiple patterns; overall counts use any match.")
         parser.add_argument("--smiles-column", default="SMILES", help="SMILES metadata column (default: SMILES).")
 
         parser.add_argument("--include-compounds", action="store_true",

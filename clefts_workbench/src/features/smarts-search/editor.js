@@ -5,7 +5,7 @@ const vscode = require('vscode');
 function buildArgs(payload) {
   return ['-m', 'clefts.cli', 'molecule', 'smarts-search',
     '--input', String(payload.file || '').trim(),
-    '--smarts', String(payload.smarts || '').trim(),
+    ...(Array.isArray(payload.smarts) ? payload.smarts : [payload.smarts || '']).flatMap(value => ['--smarts', String(value).trim()]),
     '--smiles-column', String(payload.column || 'SMILES').trim(), '--include-compounds'];
 }
 
@@ -67,7 +67,7 @@ function html() {
   <p>Count SMILES containing a SMARTS substructure. Each record is counted once, even if it contains multiple matches.</p>
   <form id="smartsForm"><label>MSDataset (.msds)<input id="smartsFile" required></label><button type="button" id="smartsBrowse">Browse…</button>
   <label>SMILES column<input id="smartsColumn" value="SMILES" required></label>
-  <label>SMARTS<input id="smartsQuery" placeholder="e.g. c1ccccc1" required></label>
+  <div id="smartsQueries"></div><button type="button" id="smartsAddQuery">Add reactant SMARTS</button>
   <p class="muted">Percentages use valid SMILES as the denominator. Unique molecules are deduplicated using canonical isomeric SMILES. Stereochemistry is not required for substructure matching.</p>
   <button type="button" id="smartsCopy">Copy Command</button> <button class="primary" id="smartsRun">Run CLI</button> <button type="button" id="smartsCancel" disabled>Cancel</button></form>
   <p id="smartsStatus" role="status"></p><pre id="smartsCommand" style="white-space:pre-wrap;overflow-wrap:anywhere"></pre><div id="smartsResult"></div></section></div>`;
@@ -77,13 +77,39 @@ function script() { return `(${client.toString()})();`; }
 function client() {
   const el = id => document.getElementById(id);
   const form = el('smartsForm');
+  const queryRows = [];
+  function addQuery() {
+    const row = document.createElement('div');
+    const label = document.createElement('label');
+    const input = document.createElement('input');
+    input.required = true; input.placeholder = 'e.g. c1ccccc1';
+    const remove = document.createElement('button');
+    remove.type = 'button'; remove.textContent = 'Remove';
+    const item = { row, label, input, remove };
+    label.append(input); row.append(label, remove);
+    queryRows.push(item); el('smartsQueries').append(row);
+    function update() {
+      queryRows.forEach((value, index) => {
+        value.label.replaceChildren('Reactant SMARTS ' + (index + 1), value.input);
+        value.remove.disabled = queryRows.length === 1;
+      });
+    }
+    remove.onclick = () => {
+      if (queryRows.length === 1) return;
+      queryRows.splice(queryRows.indexOf(item), 1); row.remove(); update();
+    };
+    update();
+  }
+  el('smartsAddQuery').onclick = addQuery;
+  addQuery();
   function busy(value) {
     for (const input of form.querySelectorAll('input,button')) input.disabled = value;
     el('smartsCancel').disabled = !value;
+    if (!value && queryRows.length === 1) queryRows[0].remove.disabled = true;
   }
   el('smartsBrowse').onclick = () => vscode.postMessage({ type: 'pickSmartsDataset' });
   el('smartsCancel').onclick = () => vscode.postMessage({ type: 'cancelSmartsSearch' });
-  const payload = () => ({ file: el('smartsFile').value.trim(), column: el('smartsColumn').value.trim(), smarts: el('smartsQuery').value.trim() });
+  const payload = () => ({ file: el('smartsFile').value.trim(), column: el('smartsColumn').value.trim(), smarts: queryRows.map(row => row.input.value.trim()) });
   el('smartsCopy').onclick = () => {
     if (form.reportValidity()) vscode.postMessage({ type: 'copySmartsCommand', payload: payload() });
   };
@@ -105,17 +131,37 @@ function client() {
     if (!m.ok) return;
     const r = m.result, percent = v => v === null ? 'N/A' : v.toFixed(2) + '%';
     const table = document.createElement('table');
-    for (const values of [['Counting basis', 'Detected', 'Valid total', 'Percentage'],
-      ['Records (including duplicates)', r.matched, r.valid, percent(r.percent)],
-      ['Unique molecules', r.uniqueMatched, r.unique, percent(r.uniquePercent)]]) {
+    const summaries = [{ label: 'Any reactant SMARTS (OR)', ...r },
+      ...(r.patterns || []).map((pattern, index) => ({ ...pattern, label: 'Reactant SMARTS ' + (index + 1) + ': ' + pattern.smarts }))];
+    const header = table.insertRow();
+    for (const label of ['Query', 'Detected records / valid', 'Record percentage', 'Detected unique / valid', 'Unique percentage']) {
+      const cell = document.createElement('th'); cell.textContent = label; header.append(cell);
+    }
+    for (const summary of summaries) {
       const row = table.insertRow();
-      for (const value of values) row.insertCell().textContent = value;
+      for (const value of [summary.label, summary.matched + ' / ' + summary.valid,
+        percent(summary.percent), summary.uniqueMatched + ' / ' + summary.unique, percent(summary.uniquePercent)]) {
+        const cell = row.insertCell(); cell.textContent = value; cell.style.overflowWrap = 'anywhere';
+      }
     }
     const detail = document.createElement('p');
     detail.textContent = 'Total records: ' + r.total + ' · Missing SMILES: ' + r.missing + ' · Invalid SMILES: ' + r.invalid;
     el('smartsResult').replaceChildren(table, detail);
-    for (const matched of [true, false]) {
-      const compounds = (r.compounds || []).filter(compound => compound.matched === matched);
+    const scopeLabel = document.createElement('label');
+    scopeLabel.textContent = 'Compound lists for';
+    const scope = document.createElement('select');
+    summaries.forEach((summary, index) => {
+      const option = document.createElement('option'); option.value = String(index - 1); option.textContent = summary.label; scope.append(option);
+    });
+    scope.value = '-1'; scopeLabel.append(scope);
+    const lists = document.createElement('div');
+    el('smartsResult').append(scopeLabel, lists);
+    function renderLists() {
+      lists.replaceChildren();
+      const patternIndex = Number(scope.value);
+      for (const matched of [true, false]) {
+      const compounds = (r.compounds || []).filter(compound =>
+        (patternIndex < 0 ? compound.matched : (compound.matchedPatterns || []).includes(patternIndex)) === matched);
       const section = document.createElement('details');
       section.open = true;
       const title = document.createElement('summary');
@@ -153,9 +199,12 @@ function client() {
       previous.onclick = () => { page--; renderPage(); };
       next.onclick = () => { page++; renderPage(); };
       section.append(title, filter, list, previous, pageLabel, next);
-      el('smartsResult').append(section);
+      lists.append(section);
       renderPage();
+      }
     }
+    scope.onchange = renderLists;
+    renderLists();
   });
 }
 module.exports = { attach, html, script, buildArgs, shellDisplay };

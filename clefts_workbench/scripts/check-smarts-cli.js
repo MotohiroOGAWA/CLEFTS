@@ -37,3 +37,16 @@ assert.strictEqual(roundTrip.status, 0, roundTrip.stderr);
 assert.deepStrictEqual(JSON.parse(roundTrip.stdout), special);
 new Function(script());
 console.log('SMARTS CLI and copied command checks passed.');
+
+const multiArgs = buildArgs({ ...payload, smarts: ['C', '[#118]'] });
+assert.strictEqual(multiArgs.filter(arg => arg === '--smarts').length, 2);
+const multi = spawnSync('python', multiArgs, { cwd, encoding: 'utf8' });
+assert.strictEqual(multi.status, 0, multi.stderr);
+const result = JSON.parse(multi.stdout);
+assert.strictEqual(result.matched, 6);
+assert.deepStrictEqual(result.patterns.map(p => p.matched), [6, 0]);
+assert.deepStrictEqual(result.compounds[0].matchedPatterns, [0]);
+const multiCopied = spawnSync('bash', ['-c', shellDisplay('python', multiArgs)], { cwd, encoding: 'utf8' });
+assert.strictEqual(multiCopied.status, 0, multiCopied.stderr);
+assert.deepStrictEqual(JSON.parse(multiCopied.stdout), result);
+console.log('Multiple SMARTS CLI and copied command checks passed.');
