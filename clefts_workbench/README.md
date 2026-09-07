@@ -94,3 +94,18 @@ npm run package
 ```
 
 Packages are written to `artifacts/clefts_workbench-<version>.vsix`, keeping generated files out of the extension root. Install the generated file with `Extensions: Install from VSIX...` in VS Code.
+
+### Assignment score distribution
+
+The result viewer reads all sample rows from `assignment_scores.tsv` in the result
+folder and its `train_structures` / `validation_structures` folders. Select a dataset
+in **Assignment Score Distribution** and adjust the bin width (0.001–1; default
+0.1 gives 10 bins). Bars show sample counts on the left axis; the line shows the
+cumulative percentage from low to high scores on the right axis. Bins include
+their lower boundary, with score 1 included in the final bin. Missing, nonnumeric,
+and out-of-range scores are excluded and their count is displayed.
+
+Bar, line, background, and text colors are editable. **Save PNG** saves the current
+chart at 1200 × 640 pixels; **Save TSV** exports bin bounds, counts, cumulative
+counts, and cumulative percentages. The same distribution is available in the
+expandable table. Use **Refresh** after score files are generated or updated.
