@@ -1052,3 +1052,78 @@ new embedding rows when loading the checkpoint.
      importance top-k; this trade-off has not been evaluated end-to-end.
 
 Keep this README synchronized with algorithm, configuration, and workflow changes.
+
+## Frozen-base fine-tuning with a new cleavage pattern set
+
+`clefts train fragment-tree-finetune` initializes a separate fine-tuning run from
+a **fragment-tree training** `model.pt` checkpoint. The MolEncoder stays entirely
+frozen, in evaluation mode, without added parameters. Every existing parameter
+in the other models is also frozen, including biases, normalization parameters,
+and existing category embeddings.
+
+Small linear bottlenecks are added to non-MolEncoder `nn.Linear` weights and
+Attention Q/K/V and output projections. For a projection the effective operation
+is `y = (W_frozen + B @ A) x + b_frozen`, where `A` has `adapter_width` rows.
+Only `A` and `B` are trainable; `B` starts at zero. This is a low-rank parallel
+expansion, not a change to the original hidden dimensions or number of attention
+heads. Norm layers and existing non-cleavage embeddings remain fixed. Changes to
+the added paths can change predictions for old compounds even though old weights
+stay fixed, so retain representative old compounds in training and validation.
+
+The new set must contain all old chemical definitions and at least one new
+pattern. Definition matching preserves old embedding values even if automatic
+sorting assigns different IDs. Pattern/reaction/product rows for genuinely new
+categories are independently trainable; old rows are immutable even with AdamW
+weight decay. The CLI rejects deleted/changed definitions, duplicate or
+noncontiguous IDs, and changes to other Fragmenter settings (such as adducts or
+depth). All other model dimensions are inherited from the base checkpoint.
+
+1. Save the complete old + new `*.clevageset.json` in the pattern editor.
+2. Prepare new training and validation structures using that complete set and
+   the original Fragmenter settings. Include `valid_records.msds` in the
+   validation split. Keep the original prepared dataset separately.
+3. Run from the CLEFTS application directory:
+
+```bash
+python -m clefts.cli train fragment-tree-finetune \
+  --checkpoint /path/to/base/model.pt \
+  --cleavage-pattern-set /path/to/expanded.clevageset.json \
+  --train-dir /path/to/new/train_structures \
+  --val-dir /path/to/new/validation_structures \
+  --output-dir /path/to/finetuning \
+  --adapter-width 8 --lr 0.0001 --epochs 10 --device cpu
+```
+
+Split directories and their `data/` subdirectories are both accepted. The CLI
+verifies that the selected set matches the preprocessing definitions saved with
+both splits; it does not regenerate those structures itself. `--dry-run` checks
+configuration and checkpoint compatibility and prints frozen/trainable parameter
+counts without optimization or output files. This checks preprocessing metadata,
+not every stored structure or model quality. Normal training additionally uses
+the existing dataset validation and spectrum validation pipeline.
+
+Workbench's **Fine-tuning** tab calls this same CLI. **Copy Command** uses the
+same arguments, quoting only where needed; **Validate only** adds `--dry-run`.
+**Stop** cancels the CLI. Logs appear in the tab and in the CLEFTS output channel.
+
+Training writes `fine_tuning_parameters.json` (including trainable tensor names)
+in the run folder, along with the usual model/configuration/checkpoint artifacts.
+The optimizer and epoch counter start fresh. To resume within the fine-tuning
+experiment, use `--ckpt-id` with the same base checkpoint, pattern set and adapter
+width. The saved optimizer and epoch then follow the standard resume semantics.
+Starting another expansion from an already adapted checkpoint is not supported.
+
+Saved fine-tuning checkpoints contain both frozen and added weights and can be
+loaded by the normal prediction CLI / Workbench Predict Spectrum without the
+base checkpoint or a separate MolEncoder checkpoint file. The base path in the
+configuration is used only when initializing a new run.
+
+Validation:
+
+```bash
+python -m pytest tests/ml/training/test_fragment_tree_finetune.py -q
+```
+
+These tests cover ID remapping, exact preservation of frozen weights under
+AdamW, updates to new rows/attention adapters, inference reload without the base
+file, CLI dry-run, and a one-epoch CLI run on a small generated training tree.

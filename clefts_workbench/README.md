@@ -171,3 +171,23 @@ Top-level JSON counts describe the OR union. `patterns` contains each query's
 counts, percentages and zero-based `index`. Compound entries include
 `matchedPatterns` (matching query indices); `matched` indicates any query match.
 The file is loaded once and each distinct input SMILES is parsed once per run.
+
+### Fragment Tree Fine-tuning
+
+Open **Fine-tuning**, select a base fragment-tree `model.pt`, a complete expanded
+Cleavage Pattern Set, and training/validation splits regenerated with that set.
+Select a separate output directory. All old parameters and MolEncoder are frozen;
+only new category embeddings and small per-projection low-rank expansions train.
+**Added nodes per projection** defaults to 8. The original model dimensions stay
+the same. Use representative old compounds as well as new-pattern examples when
+checking performance.
+
+**Validate only** checks preprocessing/configuration and checkpoint compatibility
+and reports trainable/frozen parameter counts. **Run Fine-tuning CLI** invokes
+`python -m clefts.cli train fragment-tree-finetune`; **Copy Command** copies the
+same arguments. Logs stream into the tab and the CLEFTS output channel. The new
+set must include all old definitions, and other Fragmenter settings must match
+the base. The validation split must include `valid_records.msds`.
+
+See `../clefts/ml/training/fragment_tree_training/README.md` for CLI usage,
+checkpoint/resume behavior, and the exact expansion architecture.

@@ -978,6 +978,9 @@ def load_or_initialize_state(
     if ckpt_id is None:
         ckpt_manager.checkout_base()
         model = build_training_model(model_config, device=device)
+        if model_config.get("fine_tuning"):
+            from .fine_tuning import initialize_from_base
+            initialize_from_base(model, model_config)
         optimizer, scheduler = build_optimizer_and_scheduler(model, optimizer_info)
         return TrainState(
             model=model,
@@ -1006,6 +1009,9 @@ def load_or_initialize_state(
         create_training_model_from_checkpoint_config,
         device=device,
     )
+
+    if model_config.get("fine_tuning") and model.get_params() != model_config:
+        raise ValueError("Fine-tuning resume configuration differs from the saved checkpoint. Use the same base, pattern set and adapter width.")
 
     checkpoint_extra_data = dict(checkpoint_extra_data or {})
     if optimizer is None:
@@ -2143,6 +2149,11 @@ def main(
         ckpt_id=ckpt_id,
     )
     model = state.model
+    if model_config.get("fine_tuning"):
+        from .fine_tuning import parameter_report
+        report = parameter_report(model)
+        save_config(report, run_dir / "fine_tuning_parameters.json")
+        print(f"[Fine-tuning] Frozen: {report['frozen_parameters']:,}; trainable: {report['trainable_parameters']:,}")
     optimizer = state.optimizer
     scheduler = state.scheduler
     global_step = state.global_step

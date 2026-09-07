@@ -258,6 +258,7 @@ class FragmentSpectrumGenerator(ModelBase):
         ranking_intensity_threshold: float = 0.05,
         mol_encoder_checkpoint: Optional[str] = None,
         freeze_mol_encoder: bool = True,
+        fine_tuning: Optional[Dict] = None,
     ) -> None:
         super(FragmentSpectrumGenerator, self).__init__(
             ignore_config_keys=["formula_mz_resolver"],
@@ -314,6 +315,10 @@ class FragmentSpectrumGenerator(ModelBase):
             max_retained_edges=max_retained_edges,
             max_next_cleavage_candidates=max_next_cleavage_candidates,
         )
+
+        if fine_tuning:
+            from .fine_tuning import install_expansion
+            install_expansion(self, fine_tuning)
 
         self.min_peak_intensity = min_peak_intensity
         self.include_precursor_peaks = include_precursor_peaks
