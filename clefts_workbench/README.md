@@ -109,3 +109,47 @@ Bar, line, background, and text colors are editable. **Save PNG** saves the curr
 chart at 1200 × 640 pixels; **Save TSV** exports bin bounds, counts, cumulative
 counts, and cumulative percentages. The same distribution is available in the
 expandable table. Use **Refresh** after score files are generated or updated.
+
+### SMARTS Search
+
+Select **SMARTS Search**, browse for an `.msds` file, enter a SMARTS query
+(for example `c1ccccc1`), and press **Run CLI**. The SMILES column defaults to
+`SMILES` and can be changed. **Cancel** stops an active search.
+
+Results show matching records and matching unique molecules, with counts and
+percentages. Record percentages use all valid SMILES records as the denominator;
+unique percentages use valid molecules deduplicated by RDKit canonical isomeric
+SMILES. Missing and invalid SMILES are excluded and reported separately. A record
+is counted once regardless of the number of substructure matches. Matching uses
+RDKit's default substructure behavior (chirality is not required). An empty valid
+set displays `N/A` for its percentage.
+
+The Workbench only invokes the CLEFTS CLI and displays its JSON output. Search
+and counting logic live in the Python application, not the extension. **Copy
+Command** copies the same command and arguments used by **Run CLI**, using
+`clefts.pythonPath`. Run the copied command from the application directory shown
+in the status message (`mnt/app` by default).
+
+The CLI can also be used independently from the application directory:
+
+```bash
+python -m clefts.cli molecule smarts-search --input /path/to/data.msds --smarts 'c1ccccc1' --smiles-column SMILES
+```
+
+An installed CLEFTS environment also supports `clefts molecule smarts-search`.
+Results go to stdout as JSON; errors go to stderr with a nonzero exit code.
+
+Run `python scripts/check-smarts-search.py` with that environment to check the
+counting behavior.
+
+Run `node scripts/check-smarts-cli.js` to verify CLI results, failures, and copied
+command quoting with the CLEFTS Python environment available as `python`.
+
+Search results include separate **Detected compounds** and **Not detected
+compounds** lists. Each row shows a canonical isomeric SMILES and the number of
+source records for that molecule. Lists show 50 molecules per page and support
+SMILES text filtering. Missing and invalid SMILES remain excluded from both lists.
+
+Workbench runs and copied commands include `--include-compounds`. This CLI flag
+adds a `compounds` array to the JSON result; each entry contains `smiles`,
+`matched`, and `records`. Without the flag, CLI output remains summary-only.
