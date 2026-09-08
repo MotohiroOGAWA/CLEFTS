@@ -55,39 +55,54 @@ function distributionClient(datasets, histogram) {
   function draw() {
     selected = datasets[Number(get('scoreDataset').value)];
     const width = Number(get('scoreWidth').value);
+    const imageWidth = Number(get('scoreImageWidth').value);
+    const imageHeight = Number(get('scoreImageHeight').value);
+    const validImageSize = Number.isInteger(imageWidth) && imageWidth >= 320 && imageWidth <= 8192
+      && Number.isInteger(imageHeight) && imageHeight >= 240 && imageHeight <= 8192;
+    get('scoreBackground').disabled = get('scoreTransparent').checked;
+    if (!validImageSize) {
+      get('scoreStatus').textContent = 'PNG width must be 320–8192 px and height must be 240–8192 px.';
+      get('scorePng').disabled = get('scoreTsv').disabled = true;
+      return;
+    }
     try { rows = histogram(selected.scores, width); }
     catch (error) { get('scoreStatus').textContent = error.message; get('scorePng').disabled = get('scoreTsv').disabled = true; return; }
     get('scoreStatus').textContent = selected.error || `${selected.scores.length} samples · ${rows.length} bins · ${selected.skipped} invalid/missing scores excluded. Bins include the lower bound; only the final bin includes its upper bound (1).`;
     get('scorePng').disabled = get('scoreTsv').disabled = !selected.scores.length || !!selected.error;
     canvas.hidden = false;
+    canvas.width = imageWidth; canvas.height = imageHeight;
+    const sx = imageWidth / 1200, sy = imageHeight / 640, scale = Math.min(sx, sy);
+    const x = value => value * sx, y = value => value * sy;
     const foreground = get('scoreText').value;
-    ctx.fillStyle = get('scoreBackground').value; ctx.fillRect(0, 0, 1200, 640);
-    ctx.fillStyle = foreground; ctx.font = 'bold 22px sans-serif'; ctx.textAlign = 'center';
-    ctx.fillText('Assignment score distribution — ' + selected.label, 600, 36);
-    ctx.font = '16px sans-serif'; ctx.fillText(`n = ${selected.scores.length} · bin width = ${width}`, 600, 63);
-    const left = 100, top = 110, w = 1000, h = 420, bottom = top + h;
+    ctx.clearRect(0, 0, imageWidth, imageHeight);
+    if (!get('scoreTransparent').checked) { ctx.fillStyle = get('scoreBackground').value; ctx.fillRect(0, 0, imageWidth, imageHeight); }
+    ctx.fillStyle = foreground; ctx.font = `bold ${Math.max(11, 22 * scale)}px sans-serif`; ctx.textAlign = 'center';
+    ctx.fillText('Assignment score distribution — ' + selected.label, x(600), y(36));
+    ctx.font = `${Math.max(8, 16 * scale)}px sans-serif`; ctx.fillText(`n = ${selected.scores.length} · bin width = ${width}`, x(600), y(63));
+    const left = x(100), top = y(110), w = x(1000), h = y(420), bottom = top + h;
     const max = Math.max(1, ...rows.map(row => row.count)), step = Math.max(1, Math.ceil(max / 5)), ceiling = step * 5;
-    ctx.lineWidth = 1;
+    ctx.lineWidth = Math.max(1, scale);
     for (let i = 0; i <= 5; i++) {
       const y = bottom - i * h / 5;
       ctx.strokeStyle = foreground; ctx.globalAlpha = 0.15; ctx.beginPath(); ctx.moveTo(left, y); ctx.lineTo(left + w, y); ctx.stroke(); ctx.globalAlpha = 1;
-      ctx.fillStyle = foreground; ctx.textAlign = 'right'; ctx.fillText(String(i * step), left - 12, y + 5);
-      ctx.textAlign = 'left'; ctx.fillText(i * 20 + '%', left + w + 12, y + 5);
+      ctx.fillStyle = foreground; ctx.textAlign = 'right'; ctx.fillText(String(i * step), left - x(12), y + sy * 5);
+      ctx.textAlign = 'left'; ctx.fillText(i * 20 + '%', left + w + x(12), y + sy * 5);
     }
     ctx.fillStyle = get('scoreBar').value;
     for (const row of rows) {
       const height = row.count / ceiling * h, binPixels = (row.upper - row.lower) * w;
-      ctx.fillRect(left + row.lower * w + Math.min(1, binPixels / 10), bottom - height, binPixels - Math.min(2, binPixels / 5), height);
+      const gap = Math.min(Math.max(0.5, scale), binPixels / 5);
+      ctx.fillRect(left + row.lower * w + gap / 2, bottom - height, Math.max(0.5, binPixels - gap), height);
     }
-    ctx.strokeStyle = get('scoreLine').value; ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(left, bottom);
+    ctx.strokeStyle = get('scoreLine').value; ctx.lineWidth = Math.max(1, 3 * scale); ctx.beginPath(); ctx.moveTo(left, bottom);
     for (const row of rows) ctx.lineTo(left + row.upper * w, bottom - row.percent / 100 * h);
     ctx.stroke(); ctx.fillStyle = foreground; ctx.textAlign = 'center';
-    for (let i = 0; i <= 10; i++) ctx.fillText((i / 10).toFixed(1), left + i * w / 10, bottom + 28);
-    ctx.fillText('Assignment score', 600, 592);
-    ctx.save(); ctx.translate(28, 320); ctx.rotate(-Math.PI / 2); ctx.fillText('Sample count', 0, 0); ctx.restore();
-    ctx.save(); ctx.translate(1180, 320); ctx.rotate(Math.PI / 2); ctx.fillText('Cumulative percentage (%)', 0, 0); ctx.restore();
-    ctx.fillStyle = get('scoreBar').value; ctx.fillRect(365, 79, 20, 12); ctx.fillStyle = foreground; ctx.textAlign = 'left'; ctx.fillText('Sample count', 392, 91);
-    ctx.fillStyle = get('scoreLine').value; ctx.fillRect(600, 83, 24, 3); ctx.fillStyle = foreground; ctx.fillText('Cumulative percentage', 632, 91);
+    for (let i = 0; i <= 10; i++) ctx.fillText((i / 10).toFixed(1), left + i * w / 10, bottom + y(28));
+    ctx.fillText('Assignment score', x(600), y(592));
+    ctx.save(); ctx.translate(x(28), y(320)); ctx.rotate(-Math.PI / 2); ctx.fillText('Sample count', 0, 0); ctx.restore();
+    ctx.save(); ctx.translate(x(1180), y(320)); ctx.rotate(Math.PI / 2); ctx.fillText('Cumulative percentage (%)', 0, 0); ctx.restore();
+    ctx.fillStyle = get('scoreBar').value; ctx.fillRect(x(365), y(79), x(20), y(12)); ctx.fillStyle = foreground; ctx.textAlign = 'left'; ctx.fillText('Sample count', x(392), y(91));
+    ctx.fillStyle = get('scoreLine').value; ctx.fillRect(x(600), y(83), x(24), Math.max(1, y(3))); ctx.fillStyle = foreground; ctx.fillText('Cumulative percentage', x(632), y(91));
     get('scoreTable').textContent = '';
     rows.forEach(row => { const tr = document.createElement('tr'); [row.lower, row.upper, row.count, row.cumulative, row.percent.toFixed(6)].forEach(value => { const td = document.createElement('td'); td.textContent = value; tr.appendChild(td); }); get('scoreTable').appendChild(tr); });
   }
@@ -102,6 +117,8 @@ function distributionHtml(datasets) {
   <div id="scoreControls" hidden><div style="display:flex;gap:16px;flex-wrap:wrap;align-items:center">
   <label>Dataset<select id="scoreDataset"></select></label><label>Bin width<input id="scoreWidth" type="number" min="0.001" max="1" step="any" value="0.1"></label>
   ${[['Bar', '#4285d4'], ['Line', '#e67722'], ['Background', '#ffffff'], ['Text', '#222222']].map(([name, color]) => `<label>${name} color<input id="score${name}" type="color" value="${color}"></label>`).join('')}
+  <label>PNG width (px)<input id="scoreImageWidth" type="number" min="320" max="8192" step="1" value="1200"></label><label>PNG height (px)<input id="scoreImageHeight" type="number" min="240" max="8192" step="1" value="640"></label>
+  <label><input id="scoreTransparent" type="checkbox" checked> Transparent background</label>
   <button id="scorePng">Save PNG</button><button id="scoreTsv">Save TSV</button></div></div>
   <p id="scoreStatus" role="status"></p><canvas id="scoreCanvas" width="1200" height="640" style="width:100%;max-width:1200px;height:auto" aria-label="Assignment score histogram and cumulative percentage" role="img" hidden></canvas>
   <details><summary>Distribution table</summary><p>Upper bounds are exclusive, except the last bin which includes 1.</p><div style="max-height:360px;overflow:auto"><table><thead><tr><th>Lower (inclusive)</th><th>Upper</th><th>Count</th><th>Cumulative count</th><th>Cumulative (%)</th></tr></thead><tbody id="scoreTable"></tbody></table></div></details></section>

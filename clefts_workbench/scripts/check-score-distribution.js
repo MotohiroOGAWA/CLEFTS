@@ -23,6 +23,10 @@ const { histogram, readScores, distributionHtml } = require('../src/features/fra
     assert.deepEqual(datasets[0].scores, [0, 1]);
     assert.equal(datasets[0].skipped, 4);
     const html = distributionHtml(datasets);
+    assert.match(html, /id="scoreImageWidth"[^>]*value="1200"/);
+    assert.match(html, /id="scoreImageHeight"[^>]*value="640"/);
+    assert.match(html, /id="scoreTransparent"[^>]*checked/);
+    assert.match(html, /ctx\.clearRect/);
     for (const match of html.matchAll(/<script>([\s\S]*?)<\/script>/g)) new Function(match[1]);
     fs.writeFileSync(path.join(directory, 'assignment_scores.tsv'), 'id\tother\na\t1\n');
     assert.match((await readScores(directory))[0].error, /column is missing/);
