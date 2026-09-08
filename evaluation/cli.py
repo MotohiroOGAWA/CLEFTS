@@ -7,6 +7,7 @@ from typing import Sequence
 
 from .chart import box_plot_svg, save_svg
 from .core import EvaluationRequest, inspect_dataset, summarize
+from .grouped import compare, grouped_box_plot_svg
 
 
 def _json_list(value: str | None) -> tuple[str, ...] | None:
@@ -20,6 +21,23 @@ def _json_list(value: str | None) -> tuple[str, ...] | None:
 
 def _bins(value: str) -> tuple[float, ...]:
     return tuple(float(item.strip()) for item in value.split(",") if item.strip())
+
+
+def _grouped_config(args: argparse.Namespace) -> dict:
+    if args.request_json:
+        value = json.loads(args.request_json)
+    else:
+        with open(args.config, encoding="utf-8") as stream:
+            value = json.load(stream)
+    if not isinstance(value, dict):
+        raise ValueError("Grouped evaluation configuration must be a JSON object.")
+    if value.get("schema") == "clefts.evaluation.config":
+        if value.get("schemaVersion") != 1 or value.get("kind") != "grouped":
+            raise ValueError("Expected a version 1 grouped evaluation configuration.")
+        value = value.get("config")
+        if not isinstance(value, dict):
+            raise ValueError("Grouped evaluation configuration payload is missing.")
+    return value
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -44,12 +62,45 @@ def build_parser() -> argparse.ArgumentParser:
     summary.add_argument("--opaque", action="store_true", help="Use a white background instead of transparency.")
     summary.add_argument("--output-image", help="Optional SVG output path.")
     summary.add_argument("--output-json", help="Optional JSON result path.")
+    grouped = commands.add_parser("compare", help="Compare multiple .mssim files by group and series.")
+    source = grouped.add_mutually_exclusive_group(required=True)
+    source.add_argument("--config", help="Grouped evaluation JSON configuration path.")
+    source.add_argument("--request-json", help="Grouped evaluation configuration as JSON.")
+    grouped.add_argument("--width", type=int)
+    grouped.add_argument("--height", type=int)
+    grouped.add_argument("--opaque", action="store_true", help="Use a solid background instead of transparency.")
+    grouped.add_argument("--background-color")
+    grouped.add_argument("--text-color")
+    grouped.add_argument("--output-image", help="Optional SVG output path.")
+    grouped.add_argument("--output-json", help="Optional JSON result path.")
     return parser
 
 
 def execute(args: argparse.Namespace) -> dict:
     if args.command == "inspect":
         return inspect_dataset(args.input, args.metadata, args.join_column)
+    if args.command == "compare":
+        config = _grouped_config(args)
+        result = compare(config)
+        result["svg"] = grouped_box_plot_svg(
+            result,
+            width=args.width or int(config.get("width", 1000)),
+            height=args.height or int(config.get("height", 600)),
+            transparent=not args.opaque and bool(config.get("transparent", True)),
+            background_color=args.background_color or str(config.get("backgroundColor", "#ffffff")),
+            text_color=args.text_color or str(config.get("textColor", "#555555")),
+            group_gap=float(config.get("groupGap", 56)),
+            series_gap=float(config.get("seriesGap", 6)),
+            box_width=float(config.get("boxWidth", 0)),
+        )
+        if args.output_image:
+            save_svg(result["svg"], args.output_image)
+            result["imagePath"] = args.output_image
+        if args.output_json:
+            with open(args.output_json, "w", encoding="utf-8") as stream:
+                json.dump({key: value for key, value in result.items() if key != "svg"}, stream, ensure_ascii=False, indent=2)
+                stream.write("\n")
+        return result
     request = EvaluationRequest(
         input_path=args.input, group_column=args.group_column,
         metadata=args.metadata, join_column=args.join_column, mode=args.mode,

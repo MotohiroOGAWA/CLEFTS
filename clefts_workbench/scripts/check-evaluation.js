@@ -6,16 +6,47 @@ Module._load = function (request, parent, isMain) {
   if (request === 'vscode') return {};
   return originalLoad.call(this, request, parent, isMain);
 };
-const { html, summaryArgs } = require('../src/features/evaluation/editor');
+const {
+  html, summaryArgs, groupedArgs, evaluationConfigDocument, parseEvaluationConfig
+} = require('../src/features/evaluation/editor');
 Module._load = originalLoad;
 
 const page = html();
 assert.match(page, /id="bins"[^>]*disabled/);
 assert.doesNotMatch(page, /Aggregation|Value column/);
 assert.match(page, /Box color/);
+assert.match(page, /data-eval-tab="column"/);
+assert.match(page, /data-eval-tab="grouped"/);
+assert.match(page, /id="groupedAddGroup"/);
+assert.match(page, /id="groupedAddSeries"/);
+assert.match(page, /data-no-data/);
+assert.match(page, /Transparent background/);
+assert.match(page, /id="loadColumnConfig"/);
+assert.match(page, /id="saveColumnConfig"/);
+assert.match(page, /id="groupedLoadConfig"/);
+assert.match(page, /id="groupedSaveConfig"/);
+assert.match(page, /id="groupedGroupGap"/);
+assert.match(page, /id="groupedSeriesGap"/);
+assert.match(page, /id="groupedBoxWidth"/);
+for (const match of page.matchAll(/<script>([\s\S]*?)<\/script>/g)) new Function(match[1]);
+
+const compare = groupedArgs({
+  width: 800, height: 500, transparent: false, backgroundColor: '#ffffff',
+  groupGap: 72, seriesGap: 5, boxWidth: 30,
+  groups: [{ id: 'g1', name: 'MoNA' }],
+  series: [{ id: 's1', name: 'FIORA', color: '#123456' }], entries: []
+}, '/tmp/result.svg');
+assert.equal(compare[0], 'compare');
+assert.ok(compare.includes('--request-json'));
+assert.ok(compare.includes('--opaque'));
+assert.ok(compare.includes('/tmp/result.svg'));
+const configDocument = evaluationConfigDocument('column', { input: '/tmp/results.mssim' });
+assert.equal(configDocument.schema, 'clefts.evaluation.config');
+assert.deepEqual(parseEvaluationConfig(JSON.parse(JSON.stringify(configDocument)), 'column'), configDocument.config);
+assert.throws(() => parseEvaluationConfig(configDocument, 'grouped'), /Expected a grouped/);
+assert.throws(() => parseEvaluationConfig({ schemaVersion: 1 }, 'column'), /not a supported/);
 const scripts = [...page.matchAll(/<script>([\s\S]*?)<\/script>/g)];
-assert.equal(scripts.length, 1);
-new Function(scripts[0][1]);
+assert.equal(scripts.length, 2);
 
 const args = summaryArgs({
   input: '/tmp/results.mssim', groupColumn: 'AdductType', mode: 'categorical',

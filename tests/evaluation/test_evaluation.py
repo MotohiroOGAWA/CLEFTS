@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import h5py
@@ -10,6 +11,7 @@ import pandas as pd
 from evaluation.chart import box_plot_svg
 from evaluation.cli import build_parser, execute
 from evaluation.core import EvaluationRequest, inspect_dataset, summarize
+from evaluation.grouped import compare, grouped_box_plot_svg
 
 
 def _write_similarity(path, table):
@@ -113,3 +115,75 @@ def test_explicit_join_column_supports_msds_metadata(tmp_path):
     assert [(row["category"], row["count"]) for row in result["rows"]] == [
         ("[25,35)", 1), ("[0,25)", 1)
     ]
+
+
+def test_grouped_boxplot_compares_series_and_preserves_order(tmp_path):
+    clefts = _write_similarity(
+        tmp_path / "clefts.mssim",
+        pd.DataFrame({"index1": range(4), "index2": range(4),
+                      "cosine_similarity": [0.2, 0.4, 0.6, 0.8]}),
+    )
+    fiora = _write_similarity(
+        tmp_path / "fiora.mssim",
+        pd.DataFrame({"index1": range(3), "index2": range(3),
+                      "cosine_similarity": [0.5, 0.7, np.nan]}),
+    )
+    config = {
+        "title": "Tool comparison",
+        "groups": [{"id": "massbank", "name": "MassBank"}, {"id": "mona", "name": "MoNA"}],
+        "series": [
+            {"id": "fiora", "name": "FIORA", "color": "#ff00aa"},
+            {"id": "clefts", "name": "CLEFTS", "color": "#00aacc"},
+        ],
+        "entries": [
+            {"groupId": "massbank", "seriesId": "fiora", "path": str(fiora), "noData": False},
+            {"groupId": "massbank", "seriesId": "clefts", "path": str(clefts), "noData": False},
+            {"groupId": "mona", "seriesId": "fiora", "noData": True},
+            {"groupId": "mona", "seriesId": "clefts", "path": str(clefts), "noData": False},
+        ],
+    }
+    result = compare(config)
+    assert [item["name"] for item in result["groups"]] == ["MassBank", "MoNA"]
+    assert [item["name"] for item in result["series"]] == ["FIORA", "CLEFTS"]
+    cells = {(cell["groupId"], cell["seriesId"]): cell for cell in result["cells"]}
+    assert cells[("massbank", "fiora")]["count"] == 2
+    assert cells[("massbank", "fiora")]["invalidCount"] == 1
+    assert cells[("mona", "fiora")]["status"] == "no-data"
+    svg = grouped_box_plot_svg(result, width=900, height=500)
+    assert 'width="900" height="500"' in svg
+    assert svg.count("#ff00aa") >= 2
+    assert "No data" in svg
+    assert 'class="separator"' in svg
+    assert '<rect width="900" height="500"' not in svg
+    wider = grouped_box_plot_svg(result, width=1400, height=500)
+    box_pattern = r'<rect x="[^"]+" y="[^"]+" width="([^"]+)"[^>]+fill-opacity'
+    assert float(re.search(box_pattern, wider).group(1)) > float(re.search(box_pattern, svg).group(1))
+    fixed = grouped_box_plot_svg(
+        result, width=1400, height=500, group_gap=90, series_gap=4, box_width=28
+    )
+    assert re.search(box_pattern, fixed).group(1) == "28.00"
+
+
+def test_grouped_cli_writes_opaque_svg(tmp_path):
+    similarity, _ = _fixtures(tmp_path)
+    image = tmp_path / "comparison.svg"
+    config = {
+        "groups": [{"id": "mona", "name": "MoNA"}],
+        "series": [{"id": "tool", "name": "Tool", "color": "#123456"}],
+        "entries": [{"groupId": "mona", "seriesId": "tool", "path": str(similarity)}],
+    }
+    args = build_parser().parse_args([
+        "compare", "--request-json", json.dumps(config), "--width", "640",
+        "--height", "400", "--opaque", "--background-color", "#abcdef",
+        "--output-image", str(image),
+    ])
+    result = execute(args)
+    assert result["cells"][0]["count"] == 6
+    assert '<rect width="640" height="400" fill="#abcdef"/>' in image.read_text()
+    saved_settings = tmp_path / "grouped-settings.json"
+    saved_settings.write_text(json.dumps({
+        "schema": "clefts.evaluation.config", "schemaVersion": 1,
+        "kind": "grouped", "config": config,
+    }))
+    loaded = execute(build_parser().parse_args(["compare", "--config", str(saved_settings)]))
+    assert loaded["cells"][0]["count"] == 6
