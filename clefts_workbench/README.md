@@ -191,3 +191,19 @@ the base. The validation split must include `valid_records.msds`.
 
 See `../clefts/ml/training/fragment_tree_training/README.md` for CLI usage,
 checkpoint/resume behavior, and the exact expansion architecture.
+
+### Training metrics
+
+Open **Metrics** in Workbench, enter the absolute training run directory, and click
+**Load / Refresh**. Select a metric and click **＋ Add chart** to add charts; use
+**×** to remove them. Click **Add all charts** to add every available chart at
+once. Enter a search in **Filter charts** to use **Add matching charts** instead.
+**Clear charts** removes all selected charts. Set **Layout** to **Vertical** to stack all charts in one
+column, or **Grid** to arrange them side by side. The layout selection is retained
+in the webview state. **Auto refresh (15s)** updates charts while the tab is visible.
+The viewer reads `metrics.tsv` and `metric_distributions.tsv` directly. Distribution charts combine min–max and q1–q3 bands with a median line over global
+steps. Mean charts group adducts (or CE ranges) for comparison. Each chart combines
+train, train_window, and validation, with colors and line styles plus toggles in the
+legend. These are recorded summary statistics, rather than raw sample histograms. Non-finite and missing values are omitted.
+Hover over a chart to inspect its nearest recorded step and value. The run path and
+selected charts are retained in the webview state.
