@@ -26,6 +26,24 @@ Training configurations use the dedicated `*.pfttrain.json` suffix. Every CLI ru
 
 Set `clefts.pythonPath` when the required Python environment is not available as `python`. The CLEFTS project directory defaults to the parent directory of this extension and can be overridden with `clefts.applicationRoot`.
 
+## Batch spectrum prediction
+
+In **Predict Spectrum**, the single-molecule preview remains available and a
+separate **Batch MSDataset prediction** section accepts input/output `.msds`
+paths. Select the trained checkpoint and device, specify the source column names,
+DB label, and unique-SMILES chunk size, then run or copy the CLI command. The
+Workbench invokes:
+
+```bash
+python -m clefts.ml.specgen.predict_spectrum --input input.msds --output predicted.msds --model model.pt --db MoNA
+```
+
+The checkpoint is loaded once. Prediction progress is streamed to the CLEFTS
+output panel, and the operation can be stopped from the Workbench. Output
+metadata preserves source values and adds interoperable prediction provenance;
+run details and record-level failures are written beside the output under
+`<output>.run/`.
+
 ## Configuration and results
 
 - `Save Configuration` and `Load Configuration` export and import Workbench settings as JSON.

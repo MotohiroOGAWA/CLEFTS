@@ -24,6 +24,8 @@ dependencies = [
 [project.scripts]
 clefts = "clefts.cli.main:main"
 clefts-evaluation = "evaluation.cli:main"
+clefts-predict-spectrum = "clefts.ml.specgen.predict_spectrum:main"
+msentity-predict-clefts = "clefts.ml.specgen.predict_spectrum:main"
 
 [tool.setuptools.packages.find]
 include = ["clefts*", "evaluation*"]

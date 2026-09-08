@@ -2,6 +2,7 @@ const trainingMetrics = require('./features/training-metrics/editor');
 const fineTune = require('./features/fragment-tree-finetune/editor');
 const smartsSearch = require('./features/smarts-search/editor');
 const evaluation = require('./features/evaluation/editor');
+const spectrumPrediction = require('./features/spectrum-prediction/editor');
 const { createFragmenterEditor } = require('./components/fragmenter-editor');
 const vscode = require('vscode');
 const fs = require('fs');
@@ -133,6 +134,7 @@ function openWorkbench(context, output) {
   });
   smartsSearch.attach(panel, context, projectRoot);
   fineTune.attach(panel, context, projectRoot, output);
+  spectrumPrediction.attach(panel, context, projectRoot, output);
   trainingMetrics.attach(panel);
   const initialConfig = defaultConfig(context);
   const initialTrainingConfig = defaultTrainingConfig(context);
@@ -759,10 +761,11 @@ function workbenchHtml(config, fragmenterText, trainingConfig) {
   </form>
   <form id="predictForm" data-app-panel="predict" hidden>
     <section><h2>Model</h2><p class="muted">Points at a checkpoint produced by fragment-tree training (a full <code>model.pt</code>, or a raw generator state_dict). Apply it to load its trained main adduct types before specifying a molecule.</p>${pathField('modelPath','Model checkpoint *','file','predict')}<label>Device<select name="device"><option value="cpu">cpu</option><option value="cuda">cuda</option><option value="mps">mps</option></select></label><div class="actions"><button type="button" id="predictApplyModel" class="primary">Apply Model</button></div><div id="predictModelStatus" class="status idle">No model applied yet.</div></section>
+    ${spectrumPrediction.html()}
     <section><h2>Molecule and conditions</h2><label>SMILES *<input name="smiles" placeholder="CC(=O)Oc1ccccc1C(=O)O"></label><div class="grid">${field('ce','Collision energy (eV) *','text')}<label>Adduct type *<select name="adductType"><option value="">Apply a model first…</option></select></label></div><div class="actions"><button type="button" id="predictPreview">Preview Molecule</button></div><div id="predictMoleculePreview" class="molecule-preview" hidden></div></section>
     <section id="predictResultSection" hidden><h2>Predicted Spectrum</h2><div id="predictResult"></div></section>
     <footer><div><div id="predictStatus" class="status idle">Ready</div></div><div class="actions"><button type="submit" class="primary" id="predictSubmit">Predict Spectrum</button></div></footer>
-  </form><div id="helpTooltip" role="tooltip"></div><script>const vscode=acquireVsCodeApi(); const initial=${safeJson(config)}; const initialTraining=${safeJson(trainingConfig)}; const initialFragmenter=${safeJson(fragmenterText)}; ${webviewScript()}</script></main></body></html>`;
+  </form><div id="helpTooltip" role="tooltip"></div><script>const vscode=acquireVsCodeApi(); const initial=${safeJson(config)}; const initialTraining=${safeJson(trainingConfig)}; const initialFragmenter=${safeJson(fragmenterText)}; ${webviewScript()}${spectrumPrediction.script()}</script></main></body></html>`;
 }
 function pathField(name,label,kind,form='data') { return `<label data-help="${HELP[name] || ''}">${label}<div class="path"><input name="${name}"><button type="button" data-pick="${name}" data-kind="${kind}" data-form="${form}">Browse</button></div>${HELP[name]?`<small class="field-help">${HELP[name]}</small>`:''}</label>`; }
 function field(name,label,type,step='1') { return `<label data-help="${HELP[name] || ''}">${label}<input name="${name}" type="${type}"${type==='number'?` step="${step}"`:''}>${HELP[name]?`<small class="field-help">${HELP[name]}</small>`:''}</label>`; }

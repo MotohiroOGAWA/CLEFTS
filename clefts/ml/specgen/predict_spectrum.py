@@ -1,8 +1,14 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
+from importlib.metadata import PackageNotFoundError, version
 import json
+import os
 from pathlib import Path
+import re
+import sys
+import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -13,6 +19,7 @@ from torch import Tensor
 from clefts.libs.mmkit.mmkit import Adduct, Compound
 from clefts.libs.msentity.msentity import MSDataset
 from clefts.libs.msentity.msentity.core.PeakSeries import PeakSeries
+from clefts.domain.mass.parse_ce import parse_ce_to_ev
 from clefts.ml.input.fragment_tree_structure import FragmentTreeStructure
 from clefts.ml.input.single_fragment_tree_structure_builder import (
     SingleFragmentTreeStructureBuilder,
@@ -58,6 +65,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--adduct-type-column", default="AdductType")
     parser.add_argument("--collision-energy-column", default="CollisionEnergy")
     parser.add_argument("--instrument-column", default=None)
+    parser.add_argument("--spec-id-column", default="SpecID")
+    parser.add_argument(
+        "--db", default="unspecified",
+        help="Database label written to DB and generated SpecID values.",
+    )
+    parser.add_argument(
+        "--batch-size", type=int, default=32,
+        help="Number of unique SMILES processed per inference chunk. Default: 32.",
+    )
+    parser.add_argument(
+        "--overwrite", action="store_true",
+        help="Allow replacement of an existing output MSDataset.",
+    )
     parser.add_argument(
         "--smiles",
         nargs="+",
@@ -100,6 +120,8 @@ def parse_args() -> argparse.Namespace:
         help="Use strict state_dict loading.",
     )
     args = parser.parse_args()
+    if args.batch_size <= 0:
+        parser.error("--batch-size must be a positive integer")
     if args.input is None:
         missing = [
             name
@@ -240,16 +262,140 @@ def select_smiles_values(
     return [str(value) for value in dataset[smiles_column].dropna().unique()]
 
 
+def validate_prediction_input(
+    dataset: MSDataset,
+    *,
+    smiles_column: str,
+    precursor_mz_column: str,
+    adduct_type_column: str,
+    collision_energy_column: str,
+    spec_id_column: str,
+    instrument_column: Optional[str],
+) -> None:
+    required = [
+        smiles_column, precursor_mz_column, adduct_type_column,
+        collision_energy_column, spec_id_column,
+    ]
+    if instrument_column:
+        required.append(instrument_column)
+    missing = [column for column in required if column not in dataset.columns]
+    if missing:
+        raise ValueError(f"Input MSDataset is missing required columns: {missing}")
+    spec_ids = dataset[spec_id_column]
+    if spec_ids.isna().any() or spec_ids.astype(str).str.strip().eq("").any():
+        raise ValueError(f"{spec_id_column} must not contain null or empty values.")
+    duplicated = spec_ids.astype(str).duplicated(keep=False)
+    if duplicated.any():
+        examples = spec_ids.astype(str)[duplicated].drop_duplicates().head(5).tolist()
+        raise ValueError(f"{spec_id_column} must be unique; duplicates include: {examples}")
+
+
+def _tool_version() -> str:
+    try:
+        return version("clefts")
+    except PackageNotFoundError:
+        return "0.1.0"
+
+
+def _id_component(value: str) -> str:
+    token = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(value).strip()).strip("-.")
+    return token or "unspecified"
+
+
+def prediction_metadata(
+    metadata: pd.DataFrame,
+    *,
+    db: str,
+    model_path: str,
+    spec_id_column: str,
+    smiles_column: str,
+    adduct_type_column: str,
+    collision_energy_column: str,
+    precursor_mz_column: str,
+    instrument_column: Optional[str],
+    first_sequence: int,
+    timestamp: str,
+) -> pd.DataFrame:
+    """Apply the shared predicted-MSDataset provenance contract.
+
+    Original metadata is retained. The immediate input identifier and DB are
+    moved to SourceSpecID/SourceDB, while calculated values receive Predicted*
+    names so measured PrecursorMZ and ExactMass are never overwritten.
+    """
+    result = metadata.reset_index(drop=True).copy()
+    immediate_source_ids = result[spec_id_column].astype(str).copy()
+    if "SourceSpecID" in result.columns and spec_id_column != "SourceSpecID":
+        result.rename(columns={"SourceSpecID": "UpstreamSourceSpecID"}, inplace=True)
+    if "SpecID" in result.columns and spec_id_column != "SpecID":
+        result.rename(columns={"SpecID": "InputSpecID"}, inplace=True)
+    result["SourceSpecID"] = immediate_source_ids
+    if "DB" in result.columns:
+        if "SourceDB" in result.columns:
+            result.rename(columns={"SourceDB": "UpstreamSourceDB"}, inplace=True)
+        result["SourceDB"] = result["DB"]
+
+    db_label = str(db).strip() or "unspecified"
+    safe_db = _id_component(db_label)
+    result["SpecID"] = [
+        f"clefts-{safe_db}-{sequence:09d}"
+        for sequence in range(first_sequence, first_sequence + len(result))
+    ]
+    result["DB"] = db_label
+    result["PredictionTool"] = "CLEFTS"
+    result["PredictionToolVersion"] = _tool_version()
+    result["PredictionModel"] = Path(model_path).name
+    result["PredictionTimestamp"] = timestamp
+    result["SpectrumType"] = "MS2"
+
+    predicted_precursors: list[float] = []
+    collision_energy_ev: list[float] = []
+    for _, row in result.iterrows():
+        try:
+            exact_mass = Compound.from_smiles(str(row[smiles_column])).exact_mass
+            predicted_mz = float(Adduct.parse(str(row[adduct_type_column])).apply_to_mz(exact_mass))
+        except Exception:
+            predicted_mz = float("nan")
+        predicted_precursors.append(predicted_mz)
+        instrument = row.get(instrument_column) if instrument_column else None
+        parsed_ce = parse_ce_to_ev(row.get(collision_energy_column), row.get(precursor_mz_column), instrument)
+        collision_energy_ev.append(float(parsed_ce) if parsed_ce is not None else float("nan"))
+    result["PredictedPrecursorMZ"] = predicted_precursors
+    result["PredictionCollisionEnergy"] = collision_energy_ev
+    result["PredictionCollisionEnergyUnit"] = "eV"
+    result["PredictionCollisionEnergyEV"] = collision_energy_ev
+    result["PredictionAdductType"] = result[adduct_type_column].astype(str)
+    return result
+
+
+def validate_prediction_output(dataset: MSDataset) -> None:
+    required = [
+        "SpecID", "SourceSpecID", "DB", "PredictionTool",
+        "PredictionToolVersion", "PredictionModel", "PredictionTimestamp",
+        "PredictedPrecursorMZ", "PredictionCollisionEnergy",
+        "PredictionCollisionEnergyUnit", "PredictionAdductType",
+    ]
+    missing = [column for column in required if column not in dataset.columns]
+    if missing:
+        raise ValueError(f"Predicted MSDataset is missing required columns: {missing}")
+    spec_ids = dataset["SpecID"].astype(str)
+    if spec_ids.str.strip().eq("").any() or spec_ids.duplicated().any():
+        raise ValueError("Predicted SpecID values must be non-empty and unique.")
+    if dataset["SourceSpecID"].isna().any() or dataset["SourceSpecID"].astype(str).str.strip().eq("").any():
+        raise ValueError("Predicted SourceSpecID values must be non-empty.")
+
+
+def _chunks(values: Sequence[str], size: int) -> Sequence[Sequence[str]]:
+    return [values[index:index + size] for index in range(0, len(values), size)]
+
+
 def record_metadata(
     record: object,
     *,
     source_group: str,
     source_record_index: int,
 ) -> Dict[str, Any]:
-    metadata = {column: record[column] for column in record.columns}
-    metadata["source_group_smiles"] = source_group
-    metadata["source_record_index_in_group"] = int(source_record_index)
-    return metadata
+    del source_group, source_record_index
+    return {column: record[column] for column in record.columns}
 
 
 def build_structure_from_dataset(
@@ -317,16 +463,152 @@ def build_structure_from_dataset(
     structure = FragmentTreeStructure.from_structures(structures, device=device)
     metadata_rows = []
     for sample_id in range(structure.num_samples):
-        row = metadata_by_sample_id.get(sample_id, {}).copy()
-        row["predicted_sample_id"] = int(sample_id)
-        metadata_rows.append(row)
+        metadata_rows.append(metadata_by_sample_id.get(sample_id, {}).copy())
 
     return structure, pd.DataFrame(metadata_rows)
+
+
+def predict_msdataset(
+    *,
+    dataset: MSDataset,
+    generator: FragmentSpectrumGenerator,
+    model_path: str,
+    db: str,
+    batch_size: int,
+    smiles_values: Sequence[str],
+    smiles_column: str,
+    precursor_mz_column: str,
+    adduct_type_column: str,
+    collision_energy_column: str,
+    instrument_column: Optional[str],
+    spec_id_column: str,
+    device: torch.device,
+    include_formula_annotation: bool,
+    include_fragment_ion_annotation: bool,
+) -> tuple[MSDataset, pd.DataFrame]:
+    """Predict a database in bounded structure chunks with one loaded model."""
+    predicted_parts: list[MSDataset] = []
+    failures: list[dict[str, str]] = []
+    next_sequence = 1
+    timestamp = datetime.now(timezone.utc).isoformat()
+    pending = list(_chunks(list(smiles_values), batch_size))
+    completed_inputs: set[str] = set()
+
+    while pending:
+        smiles_chunk = list(pending.pop(0))
+        try:
+            structure, metadata = build_structure_from_dataset(
+                dataset=dataset,
+                generator=generator,
+                smiles_values=smiles_chunk,
+                smiles_column=smiles_column,
+                precursor_mz_column=precursor_mz_column,
+                adduct_type_column=adduct_type_column,
+                collision_energy_column=collision_energy_column,
+                instrument_column=instrument_column,
+                device=device,
+            )
+            with torch.no_grad():
+                output = generator(
+                    structure,
+                    include_formula_annotation=include_formula_annotation,
+                    include_fragment_ion_annotation=include_fragment_ion_annotation,
+                )
+            output_sample_ids = [int(spectrum.sample_id) for spectrum in output.spectra]
+            raw_metadata = metadata.iloc[output_sample_ids].reset_index(drop=True)
+            enriched = prediction_metadata(
+                raw_metadata,
+                db=db,
+                model_path=model_path,
+                spec_id_column=spec_id_column,
+                smiles_column=smiles_column,
+                adduct_type_column=adduct_type_column,
+                collision_energy_column=collision_energy_column,
+                precursor_mz_column=precursor_mz_column,
+                instrument_column=instrument_column,
+                first_sequence=next_sequence,
+                timestamp=timestamp,
+            )
+            predicted_part = fragment_spectrum_output_to_msdataset(output, metadata=enriched)
+            peak_metadata = predicted_part.peaks._metadata_ref
+            if peak_metadata is not None and "sample_id" in peak_metadata.columns:
+                peak_metadata["sample_id"] = peak_metadata["sample_id"].astype(int) + next_sequence - 1
+            predicted_parts.append(predicted_part)
+            next_sequence += len(enriched)
+            completed_inputs.update(enriched["SourceSpecID"].astype(str).tolist())
+            print(
+                f"prediction progress: chunks_done={len(predicted_parts)}, "
+                f"spectra={next_sequence - 1}, failures={len(failures)}"
+            )
+        except Exception as exc:
+            if len(smiles_chunk) > 1:
+                pending = [[value] for value in smiles_chunk] + pending
+                print(f"retrying failed chunk per SMILES: {type(exc).__name__}: {exc}")
+                continue
+            failed_smiles = smiles_chunk[0] if smiles_chunk else ""
+            subset = dataset[dataset[smiles_column].astype(str) == failed_smiles]
+            for source_id in subset[spec_id_column].astype(str).tolist():
+                failures.append({
+                    "SourceSpecID": source_id,
+                    "FailureType": type(exc).__name__,
+                    "FailureMessage": str(exc),
+                })
+            print(f"failed {failed_smiles!r}: {type(exc).__name__}: {exc}")
+
+    selected_smiles = {str(value) for value in smiles_values}
+    selected_dataset = dataset[dataset[smiles_column].astype(str).isin(selected_smiles)]
+    input_ids = selected_dataset[spec_id_column].astype(str).tolist()
+    already_failed = {row["SourceSpecID"] for row in failures}
+    for source_id in input_ids:
+        if source_id not in completed_inputs and source_id not in already_failed:
+            failures.append({
+                "SourceSpecID": source_id,
+                "FailureType": "InputRejected",
+                "FailureMessage": "The fragment-tree builder did not produce a valid prediction sample.",
+            })
+
+    if not predicted_parts:
+        raise ValueError("No spectra were predicted successfully.")
+    tags = list(dict.fromkeys([*dataset.tags, "predicted", "CLEFTS"]))
+    attributes = {
+        **dataset.attributes,
+        "prediction_tool": "CLEFTS",
+        "prediction_tool_version": _tool_version(),
+        "prediction_model": Path(model_path).name,
+        "prediction_db": str(db).strip() or "unspecified",
+        "prediction_timestamp": timestamp,
+    }
+    predicted = MSDataset.concat(
+        predicted_parts,
+        description="In silico MS/MS spectra generated by CLEFTS",
+        attributes=attributes,
+        tags=tags,
+    )
+    validate_prediction_output(predicted)
+    return predicted, pd.DataFrame(
+        failures, columns=["SourceSpecID", "FailureType", "FailureMessage"]
+    )
+
+
+def _atomic_save(dataset: MSDataset, output_path: Path) -> None:
+    temporary = output_path.with_name(f".{output_path.name}.tmp")
+    try:
+        dataset.save(str(temporary))
+        os.replace(temporary, output_path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
 
 
 def main() -> None:
     args = parse_args()
     device = torch.device(args.device)
+
+    output_path = Path(args.output).resolve()
+    if output_path.exists() and not args.overwrite:
+        raise FileExistsError(f"Output already exists; use --overwrite: {output_path}")
+    if args.input is not None and Path(args.input).resolve() == output_path:
+        raise ValueError("--input and --output must be different paths.")
 
     dataset = (
         MSDataset.load(args.input)
@@ -336,6 +618,17 @@ def main() -> None:
             collision_energy=args.ce,
             adduct_type=args.adduct_type,
         )
+    )
+    if args.input is None and args.spec_id_column not in dataset.columns:
+        dataset[args.spec_id_column] = [f"direct-{index + 1:09d}" for index in range(len(dataset))]
+    validate_prediction_input(
+        dataset,
+        smiles_column=args.smiles_column,
+        precursor_mz_column=args.precursor_mz_column,
+        adduct_type_column=args.adduct_type_column,
+        collision_energy_column=args.collision_energy_column,
+        spec_id_column=args.spec_id_column,
+        instrument_column=args.instrument_column,
     )
     smiles_values = select_smiles_values(
         dataset,
@@ -347,7 +640,11 @@ def main() -> None:
     print(f"model: {args.model}")
     print(f"output: {args.output}")
     print(f"device: {device}")
+    print(f"db: {args.db}")
+    print(f"unique-SMILES batch size: {args.batch_size}")
     print(f"selected SMILES count: {len(smiles_values)}")
+
+    started = time.time()
 
     generator = load_generator(
         model_path=args.model,
@@ -356,41 +653,56 @@ def main() -> None:
         strict=args.strict,
     )
 
-    structure, metadata = build_structure_from_dataset(
+    predicted, failures = predict_msdataset(
         dataset=dataset,
         generator=generator,
+        model_path=args.model,
+        db=args.db,
+        batch_size=args.batch_size,
         smiles_values=smiles_values,
         smiles_column=args.smiles_column,
         precursor_mz_column=args.precursor_mz_column,
         adduct_type_column=args.adduct_type_column,
         collision_energy_column=args.collision_energy_column,
         instrument_column=args.instrument_column,
+        spec_id_column=args.spec_id_column,
         device=device,
+        include_formula_annotation=not args.no_formula_annotation,
+        include_fragment_ion_annotation=args.include_fragment_ion_annotation,
     )
-
-    with torch.no_grad():
-        output = generator(
-            structure,
-            include_formula_annotation=not args.no_formula_annotation,
-            include_fragment_ion_annotation=args.include_fragment_ion_annotation,
-        )
-
-    output_sample_ids = [int(spectrum.sample_id) for spectrum in output.spectra]
-    metadata_for_output = metadata.iloc[output_sample_ids].reset_index(drop=True)
-    predicted = fragment_spectrum_output_to_msdataset(
-        output,
-        metadata=metadata_for_output,
-    )
-
-    output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    predicted.save(str(output_path))
+    _atomic_save(predicted, output_path)
+
+    run_dir = Path(f"{output_path}.run")
+    run_dir.mkdir(parents=True, exist_ok=True)
+    failures.to_csv(run_dir / "failures.tsv", sep="\t", index=False)
+    run_info = {
+        "tool": "CLEFTS",
+        "tool_version": _tool_version(),
+        "model": str(Path(args.model).resolve()),
+        "input": str(Path(args.input).resolve()) if args.input else None,
+        "output": str(output_path),
+        "db": args.db,
+        "device": str(device),
+        "batch_size": args.batch_size,
+        "success_count": len(predicted),
+        "failure_count": len(failures),
+        "elapsed_seconds": time.time() - started,
+        "arguments": vars(args),
+    }
+    (run_dir / "run.json").write_text(
+        json.dumps(run_info, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
 
     print(
         f"predicted spectra: n_spectra={len(predicted)}, "
         f"n_peaks={predicted.n_peaks_total}"
     )
     print(f"saved: {output_path}")
+    print(f"run information: {run_dir}")
+    if len(failures):
+        print(f"partial success: {len(failures)} record(s) failed", file=sys.stderr)
+        raise SystemExit(3)
 
 
 if __name__ == "__main__":
