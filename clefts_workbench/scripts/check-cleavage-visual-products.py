@@ -126,6 +126,19 @@ assert backend.validate({
     "products": [],
 })["valid"]
 
+unconstrained_product = backend.product_from_structure({
+    "sourceType": "smarts",
+    "smarts": complex_smarts,
+    "reactantSmarts": complex_round_trip["smarts"],
+    "atomMaps": complex_maps,
+})
+unconstrained_product_mol = backend.Chem.MolFromSmarts(unconstrained_product["smarts"])
+assert unconstrained_product_mol is not None
+assert "$(" not in unconstrained_product["smarts"]
+assert "X2" not in unconstrained_product["smarts"]
+assert "H1" not in unconstrained_product["smarts"]
+assert unconstrained_product_mol.GetAtomWithIdx(2).GetSmarts() == "[#6:3]"
+
 aromatic_complex_smarts = (
     r"[#8:1]=[#6:2]1:[#6;!$([#6]-[OX2H1]):3]:[#6:4](-\[#6:5]2:"
     r"\[#6:6]:\[#6:7]:\[#6:8]:\[#6:9]:\[#6:10]:2):[#8:11]:[#6:12]2:"
@@ -150,6 +163,11 @@ assert "chemistry('productFromStructure'" in extension
 assert "atom.mapNumber||index+1" in extension
 assert 'id="allowProductAtomTypes"' in extension
 assert "Delete Atom" in extension
+assert "Delete Selected" in extension
+assert "productSelectedAtoms" in extension
+assert "productCanvas.onpointerdown" in extension
+assert "data-delete-selected-product-atoms" in extension
+assert ".selection-lasso{stroke:#fff}" in extension
 assert "Start New Bond" in extension
 assert "Update Product" in extension
 assert "Custom SMARTS" in extension

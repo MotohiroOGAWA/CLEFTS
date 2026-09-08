@@ -218,8 +218,8 @@ def product_from_structure(payload: dict[str, Any]) -> dict[str, Any]:
     reactant = Chem.MolFromSmarts(str(payload.get("reactantSmarts", "")))
     if reactant is None:
         raise ValueError("Invalid reactant SMARTS.")
-    reactant_atoms = {
-        atom.GetAtomMapNum(): atom.GetSmarts()
+    reactant_atomic_numbers = {
+        atom.GetAtomMapNum(): atom.GetAtomicNum()
         for atom in reactant.GetAtoms()
         if atom.GetAtomMapNum() > 0
     }
@@ -244,10 +244,21 @@ def product_from_structure(payload: dict[str, Any]) -> dict[str, Any]:
     atom_overrides = {int(key): str(value).strip() for key, value in payload.get("atomOverrides", {}).items()}
     for atom_id in sorted(expected):
         map_number = map_by_atom[atom_id]
-        query = atom_overrides.get(atom_id, reactant_atoms.get(map_number, ""))
+        if atom_id in atom_overrides:
+            query = atom_overrides[atom_id]
+        else:
+            if map_number not in reactant_atomic_numbers:
+                raise ValueError(
+                    f"Product mapping number {map_number} does not exist in the reactant. "
+                    "Enable atom type changes and specify Atom SMARTS to create it explicitly."
+                )
+            atomic_number = reactant_atomic_numbers.get(map_number, 0)
+            if atomic_number <= 0:
+                atomic_number = mol.GetAtomWithIdx(atom_id).GetAtomicNum()
+            query = f"[#{atomic_number}]" if atomic_number > 0 else ""
         if not query:
             raise ValueError(
-                f"Product mapping number {map_number} does not exist in the reactant. "
+                f"Product mapping number {map_number} does not identify an element in the reactant. "
                 "Enable atom type changes and specify Atom SMARTS to create it explicitly."
             )
         if query.startswith(("#", "!")):

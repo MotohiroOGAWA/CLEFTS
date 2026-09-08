@@ -49,7 +49,7 @@ Select `Cleavage Pattern Set` on the left side of the Workbench navigation. The 
 - edit each pattern name and `reactant_smarts` value;
 - add and remove products;
 - edit each product name and `smarts` value.
-- load or save an individual pattern as `*.clevage.json`;
+- load or save an individual pattern as `*.cleavage.json` (legacy `*.clevage.json` files remain supported);
 - build a pattern visually from a SMILES structure using RDKit;
 - draw single, double, triple, and aromatic bonds in a PubChem-style structure view;
 - select atoms and bonds individually or with a freehand lasso, and clear the selection explicitly;
