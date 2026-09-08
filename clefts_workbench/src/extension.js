@@ -1,6 +1,7 @@
 const trainingMetrics = require('./features/training-metrics/editor');
 const fineTune = require('./features/fragment-tree-finetune/editor');
 const smartsSearch = require('./features/smarts-search/editor');
+const evaluation = require('./features/evaluation/editor');
 const { createFragmenterEditor } = require('./components/fragmenter-editor');
 const vscode = require('vscode');
 const fs = require('fs');
@@ -20,6 +21,7 @@ function activate(context) {
     output,
     vscode.commands.registerCommand('clefts.openWorkbench', () => openWorkbench(context, output)),
     vscode.commands.registerCommand('clefts.openResult', openResultPicker),
+    vscode.commands.registerCommand('clefts.openEvaluation', () => evaluation.open(context, output, projectRoot)),
     vscode.window.registerCustomEditorProvider('clefts.resultViewer', provider, {
       webviewOptions: { retainContextWhenHidden: true },
       supportsMultipleEditorsPerDocument: true
@@ -185,6 +187,8 @@ function openWorkbench(context, output) {
         }
       } else if (message.type === 'openResult') {
         await openResultPicker();
+      } else if (message.type === 'openEvaluation') {
+        evaluation.open(context, output, projectRoot);
       } else if (message.type === 'copyCommand') {
         const python = vscode.workspace.getConfiguration('clefts').get('pythonPath', 'python');
         const command = shellDisplay(python, buildArgs(normalizeConfig(message.config)));
@@ -717,7 +721,7 @@ const HELP = {
 
 function workbenchHtml(config, fragmenterText, trainingConfig) {
   return `<!doctype html><html><head><meta charset="UTF-8"><style>${commonCss()}${formCss()}${trainingCss()}</style></head><body><main>
-  <header><div><span class="eyebrow">CLEFTS PLATFORM</span><h1>Workbench</h1><p id="appSubtitle" class="muted">Fragment Tree Data Preparation</p></div><div id="dataActions" class="actions"><button id="openResult">Open Result</button><button id="load">Load Configuration</button><button id="save">Save Configuration</button></div></header>
+  <header><div><span class="eyebrow">CLEFTS PLATFORM</span><h1>Workbench</h1><p id="appSubtitle" class="muted">Fragment Tree Data Preparation</p></div><div class="actions"><button id="openEvaluation" class="primary">Evaluation</button><div id="dataActions" class="actions"><button id="openResult">Open Result</button><button id="load">Load Configuration</button><button id="save">Save Configuration</button></div></div></header>
   <nav><button class="tab" data-app="smarts">SMARTS Search</button><button class="tab" data-app="cleavage">Cleavage Pattern Set</button><button class="tab active" data-app="data">Data Preparation</button><button class="tab" data-app="training">Training</button><button class="tab" data-app="metrics">Metrics</button><button class="tab" data-app="finetune">Fine-tuning</button><button class="tab" data-app="predict">Predict Spectrum</button></nav>
   ${trainingMetrics.html()}
   ${fineTune.html()}
@@ -773,7 +777,7 @@ function webviewScript() { return `
     setConfig(initial);setFormConfig(trainingForm,initialTraining);setPredictEnabled(false); document.querySelectorAll('[data-pick]').forEach(b=>b.onclick=()=>vscode.postMessage({type:'pick',form:b.dataset.form||'data',field:b.dataset.pick,kind:b.dataset.kind}));
     document.querySelectorAll('[data-open-model]').forEach(button=>button.onclick=()=>{const key=button.dataset.openModel,target=trainingForm.querySelector('[data-model-block="'+key+'"]');document.querySelectorAll('[data-open-model]').forEach(x=>x.classList.toggle('selected',x===button));document.querySelectorAll('[data-model-block]').forEach(x=>x.classList.toggle('selected',x===target));document.getElementById('modelHint').textContent=button.querySelector('b').textContent+': '+button.querySelector('span').textContent;target.scrollIntoView({behavior:'smooth',block:'start'});});
     document.querySelectorAll('[data-app]').forEach(button=>button.onclick=()=>{document.querySelectorAll('[data-app]').forEach(x=>x.classList.toggle('active',x===button));const app=button.dataset.app;document.getElementById('metricsApp').hidden=app!=='metrics';document.getElementById('fineTuneApp').hidden=app!=='finetune';document.getElementById('smartsApp').hidden=app!=='smarts';document.getElementById('cleavageApp').hidden=app!=='cleavage';form.hidden=app!=='data';trainingForm.hidden=app!=='training';predictForm.hidden=app!=='predict';document.getElementById('dataActions').hidden=app!=='data';document.getElementById('appSubtitle').textContent=app==='metrics'?'Training Metrics':app==='finetune'?'Fragment Tree Fine-tuning':app==='smarts'?'SMARTS Search':app==='cleavage'?'Cleavage Pattern Set Editor':app==='training'?'Fragment Tree Training':app==='predict'?'Predict Spectrum':'Fragment Tree Data Preparation';});
-    document.getElementById('save').onclick=()=>vscode.postMessage({type:'saveConfig',config:getConfig()}); document.getElementById('load').onclick=()=>vscode.postMessage({type:'loadConfig'}); document.getElementById('openResult').onclick=()=>vscode.postMessage({type:'openResult'});
+    document.getElementById('save').onclick=()=>vscode.postMessage({type:'saveConfig',config:getConfig()}); document.getElementById('load').onclick=()=>vscode.postMessage({type:'loadConfig'}); document.getElementById('openResult').onclick=()=>vscode.postMessage({type:'openResult'}); document.getElementById('openEvaluation').onclick=()=>vscode.postMessage({type:'openEvaluation'});
     function renderCleavage(){document.getElementById('cleavageSetName').value=cleavageModel.cleavage_pattern_set.name;document.getElementById('cleavagePatterns').innerHTML=cleavageModel.cleavage_pattern_set.patterns.map((p,pi)=>\`<section class="pattern-card"><div class="section-title"><h2>Pattern \${pi+1}</h2><div class="actions"><button type="button" data-edit-visual="\${pi}">Edit Visually</button><button type="button" data-load-pattern="\${pi}">Load</button><button type="button" data-save-pattern="\${pi}">Save</button><button type="button" class="danger" data-remove-pattern="\${pi}">Remove Pattern</button></div></div><div class="grid"><label>Pattern name<input data-pattern="\${pi}" data-key="name" value="\${htmlEscape(p.name)}" placeholder="single_bond_cleavage"></label><label>Reactant SMARTS<input data-pattern="\${pi}" data-key="reactant_smarts" value="\${htmlEscape(p.reactant_smarts)}" placeholder="[!#1:1]-[!#1:2]"></label></div><div class="section-title product-title"><h3>Products</h3><button type="button" data-add-product="\${pi}">Add Product</button></div><div class="product-list">\${p.products.map((product,xi)=>\`<div class="product-row"><label>Product name<input data-pattern="\${pi}" data-product="\${xi}" data-key="name" value="\${htmlEscape(product.name)}"></label><label>Product SMARTS<input data-pattern="\${pi}" data-product="\${xi}" data-key="smarts" value="\${htmlEscape(product.smarts)}" placeholder="[!#1:1]"></label><button type="button" class="danger" data-remove-product="\${pi}:\${xi}">Remove</button></div>\`).join('')}</div></section>\`).join('');}
     document.getElementById('cleavageSetName').oninput=e=>cleavageModel.cleavage_pattern_set.name=e.target.value;document.getElementById('addCleavagePattern').onclick=()=>{cleavageModel.cleavage_pattern_set.patterns.push({name:'',reactant_smarts:'',products:[]});renderCleavage()};
     document.getElementById('cleavagePatterns').addEventListener('input',e=>{const pi=Number(e.target.dataset.pattern);if(!Number.isInteger(pi))return;const xi=e.target.dataset.product;if(xi===undefined)cleavageModel.cleavage_pattern_set.patterns[pi][e.target.dataset.key]=e.target.value;else cleavageModel.cleavage_pattern_set.patterns[pi].products[Number(xi)][e.target.dataset.key]=e.target.value;});

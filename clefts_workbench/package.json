@@ -9,6 +9,7 @@
   "activationEvents": [
     "onCommand:clefts.openWorkbench",
     "onCommand:clefts.openResult",
+    "onCommand:clefts.openEvaluation",
     "onCustomEditor:clefts.resultViewer",
     "onCustomEditor:clefts.cleavagePatternSetEditor"
   ],
@@ -16,7 +17,8 @@
   "contributes": {
     "commands": [
       { "command": "clefts.openWorkbench", "title": "CLEFTS: Open Workbench" },
-      { "command": "clefts.openResult", "title": "CLEFTS: Open Result" }
+      { "command": "clefts.openResult", "title": "CLEFTS: Open Result" },
+      { "command": "clefts.openEvaluation", "title": "CLEFTS: Open Evaluation" }
     ],
     "customEditors": [
       {
@@ -50,7 +52,7 @@
   },
   "scripts": {
     "dev": "code --extensionDevelopmentPath=. --new-window .",
-    "check": "node --check src/extension.js && node --check src/features/smarts-search/editor.js && node --check src/features/cleavage-pattern-set/editor.js && node scripts/check-result-webview.js && node scripts/check-score-distribution.js && node scripts/check-smarts-compound-view.js && node scripts/check-finetune.js && node scripts/check-step-validation.js && node scripts/check-training-metrics.js",
+    "check": "node --check src/extension.js && node --check src/features/evaluation/editor.js && node --check src/features/smarts-search/editor.js && node --check src/features/cleavage-pattern-set/editor.js && node scripts/check-evaluation.js && node scripts/check-result-webview.js && node scripts/check-score-distribution.js && node scripts/check-smarts-compound-view.js && node scripts/check-finetune.js && node scripts/check-step-validation.js && node scripts/check-training-metrics.js",
     "package": "mkdir -p artifacts && npx @vscode/vsce package --allow-missing-repository --out artifacts/clefts_workbench-${npm_package_version}.vsix"
   },
   "devDependencies": { "@vscode/vsce": "2.15.0" },
