@@ -11,6 +11,7 @@ def box_plot_svg(
     color: str = "#36c5a2", transparent: bool = True,
     graph_opacity: float = 1.0, x_label_size: float = 11.0,
     y_label_size: float = 11.0, title_size: float = 17.0,
+    plot_type: str = "box",
 ) -> str:
     if width < 240 or height < 200:
         raise ValueError("Image size must be at least 240 x 200 pixels.")
@@ -18,6 +19,8 @@ def box_plot_svg(
         raise ValueError("Graph opacity must be between 0 and 1.")
     if any(not math.isfinite(value) or value < 6 or value > 96 for value in (x_label_size, y_label_size, title_size)):
         raise ValueError("Label and title sizes must be between 6 and 96 pixels.")
+    if plot_type not in {"box", "violin"}:
+        raise ValueError("Plot type must be box or violin.")
     rows = result["rows"]
     margin_left, margin_right, margin_top, margin_bottom = 62, 24, 45, 100
     plot_width = max(1, width - margin_left - margin_right)
@@ -31,14 +34,30 @@ def box_plot_svg(
         x = margin_left + index * slot + slot / 2
         label = escape(str(row["category"]))
         if row["median"] is not None:
-            low, q1, median, q3, high = (y(row[key]) for key in ("whiskerLow", "q1", "median", "q3", "whiskerHigh"))
             left, right = x - box_width / 2, x + box_width / 2
-            marks.extend([
-                f'<path class="whisker" d="M{x:.2f} {low:.2f}V{q1:.2f}M{x:.2f} {q3:.2f}V{high:.2f}M{left:.2f} {low:.2f}H{right:.2f}M{left:.2f} {high:.2f}H{right:.2f}"/>',
-                f'<rect x="{left:.2f}" y="{q3:.2f}" width="{box_width:.2f}" height="{max(1, q1-q3):.2f}" fill="{escape(color)}" fill-opacity=".55" stroke="{escape(color)}"/>',
-                f'<path class="median" stroke="{escape(color)}" d="M{left:.2f} {median:.2f}H{right:.2f}"/>',
-                *[f'<circle cx="{x:.2f}" cy="{y(value):.2f}" r="3" fill="{escape(color)}"/>' for value in row["outliers"]],
-            ])
+            if plot_type == "violin":
+                profile = row.get("density") or [
+                    [max(0.0, row["median"] - 0.025), 0.0], [row["median"], 1.0],
+                    [min(1.0, row["median"] + 0.025), 0.0],
+                ]
+                right_points = [(x + box_width * point[1] / 2, y(point[0])) for point in profile]
+                points = right_points + [(2 * x - px, py) for px, py in reversed(right_points)]
+                path = " ".join(("M" if point_index == 0 else "L") + f"{px:.2f},{py:.2f}" for point_index, (px, py) in enumerate(points))
+                median_y = y(row["median"])
+                median_weight = min(profile, key=lambda point: abs(point[0] - row["median"]))[1]
+                median_half_width = box_width * median_weight / 2
+                marks.extend([
+                    f'<path class="violin" d="{path} Z" fill="{escape(color)}" fill-opacity=".55" stroke="{escape(color)}"/>',
+                    f'<path class="median" stroke="{escape(color)}" d="M{x-median_half_width:.2f} {median_y:.2f}H{x+median_half_width:.2f}"/>',
+                ])
+            else:
+                low, q1, median, q3, high = (y(row[key]) for key in ("whiskerLow", "q1", "median", "q3", "whiskerHigh"))
+                marks.extend([
+                    f'<path class="whisker" d="M{x:.2f} {low:.2f}V{q1:.2f}M{x:.2f} {q3:.2f}V{high:.2f}M{left:.2f} {low:.2f}H{right:.2f}M{left:.2f} {high:.2f}H{right:.2f}"/>',
+                    f'<rect x="{left:.2f}" y="{q3:.2f}" width="{box_width:.2f}" height="{max(1, q1-q3):.2f}" fill="{escape(color)}" fill-opacity=".55" stroke="{escape(color)}"/>',
+                    f'<path class="median" stroke="{escape(color)}" d="M{left:.2f} {median:.2f}H{right:.2f}"/>',
+                    *[f'<circle cx="{x:.2f}" cy="{y(value):.2f}" r="3" fill="{escape(color)}"/>' for value in row["outliers"]],
+                ])
         marks.append(f'<text transform="translate({x:.2f},{margin_top + plot_height + 13}) rotate(35)" text-anchor="start" class="x-label">{label}</text>')
     title = escape(f'Cosine similarity by {result["groupColumn"]}')
     return (

@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 
 from .io import read_table
+from .core import _density_profile
 
 
 def _validate_items(items: Any, label: str) -> list[dict[str, str]]:
@@ -53,6 +54,7 @@ def _statistics(values: pd.Series, outlier_limit: int = 250) -> dict[str, Any]:
             "count": 0, "invalidCount": invalid_count, "min": None, "q1": None,
             "median": None, "q3": None, "max": None, "whiskerLow": None,
             "whiskerHigh": None, "outliers": [], "outlierCount": 0,
+            "density": [],
         }
     q1, median, q3 = (float(valid.quantile(q)) for q in (0.25, 0.5, 0.75))
     iqr = q3 - q1
@@ -68,7 +70,7 @@ def _statistics(values: pd.Series, outlier_limit: int = 250) -> dict[str, Any]:
         "min": float(valid.min()), "q1": q1, "median": median, "q3": q3,
         "max": float(valid.max()), "whiskerLow": float(central.min()),
         "whiskerHigh": float(central.max()), "outliers": displayed,
-        "outlierCount": len(outliers),
+        "outlierCount": len(outliers), "density": _density_profile(valid),
     }
 
 
@@ -127,6 +129,7 @@ def grouped_box_plot_svg(
     series_gap: float = 6.0, box_width: float = 0.0,
     graph_opacity: float = 1.0, x_label_size: float = 12.0,
     y_label_size: float = 11.0, title_size: float = 18.0,
+    plot_type: str = "box",
 ) -> str:
     if width < 400 or height < 300 or width > 8192 or height > 8192:
         raise ValueError("Image size must be between 400 x 300 and 8192 x 8192 pixels.")
@@ -137,6 +140,8 @@ def grouped_box_plot_svg(
         raise ValueError("Graph opacity must be between 0 and 1.")
     if any(not math.isfinite(value) or value < 6 or value > 96 for value in (x_label_size, y_label_size, title_size)):
         raise ValueError("Label and title sizes must be between 6 and 96 pixels.")
+    if plot_type not in {"box", "violin"}:
+        raise ValueError("Plot type must be box or violin.")
     cell_by_pair = {(cell["groupId"], cell["seriesId"]): cell for cell in cells}
     margin_left, margin_right, margin_top, margin_bottom = 70, 28, 85, 82
     plot_width, plot_height = width - margin_left - margin_right, height - margin_top - margin_bottom
@@ -177,14 +182,30 @@ def grouped_box_plot_svg(
             if cell["median"] is None:
                 marks.append(f'<path class="no-data" d="M{x-5:.2f} {y(.05)-5:.2f}l10 10m0-10l-10 10"/><text x="{x:.2f}" y="{y(.05)-10:.2f}" text-anchor="middle" class="no-data-label">No data</text>')
                 continue
-            low, q1, median, q3, high = (y(cell[key]) for key in ("whiskerLow", "q1", "median", "q3", "whiskerHigh"))
             left, right = x - resolved_box_width / 2, x + resolved_box_width / 2
-            marks.extend([
-                f'<path class="whisker" d="M{x:.2f} {low:.2f}V{q1:.2f}M{x:.2f} {q3:.2f}V{high:.2f}M{left:.2f} {low:.2f}H{right:.2f}M{left:.2f} {high:.2f}H{right:.2f}"/>',
-                f'<rect x="{left:.2f}" y="{q3:.2f}" width="{resolved_box_width:.2f}" height="{max(1, q1-q3):.2f}" fill="{color}" fill-opacity=".62" stroke="{color}"/>',
-                f'<path class="median" stroke="{color}" d="M{left:.2f} {median:.2f}H{right:.2f}"/>',
-                *[f'<circle cx="{x:.2f}" cy="{y(value):.2f}" r="2.2" fill="{color}"/>' for value in cell["outliers"]],
-            ])
+            if plot_type == "violin":
+                profile = cell.get("density") or [
+                    [max(0.0, cell["median"] - 0.025), 0.0], [cell["median"], 1.0],
+                    [min(1.0, cell["median"] + 0.025), 0.0],
+                ]
+                right_points = [(x + resolved_box_width * point[1] / 2, y(point[0])) for point in profile]
+                points = right_points + [(2 * x - px, py) for px, py in reversed(right_points)]
+                path = " ".join(("M" if point_index == 0 else "L") + f"{px:.2f},{py:.2f}" for point_index, (px, py) in enumerate(points))
+                median_y = y(cell["median"])
+                median_weight = min(profile, key=lambda point: abs(point[0] - cell["median"]))[1]
+                median_half_width = resolved_box_width * median_weight / 2
+                marks.extend([
+                    f'<path class="violin" d="{path} Z" fill="{color}" fill-opacity=".62" stroke="{color}"/>',
+                    f'<path class="median" stroke="{color}" d="M{x-median_half_width:.2f} {median_y:.2f}H{x+median_half_width:.2f}"/>',
+                ])
+            else:
+                low, q1, median, q3, high = (y(cell[key]) for key in ("whiskerLow", "q1", "median", "q3", "whiskerHigh"))
+                marks.extend([
+                    f'<path class="whisker" d="M{x:.2f} {low:.2f}V{q1:.2f}M{x:.2f} {q3:.2f}V{high:.2f}M{left:.2f} {low:.2f}H{right:.2f}M{left:.2f} {high:.2f}H{right:.2f}"/>',
+                    f'<rect x="{left:.2f}" y="{q3:.2f}" width="{resolved_box_width:.2f}" height="{max(1, q1-q3):.2f}" fill="{color}" fill-opacity=".62" stroke="{color}"/>',
+                    f'<path class="median" stroke="{color}" d="M{left:.2f} {median:.2f}H{right:.2f}"/>',
+                    *[f'<circle cx="{x:.2f}" cy="{y(value):.2f}" r="2.2" fill="{color}"/>' for value in cell["outliers"]],
+                ])
     legend_parts, legend_x = [], float(margin_left)
     for item in series:
         name = item["name"]

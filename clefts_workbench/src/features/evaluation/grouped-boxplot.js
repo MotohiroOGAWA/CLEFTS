@@ -6,7 +6,8 @@ function groupedArgs(request, outputImage) {
     '--graph-opacity', String(request.graphOpacity ?? 1),
     '--x-label-size', String(request.xLabelSize ?? 12),
     '--y-label-size', String(request.yLabelSize ?? 11),
-    '--title-size', String(request.titleSize ?? 18)];
+    '--title-size', String(request.titleSize ?? 18),
+    '--plot-type', request.plotType || 'box'];
   if (!request.transparent) args.push('--opaque');
   if (outputImage) args.push('--output-image', outputImage);
   return args;
@@ -18,10 +19,10 @@ function groupedHtml() {
   <div class="grouped-layout"><aside>
     <section class="panel"><h2>Groups (x-axis)</h2><p class="muted">For example: MoNA, MassBank, or an evaluation subset.</p><div id="groupedGroups" class="edit-list"></div><button id="groupedAddGroup">＋ Add group</button></section>
     <section class="panel"><h2>Series</h2><p class="muted">For example: CLEFTS or FIORA. A series keeps the same color in every group.</p><div id="groupedSeries" class="edit-list"></div><button id="groupedAddSeries">＋ Add series</button></section>
-    <section class="panel"><h2>Image</h2><label>Title<input id="groupedTitle" value="MS/MS similarity comparison"></label><div class="size-row"><label>Width<input id="groupedWidth" type="number" min="400" max="8192" value="1000"></label><label>Height<input id="groupedHeight" type="number" min="300" max="8192" value="600"></label></div><label>Graph opacity<input id="groupedGraphOpacity" type="number" min="0" max="1" step="0.05" value="1"></label><div class="size-row"><label>X-axis label size<input id="groupedXLabelSize" type="number" min="6" max="96" value="12"></label><label>Y-axis label size<input id="groupedYLabelSize" type="number" min="6" max="96" value="11"></label></div><label>Title size<input id="groupedTitleSize" type="number" min="6" max="96" value="18"></label><div class="size-row"><label>Group gap (px)<input id="groupedGroupGap" type="number" min="0" step="1" value="56"></label><label>Within-group gap (px)<input id="groupedSeriesGap" type="number" min="0" step="1" value="6"></label></div><label>Box width (px, 0 = auto)<input id="groupedBoxWidth" type="number" min="0" step="1" value="0"><small class="muted">Auto expands boxes with the image width. A fixed value keeps boxes narrow and centers each group.</small></label><label>Text and axis color<input id="groupedText" type="color" value="#555555"></label><label class="check"><input id="groupedTransparent" type="checkbox" checked>Transparent background</label><label>Background color<input id="groupedBackground" type="color" value="#ffffff" disabled></label><button id="groupedGenerate" class="primary">Generate box plot</button></section>
+    <section class="panel"><h2>Image</h2><label>Title<input id="groupedTitle" value="MS/MS similarity comparison"></label><label>Plot type<select id="groupedPlotType"><option value="box">Box plot</option><option value="violin">Violin plot</option></select></label><div class="size-row"><label>Width<input id="groupedWidth" type="number" min="400" max="8192" value="1000"></label><label>Height<input id="groupedHeight" type="number" min="300" max="8192" value="600"></label></div><label>Graph opacity<input id="groupedGraphOpacity" type="number" min="0" max="1" step="0.05" value="1"></label><div class="size-row"><label>X-axis label size<input id="groupedXLabelSize" type="number" min="6" max="96" value="12"></label><label>Y-axis label size<input id="groupedYLabelSize" type="number" min="6" max="96" value="11"></label></div><label>Title size<input id="groupedTitleSize" type="number" min="6" max="96" value="18"></label><div class="size-row"><label>Group gap (px)<input id="groupedGroupGap" type="number" min="0" step="1" value="56"></label><label>Within-group gap (px)<input id="groupedSeriesGap" type="number" min="0" step="1" value="6"></label></div><label>Plot width (px, 0 = auto)<input id="groupedBoxWidth" type="number" min="0" step="1" value="0"><small class="muted">Auto expands plots with the image width. A fixed value keeps plots narrow and centers each group.</small></label><label>Text and axis color<input id="groupedText" type="color" value="#555555"></label><label class="check"><input id="groupedTransparent" type="checkbox" checked>Transparent background</label><label>Background color<input id="groupedBackground" type="color" value="#ffffff" disabled></label><button id="groupedGenerate" class="primary">Generate plot</button></section>
   </aside><section>
     <section class="panel"><h2>Similarity results</h2><p class="muted">Assign one .mssim file to each group/series pair. Enable “No data” when a tool produced no result for that group.</p><div class="result-matrix-scroll"><table class="result-matrix"><thead><tr><th>Group</th><th>Series</th><th>.mssim file</th><th>No data</th></tr></thead><tbody id="groupedEntries"></tbody></table></div></section>
-    <section class="panel"><div class="actions"><span id="groupedStatus" class="status">Configure groups and result files.</span></div><div id="groupedChart" class="chart"><p class="muted">The grouped box plot will appear here.</p></div><div class="result-matrix-scroll"><table id="groupedTable" hidden><thead><tr><th>Group</th><th>Series</th><th>Status</th><th>n</th><th>Invalid</th><th>Min</th><th>Q1</th><th>Median</th><th>Q3</th><th>Max</th></tr></thead><tbody></tbody></table></div></section>
+    <section class="panel"><div class="actions"><span id="groupedStatus" class="status">Configure groups and result files.</span></div><div id="groupedChart" class="chart"><p class="muted">The grouped plot will appear here.</p></div><div class="result-matrix-scroll"><table id="groupedTable" hidden><thead><tr><th>Group</th><th>Series</th><th>Status</th><th>n</th><th>Invalid</th><th>Min</th><th>Q1</th><th>Median</th><th>Q3</th><th>Max</th></tr></thead><tbody></tbody></table></div></section>
   </section></div></section>`;
 }
 
@@ -57,6 +58,7 @@ function groupedClient() {
   function request() {
     return {
       title: get('groupedTitle').value,
+      plotType: get('groupedPlotType').value,
       groups: groups.map(item => ({ ...item })), series: series.map(item => ({ ...item })),
       entries: groups.flatMap(group => series.map(item => ({ ...entry(group.id, item.id) }))),
       width: Number(get('groupedWidth').value), height: Number(get('groupedHeight').value),
@@ -98,7 +100,7 @@ function groupedClient() {
     const row = button.closest('tr'); vscode.postMessage({ type: 'pickGroupedInput', groupId: row.dataset.group, seriesId: row.dataset.series });
   };
   get('groupedTransparent').onchange = () => { get('groupedBackground').disabled = get('groupedTransparent').checked; };
-  get('groupedGenerate').onclick = () => { status('Generating grouped box plot…'); vscode.postMessage({ type: 'groupedSummarize', request: request() }); };
+  get('groupedGenerate').onclick = () => { status('Generating grouped plot…'); vscode.postMessage({ type: 'groupedSummarize', request: request() }); };
   get('groupedSave').onclick = () => vscode.postMessage({ type: 'saveGroupedImage', request: request() });
   get('groupedSaveConfig').onclick = () => vscode.postMessage({ type: 'saveEvaluationConfig', kind: 'grouped', config: request() });
   get('groupedLoadConfig').onclick = () => vscode.postMessage({ type: 'loadEvaluationConfig', kind: 'grouped' });
@@ -116,6 +118,7 @@ function groupedClient() {
       nextGroup = 1; while (groups.some(item => item.id === 'g' + nextGroup)) nextGroup++;
       nextSeries = 1; while (series.some(item => item.id === 's' + nextSeries)) nextSeries++;
       get('groupedTitle').value = config.title || 'MS/MS similarity comparison';
+      get('groupedPlotType').value = config.plotType || 'box';
       get('groupedWidth').value = config.width || 1000; get('groupedHeight').value = config.height || 600;
       get('groupedGraphOpacity').value = config.graphOpacity ?? 1;
       get('groupedXLabelSize').value = config.xLabelSize ?? 12;

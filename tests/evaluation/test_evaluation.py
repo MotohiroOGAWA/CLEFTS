@@ -63,6 +63,11 @@ def test_default_spec_id_join_and_categorical_boxplot(tmp_path):
     assert box["median"] == 0.3
     assert box["whiskerHigh"] == 0.4
     assert box["outliers"] == [1.0]
+    assert len(box["density"]) == 65
+    assert max(point[1] for point in box["density"]) == 1.0
+    violin = box_plot_svg(result, plot_type="violin")
+    assert 'class="violin"' in violin
+    assert 'class="whisker"' not in violin
     assert summarize(EvaluationRequest(
         str(similarity), "AdductType", metadata=str(source), include=()
     ))["rows"] == []
@@ -205,6 +210,9 @@ def test_grouped_boxplot_compares_series_and_preserves_order(tmp_path):
     assert '<rect x="70.00" y="48" width="14" height="10" fill="#ff00aa"/>' in svg
     assert '<text x="90.00" y="58" class="legend">FIORA</text>' in svg
     assert '<rect x="140.50" y="48" width="14" height="10" fill="#00aacc"/>' in svg
+    violin = grouped_box_plot_svg(result, width=900, height=500, plot_type="violin")
+    assert violin.count('class="violin"') == 3
+    assert 'class="whisker"' not in violin
     wider = grouped_box_plot_svg(result, width=1400, height=500)
     box_pattern = r'<rect x="[^"]+" y="[^"]+" width="([^"]+)"[^>]+fill-opacity'
     assert float(re.search(box_pattern, wider).group(1)) > float(re.search(box_pattern, svg).group(1))

@@ -14,7 +14,10 @@ Module._load = originalLoad;
 const page = html();
 assert.match(page, /id="bins"[^>]*disabled/);
 assert.doesNotMatch(page, /Aggregation|Value column/);
-assert.match(page, /Box color/);
+assert.match(page, /Plot color/);
+assert.match(page, /id="plotType"/);
+assert.match(page, /id="groupedPlotType"/);
+assert.match(page, /Violin plot/);
 assert.match(page, /data-eval-tab="column"/);
 assert.match(page, /data-eval-tab="grouped"/);
 assert.match(page, /id="groupedAddGroup"/);
@@ -31,7 +34,7 @@ assert.match(page, /id="groupedBoxWidth"/);
 assert.match(page, /Collision Energy parser/);
 assert.match(page, /SMILES chemical information/);
 assert.match(page, /HeavyAtomCount/);
-assert.match(page, /Changes are applied only when Generate box plot is pressed/);
+assert.match(page, /Changes are applied only when Generate plot is pressed/);
 assert.match(page, /id="graphOpacity"/);
 assert.match(page, /id="xLabelSize"/);
 assert.match(page, /id="yLabelSize"/);
@@ -55,6 +58,7 @@ assert.ok(compare.includes('--request-json'));
 assert.ok(compare.includes('--opaque'));
 assert.ok(compare.includes('/tmp/result.svg'));
 for (const option of ['--graph-opacity', '--x-label-size', '--y-label-size', '--title-size']) assert.ok(compare.includes(option));
+assert.deepEqual(compare.slice(compare.indexOf('--plot-type'), compare.indexOf('--plot-type') + 2), ['--plot-type', 'box']);
 const configDocument = evaluationConfigDocument('column', { input: '/tmp/results.mssim' });
 assert.equal(configDocument.schema, 'clefts.evaluation.config');
 assert.deepEqual(parseEvaluationConfig(JSON.parse(JSON.stringify(configDocument)), 'column'), configDocument.config);
@@ -76,6 +80,7 @@ assert.deepEqual(args.slice(args.indexOf('--metadata'), args.indexOf('--metadata
 assert.deepEqual(args.slice(args.indexOf('--join-column'), args.indexOf('--join-column') + 2), ['--join-column', 'SpecID']);
 assert.ok(!args.includes('--bins'));
 for (const option of ['--graph-opacity', '--x-label-size', '--y-label-size', '--title-size']) assert.ok(args.includes(option));
+assert.deepEqual(args.slice(args.indexOf('--plot-type'), args.indexOf('--plot-type') + 2), ['--plot-type', 'box']);
 assert.deepEqual(args.slice(args.indexOf('--transform'), args.indexOf('--transform') + 2), ['--transform', 'none']);
 const transformed = summaryArgs({
   input: '/tmp/results.mssim', groupColumn: 'CollisionEnergy', mode: 'numeric',

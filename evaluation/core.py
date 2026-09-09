@@ -166,7 +166,8 @@ def _boxplot_rows(frame: pd.DataFrame, group_key: pd.Series) -> list[dict[str, A
         if scores.empty:
             rows.append({"category": str(category), "count": 0, "min": None, "q1": None,
                          "median": None, "q3": None, "max": None,
-                         "whiskerLow": None, "whiskerHigh": None, "outliers": []})
+                         "whiskerLow": None, "whiskerHigh": None, "outliers": [],
+                         "density": []})
             continue
         q1, median, q3 = (float(scores.quantile(q)) for q in (0.25, 0.5, 0.75))
         iqr = q3 - q1
@@ -177,8 +178,23 @@ def _boxplot_rows(frame: pd.DataFrame, group_key: pd.Series) -> list[dict[str, A
             "min": float(scores.min()), "q1": q1, "median": median, "q3": q3,
             "max": float(scores.max()), "whiskerLow": float(central.min()),
             "whiskerHigh": float(central.max()), "outliers": [float(value) for value in outliers],
+            "density": _density_profile(scores),
         })
     return rows
+
+
+def _density_profile(values: pd.Series, points: int = 65) -> list[list[float]]:
+    """Return a normalized Gaussian KDE sampled across the similarity axis."""
+    samples = values.to_numpy(dtype=float)
+    if len(samples) > 5000:
+        samples = np.sort(samples)[np.linspace(0, len(samples) - 1, 5000, dtype=int)]
+    grid = np.linspace(0.0, 1.0, points)
+    spread = float(np.std(samples, ddof=1)) if len(samples) > 1 else 0.0
+    bandwidth = max(0.025, 1.06 * spread * len(samples) ** -0.2)
+    density = np.exp(-0.5 * ((grid[:, None] - samples[None, :]) / bandwidth) ** 2).sum(axis=1)
+    maximum = float(density.max())
+    normalized = density / maximum if maximum else density
+    return [[float(value), float(weight)] for value, weight in zip(grid, normalized)]
 
 
 def summarize(request: EvaluationRequest) -> dict[str, Any]:
