@@ -41,6 +41,8 @@ def _fixtures(tmp_path):
         "SpecID": spec_ids,
         "AdductType": ["[M+H]+"] * 5 + ["[M+Na]+"],
         "CollisionEnergy": [5, 7, 12, 15, 25, 25],
+        "PrecursorMZ": [500.0] * 6,
+        "SMILES": ["CCO", "CCO", "c1ccccc1", "c1ccccc1", "CC(=O)O", "CC(=O)O"],
     }).to_csv(metadata, index=False)
     return similarity, metadata
 
@@ -74,6 +76,36 @@ def test_numeric_ranges_are_grouped_and_ordered(tmp_path):
     ))
     assert [row["category"] for row in result["rows"]] == ["[20,~)", "[0,10)", "[10,20)"]
     assert [row["count"] for row in result["rows"]] == [2, 2, 2]
+
+
+def test_collision_energy_parser_converts_metadata_before_grouping(tmp_path):
+    similarity, source = _fixtures(tmp_path)
+    metadata = pd.read_csv(source)
+    metadata["CollisionEnergy"] = ["5 eV", "7 V", "12eV", "15", "25", "25%"]
+    metadata.to_csv(source, index=False)
+    result = summarize(EvaluationRequest(
+        str(similarity), "CollisionEnergy", metadata=str(source), mode="numeric",
+        bins=(0, 10, 20), transform="collision-energy",
+        precursor_mz_column="PrecursorMZ",
+    ))
+    assert result["groupColumn"] == "CollisionEnergy (eV)"
+    assert result["transform"] == "collision-energy"
+    assert [(row["category"], row["count"]) for row in result["rows"]] == [
+        ("[0,10)", 2), ("[10,20)", 2), ("[20,~)", 2)
+    ]
+
+
+def test_smiles_heavy_atom_count_is_available_as_numeric_group(tmp_path):
+    similarity, source = _fixtures(tmp_path)
+    result = summarize(EvaluationRequest(
+        str(similarity), "SMILES", metadata=str(source), mode="numeric",
+        bins=(0, 4, 6), transform="chemical", smiles_column="SMILES",
+        chemical_descriptor="HeavyAtomCount",
+    ))
+    assert result["groupColumn"] == "HeavyAtomCount"
+    assert [(row["category"], row["count"]) for row in result["rows"]] == [
+        ("[0,4)", 2), ("[4,6)", 2), ("[6,~)", 2)
+    ]
 
 
 def test_cli_writes_transparent_colored_boxplot(tmp_path):
@@ -113,7 +145,7 @@ def test_explicit_join_column_supports_msds_metadata(tmp_path):
         join_column="IDENTIFIER", mode="numeric", bins=(0, 25, 35),
     ))
     assert [(row["category"], row["count"]) for row in result["rows"]] == [
-        ("[25,35)", 1), ("[0,25)", 1)
+        ("[0,25)", 1), ("[25,35)", 1)
     ]
 
 

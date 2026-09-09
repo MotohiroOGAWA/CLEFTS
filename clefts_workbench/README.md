@@ -29,20 +29,31 @@ Set `clefts.pythonPath` when the required Python environment is not available as
 ## Batch spectrum prediction
 
 In **Predict Spectrum**, the single-molecule preview remains available and a
-separate **Batch MSDataset prediction** section accepts input/output `.msds`
-paths. Select the trained checkpoint and device, specify the source column names,
-DB label, and unique-SMILES chunk size, then run or copy the CLI command. The
+separate **Batch MSDataset prediction** section accepts an input `.msds` and an
+output directory. Select the trained checkpoint and device, specify the source column names,
+DB label, chemical precompute batch size, and first-cleavage worker count, then run
+or copy the CLI command. The
 Workbench invokes:
 
 ```bash
-python -m clefts.ml.specgen.predict_spectrum --input input.msds --output predicted.msds --model model.pt --db MoNA
+python -m clefts.ml.specgen.predict_spectrum --input input.msds --output-dir prediction-output --model model.pt --db MoNA
 ```
 
-The checkpoint is loaded once. Prediction progress is streamed to the CLEFTS
-output panel, and the operation can be stopped from the Workbench. Output
+The checkpoint is loaded once. CLEFTS creates a temporary directory next to the
+output and invokes a separate Python subprocess worker for each compound batch.
+Each worker reconstructs only the non-neural chemistry context, not a copy of
+the full prediction model. Neural prediction then expands only model-selected fragments and
+finishes that compound before moving on. Compact `tqdm` status is shown in the
+tab without appending every refresh to the log; the operation can be stopped
+from the Workbench. Output
 metadata preserves source values and adds interoperable prediction provenance;
-run details and record-level failures are written beside the output under
-`<output>.run/`.
+the final `.msds` is written below that directory, and run details plus
+record-level failures are written under `<output-dir>/run/`.
+
+**Load Configuration** and **Save Configuration** preserve the model/device,
+single-spectrum SMILES, adduct and collision energy, plus every batch prediction
+path, column mapping, DB label, chemical batch size, precompute worker count,
+temporary-cache option, and overwrite option.
 
 ## Configuration and results
 
@@ -206,6 +217,8 @@ and reports trainable/frozen parameter counts. **Run Fine-tuning CLI** invokes
 same arguments. Logs stream into the tab and the CLEFTS output channel. The new
 set must include all old definitions, and other Fragmenter settings must match
 the base. The validation split must include `valid_records.msds`.
+**Load Configuration** and **Save Configuration** preserve all file paths and
+fine-tuning hyperparameters in an editable, versioned JSON document.
 
 See `../clefts/ml/training/fragment_tree_training/README.md` for CLI usage,
 checkpoint/resume behavior, and the exact expansion architecture.

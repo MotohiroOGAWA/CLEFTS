@@ -6,10 +6,20 @@ import pytest
 from clefts.libs.msentity.msentity import MSDataset
 from clefts.ml.specgen.predict_spectrum import (
     direct_input_dataset,
+    make_precompute_batches,
     prediction_metadata,
     validate_prediction_input,
     validate_prediction_output,
 )
+
+
+def test_precompute_batches_assign_batch_size_compounds_per_worker_task() -> None:
+    batches = make_precompute_batches([f"SMILES-{index}" for index in range(100)], 32)
+
+    assert len(batches) == 4
+    assert [len(batch) for batch in batches] == [32, 32, 32, 4]
+    assert batches[0][0] == (0, "SMILES-0")
+    assert batches[-1][-1] == (99, "SMILES-99")
 
 
 def _dataset():

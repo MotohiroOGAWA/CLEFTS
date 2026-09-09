@@ -14,6 +14,7 @@ Module._load = function(request, parent, main) {
   return originalLoad.call(this, request, parent, main);
 };
 const feature = require('../src/features/fragment-tree-finetune/editor');
+const configuration = require('../src/configuration');
 const config = Object.fromEntries(feature.fields.map(([key, , , value]) => [key, value ?? '/path with space/' + key]));
 config.ckptId = '';
 const args = feature.buildArgs(config);
@@ -23,6 +24,10 @@ assert(!args.includes('--ckpt-id') && !args.includes('--dry-run'));
 assert.strictEqual(feature.buildArgs(config, true).at(-1), '--dry-run');
 assert(feature.shellDisplay('python', args).startsWith('python -m clefts.cli train fragment-tree-finetune '));
 new Function(feature.script());
+assert(feature.html().includes('fineTuneLoadConfig') && feature.html().includes('fineTuneSaveConfig'));
+const saved = configuration.configurationDocument('fine-tuning', config);
+assert.deepStrictEqual(configuration.parseConfiguration(saved, 'fine-tuning'), config);
+assert.throws(() => configuration.parseConfiguration(saved, 'spectrum-prediction'), /Expected spectrum-prediction/);
 const { workbenchHtml } = require('../src/extension');
 const html = workbenchHtml({}, '{}', {});
 assert(html.includes('id="fineTuneApp"') && html.includes('data-app="finetune"'));

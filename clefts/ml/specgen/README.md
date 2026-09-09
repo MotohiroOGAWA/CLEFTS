@@ -54,7 +54,7 @@ python -m clefts.ml.specgen.predict_spectrum \
   --smiles 'CC(=O)OC1=CC=CC=C1C(=O)O' \
   --ce 20 \
   --adduct-type '[M+H]+' \
-  --output predicted.msds
+  --output-dir prediction-output
 ```
 
 `--adduct` is an alias for `--adduct-type`. The spelling is `AdductType`
@@ -74,7 +74,8 @@ python -m clefts.ml.specgen.predict_spectrum \
   --smiles 'CCO' 'CCN' \
   --ce 20 \
   --adduct-type '[M+H]+' \
-  --output predictions.msds
+  --output-dir prediction-output \
+  --output-name predictions.msds
 ```
 
 The default device is CUDA when available, otherwise CPU. Override it with
@@ -109,13 +110,30 @@ The earlier dataset-based mode remains available:
 python -m clefts.ml.specgen.predict_spectrum \
   --input input.msds \
   --model /path/to/model.pt \
-  --output predicted.msds
+  --output-dir prediction-output
 ```
 
 By default it uses the `SMILES`, `PrecursorMZ`, `AdductType`, and
 `CollisionEnergy` columns and predicts all unique SMILES. Use the corresponding
 `--*-column` options when a dataset uses different column names. Passing
 `--smiles` in this mode restricts prediction to matching records.
+
+Before inference, the predictor creates a temporary directory below the output
+directory and precomputes the precursor plus every first-cleavage candidate once
+per unique SMILES. Chemical work is executed by the separate
+`precompute_first_cleavage_worker.py` module in independent Python subprocesses;
+the parent threads only wait for subprocess completion. `--precompute-workers`
+controls the number of concurrent subprocesses.
+At deeper levels, the neural model selects the fragments to continue and only
+those fragments are chemically expanded; each compound is predicted through its
+final selected depth in the same processing pass. The cache is removed after the
+run unless `--keep-temp` is supplied.
+
+`--batch-size` is the number of unique compounds assigned to one chemical
+precompute worker task. Each worker processes its batch serially, while up to
+`--precompute-workers` batches run concurrently. The precompute progress total is
+therefore `ceil(unique compounds / batch size)`. It does not limit fragmentation
+depth. Run metadata records both values.
 
 Use `--strict` when you want checkpoint loading to fail on any missing or
 unexpected parameter. Without it, counts are printed for incompatible keys.

@@ -53,6 +53,15 @@ def build_parser() -> argparse.ArgumentParser:
     summary.add_argument("--join-column")
     summary.add_argument("--group-column", required=True)
     summary.add_argument("--mode", choices=("auto", "categorical", "numeric"), default="auto")
+    summary.add_argument(
+        "--transform",
+        choices=("none", "collision-energy", "chemical"),
+        default="none",
+    )
+    summary.add_argument("--precursor-mz-column", default="PrecursorMZ")
+    summary.add_argument("--instrument-column")
+    summary.add_argument("--smiles-column", default="SMILES")
+    summary.add_argument("--chemical-descriptor", default="HeavyAtomCount")
     summary.add_argument("--bins", default="", help="Comma-separated boundaries, e.g. 0,10,20.")
     summary.add_argument("--include", help="JSON array of category/range labels to include.")
     summary.add_argument("--order", help="JSON array defining output order.")
@@ -105,6 +114,9 @@ def execute(args: argparse.Namespace) -> dict:
         input_path=args.input, group_column=args.group_column,
         metadata=args.metadata, join_column=args.join_column, mode=args.mode,
         bins=_bins(args.bins), include=_json_list(args.include), order=_json_list(args.order) or (),
+        transform=args.transform, precursor_mz_column=args.precursor_mz_column,
+        instrument_column=args.instrument_column, smiles_column=args.smiles_column,
+        chemical_descriptor=args.chemical_descriptor,
     )
     result = summarize(request)
     result["svg"] = box_plot_svg(result, width=args.width, height=args.height, color=args.color, transparent=not args.opaque)

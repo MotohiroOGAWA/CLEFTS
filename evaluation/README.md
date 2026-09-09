@@ -11,13 +11,23 @@ python -m evaluation summarize --input result.mssim --metadata observed.msds \
   --group-column AdductType --output-image adduct-boxplot.svg
 python -m evaluation summarize --input result.mssim --metadata observed.msds \
   --join-column IDENTIFIER --group-column CollisionEnergy \
+  --transform collision-energy --precursor-mz-column PrecursorMZ \
   --mode numeric --bins 0,10,20 --output-image collision-energy-boxplot.svg
+python -m evaluation summarize --input result.mssim --metadata observed.msds \
+  --group-column SMILES --transform chemical --smiles-column SMILES \
+  --chemical-descriptor HeavyAtomCount --mode numeric --bins 0,10,20 \
+  --output-image heavy-atom-count-boxplot.svg
 ```
 
 Each group is represented as a Tukey box plot of the `.mssim`
 `cosine_similarity` values. SVG output is transparent by default. Use
 `--opaque` for a white background and `--width`, `--height`, and `--color` to
 customize its appearance.
+
+Column values can be left unchanged, parsed as collision energy using CLEFTS'
+existing CE-to-eV parser, or derived from SMILES using the supported molecular
+descriptors. The Workbench keeps edits as a draft and does not recalculate the
+chart until **Generate box plot** is pressed.
 
 ## Grouped multi-tool comparison
 

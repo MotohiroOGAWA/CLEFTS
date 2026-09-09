@@ -297,7 +297,16 @@ class FragmentTreeCandidateSelector(nn.Module):
             return None
         return torch.cat(selected_parts).unique(sorted=True)
 
-    def generate_depth_limited_candidates(self, data: Union[FragmentTreeStructure, FragmentTreeFeatures], *, max_depth: int, on_step: Optional[Callable[[int, FragmentTreeCandidateSelectionOutput], None]] = None) -> FragmentTreeCandidateSelectionOutput:
+    def generate_depth_limited_candidates(
+        self,
+        data: Union[FragmentTreeStructure, FragmentTreeFeatures],
+        *,
+        max_depth: int,
+        on_step: Optional[Callable[[int, FragmentTreeCandidateSelectionOutput], None]] = None,
+        structure_expander: Optional[
+            Callable[[int, FragmentTreeCandidateSelectionOutput], FragmentTreeStructure]
+        ] = None,
+    ) -> FragmentTreeCandidateSelectionOutput:
         if max_depth < 0:
             raise ValueError("max_depth must be non-negative.")
         # Molecular and cleavage-event encoders are evaluated once.  The much
@@ -315,6 +324,13 @@ class FragmentTreeCandidateSelector(nn.Module):
         for expansion_depth in range(1, max_depth + 1):
             if len(output.next_cleavage_candidates) == 0:
                 break
+            if structure_expander is not None:
+                expanded_structure = structure_expander(expansion_depth, output)
+                selected_edge_index = self._tree_bounded_edge_selection(expanded_structure)
+                expanded_features = self.feature_model.build_features(
+                    expanded_structure, selected_edge_index=selected_edge_index
+                )
+                output = replace(output, features=expanded_features)
             next_features = self._expand_features_for_next_cleavage(
                 output, expansion_depth=expansion_depth
             )

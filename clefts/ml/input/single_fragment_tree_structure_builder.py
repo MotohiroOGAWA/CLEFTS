@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, Optional, Tuple, List, Set, Sequence
+from typing import Any, Dict, Optional, Tuple, List, Set, Sequence
 
 import torch
 from torch_geometric.data import Batch, Data
@@ -574,7 +574,7 @@ class SingleFragmentTreeStructureBuilder:
         # -------------------------
         # Build shared FragmentIonTree only once
         # -------------------------
-        fragment_ion_tree = self._context._fragmenter.build_fragment_ion_tree(
+        fragment_ion_tree = self._context.fragmenter.build_fragment_ion_tree(
             compound=compound,
             max_depth=self._context.precursor_candidate_max_depth,
             _include_fragment_compound_cache=True,
@@ -864,6 +864,75 @@ class SingleFragmentTreeStructureBuilder:
         self._edge_index_by_node_indexes = {}
         self._cleavage_event_index_by_key = {}
         self._atom_row_index_by_atom_idxs = {}
+
+    def export_state(self) -> Dict[str, Any]:
+        """Return serializable state without duplicating the model context."""
+        return {
+            key: value for key, value in self.__dict__.items()
+            if key != "_context"
+        }
+
+    @classmethod
+    def from_state(
+        cls,
+        context: FragmentTreePreprocessingContext,
+        state: Dict[str, Any],
+    ) -> "SingleFragmentTreeStructureBuilder":
+        """Restore a first-cleavage cache against an already loaded model."""
+        if not isinstance(state, dict):
+            raise TypeError("Builder state must be a dictionary.")
+        builder = cls(context)
+        for key, value in state.items():
+            if key == "_context" or not hasattr(builder, key):
+                raise ValueError(f"Unknown builder-state field: {key}")
+            setattr(builder, key, value)
+        return builder
+
+    def add_selected_node_cleavages(
+        self,
+        sample_node_pairs: Sequence[Tuple[int, int]],
+    ) -> int:
+        """Calculate one additional cleavage step only for model-selected nodes."""
+        edges_by_node: Dict[int, List[int]] = {}
+        for _, node_index_value in sample_node_pairs:
+            node_index = int(node_index_value)
+            if node_index in edges_by_node:
+                continue
+            if node_index < 0 or node_index >= len(self.node_smiles):
+                raise IndexError(f"Selected node index is out of range: {node_index}")
+            src_smiles = str(self.node_smiles[node_index])
+            compound = Compound.from_smiles(src_smiles)
+            products: Dict[str, List[CleavageStep]] = {}
+            for cleavage_result in self._context.fragmenter.cleavage_pattern_set.fragment_all(compound):
+                for product in cleavage_result.products:
+                    for product_molecule in product.product_molecules:
+                        dst_smiles = product_molecule.compound.smiles
+                        products.setdefault(dst_smiles, []).append(CleavageStep(
+                            cleavage_pattern_id=cleavage_result.pattern_id,
+                            reaction_id=product.id,
+                            product_molecule_id=product_molecule.id,
+                            reactant_indices=tuple(product.reactant_indices),
+                            product_indices=tuple(product_molecule.product_indices),
+                        ))
+            edge_indexes = []
+            for dst_smiles, steps in products.items():
+                edge_index = self._ensure_get_edge_index(
+                    src_smiles, dst_smiles, FragmentPathwayEdge(tuple(steps))
+                )
+                if edge_index is not None:
+                    edge_indexes.append(int(edge_index))
+            edges_by_node[node_index] = edge_indexes
+
+        added = 0
+        for sample_index_value, node_index_value in sample_node_pairs:
+            sample_index, node_index = int(sample_index_value), int(node_index_value)
+            sample = self.samples.get(sample_index)
+            if sample is None:
+                continue
+            before = len(sample.edge_indexes)
+            sample.edge_indexes.update(edges_by_node.get(node_index, ()))
+            added += len(sample.edge_indexes) - before
+        return added
 
     # -------------------------
     # internal helpers

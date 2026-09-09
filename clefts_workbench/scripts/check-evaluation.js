@@ -28,6 +28,10 @@ assert.match(page, /id="groupedSaveConfig"/);
 assert.match(page, /id="groupedGroupGap"/);
 assert.match(page, /id="groupedSeriesGap"/);
 assert.match(page, /id="groupedBoxWidth"/);
+assert.match(page, /Collision Energy parser/);
+assert.match(page, /SMILES chemical information/);
+assert.match(page, /HeavyAtomCount/);
+assert.match(page, /Changes are applied only when Generate box plot is pressed/);
 for (const match of page.matchAll(/<script>([\s\S]*?)<\/script>/g)) new Function(match[1]);
 
 const compare = groupedArgs({
@@ -60,4 +64,13 @@ assert.ok(!args.includes('--opaque'));
 assert.deepEqual(args.slice(args.indexOf('--metadata'), args.indexOf('--metadata') + 2), ['--metadata', '/tmp/source.msds']);
 assert.deepEqual(args.slice(args.indexOf('--join-column'), args.indexOf('--join-column') + 2), ['--join-column', 'SpecID']);
 assert.ok(!args.includes('--bins'));
+assert.deepEqual(args.slice(args.indexOf('--transform'), args.indexOf('--transform') + 2), ['--transform', 'none']);
+const transformed = summaryArgs({
+  input: '/tmp/results.mssim', groupColumn: 'CollisionEnergy', mode: 'numeric',
+  transform: 'collision-energy', precursorMzColumn: 'PrecursorMZ',
+  instrumentColumn: 'InstrumentType', bins: '0,10,20'
+});
+assert.ok(transformed.includes('--chemical-descriptor') === false);
+assert.deepEqual(transformed.slice(transformed.indexOf('--transform'), transformed.indexOf('--transform') + 2), ['--transform', 'collision-energy']);
+assert.ok(transformed.includes('--bins'));
 console.log('Evaluation webview and CLI argument checks passed.');

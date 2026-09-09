@@ -1,6 +1,7 @@
 const vscode = require('vscode');
 const { spawn } = require('child_process');
 const path = require('path');
+const { saveConfiguration, loadConfiguration } = require('../../configuration');
 
 const fields = [
   ['checkpoint', 'Base fragment-tree checkpoint', 'file'],
@@ -37,10 +38,20 @@ function attach(panel, context, projectRoot, output) {
   let child;
   panel.onDidDispose(() => { if (child) child.kill('SIGTERM'); });
   panel.webview.onDidReceiveMessage(async message => {
-    if (!['fineTunePick', 'fineTuneCopy', 'fineTuneRun', 'fineTuneStop'].includes(message.type)) return;
+    if (!['fineTunePick', 'fineTuneCopy', 'fineTuneRun', 'fineTuneStop', 'fineTuneSaveConfig', 'fineTuneLoadConfig'].includes(message.type)) return;
     if (message.type === 'fineTuneRun' && child) return;
     const post = data => panel.webview.postMessage({ type: 'fineTuneStatus', ...data });
     try {
+      if (message.type === 'fineTuneSaveConfig') {
+        const saved = await saveConfiguration('fine-tuning', message.config, 'fragment-tree-fine-tuning.json');
+        if (saved) panel.webview.postMessage({ type: 'fineTuneConfigSaved', path: saved });
+        return;
+      }
+      if (message.type === 'fineTuneLoadConfig') {
+        const loaded = await loadConfiguration('fine-tuning');
+        if (loaded) panel.webview.postMessage({ type: 'fineTuneConfigLoaded', ...loaded });
+        return;
+      }
       if (message.type === 'fineTuneStop') { if (child) child.kill('SIGTERM'); return; }
       if (message.type === 'fineTunePick') {
         const field = fields.find(([key]) => key === message.field);
@@ -84,7 +95,7 @@ function attach(panel, context, projectRoot, output) {
   });
 }
 function html() {
-  return `<div id="fineTuneApp" hidden><section><h2>Fragment Tree Fine-tuning</h2>
+  return `<div id="fineTuneApp" hidden><section><div class="section-title"><div><h2>Fragment Tree Fine-tuning</h2></div><div class="actions"><button type="button" id="fineTuneLoadConfig">Load Configuration</button><button type="button" id="fineTuneSaveConfig">Save Configuration</button></div></div>
   <p>MolEncoder and all existing parameters stay frozen. Train only added low-rank nodes and new cleavage-category embeddings.</p>
   <p>Choose a complete set containing the old patterns plus new patterns. First regenerate both data splits with this set in Data Preparation. Keep other Fragmenter settings unchanged.</p>
   <form id="fineTuneForm"><div class="grid">${fields.map(([key, label, kind, value = '']) =>
@@ -102,10 +113,17 @@ function client() {
   el('fineTuneCopy').onclick = () => send('fineTuneCopy');
   el('fineTuneValidate').onclick = () => send('fineTuneRun', true);
   el('fineTuneStop').onclick = () => vscode.postMessage({ type: 'fineTuneStop' });
+  el('fineTuneSaveConfig').onclick = () => vscode.postMessage({ type: 'fineTuneSaveConfig', config: config() });
+  el('fineTuneLoadConfig').onclick = () => vscode.postMessage({ type: 'fineTuneLoadConfig' });
   form.querySelectorAll('[data-finetune-pick]').forEach(button => button.onclick = () => vscode.postMessage({ type: 'fineTunePick', field: button.dataset.finetunePick }));
   window.addEventListener('message', event => {
     const m = event.data;
     if (m.type === 'fineTunePicked' && form.elements[m.field]) form.elements[m.field].value = m.value;
+    if (m.type === 'fineTuneConfigLoaded') {
+      for (const [name, value] of Object.entries(m.config || {})) if (form.elements[name]) form.elements[name].value = value ?? '';
+      el('fineTuneStatus').textContent = 'Loaded configuration ' + m.path;
+    }
+    if (m.type === 'fineTuneConfigSaved') el('fineTuneStatus').textContent = 'Saved configuration ' + m.path;
     if (m.type !== 'fineTuneStatus') return;
     if (m.running !== undefined) {
       for (const element of form.elements) element.disabled = m.running;

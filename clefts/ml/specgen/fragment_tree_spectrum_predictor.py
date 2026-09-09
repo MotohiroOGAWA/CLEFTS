@@ -114,6 +114,7 @@ class FragmentTreeSpectrumPredictor(nn.Module):
         *,
         include_formula_annotation: bool = False,
         include_fragment_ion_annotation: bool = False,
+        structure_expander: Optional[Callable] = None,
     ) -> FragmentSpectrumGeneratorOutput:
         additional_depth = (
             min(3, max(0, int(self.candidate_selector.fragmenter.tree_max_depth) - 1))
@@ -123,6 +124,7 @@ class FragmentTreeSpectrumPredictor(nn.Module):
         candidate_output = self.candidate_selector.generate_depth_limited_candidates(
             data,
             max_depth=additional_depth,
+            structure_expander=structure_expander,
         )
         formula_intensity_output = self.formula_intensity_predictor.predict_from_candidate_output(candidate_output)
         peaks_by_sample: Dict[int, List[GeneratedSpectrumPeak]] = {}
@@ -345,9 +347,11 @@ class FragmentSpectrumGenerator(ModelBase):
         *,
         include_formula_annotation: bool = False,
         include_fragment_ion_annotation: bool = False,
+        structure_expander: Optional[Callable] = None,
     ) -> FragmentSpectrumGeneratorOutput:
         return self.spectrum_predictor(
             data,
             include_formula_annotation=include_formula_annotation,
             include_fragment_ion_annotation=include_fragment_ion_annotation,
+            structure_expander=structure_expander,
         )

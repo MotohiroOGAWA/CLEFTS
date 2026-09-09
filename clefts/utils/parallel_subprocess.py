@@ -106,6 +106,7 @@ def run_parallel_subprocesses(
     print_output: bool = False,
     env: Optional[Dict[str, str]] = None,
     desc: str = "Parallel tasks",
+    unit: str = "it",
 ) -> None:
     """Run multiple subprocesses in parallel.
 
@@ -137,5 +138,6 @@ def run_parallel_subprocesses(
             as_completed(futures),
             total=len(futures),
             desc=desc,
+            unit=unit,
         ):
             future.result()
