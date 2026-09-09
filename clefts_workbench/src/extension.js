@@ -29,6 +29,7 @@ function activate(context) {
       supportsMultipleEditorsPerDocument: true
     })
   );
+  evaluation.register(context, output, projectRoot);
   cleavagePatternSetEditor.register(context);
   enableDevelopmentReload(context, output);
 }

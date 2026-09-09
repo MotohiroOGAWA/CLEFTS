@@ -71,7 +71,10 @@ def build_parser() -> argparse.ArgumentParser:
     summary.add_argument("--graph-opacity", type=float, default=1.0)
     summary.add_argument("--x-label-size", type=float, default=11.0)
     summary.add_argument("--y-label-size", type=float, default=11.0)
+    summary.add_argument("--x-axis-title-size", type=float, default=12.0)
+    summary.add_argument("--y-axis-title-size", type=float, default=12.0)
     summary.add_argument("--title-size", type=float, default=17.0)
+    summary.add_argument("--title", default="")
     summary.add_argument("--plot-type", choices=("box", "violin"), default="box")
     summary.add_argument("--opaque", action="store_true", help="Use a white background instead of transparency.")
     summary.add_argument("--output-image", help="Optional SVG output path.")
@@ -88,6 +91,8 @@ def build_parser() -> argparse.ArgumentParser:
     grouped.add_argument("--graph-opacity", type=float)
     grouped.add_argument("--x-label-size", type=float)
     grouped.add_argument("--y-label-size", type=float)
+    grouped.add_argument("--x-axis-title-size", type=float)
+    grouped.add_argument("--y-axis-title-size", type=float)
     grouped.add_argument("--title-size", type=float)
     grouped.add_argument("--plot-type", choices=("box", "violin"))
     grouped.add_argument("--output-image", help="Optional SVG output path.")
@@ -114,6 +119,8 @@ def execute(args: argparse.Namespace) -> dict:
             graph_opacity=args.graph_opacity if args.graph_opacity is not None else float(config.get("graphOpacity", 1)),
             x_label_size=args.x_label_size if args.x_label_size is not None else float(config.get("xLabelSize", 12)),
             y_label_size=args.y_label_size if args.y_label_size is not None else float(config.get("yLabelSize", 11)),
+            x_axis_title_size=args.x_axis_title_size if args.x_axis_title_size is not None else float(config.get("xAxisTitleSize", config.get("xLabelSize", 12))),
+            y_axis_title_size=args.y_axis_title_size if args.y_axis_title_size is not None else float(config.get("yAxisTitleSize", config.get("yLabelSize", 12))),
             title_size=args.title_size if args.title_size is not None else float(config.get("titleSize", 18)),
             plot_type=args.plot_type or str(config.get("plotType", "box")),
         )
@@ -138,8 +145,10 @@ def execute(args: argparse.Namespace) -> dict:
         result, width=args.width, height=args.height, color=args.color,
         transparent=not args.opaque, graph_opacity=args.graph_opacity,
         x_label_size=args.x_label_size, y_label_size=args.y_label_size,
+        x_axis_title_size=args.x_axis_title_size,
+        y_axis_title_size=args.y_axis_title_size,
         title_size=args.title_size,
-        plot_type=args.plot_type,
+        plot_type=args.plot_type, title=args.title,
     )
     if args.output_image:
         save_svg(result["svg"], args.output_image)

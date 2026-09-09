@@ -4,6 +4,31 @@ const path = require('path');
 const { groupedArgs, groupedHtml, groupedClient } = require('./grouped-boxplot');
 const pathDrop = require('../../webview-path-drop');
 
+const VIEW_TYPE = 'clefts.evaluationConfigEditor';
+const CONFIG_SUFFIXES = { column: '.evalcol.json', grouped: '.evalgroup.json' };
+
+function evaluationConfigSuffix(kind) {
+  const suffix = CONFIG_SUFFIXES[kind];
+  if (!suffix) throw new Error(`Unknown evaluation kind: ${kind}`);
+  return suffix;
+}
+
+function ensureEvaluationConfigSuffix(filePath, kind) {
+  const suffix = evaluationConfigSuffix(kind);
+  if (filePath.toLowerCase().endsWith(suffix)) return filePath;
+  const lower = filePath.toLowerCase();
+  const existingSuffix = Object.values(CONFIG_SUFFIXES).find(value => lower.endsWith(value));
+  const stem = existingSuffix
+    ? filePath.slice(0, -existingSuffix.length)
+    : (lower.endsWith('.json') ? filePath.slice(0, -5) : filePath);
+  return stem + suffix;
+}
+
+function configFileStem(value, fallback) {
+  const stem = String(value || fallback).trim().replace(/[^\p{L}\p{N}._-]+/gu, '-').replace(/^-+|-+$/g, '');
+  return stem || fallback;
+}
+
 function runCli(context, projectRoot, args, output) {
   return new Promise((resolve, reject) => {
     const root = projectRoot(context);
@@ -45,7 +70,10 @@ function summaryArgs(request, outputImage) {
   args.push('--graph-opacity', String(request.graphOpacity ?? 1));
   args.push('--x-label-size', String(request.xLabelSize ?? 11));
   args.push('--y-label-size', String(request.yLabelSize ?? 11));
+  args.push('--x-axis-title-size', String(request.xAxisTitleSize ?? 12));
+  args.push('--y-axis-title-size', String(request.yAxisTitleSize ?? 12));
   args.push('--title-size', String(request.titleSize ?? 17));
+  args.push('--title', request.title || '');
   args.push('--plot-type', request.plotType || 'box');
   if (request.mode === 'numeric' && request.bins) args.push('--bins', request.bins);
   if (Array.isArray(request.include)) args.push('--include', JSON.stringify(request.include));
@@ -75,18 +103,39 @@ function open(context, output, projectRoot) {
   const panel = vscode.window.createWebviewPanel('clefts.evaluation', 'CLEFTS Evaluation', vscode.ViewColumn.One, {
     enableScripts: true, retainContextWhenHidden: true
   });
+  attach(panel, context, output, projectRoot);
+}
+
+function attach(panel, context, output, projectRoot, initialDocument = null) {
+  panel.webview.options = { ...panel.webview.options, enableScripts: true };
   panel.webview.html = html();
   panel.webview.onDidReceiveMessage(async message => {
     try {
-      if (message.type === 'saveEvaluationConfig') {
+      if (message.type === 'evaluationReady') {
+        if (!initialDocument) return;
+        if (initialDocument.error) {
+          panel.webview.postMessage({ type: 'error', message: initialDocument.error });
+          return;
+        }
+        await panel.webview.postMessage({ type: 'evaluationConfigOpened', kind: initialDocument.kind });
+        await panel.webview.postMessage({
+          type: `${initialDocument.kind}ConfigLoaded`, config: initialDocument.config,
+          path: initialDocument.path
+        });
+      } else if (message.type === 'saveEvaluationConfig') {
         const document = evaluationConfigDocument(message.kind, message.config);
+        const suffix = evaluationConfigSuffix(message.kind);
+        const suggestedName = message.kind === 'column'
+          ? configFileStem(message.config.title || message.config.groupColumn, 'evaluation')
+          : configFileStem(message.config.title, 'evaluation');
         const selected = await vscode.window.showSaveDialog({
-          filters: { 'CLEFTS evaluation configuration': ['json'] },
-          defaultUri: vscode.Uri.file(`${message.kind}-evaluation.json`)
+          filters: { 'CLEFTS evaluation configuration': [suffix.slice(1)] },
+          defaultUri: initialDocument && initialDocument.kind === message.kind
+            ? vscode.Uri.file(initialDocument.path)
+            : vscode.Uri.file(suggestedName + suffix)
         });
         if (selected) {
-          const target = selected.fsPath.toLowerCase().endsWith('.json')
-            ? selected : vscode.Uri.file(selected.fsPath + '.json');
+          const target = vscode.Uri.file(ensureEvaluationConfigSuffix(selected.fsPath, message.kind));
           await vscode.workspace.fs.writeFile(
             target, Buffer.from(JSON.stringify(document, null, 2) + '\n', 'utf8')
           );
@@ -94,8 +143,10 @@ function open(context, output, projectRoot) {
           vscode.window.showInformationMessage(`Saved ${path.basename(target.fsPath)}`);
         }
       } else if (message.type === 'loadEvaluationConfig') {
+        const suffix = evaluationConfigSuffix(message.kind);
         const selected = await vscode.window.showOpenDialog({
-          canSelectMany: false, filters: { 'CLEFTS evaluation configuration': ['json'] }
+          canSelectMany: false,
+          filters: { 'CLEFTS evaluation configuration': [suffix.slice(1), 'json'] }
         });
         if (selected && selected[0]) {
           const raw = await vscode.workspace.fs.readFile(selected[0]);
@@ -166,6 +217,29 @@ function open(context, output, projectRoot) {
   });
 }
 
+function register(context, output, projectRoot) {
+  const provider = {
+    async resolveCustomTextEditor(document, panel) {
+      let initialDocument;
+      try {
+        const value = JSON.parse(document.getText());
+        const kind = value && value.kind;
+        if (!['column', 'grouped'].includes(kind)) throw new Error('Evaluation configuration kind must be column or grouped.');
+        initialDocument = {
+          kind, config: parseEvaluationConfig(value, kind), path: document.uri.fsPath
+        };
+      } catch (error) {
+        initialDocument = { error: String(error.message || error), path: document.uri.fsPath };
+      }
+      attach(panel, context, output, projectRoot, initialDocument);
+    }
+  };
+  context.subscriptions.push(vscode.window.registerCustomEditorProvider(VIEW_TYPE, provider, {
+    webviewOptions: { retainContextWhenHidden: true },
+    supportsMultipleEditorsPerDocument: true
+  }));
+}
+
 function html() {
   return `<!doctype html><html><head><meta charset="UTF-8"><style>
   :root{color-scheme:light dark;--accent:#36c5a2;--border:color-mix(in srgb,var(--vscode-editor-foreground) 18%,transparent);--panel:color-mix(in srgb,var(--vscode-editor-background) 90%,var(--vscode-editor-foreground))}
@@ -175,7 +249,7 @@ function html() {
     <section class="panel"><h2>Dataset</h2><label>Similarity result (.mssim)<div class="path"><input id="input" data-path-kind="file" placeholder="results.mssim"><button id="browse">Browse</button></div></label><label>Metadata source (.msds or table)<div class="path"><input id="metadata" data-path-kind="file" placeholder="metadata.msds"><button data-browse-metadata>Browse</button></div></label><label>Join column<input id="joinColumn" value="SpecID" placeholder="SpecID"></label><p class="muted">The join column must exist in both files. SpecID is used by default when available.</p><button id="load" class="primary">Load columns</button><p id="datasetInfo" class="muted"></p></section>
     <section class="panel"><h2>Grouping</h2><label>Column<select id="groupColumn" disabled></select></label><fieldset class="transform-options"><legend>Value conversion</legend><label class="radio-option"><input type="radio" name="transform" value="none" checked>None</label><label class="radio-option"><input type="radio" name="transform" value="collision-energy">Collision Energy parser</label><label class="radio-option"><input type="radio" name="transform" value="chemical">SMILES chemical information</label></fieldset><div id="ceOptions" hidden><label>Precursor m/z column<input id="precursorMzColumn" value="PrecursorMZ"></label><label>Instrument column (optional)<input id="instrumentColumn"></label></div><div id="chemicalOptions" hidden><label>SMILES column<input id="smilesColumn" value="SMILES"></label><label>Chemical descriptor<select id="chemicalDescriptor"><option>HeavyAtomCount</option><option>ExactMolWt</option><option>TPSA</option><option>MolLogP</option><option>NumHAcceptors</option><option>NumHDonors</option><option>NumRotatableBonds</option><option>RingCount</option><option>NumAromaticRings</option><option>NumAliphaticRings</option><option>FractionCSP3</option><option>NumHeteroatoms</option><option>FormalCharge</option><option>BertzCT</option></select></label></div><label>Mode<select id="mode"><option value="auto">Auto</option><option value="categorical">Category</option><option value="numeric">Numeric ranges</option></select></label><label id="binsLabel" hidden>Range boundaries<input id="bins" value="0,10,20" placeholder="0,10,20" disabled><small class="muted">0,10,20 creates [0,10), [10,20), [20,~).</small></label><p class="muted">Changes are applied only when Generate plot is pressed.</p><button id="generate" class="primary" disabled>Generate plot</button></section>
     <section class="panel"><h2>Categories</h2><div class="actions"><button id="all">All</button><button id="none">None</button></div><div id="categories" class="category-list"><p class="muted" style="padding:8px">Generate once to list categories.</p></div></section>
-    <section class="panel"><h2>Image</h2><label>Plot type<select id="plotType"><option value="box">Box plot</option><option value="violin">Violin plot</option></select></label><div class="size-row"><label>Width<input id="width" type="number" min="240" value="900"></label><label>Height<input id="height" type="number" min="200" value="520"></label></div><label>Graph opacity<input id="graphOpacity" type="number" min="0" max="1" step="0.05" value="1"></label><div class="size-row"><label>X-axis label size<input id="xLabelSize" type="number" min="6" max="96" value="11"></label><label>Y-axis label size<input id="yLabelSize" type="number" min="6" max="96" value="11"></label></div><label>Title size<input id="titleSize" type="number" min="6" max="96" value="17"></label><label>Plot color<input id="color" type="color" value="#36c5a2"></label><label class="check"><input id="transparent" type="checkbox" checked>Transparent background</label></section>
+    <section class="panel"><h2>Image</h2><label>Title<input id="title" placeholder="Cosine similarity by grouping column"></label><label>Plot type<select id="plotType"><option value="box">Box plot</option><option value="violin">Violin plot</option></select></label><div class="size-row"><label>Width<input id="width" type="number" min="240" value="900"></label><label>Height<input id="height" type="number" min="200" value="520"></label></div><label>Graph opacity<input id="graphOpacity" type="number" min="0" max="1" step="0.05" value="1"></label><div class="size-row"><label>X-axis label size<input id="xLabelSize" type="number" min="6" max="96" value="11"></label><label>Y-axis label size<input id="yLabelSize" type="number" min="6" max="96" value="11"></label></div><div class="size-row"><label>X-axis title size<input id="xAxisTitleSize" type="number" min="6" max="96" value="12"></label><label>Y-axis title size<input id="yAxisTitleSize" type="number" min="6" max="96" value="12"></label></div><label>Chart title size<input id="titleSize" type="number" min="6" max="96" value="17"></label><label>Plot color<input id="color" type="color" value="#36c5a2"></label><label class="check"><input id="transparent" type="checkbox" checked>Transparent background</label></section>
   </aside><section class="panel"><div class="actions"><span id="status" class="status">Choose a dataset.</span></div><div id="chart" class="chart"><p class="muted">The plot will appear here.</p></div><table id="table" hidden><thead><tr><th>Category / range</th><th>n</th><th>Min</th><th>Q1</th><th>Median</th><th>Q3</th><th>Max</th></tr></thead><tbody></tbody></table></section></div>
   <script>
   const vscode=acquireVsCodeApi(),input=document.getElementById('input'),group=document.getElementById('groupColumn'),mode=document.getElementById('mode'),binsLabel=document.getElementById('binsLabel'),bins=document.getElementById('bins'),categories=document.getElementById('categories'),status=document.getElementById('status'),chart=document.getElementById('chart'),table=document.getElementById('table');
@@ -183,7 +257,7 @@ function html() {
   const esc=x=>String(x??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
   const transform=()=>document.querySelector('input[name="transform"]:checked').value;
   function setStatus(text,error=false){status.textContent=text;status.className='status'+(error?' error':'')}
-  function request(){const smilesColumn=document.getElementById('smilesColumn').value;return{input:input.value,metadata:document.getElementById('metadata').value,joinColumn:document.getElementById('joinColumn').value,groupColumn:transform()==='chemical'?smilesColumn:group.value,transform:transform(),precursorMzColumn:document.getElementById('precursorMzColumn').value,instrumentColumn:document.getElementById('instrumentColumn').value,smilesColumn,chemicalDescriptor:document.getElementById('chemicalDescriptor').value,mode:mode.value,bins:mode.value==='numeric'?bins.value:'',plotType:document.getElementById('plotType').value,width:Number(document.getElementById('width').value),height:Number(document.getElementById('height').value),graphOpacity:Number(document.getElementById('graphOpacity').value),xLabelSize:Number(document.getElementById('xLabelSize').value),yLabelSize:Number(document.getElementById('yLabelSize').value),titleSize:Number(document.getElementById('titleSize').value),color:document.getElementById('color').value,transparent:document.getElementById('transparent').checked,include:categoryState.filter(x=>x.checked).map(x=>x.name),order:categoryState.map(x=>x.name)}}
+  function request(){const smilesColumn=document.getElementById('smilesColumn').value;return{input:input.value,metadata:document.getElementById('metadata').value,joinColumn:document.getElementById('joinColumn').value,groupColumn:transform()==='chemical'?smilesColumn:group.value,transform:transform(),precursorMzColumn:document.getElementById('precursorMzColumn').value,instrumentColumn:document.getElementById('instrumentColumn').value,smilesColumn,chemicalDescriptor:document.getElementById('chemicalDescriptor').value,mode:mode.value,bins:mode.value==='numeric'?bins.value:'',title:document.getElementById('title').value,plotType:document.getElementById('plotType').value,width:Number(document.getElementById('width').value),height:Number(document.getElementById('height').value),graphOpacity:Number(document.getElementById('graphOpacity').value),xLabelSize:Number(document.getElementById('xLabelSize').value),yLabelSize:Number(document.getElementById('yLabelSize').value),xAxisTitleSize:Number(document.getElementById('xAxisTitleSize').value),yAxisTitleSize:Number(document.getElementById('yAxisTitleSize').value),titleSize:Number(document.getElementById('titleSize').value),color:document.getElementById('color').value,transparent:document.getElementById('transparent').checked,include:categoryState.filter(x=>x.checked).map(x=>x.name),order:categoryState.map(x=>x.name)}}
   function markDraft(){if(lastAppliedRequest)setStatus('Unapplied changes · press Generate plot')}
   function resetCategories(){categoryState=[];categories.innerHTML='<p class="muted" style="padding:8px">Press Generate to list categories.</p>';markDraft()}
   function updateMode(){const numeric=mode.value==='numeric';binsLabel.hidden=!numeric;bins.disabled=!numeric;markDraft()}
@@ -213,14 +287,14 @@ function html() {
     if(m.type==='columnConfigLoaded'){
       const c=m.config;input.value=c.input||'';document.getElementById('metadata').value=c.metadata||'';document.getElementById('joinColumn').value=c.joinColumn||'SpecID';
       const radio=document.querySelector('input[name="transform"][value="'+(c.transform||'none')+'"]');if(radio)radio.checked=true;
-      document.getElementById('precursorMzColumn').value=c.precursorMzColumn||'PrecursorMZ';document.getElementById('instrumentColumn').value=c.instrumentColumn||'';document.getElementById('smilesColumn').value=c.smilesColumn||'SMILES';document.getElementById('chemicalDescriptor').value=c.chemicalDescriptor||'HeavyAtomCount';mode.value=c.mode||'auto';bins.value=c.bins||'';document.getElementById('plotType').value=c.plotType||'box';document.getElementById('width').value=c.width||900;document.getElementById('height').value=c.height||520;document.getElementById('graphOpacity').value=c.graphOpacity??1;document.getElementById('xLabelSize').value=c.xLabelSize??11;document.getElementById('yLabelSize').value=c.yLabelSize??11;document.getElementById('titleSize').value=c.titleSize??17;document.getElementById('color').value=c.color||'#36c5a2';document.getElementById('transparent').checked=c.transparent!==false;pendingColumnConfig=c;updateTransform(false);
+      document.getElementById('precursorMzColumn').value=c.precursorMzColumn||'PrecursorMZ';document.getElementById('instrumentColumn').value=c.instrumentColumn||'';document.getElementById('smilesColumn').value=c.smilesColumn||'SMILES';document.getElementById('chemicalDescriptor').value=c.chemicalDescriptor||'HeavyAtomCount';mode.value=c.mode||'auto';bins.value=c.bins||'';document.getElementById('title').value=c.title||'';document.getElementById('plotType').value=c.plotType||'box';document.getElementById('width').value=c.width||900;document.getElementById('height').value=c.height||520;document.getElementById('graphOpacity').value=c.graphOpacity??1;document.getElementById('xLabelSize').value=c.xLabelSize??11;document.getElementById('yLabelSize').value=c.yLabelSize??11;document.getElementById('xAxisTitleSize').value=c.xAxisTitleSize??c.xLabelSize??12;document.getElementById('yAxisTitleSize').value=c.yAxisTitleSize??c.yLabelSize??12;document.getElementById('titleSize').value=c.titleSize??17;document.getElementById('color').value=c.color||'#36c5a2';document.getElementById('transparent').checked=c.transparent!==false;pendingColumnConfig=c;updateTransform(false);
       if(input.value){setStatus('Loaded '+m.path+' · inspecting columns…');document.getElementById('load').click()}else{pendingColumnConfig=null;setStatus('Loaded settings '+m.path+' · press Generate to apply')}return
     }
     if(m.type==='columnConfigSaved'){setStatus('Saved settings '+m.path);return}
     if(m.type==='busy'){setStatus(m.text);return}
     if(m.type==='inspected'){
       const cols=m.result.columns.filter(c=>!['index1','index2','cosine_similarity'].includes(c.name));group.innerHTML=cols.map(c=>'<option value="'+esc(c.name)+'" data-kind="'+c.kind+'">'+esc(c.name)+' ('+c.kind+')</option>').join('');group.disabled=document.getElementById('generate').disabled=!cols.length;document.getElementById('datasetInfo').textContent=m.result.rows+' pairs · '+cols.length+' grouping columns';
-      if(cols.length){const saved=pendingColumnConfig;pendingColumnConfig=null;if(saved&&cols.some(c=>c.name===saved.groupColumn)){group.value=saved.groupColumn;mode.value=saved.mode||'auto';bins.value=saved.bins||'';const names=Array.isArray(saved.order)?saved.order:[];const included=new Set(Array.isArray(saved.include)?saved.include:names);categoryState=names.map(name=>({name,checked:included.has(name)}));if(categoryState.length)renderCategories(categoryState.map(x=>({category:x.name})));updateTransform(false)}else{mode.value=transform()==='none'?(group.selectedOptions[0].dataset.kind==='numeric'?'numeric':'categorical'):'numeric';updateTransform(false);categoryState=[]}setStatus('Columns loaded · press Generate box plot')}return
+      if(cols.length){const saved=pendingColumnConfig;pendingColumnConfig=null;if(saved&&cols.some(c=>c.name===saved.groupColumn)){group.value=saved.groupColumn;mode.value=saved.mode||'auto';bins.value=saved.bins||'';const names=Array.isArray(saved.order)?saved.order:[];const included=new Set(Array.isArray(saved.include)?saved.include:names);categoryState=names.map(name=>({name,checked:included.has(name)}));if(categoryState.length)renderCategories(categoryState.map(x=>({category:x.name})));updateTransform(false)}else{mode.value=transform()==='none'?(group.selectedOptions[0].dataset.kind==='numeric'?'numeric':'categorical'):'numeric';updateTransform(false);categoryState=[]}setStatus('Columns loaded · press Generate plot')}return
     }
     if(m.type==='summary'){
       lastAppliedRequest=pendingAppliedRequest;pendingAppliedRequest=null;if(!categoryState.length)renderCategories(m.result.rows);chart.innerHTML=m.result.svg;table.hidden=false;const f=v=>v===null?'—':Number(v).toFixed(4);table.querySelector('tbody').innerHTML=m.result.rows.map(r=>'<tr><td>'+esc(r.category)+'</td><td>'+r.count+'</td><td>'+f(r.min)+'</td><td>'+f(r.q1)+'</td><td>'+f(r.median)+'</td><td>'+f(r.q3)+'</td><td>'+f(r.max)+'</td></tr>').join('');document.getElementById('saveImage').disabled=false;setStatus(m.result.rows.length+' groups · '+m.result.sourceRows+' similarity pairs');return
@@ -231,8 +305,13 @@ function html() {
   </script></section>${groupedHtml()}<script>
   document.querySelectorAll('[data-eval-tab]').forEach(button=>button.onclick=()=>{const grouped=button.dataset.evalTab==='grouped';document.getElementById('columnEvaluation').hidden=grouped;document.getElementById('groupedEvaluation').hidden=!grouped;document.querySelectorAll('[data-eval-tab]').forEach(item=>item.classList.toggle('active',item===button))});
   (${groupedClient.toString()})();
+  window.addEventListener('message',event=>{if(event.data.type==='evaluationConfigOpened'){const tab=document.querySelector('[data-eval-tab="'+event.data.kind+'"]');if(tab)tab.click()}});
   ${pathDrop.script()}
+  vscode.postMessage({type:'evaluationReady'});
   </script></main></body></html>`;
 }
 
-module.exports = { open, html, summaryArgs, groupedArgs, evaluationConfigDocument, parseEvaluationConfig };
+module.exports = {
+  open, register, html, summaryArgs, groupedArgs, evaluationConfigDocument,
+  parseEvaluationConfig, evaluationConfigSuffix, ensureEvaluationConfigSuffix
+};
