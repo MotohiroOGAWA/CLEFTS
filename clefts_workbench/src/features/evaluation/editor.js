@@ -29,7 +29,7 @@ function configFileStem(value, fallback) {
   return stem || fallback;
 }
 
-function runCli(context, projectRoot, args, output) {
+function runCli(context, projectRoot, args, output, onProgress) {
   return new Promise((resolve, reject) => {
     const root = projectRoot(context);
     const python = vscode.workspace.getConfiguration('clefts').get('pythonPath', 'python');
@@ -39,11 +39,29 @@ function runCli(context, projectRoot, args, output) {
       cwd: root,
       env: { ...process.env, PYTHONPATH: ['.', process.env.PYTHONPATH].filter(Boolean).join(path.delimiter) }
     });
-    let stdout = '', stderr = '';
+    let stdout = '', stderr = '', stderrBuffer = '';
     child.stdout.on('data', chunk => { stdout += chunk.toString(); });
-    child.stderr.on('data', chunk => { stderr += chunk.toString(); output.append(chunk.toString()); });
+    const consumeStderrLine = line => {
+      const prefix = 'CLEFTS_PROGRESS ';
+      if (line.startsWith(prefix)) {
+        try {
+          const progress = JSON.parse(line.slice(prefix.length));
+          if (onProgress) onProgress(progress);
+          return;
+        } catch (_) {}
+      }
+      stderr += line + '\n';
+      output.appendLine(line);
+    };
+    child.stderr.on('data', chunk => {
+      stderrBuffer += chunk.toString();
+      const lines = stderrBuffer.split(/\r?\n/);
+      stderrBuffer = lines.pop();
+      lines.forEach(consumeStderrLine);
+    });
     child.on('error', reject);
     child.on('close', code => {
+      if (stderrBuffer) consumeStderrLine(stderrBuffer);
       try {
         const response = JSON.parse(stdout.trim());
         if (code === 0 && response.ok) resolve(response.result);
@@ -109,6 +127,7 @@ function open(context, output, projectRoot) {
 function attach(panel, context, output, projectRoot, initialDocument = null) {
   panel.webview.options = { ...panel.webview.options, enableScripts: true };
   panel.webview.html = html();
+  const reportProgress = type => progress => panel.webview.postMessage({ type, ...progress });
   panel.webview.onDidReceiveMessage(async message => {
     try {
       if (message.type === 'evaluationReady') {
@@ -164,8 +183,8 @@ function attach(panel, context, output, projectRoot, initialDocument = null) {
           seriesId: message.seriesId, path: picked[0].fsPath
         });
       } else if (message.type === 'groupedSummarize') {
-        panel.webview.postMessage({ type: 'groupedBusy', text: 'Reading similarity results…' });
-        const result = await runCli(context, projectRoot, groupedArgs(message.request), output);
+        panel.webview.postMessage({ type: 'groupedBusy', text: 'Starting grouped evaluation…', percent: 2 });
+        const result = await runCli(context, projectRoot, groupedArgs(message.request), output, reportProgress('groupedProgress'));
         panel.webview.postMessage({ type: 'groupedSummary', result });
       } else if (message.type === 'saveGroupedImage') {
         const target = await vscode.window.showSaveDialog({
@@ -173,7 +192,8 @@ function attach(panel, context, output, projectRoot, initialDocument = null) {
           defaultUri: vscode.Uri.file('clefts-grouped-evaluation.svg')
         });
         if (target) {
-          const result = await runCli(context, projectRoot, groupedArgs(message.request, target.fsPath), output);
+          panel.webview.postMessage({ type: 'groupedBusy', text: 'Preparing SVG save…', percent: 2 });
+          const result = await runCli(context, projectRoot, groupedArgs(message.request, target.fsPath), output, reportProgress('groupedProgress'));
           panel.webview.postMessage({ type: 'groupedSaved', path: result.imagePath || target.fsPath });
           vscode.window.showInformationMessage(`Saved ${path.basename(target.fsPath)}`);
         }
@@ -187,15 +207,15 @@ function attach(panel, context, output, projectRoot, initialDocument = null) {
         });
         if (picked && picked[0]) panel.webview.postMessage({ type: metadata ? 'metadataPicked' : 'inputPicked', path: picked[0].fsPath });
       } else if (message.type === 'inspect') {
-        panel.webview.postMessage({ type: 'busy', text: 'Inspecting columns…' });
+        panel.webview.postMessage({ type: 'busy', text: 'Inspecting columns…', percent: 2 });
         const args = ['inspect', '--input', message.input];
         if (message.metadata) args.push('--metadata', message.metadata);
         if (message.joinColumn) args.push('--join-column', message.joinColumn);
-        const result = await runCli(context, projectRoot, args, output);
+        const result = await runCli(context, projectRoot, args, output, reportProgress('progress'));
         panel.webview.postMessage({ type: 'inspected', result });
       } else if (message.type === 'summarize') {
-        panel.webview.postMessage({ type: 'busy', text: 'Generating evaluation…' });
-        const result = await runCli(context, projectRoot, summaryArgs(message.request), output);
+        panel.webview.postMessage({ type: 'busy', text: 'Starting evaluation…', percent: 2 });
+        const result = await runCli(context, projectRoot, summaryArgs(message.request), output, reportProgress('progress'));
         panel.webview.postMessage({ type: 'summary', result });
       } else if (message.type === 'saveImage') {
         const target = await vscode.window.showSaveDialog({
@@ -203,7 +223,8 @@ function attach(panel, context, output, projectRoot, initialDocument = null) {
           defaultUri: vscode.Uri.file('clefts-evaluation.svg')
         });
         if (target) {
-          const result = await runCli(context, projectRoot, summaryArgs(message.request, target.fsPath), output);
+          panel.webview.postMessage({ type: 'busy', text: 'Preparing SVG save…', percent: 2 });
+          const result = await runCli(context, projectRoot, summaryArgs(message.request, target.fsPath), output, reportProgress('progress'));
           panel.webview.postMessage({ type: 'saved', path: result.imagePath || target.fsPath });
           vscode.window.showInformationMessage(`Saved ${path.basename(target.fsPath)}`);
         }
@@ -243,20 +264,21 @@ function register(context, output, projectRoot) {
 function html() {
   return `<!doctype html><html><head><meta charset="UTF-8"><style>
   :root{color-scheme:light dark;--accent:#36c5a2;--border:color-mix(in srgb,var(--vscode-editor-foreground) 18%,transparent);--panel:color-mix(in srgb,var(--vscode-editor-background) 90%,var(--vscode-editor-foreground))}
-  *{box-sizing:border-box}body{margin:0;color:var(--vscode-editor-foreground);background:var(--vscode-editor-background);font-family:var(--vscode-font-family)}main{max-width:1400px;margin:auto;padding:28px}header{display:flex;justify-content:space-between;align-items:start;margin-bottom:20px}h1{margin:3px 0;font-size:28px}h2{font-size:16px;margin:0 0 14px}.eyebrow{font-size:11px;letter-spacing:.14em;font-weight:700;color:var(--accent)}.muted{opacity:.65;margin:4px 0}.layout,.grouped-layout{display:grid;grid-template-columns:340px minmax(0,1fr);gap:16px}.panel{padding:18px;border:1px solid var(--border);border-radius:9px;background:var(--panel);margin-bottom:14px}label{font-size:12px;display:block;margin:11px 0}input,select{width:100%;display:block;margin-top:5px;padding:8px;color:var(--vscode-input-foreground);background:var(--vscode-input-background);border:1px solid var(--vscode-input-border,var(--border));border-radius:5px}.path{display:flex;gap:6px}.path input{flex:1}.path button{margin-top:5px}button{font:inherit;color:inherit;background:var(--vscode-button-secondaryBackground);border:1px solid var(--border);border-radius:6px;padding:7px 11px;cursor:pointer}.primary{background:var(--vscode-button-background);color:var(--vscode-button-foreground);font-weight:600}.actions{display:flex;gap:7px;flex-wrap:wrap}.check,.radio-option{display:flex;align-items:center;gap:7px}.check input,.radio-option input{width:auto;margin:0}.transform-options{border:1px solid var(--border);border-radius:6px;margin:12px 0;padding:8px 10px}.transform-options legend{font-size:12px;padding:0 4px}.radio-option{margin:7px 0}.category-list{max-height:285px;overflow:auto;border:1px solid var(--border);border-radius:6px}.category{display:grid;grid-template-columns:auto minmax(0,1fr) auto auto;align-items:center;gap:7px;padding:6px;border-bottom:1px solid var(--border)}.category input{width:auto;margin:0}.category button{padding:2px 7px}.chart{overflow:auto;min-height:260px;border:1px dashed var(--border);border-radius:7px;display:grid;place-items:center}.chart svg{max-width:100%;height:auto}.status{font-weight:600}.error{color:var(--vscode-errorForeground)}table{width:100%;border-collapse:collapse;margin-top:14px;font-size:12px}th,td{text-align:left;padding:7px;border-bottom:1px solid var(--border)}.size-row{display:grid;grid-template-columns:1fr 1fr;gap:9px}.eval-tabs{display:flex;gap:8px;margin-bottom:22px;border-bottom:1px solid var(--border);padding-bottom:10px}.eval-tabs button.active{background:var(--vscode-button-background);color:var(--vscode-button-foreground)}.edit-list{display:grid;gap:7px;margin-bottom:10px}.edit-row{display:grid;grid-template-columns:minmax(0,1fr) auto auto auto;gap:5px;align-items:center}.edit-row input{margin:0}.edit-row button{padding:6px 8px}.series-row{grid-template-columns:minmax(0,1fr) 40px auto auto auto}.series-row input[type=color]{height:34px;padding:3px}.result-matrix-scroll{overflow:auto}.result-matrix{min-width:700px}.result-matrix td:nth-child(3){min-width:330px}.series-dot{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:7px}${pathDrop.css()}@media(max-width:800px){.layout,.grouped-layout{grid-template-columns:1fr}}
+  *{box-sizing:border-box}body{margin:0;color:var(--vscode-editor-foreground);background:var(--vscode-editor-background);font-family:var(--vscode-font-family)}main{max-width:1400px;margin:auto;padding:28px}header{display:flex;justify-content:space-between;align-items:start;margin-bottom:20px}h1{margin:3px 0;font-size:28px}h2{font-size:16px;margin:0 0 14px}.eyebrow{font-size:11px;letter-spacing:.14em;font-weight:700;color:var(--accent)}.muted{opacity:.65;margin:4px 0}.layout,.grouped-layout{display:grid;grid-template-columns:340px minmax(0,1fr);gap:16px}.panel{padding:18px;border:1px solid var(--border);border-radius:9px;background:var(--panel);margin-bottom:14px}label{font-size:12px;display:block;margin:11px 0}input,select{width:100%;display:block;margin-top:5px;padding:8px;color:var(--vscode-input-foreground);background:var(--vscode-input-background);border:1px solid var(--vscode-input-border,var(--border));border-radius:5px}.path{display:flex;gap:6px}.path input{flex:1}.path button{margin-top:5px}button{font:inherit;color:inherit;background:var(--vscode-button-secondaryBackground);border:1px solid var(--border);border-radius:6px;padding:7px 11px;cursor:pointer}.primary{background:var(--vscode-button-background);color:var(--vscode-button-foreground);font-weight:600}.actions{display:flex;gap:7px;flex-wrap:wrap}.check,.radio-option{display:flex;align-items:center;gap:7px}.check input,.radio-option input{width:auto;margin:0}.transform-options{border:1px solid var(--border);border-radius:6px;margin:12px 0;padding:8px 10px}.transform-options legend{font-size:12px;padding:0 4px}.radio-option{margin:7px 0}.category-list{max-height:285px;overflow:auto;border:1px solid var(--border);border-radius:6px}.category{display:grid;grid-template-columns:auto minmax(0,1fr) auto auto;align-items:center;gap:7px;padding:6px;border-bottom:1px solid var(--border)}.category input{width:auto;margin:0}.category button{padding:2px 7px}.chart{overflow:auto;min-height:260px;border:1px dashed var(--border);border-radius:7px;display:grid;place-items:center}.chart svg{max-width:100%;height:auto}.status{font-weight:600}.error{color:var(--vscode-errorForeground)}.eval-progress{width:100%;height:7px;margin:10px 0 2px;accent-color:var(--accent)}table{width:100%;border-collapse:collapse;margin-top:14px;font-size:12px}th,td{text-align:left;padding:7px;border-bottom:1px solid var(--border)}.size-row{display:grid;grid-template-columns:1fr 1fr;gap:9px}.eval-tabs{display:flex;gap:8px;margin-bottom:22px;border-bottom:1px solid var(--border);padding-bottom:10px}.eval-tabs button.active{background:var(--vscode-button-background);color:var(--vscode-button-foreground)}.edit-list{display:grid;gap:7px;margin-bottom:10px}.edit-row{display:grid;grid-template-columns:minmax(0,1fr) auto auto auto;gap:5px;align-items:center}.edit-row input{margin:0}.edit-row button{padding:6px 8px}.series-row{grid-template-columns:minmax(0,1fr) 40px auto auto auto}.series-row input[type=color]{height:34px;padding:3px}.result-matrix-scroll{overflow:auto}.result-matrix{min-width:700px}.result-matrix td:nth-child(3){min-width:330px}.series-dot{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:7px}${pathDrop.css()}@media(max-width:800px){.layout,.grouped-layout{grid-template-columns:1fr}}
   </style></head><body><main><nav class="eval-tabs"><button class="active" data-eval-tab="column">Column Evaluation</button><button data-eval-tab="grouped">Grouped Box Plot</button></nav><section id="columnEvaluation"><header><div><span class="eyebrow">CLEFTS EVALUATION</span><h1>Column Evaluation</h1><p class="muted">Group a result table by categories or numeric ranges.</p></div><div class="actions"><button id="loadColumnConfig">Load Settings</button><button id="saveColumnConfig">Save Settings</button><button id="saveImage" disabled>Save SVG</button></div></header>
   <div class="layout"><aside>
     <section class="panel"><h2>Dataset</h2><label>Similarity result (.mssim)<div class="path"><input id="input" data-path-kind="file" placeholder="results.mssim"><button id="browse">Browse</button></div></label><label>Metadata source (.msds or table)<div class="path"><input id="metadata" data-path-kind="file" placeholder="metadata.msds"><button data-browse-metadata>Browse</button></div></label><label>Join column<input id="joinColumn" value="SpecID" placeholder="SpecID"></label><p class="muted">The join column must exist in both files. SpecID is used by default when available.</p><button id="load" class="primary">Load columns</button><p id="datasetInfo" class="muted"></p></section>
     <section class="panel"><h2>Grouping</h2><label>Column<select id="groupColumn" disabled></select></label><fieldset class="transform-options"><legend>Value conversion</legend><label class="radio-option"><input type="radio" name="transform" value="none" checked>None</label><label class="radio-option"><input type="radio" name="transform" value="collision-energy">Collision Energy parser</label><label class="radio-option"><input type="radio" name="transform" value="chemical">SMILES chemical information</label></fieldset><div id="ceOptions" hidden><label>Precursor m/z column<input id="precursorMzColumn" value="PrecursorMZ"></label><label>Instrument column (optional)<input id="instrumentColumn"></label></div><div id="chemicalOptions" hidden><label>SMILES column<input id="smilesColumn" value="SMILES"></label><label>Chemical descriptor<select id="chemicalDescriptor"><option>HeavyAtomCount</option><option>ExactMolWt</option><option>TPSA</option><option>MolLogP</option><option>NumHAcceptors</option><option>NumHDonors</option><option>NumRotatableBonds</option><option>RingCount</option><option>NumAromaticRings</option><option>NumAliphaticRings</option><option>FractionCSP3</option><option>NumHeteroatoms</option><option>FormalCharge</option><option>BertzCT</option></select></label></div><label>Mode<select id="mode"><option value="auto">Auto</option><option value="categorical">Category</option><option value="numeric">Numeric ranges</option></select></label><label id="binsLabel" hidden>Range boundaries<input id="bins" value="0,10,20" placeholder="0,10,20" disabled><small class="muted">0,10,20 creates [0,10), [10,20), [20,~).</small></label><p class="muted">Changes are applied only when Generate plot is pressed.</p><button id="generate" class="primary" disabled>Generate plot</button></section>
     <section class="panel"><h2>Categories</h2><div class="actions"><button id="all">All</button><button id="none">None</button></div><div id="categories" class="category-list"><p class="muted" style="padding:8px">Generate once to list categories.</p></div></section>
     <section class="panel"><h2>Image</h2><label>Title<input id="title" placeholder="Cosine similarity by grouping column"></label><label>Plot type<select id="plotType"><option value="box">Box plot</option><option value="violin">Violin plot</option></select></label><div class="size-row"><label>Width<input id="width" type="number" min="240" value="900"></label><label>Height<input id="height" type="number" min="200" value="520"></label></div><label>Graph opacity<input id="graphOpacity" type="number" min="0" max="1" step="0.05" value="1"></label><div class="size-row"><label>X-axis label size<input id="xLabelSize" type="number" min="6" max="96" value="11"></label><label>Y-axis label size<input id="yLabelSize" type="number" min="6" max="96" value="11"></label></div><div class="size-row"><label>X-axis title size<input id="xAxisTitleSize" type="number" min="6" max="96" value="12"></label><label>Y-axis title size<input id="yAxisTitleSize" type="number" min="6" max="96" value="12"></label></div><label>Chart title size<input id="titleSize" type="number" min="6" max="96" value="17"></label><label>Plot color<input id="color" type="color" value="#36c5a2"></label><label class="check"><input id="transparent" type="checkbox" checked>Transparent background</label></section>
-  </aside><section class="panel"><div class="actions"><span id="status" class="status">Choose a dataset.</span></div><div id="chart" class="chart"><p class="muted">The plot will appear here.</p></div><table id="table" hidden><thead><tr><th>Category / range</th><th>n</th><th>Min</th><th>Q1</th><th>Median</th><th>Q3</th><th>Max</th></tr></thead><tbody></tbody></table></section></div>
+  </aside><section class="panel"><div class="actions"><span id="status" class="status">Choose a dataset.</span></div><progress id="progress" class="eval-progress" max="100" hidden></progress><div id="chart" class="chart"><p class="muted">The plot will appear here.</p></div><table id="table" hidden><thead><tr><th>Category / range</th><th>n</th><th>Min</th><th>Q1</th><th>Median</th><th>Q3</th><th>Max</th></tr></thead><tbody></tbody></table></section></div>
   <script>
-  const vscode=acquireVsCodeApi(),input=document.getElementById('input'),group=document.getElementById('groupColumn'),mode=document.getElementById('mode'),binsLabel=document.getElementById('binsLabel'),bins=document.getElementById('bins'),categories=document.getElementById('categories'),status=document.getElementById('status'),chart=document.getElementById('chart'),table=document.getElementById('table');
+  const vscode=acquireVsCodeApi(),input=document.getElementById('input'),group=document.getElementById('groupColumn'),mode=document.getElementById('mode'),binsLabel=document.getElementById('binsLabel'),bins=document.getElementById('bins'),categories=document.getElementById('categories'),status=document.getElementById('status'),progressBar=document.getElementById('progress'),chart=document.getElementById('chart'),table=document.getElementById('table');
   let categoryState=[],pendingColumnConfig=null,lastAppliedRequest=null,pendingAppliedRequest=null;
   const esc=x=>String(x??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
   const transform=()=>document.querySelector('input[name="transform"]:checked').value;
-  function setStatus(text,error=false){status.textContent=text;status.className='status'+(error?' error':'')}
+  function setStatus(text,error=false){status.textContent=text;status.className='status'+(error?' error':'');progressBar.hidden=true}
+  function setProgress(text,percent){status.textContent=text;status.className='status';progressBar.hidden=false;progressBar.value=Math.max(0,Math.min(100,Number(percent)||0));document.getElementById('generate').disabled=true}
   function request(){const smilesColumn=document.getElementById('smilesColumn').value;return{input:input.value,metadata:document.getElementById('metadata').value,joinColumn:document.getElementById('joinColumn').value,groupColumn:transform()==='chemical'?smilesColumn:group.value,transform:transform(),precursorMzColumn:document.getElementById('precursorMzColumn').value,instrumentColumn:document.getElementById('instrumentColumn').value,smilesColumn,chemicalDescriptor:document.getElementById('chemicalDescriptor').value,mode:mode.value,bins:mode.value==='numeric'?bins.value:'',title:document.getElementById('title').value,plotType:document.getElementById('plotType').value,width:Number(document.getElementById('width').value),height:Number(document.getElementById('height').value),graphOpacity:Number(document.getElementById('graphOpacity').value),xLabelSize:Number(document.getElementById('xLabelSize').value),yLabelSize:Number(document.getElementById('yLabelSize').value),xAxisTitleSize:Number(document.getElementById('xAxisTitleSize').value),yAxisTitleSize:Number(document.getElementById('yAxisTitleSize').value),titleSize:Number(document.getElementById('titleSize').value),color:document.getElementById('color').value,transparent:document.getElementById('transparent').checked,include:categoryState.filter(x=>x.checked).map(x=>x.name),order:categoryState.map(x=>x.name)}}
   function markDraft(){if(lastAppliedRequest)setStatus('Unapplied changes · press Generate plot')}
   function resetCategories(){categoryState=[];categories.innerHTML='<p class="muted" style="padding:8px">Press Generate to list categories.</p>';markDraft()}
@@ -291,16 +313,16 @@ function html() {
       if(input.value){setStatus('Loaded '+m.path+' · inspecting columns…');document.getElementById('load').click()}else{pendingColumnConfig=null;setStatus('Loaded settings '+m.path+' · press Generate to apply')}return
     }
     if(m.type==='columnConfigSaved'){setStatus('Saved settings '+m.path);return}
-    if(m.type==='busy'){setStatus(m.text);return}
+    if(m.type==='busy'||m.type==='progress'){setProgress(m.message||m.text,m.percent??5);return}
     if(m.type==='inspected'){
       const cols=m.result.columns.filter(c=>!['index1','index2','cosine_similarity'].includes(c.name));group.innerHTML=cols.map(c=>'<option value="'+esc(c.name)+'" data-kind="'+c.kind+'">'+esc(c.name)+' ('+c.kind+')</option>').join('');group.disabled=document.getElementById('generate').disabled=!cols.length;document.getElementById('datasetInfo').textContent=m.result.rows+' pairs · '+cols.length+' grouping columns';
       if(cols.length){const saved=pendingColumnConfig;pendingColumnConfig=null;if(saved&&cols.some(c=>c.name===saved.groupColumn)){group.value=saved.groupColumn;mode.value=saved.mode||'auto';bins.value=saved.bins||'';const names=Array.isArray(saved.order)?saved.order:[];const included=new Set(Array.isArray(saved.include)?saved.include:names);categoryState=names.map(name=>({name,checked:included.has(name)}));if(categoryState.length)renderCategories(categoryState.map(x=>({category:x.name})));updateTransform(false)}else{mode.value=transform()==='none'?(group.selectedOptions[0].dataset.kind==='numeric'?'numeric':'categorical'):'numeric';updateTransform(false);categoryState=[]}setStatus('Columns loaded · press Generate plot')}return
     }
     if(m.type==='summary'){
-      lastAppliedRequest=pendingAppliedRequest;pendingAppliedRequest=null;if(!categoryState.length)renderCategories(m.result.rows);chart.innerHTML=m.result.svg;table.hidden=false;const f=v=>v===null?'—':Number(v).toFixed(4);table.querySelector('tbody').innerHTML=m.result.rows.map(r=>'<tr><td>'+esc(r.category)+'</td><td>'+r.count+'</td><td>'+f(r.min)+'</td><td>'+f(r.q1)+'</td><td>'+f(r.median)+'</td><td>'+f(r.q3)+'</td><td>'+f(r.max)+'</td></tr>').join('');document.getElementById('saveImage').disabled=false;setStatus(m.result.rows.length+' groups · '+m.result.sourceRows+' similarity pairs');return
+      lastAppliedRequest=pendingAppliedRequest;pendingAppliedRequest=null;if(!categoryState.length)renderCategories(m.result.rows);chart.innerHTML=m.result.svg;table.hidden=false;const f=v=>v===null?'—':Number(v).toFixed(4);table.querySelector('tbody').innerHTML=m.result.rows.map(r=>'<tr><td>'+esc(r.category)+'</td><td>'+r.count+'</td><td>'+f(r.min)+'</td><td>'+f(r.q1)+'</td><td>'+f(r.median)+'</td><td>'+f(r.q3)+'</td><td>'+f(r.max)+'</td></tr>').join('');document.getElementById('saveImage').disabled=false;document.getElementById('generate').disabled=!group.value;setStatus(m.result.rows.length+' groups · '+m.result.sourceRows+' similarity pairs');return
     }
-    if(m.type==='saved'){setStatus('Saved '+m.path);return}
-    if(m.type==='error'){pendingColumnConfig=null;pendingAppliedRequest=null;setStatus(m.message,true)}
+    if(m.type==='saved'){document.getElementById('generate').disabled=!group.value;setStatus('Saved '+m.path);return}
+    if(m.type==='error'){pendingColumnConfig=null;pendingAppliedRequest=null;document.getElementById('generate').disabled=!group.value;setStatus(m.message,true)}
   });
   </script></section>${groupedHtml()}<script>
   document.querySelectorAll('[data-eval-tab]').forEach(button=>button.onclick=()=>{const grouped=button.dataset.evalTab==='grouped';document.getElementById('columnEvaluation').hidden=grouped;document.getElementById('groupedEvaluation').hidden=!grouped;document.querySelectorAll('[data-eval-tab]').forEach(item=>item.classList.toggle('active',item===button))});

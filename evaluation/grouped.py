@@ -3,7 +3,7 @@ from __future__ import annotations
 from html import escape
 import math
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from unicodedata import east_asian_width
 
 import numpy as np
@@ -75,7 +75,10 @@ def _statistics(values: pd.Series, outlier_limit: int = 250) -> dict[str, Any]:
     }
 
 
-def compare(config: dict[str, Any]) -> dict[str, Any]:
+def compare(
+    config: dict[str, Any],
+    progress: Callable[[int, str], None] | None = None,
+) -> dict[str, Any]:
     """Compare one similarity result for every configured group/series pair."""
     if not isinstance(config, dict):
         raise ValueError("Grouped evaluation configuration must be an object.")
@@ -97,6 +100,8 @@ def compare(config: dict[str, Any]) -> dict[str, Any]:
         by_pair[pair] = entry
 
     cells = []
+    total = len(groups) * len(series)
+    completed = 0
     for group in groups:
         for item in series:
             entry = by_pair.get((group["id"], item["id"]), {})
@@ -112,11 +117,16 @@ def compare(config: dict[str, Any]) -> dict[str, Any]:
                 path = Path(cell["path"]).expanduser().resolve()
                 if path.suffix.lower() != ".mssim":
                     raise ValueError(f"Grouped box-plot input must be an .mssim file: {path}")
+                if progress:
+                    progress(10 + int(65 * completed / max(1, total)), f'Reading {group["name"]} / {item["name"]}…')
                 frame = read_table(path)
                 cell.update(_statistics(frame["cosine_similarity"]))
                 cell["sourceRows"] = int(len(frame))
                 cell["status"] = "ok" if cell["count"] else "no-data"
             cells.append(cell)
+            completed += 1
+            if progress:
+                progress(10 + int(65 * completed / max(1, total)), f"Processed {completed}/{total} result files")
     return {
         "title": str(config.get("title", "Similarity comparison")).strip() or "Similarity comparison",
         "groups": groups, "series": series, "cells": cells,

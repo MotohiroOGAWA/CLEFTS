@@ -24,7 +24,7 @@ function groupedHtml() {
     <section class="panel"><h2>Image</h2><label>Title<input id="groupedTitle" value="MS/MS similarity comparison"></label><label>Plot type<select id="groupedPlotType"><option value="box">Box plot</option><option value="violin">Violin plot</option></select></label><div class="size-row"><label>Width<input id="groupedWidth" type="number" min="400" max="8192" value="1000"></label><label>Height<input id="groupedHeight" type="number" min="300" max="8192" value="600"></label></div><label>Graph opacity<input id="groupedGraphOpacity" type="number" min="0" max="1" step="0.05" value="1"></label><div class="size-row"><label>X-axis label size<input id="groupedXLabelSize" type="number" min="6" max="96" value="12"></label><label>Y-axis label size<input id="groupedYLabelSize" type="number" min="6" max="96" value="11"></label></div><div class="size-row"><label>X-axis title size<input id="groupedXAxisTitleSize" type="number" min="6" max="96" value="12"></label><label>Y-axis title size<input id="groupedYAxisTitleSize" type="number" min="6" max="96" value="12"></label></div><label>Chart title size<input id="groupedTitleSize" type="number" min="6" max="96" value="18"></label><div class="size-row"><label>Group gap (px)<input id="groupedGroupGap" type="number" min="0" step="1" value="56"></label><label>Within-group gap (px)<input id="groupedSeriesGap" type="number" min="0" step="1" value="6"></label></div><label>Plot width (px, 0 = auto)<input id="groupedBoxWidth" type="number" min="0" step="1" value="0"><small class="muted">Auto expands plots with the image width. A fixed value keeps plots narrow and centers each group.</small></label><label>Text and axis color<input id="groupedText" type="color" value="#555555"></label><label class="check"><input id="groupedTransparent" type="checkbox" checked>Transparent background</label><label>Background color<input id="groupedBackground" type="color" value="#ffffff" disabled></label><button id="groupedGenerate" class="primary">Generate plot</button></section>
   </aside><section>
     <section class="panel"><h2>Similarity results</h2><p class="muted">Assign one .mssim file to each group/series pair. Enable “No data” when a tool produced no result for that group.</p><div class="result-matrix-scroll"><table class="result-matrix"><thead><tr><th>Group</th><th>Series</th><th>.mssim file</th><th>No data</th></tr></thead><tbody id="groupedEntries"></tbody></table></div></section>
-    <section class="panel"><div class="actions"><span id="groupedStatus" class="status">Configure groups and result files.</span></div><div id="groupedChart" class="chart"><p class="muted">The grouped plot will appear here.</p></div><div class="result-matrix-scroll"><table id="groupedTable" hidden><thead><tr><th>Group</th><th>Series</th><th>Status</th><th>n</th><th>Invalid</th><th>Min</th><th>Q1</th><th>Median</th><th>Q3</th><th>Max</th></tr></thead><tbody></tbody></table></div></section>
+    <section class="panel"><div class="actions"><span id="groupedStatus" class="status">Configure groups and result files.</span></div><progress id="groupedProgress" class="eval-progress" max="100" hidden></progress><div id="groupedChart" class="chart"><p class="muted">The grouped plot will appear here.</p></div><div class="result-matrix-scroll"><table id="groupedTable" hidden><thead><tr><th>Group</th><th>Series</th><th>Status</th><th>n</th><th>Invalid</th><th>Min</th><th>Q1</th><th>Median</th><th>Q3</th><th>Max</th></tr></thead><tbody></tbody></table></div></section>
   </section></div></section>`;
 }
 
@@ -35,6 +35,7 @@ function groupedClient() {
   let nextGroup = 2, nextSeries = 2;
   let groups = [{ id: 'g1', name: '' }];
   let series = [{ id: 's1', name: 'CLEFTS', color: '#36c5a2' }];
+  let hasResult = false;
   const entries = new Map();
   const key = (groupId, seriesId) => groupId + '::' + seriesId;
   const entry = (groupId, seriesId) => {
@@ -76,7 +77,8 @@ function groupedClient() {
       textColor: get('groupedText').value,
     };
   }
-  function status(text, error = false) { get('groupedStatus').textContent = text; get('groupedStatus').className = 'status' + (error ? ' error' : ''); }
+  function status(text, error = false) { get('groupedStatus').textContent = text; get('groupedStatus').className = 'status' + (error ? ' error' : ''); get('groupedProgress').hidden = true; }
+  function showProgress(text, percent) { status(text); get('groupedProgress').hidden = false; get('groupedProgress').value = Math.max(0, Math.min(100, Number(percent) || 0)); get('groupedGenerate').disabled = true; get('groupedSave').disabled = true; }
   get('groupedAddGroup').onclick = () => { const number = nextGroup++; groups.push({ id: 'g' + number, name: 'Group ' + number }); renderDefinitions(); };
   get('groupedAddSeries').onclick = () => { const number = nextSeries++; series.push({ id: 's' + number, name: 'Series ' + number, color: '#e67722' }); renderDefinitions(); };
   get('groupedGroups').oninput = event => { const row = event.target.closest('[data-group]'); if (row) { groups.find(item => item.id === row.dataset.group).name = event.target.value; renderEntries(); } };
@@ -137,11 +139,11 @@ function groupedClient() {
       get('groupedBackground').value = config.backgroundColor || '#ffffff';
       get('groupedText').value = config.textColor || '#555555';
       get('groupedBackground').disabled = get('groupedTransparent').checked;
-      get('groupedSave').disabled = true; renderDefinitions(); status('Loaded settings ' + message.path);
+      hasResult = false; get('groupedSave').disabled = true; renderDefinitions(); status('Loaded settings ' + message.path);
     } else if (message.type === 'groupedConfigSaved') status('Saved settings ' + message.path);
-    else if (message.type === 'groupedBusy') status(message.text);
+    else if (message.type === 'groupedBusy' || message.type === 'groupedProgress') showProgress(message.message || message.text, message.percent ?? 5);
     else if (message.type === 'groupedSummary') {
-      get('groupedChart').innerHTML = message.result.svg; get('groupedSave').disabled = false;
+      hasResult = true; get('groupedChart').innerHTML = message.result.svg; get('groupedGenerate').disabled = false; get('groupedSave').disabled = false;
       const groupNames = new Map(message.result.groups.map(item => [item.id, item.name]));
       const seriesNames = new Map(message.result.series.map(item => [item.id, item.name]));
       const f = value => value === null ? '—' : Number(value).toFixed(4);
@@ -149,8 +151,8 @@ function groupedClient() {
       get('groupedTable').querySelector('tbody').innerHTML = message.result.cells.map(cell => `<tr><td>${esc(groupNames.get(cell.groupId))}</td><td>${esc(seriesNames.get(cell.seriesId))}</td><td>${cell.status === 'ok' ? 'Available' : 'No data'}</td><td>${cell.count}</td><td>${cell.invalidCount}</td><td>${f(cell.min)}</td><td>${f(cell.q1)}</td><td>${f(cell.median)}</td><td>${f(cell.q3)}</td><td>${f(cell.max)}</td></tr>`).join('');
       const available = message.result.cells.filter(cell => cell.status === 'ok').length;
       status(`${available} available · ${message.result.cells.length - available} no-data combinations`);
-    } else if (message.type === 'groupedSaved') status('Saved ' + message.path);
-    else if (message.type === 'groupedError') status(message.message, true);
+    } else if (message.type === 'groupedSaved') { get('groupedGenerate').disabled = false; get('groupedSave').disabled = false; status('Saved ' + message.path); }
+    else if (message.type === 'groupedError') { get('groupedGenerate').disabled = false; get('groupedSave').disabled = !hasResult; status(message.message, true); }
   });
   renderDefinitions();
 }

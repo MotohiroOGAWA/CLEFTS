@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 
 from evaluation.chart import box_plot_svg
-from evaluation.cli import build_parser, execute
+from evaluation.cli import PROGRESS_PREFIX, build_parser, execute, main
 from evaluation.core import EvaluationRequest, inspect_dataset, summarize
 from evaluation.grouped import compare, grouped_box_plot_svg
 
@@ -83,6 +83,19 @@ def test_numeric_ranges_are_grouped_and_ordered(tmp_path):
     assert [row["count"] for row in result["rows"]] == [2, 2, 2]
 
 
+def test_cli_emits_machine_readable_progress(tmp_path, capsys):
+    similarity, _ = _fixtures(tmp_path)
+    main(["inspect", "--input", str(similarity)])
+    captured = capsys.readouterr()
+    updates = [
+        json.loads(line.removeprefix(PROGRESS_PREFIX))
+        for line in captured.err.splitlines() if line.startswith(PROGRESS_PREFIX)
+    ]
+    assert updates[0]["percent"] == 10
+    assert updates[-1] == {"percent": 100, "message": "Columns loaded"}
+    assert json.loads(captured.out)["ok"] is True
+
+
 def test_collision_energy_parser_converts_metadata_before_grouping(tmp_path):
     similarity, source = _fixtures(tmp_path)
     metadata = pd.read_csv(source)
@@ -126,9 +139,12 @@ def test_cli_writes_transparent_colored_boxplot(tmp_path):
         "--title", "Custom evaluation",
         "--output-image", str(image),
     ])
-    result = execute(args)
+    progress = []
+    result = execute(args, progress=lambda percent, message: progress.append((percent, message)))
     svg = image.read_text(encoding="utf-8")
     assert result["rows"][0]["category"] == "[M+Na]+"
+    assert progress[-1] == (100, "Evaluation complete")
+    assert any(message == "Rendering evaluation SVG…" for _, message in progress)
     assert 'width="500" height="300"' in svg
     assert 'fill="#ff00aa"' in svg
     assert '<rect width="500" height="300" fill="#ffffff"/>' not in svg
@@ -270,8 +286,11 @@ def test_grouped_cli_writes_opaque_svg(tmp_path):
         "--height", "400", "--opaque", "--background-color", "#abcdef",
         "--output-image", str(image),
     ])
-    result = execute(args)
+    progress = []
+    result = execute(args, progress=lambda percent, message: progress.append((percent, message)))
     assert result["cells"][0]["count"] == 6
+    assert progress[-1] == (100, "Grouped evaluation complete")
+    assert any(message == "Rendering grouped SVG…" for _, message in progress)
     cli_svg = image.read_text()
     assert '<rect width="640" height="400" fill="#abcdef"/>' in cli_svg
     assert '<g class="graph" opacity="0.45">' in cli_svg

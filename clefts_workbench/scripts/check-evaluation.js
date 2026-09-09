@@ -51,6 +51,8 @@ assert.match(page, /id="groupedXAxisTitleSize"/);
 assert.match(page, /id="groupedYAxisTitleSize"/);
 assert.match(page, /id="groupedTitleSize"/);
 assert.match(page, /let groups = \[\{ id: 'g1', name: '' \}\]/);
+assert.match(page, /id="progress" class="eval-progress"/);
+assert.match(page, /id="groupedProgress" class="eval-progress"/);
 assert.match(page, /id="input" data-path-kind="file"/);
 assert.match(page, /data-result-path data-path-kind="file"/);
 for (const match of page.matchAll(/<script>([\s\S]*?)<\/script>/g)) new Function(match[1]);
@@ -88,6 +90,10 @@ const manifest = require('../package.json');
 const evaluationEditor = manifest.contributes.customEditors.find(item => item.viewType === 'clefts.evaluationConfigEditor');
 assert.deepEqual(evaluationEditor.selector.map(item => item.filenamePattern), ['*.evalcol.json', '*.evalgroup.json']);
 assert.match(fs.readFileSync(require.resolve('../src/extension'), 'utf8'), /evaluation\.register\(context, output, projectRoot\)/);
+const editorSource = fs.readFileSync(require.resolve('../src/features/evaluation/editor'), 'utf8');
+assert.match(editorSource, /CLEFTS_PROGRESS/);
+assert.match(editorSource, /reportProgress\('progress'\)/);
+assert.match(editorSource, /reportProgress\('groupedProgress'\)/);
 
 const args = summaryArgs({
   input: '/tmp/results.mssim', groupColumn: 'AdductType', mode: 'categorical',
