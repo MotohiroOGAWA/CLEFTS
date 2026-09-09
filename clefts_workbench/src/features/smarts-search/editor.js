@@ -65,7 +65,7 @@ function attach(panel, context, projectRoot) {
 function html() {
   return `<div id="smartsApp" hidden><section><h2>SMARTS Search</h2>
   <p>Count SMILES containing a SMARTS substructure. Each record is counted once, even if it contains multiple matches.</p>
-  <form id="smartsForm"><label>MSDataset (.msds)<input id="smartsFile" required></label><button type="button" id="smartsBrowse">Browse…</button>
+  <form id="smartsForm"><label>MSDataset (.msds)<input id="smartsFile" data-path-kind="file" required></label><button type="button" id="smartsBrowse">Browse…</button>
   <label>SMILES column<input id="smartsColumn" value="SMILES" required></label>
   <div id="smartsQueries"></div><button type="button" id="smartsAddQuery">Add reactant SMARTS</button>
   <p class="muted">Percentages use valid SMILES as the denominator. Unique molecules are deduplicated using canonical isomeric SMILES. Stereochemistry is not required for substructure matching.</p>

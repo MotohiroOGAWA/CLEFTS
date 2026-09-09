@@ -99,7 +99,7 @@ function html() {
   <p>MolEncoder and all existing parameters stay frozen. Train only added low-rank nodes and new cleavage-category embeddings.</p>
   <p>Choose a complete set containing the old patterns plus new patterns. First regenerate both data splits with this set in Data Preparation. Keep other Fragmenter settings unchanged.</p>
   <form id="fineTuneForm"><div class="grid">${fields.map(([key, label, kind, value = '']) =>
-    `<label>${label}<input name="${key}" type="${kind === 'number' ? 'number' : 'text'}" value="${value}" ${kind === 'number' ? 'step="any"' : ''} ${key === 'ckptId' ? '' : 'required'}>${['file','folder'].includes(kind) ? `<button type="button" data-finetune-pick="${key}">Browse…</button>` : ''}</label>`).join('')}</div>
+    `<label>${label}<input name="${key}" type="${kind === 'number' ? 'number' : 'text'}" value="${value}" ${['file','folder'].includes(kind) ? `data-path-kind="${kind}"` : ''} ${kind === 'number' ? 'step="any"' : ''} ${key === 'ckptId' ? '' : 'required'}>${['file','folder'].includes(kind) ? `<button type="button" data-finetune-pick="${key}">Browse…</button>` : ''}</label>`).join('')}</div>
   <div class="actions"><button type="button" id="fineTuneCopy">Copy Command</button><button type="button" id="fineTuneValidate">Validate only</button><button type="button" id="fineTuneStop" disabled>Stop</button><button type="submit" class="primary">Run Fine-tuning CLI</button></div></form>
   <p id="fineTuneStatus" role="status">Ready</p><pre id="fineTuneCommand" style="white-space:pre-wrap;overflow-wrap:anywhere"></pre>
   <pre id="fineTuneLog" style="max-height:400px;overflow:auto;white-space:pre-wrap"></pre></section></div>`;

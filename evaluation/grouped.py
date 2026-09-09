@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from html import escape
+import math
 from pathlib import Path
 from typing import Any
+from unicodedata import east_asian_width
 
 import numpy as np
 import pandas as pd
@@ -123,12 +125,18 @@ def grouped_box_plot_svg(
     transparent: bool = True, background_color: str = "#ffffff",
     text_color: str = "#555555", group_gap: float = 56.0,
     series_gap: float = 6.0, box_width: float = 0.0,
+    graph_opacity: float = 1.0, x_label_size: float = 12.0,
+    y_label_size: float = 11.0, title_size: float = 18.0,
 ) -> str:
     if width < 400 or height < 300 or width > 8192 or height > 8192:
         raise ValueError("Image size must be between 400 x 300 and 8192 x 8192 pixels.")
     groups, series, cells = result["groups"], result["series"], result["cells"]
     if group_gap < 0 or series_gap < 0 or box_width < 0:
         raise ValueError("Group gap, series gap, and box width must not be negative.")
+    if not math.isfinite(graph_opacity) or not 0 <= graph_opacity <= 1:
+        raise ValueError("Graph opacity must be between 0 and 1.")
+    if any(not math.isfinite(value) or value < 6 or value > 96 for value in (x_label_size, y_label_size, title_size)):
+        raise ValueError("Label and title sizes must be between 6 and 96 pixels.")
     cell_by_pair = {(cell["groupId"], cell["seriesId"]): cell for cell in cells}
     margin_left, margin_right, margin_top, margin_bottom = 70, 28, 85, 82
     plot_width, plot_height = width - margin_left - margin_right, height - margin_top - margin_bottom
@@ -150,11 +158,11 @@ def grouped_box_plot_svg(
     marks = []
     for tick in (0, .25, .5, .75, 1):
         tick_y = y(tick)
-        marks.append(f'<path class="grid" d="M{margin_left} {tick_y:.2f}H{margin_left + plot_width}"/><text x="{margin_left - 9}" y="{tick_y + 4:.2f}" text-anchor="end" class="label">{tick:g}</text>')
+        marks.append(f'<path class="grid" d="M{margin_left} {tick_y:.2f}H{margin_left + plot_width}"/><text x="{margin_left - 9}" y="{tick_y + 4:.2f}" text-anchor="end" class="y-label">{tick:g}</text>')
     for group_index, group in enumerate(groups):
         group_start = margin_left + group_index * (group_width + resolved_group_gap)
         center = group_start + group_width / 2
-        marks.append(f'<text x="{center:.2f}" y="{margin_top + plot_height + 25}" text-anchor="middle" class="group-label">{escape(group["name"])}</text>')
+        marks.append(f'<text x="{center:.2f}" y="{margin_top + plot_height + 25}" text-anchor="middle" class="x-label">{escape(group["name"])}</text>')
         if group_index:
             boundary = group_start - resolved_group_gap / 2
             marks.append(f'<path class="separator" d="M{boundary:.2f} {margin_top}V{margin_top + plot_height}"/>')
@@ -177,17 +185,23 @@ def grouped_box_plot_svg(
                 f'<path class="median" stroke="{color}" d="M{left:.2f} {median:.2f}H{right:.2f}"/>',
                 *[f'<circle cx="{x:.2f}" cy="{y(value):.2f}" r="2.2" fill="{color}"/>' for value in cell["outliers"]],
             ])
-    legend_width = plot_width / max(1, len(series))
-    legend = "".join(
-        f'<rect x="{margin_left + index * legend_width:.2f}" y="48" width="14" height="10" fill="{escape(item["color"])}"/><text x="{margin_left + index * legend_width + 20:.2f}" y="58" class="legend">{escape(item["name"])}</text>'
-        for index, item in enumerate(series)
-    )
+    legend_parts, legend_x = [], float(margin_left)
+    for item in series:
+        name = item["name"]
+        legend_parts.append(
+            f'<rect x="{legend_x:.2f}" y="48" width="14" height="10" fill="{escape(item["color"])}"/>'
+            f'<text x="{legend_x + 20:.2f}" y="58" class="legend">{escape(name)}</text>'
+        )
+        # Keep legend entries close together while allowing wider CJK glyphs.
+        label_width = sum(11.0 if east_asian_width(character) in {"W", "F"} else 6.5 for character in name)
+        legend_x += 20.0 + label_width + 18.0
+    legend = "".join(legend_parts)
     background = "" if transparent else f'<rect width="{width}" height="{height}" fill="{escape(background_color)}"/>'
     return (
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">'
-        f'<style>text{{font-family:system-ui,-apple-system,sans-serif;fill:{escape(text_color)}}}.title{{font-size:18px;font-weight:600}}.label,.legend{{font-size:11px}}.group-label{{font-size:12px;font-weight:600}}.axis{{stroke:{escape(text_color)}}}.grid{{stroke:{escape(text_color)};stroke-opacity:.2}}.separator{{stroke:{escape(text_color)};stroke-opacity:.12}}.whisker{{stroke:{escape(text_color)};stroke-width:1.4}}.median{{stroke-width:3}}.no-data{{stroke:{escape(text_color)};stroke-width:1.5;stroke-opacity:.65}}.no-data-label{{font-size:9px;fill:{escape(text_color)};fill-opacity:.75}}</style>'
-        f'{background}<text x="{margin_left}" y="27" class="title">{escape(result["title"])}</text>{legend}'
+        f'<style>text{{font-family:system-ui,-apple-system,sans-serif;fill:{escape(text_color)}}}.title{{font-size:{title_size:g}px;font-weight:600}}.legend{{font-size:11px}}.x-label{{font-size:{x_label_size:g}px;font-weight:600}}.y-label,.y-axis-title{{font-size:{y_label_size:g}px}}.axis{{stroke:{escape(text_color)}}}.grid{{stroke:{escape(text_color)};stroke-opacity:.2}}.separator{{stroke:{escape(text_color)};stroke-opacity:.12}}.whisker{{stroke:{escape(text_color)};stroke-width:1.4}}.median{{stroke-width:3}}.no-data{{stroke:{escape(text_color)};stroke-width:1.5;stroke-opacity:.65}}.no-data-label{{font-size:9px;fill:{escape(text_color)};fill-opacity:.75}}</style>'
+        f'{background}<g class="graph" opacity="{graph_opacity:g}"><text x="{width / 2:.2f}" y="27" text-anchor="middle" class="title">{escape(result["title"])}</text>{legend}'
         f'<path class="axis" fill="none" d="M{margin_left} {margin_top}V{margin_top + plot_height}H{margin_left + plot_width}"/>'
-        f'<text transform="translate(18,{margin_top + plot_height / 2}) rotate(-90)" text-anchor="middle" class="group-label">Cosine similarity</text>'
-        f'{"".join(marks)}</svg>'
+        f'<text transform="translate(18,{margin_top + plot_height / 2}) rotate(-90)" text-anchor="middle" class="y-axis-title">Cosine similarity</text>'
+        f'{"".join(marks)}</g></svg>'
     )

@@ -115,6 +115,8 @@ def test_cli_writes_transparent_colored_boxplot(tmp_path):
         "summarize", "--input", str(similarity), "--metadata", str(source),
         "--group-column", "AdductType", "--include", json.dumps(["[M+Na]+"]),
         "--width", "500", "--height", "300", "--color", "#ff00aa",
+        "--graph-opacity", "0.4", "--x-label-size", "15",
+        "--y-label-size", "16", "--title-size", "24",
         "--output-image", str(image),
     ])
     result = execute(args)
@@ -123,7 +125,20 @@ def test_cli_writes_transparent_colored_boxplot(tmp_path):
     assert 'width="500" height="300"' in svg
     assert 'fill="#ff00aa"' in svg
     assert '<rect width="500" height="300" fill="#ffffff"/>' not in svg
+    assert '<g class="graph" opacity="0.4">' in svg
+    assert '.x-label{font-size:15px}' in svg
+    assert '.y-label,.y-axis-title{font-size:16px}' in svg
+    assert '.title{font-size:24px' in svg
+    assert '<text x="250.00" y="25" text-anchor="middle" class="title">' in svg
     assert box_plot_svg(result, transparent=False).count('fill="#ffffff"') == 1
+    styled = box_plot_svg(
+        result, graph_opacity=0.4, x_label_size=15,
+        y_label_size=16, title_size=24,
+    )
+    assert '<g class="graph" opacity="0.4">' in styled
+    assert '.x-label{font-size:15px}' in styled
+    assert '.y-label,.y-axis-title{font-size:16px}' in styled
+    assert '.title{font-size:24px' in styled
 
 
 def test_explicit_join_column_supports_msds_metadata(tmp_path):
@@ -187,19 +202,30 @@ def test_grouped_boxplot_compares_series_and_preserves_order(tmp_path):
     assert "No data" in svg
     assert 'class="separator"' in svg
     assert '<rect width="900" height="500"' not in svg
+    assert '<rect x="70.00" y="48" width="14" height="10" fill="#ff00aa"/>' in svg
+    assert '<text x="90.00" y="58" class="legend">FIORA</text>' in svg
+    assert '<rect x="140.50" y="48" width="14" height="10" fill="#00aacc"/>' in svg
     wider = grouped_box_plot_svg(result, width=1400, height=500)
     box_pattern = r'<rect x="[^"]+" y="[^"]+" width="([^"]+)"[^>]+fill-opacity'
     assert float(re.search(box_pattern, wider).group(1)) > float(re.search(box_pattern, svg).group(1))
     fixed = grouped_box_plot_svg(
-        result, width=1400, height=500, group_gap=90, series_gap=4, box_width=28
+        result, width=1400, height=500, group_gap=90, series_gap=4, box_width=28,
+        graph_opacity=0.35, x_label_size=17, y_label_size=16, title_size=25,
     )
     assert re.search(box_pattern, fixed).group(1) == "28.00"
+    assert '<g class="graph" opacity="0.35">' in fixed
+    assert '.x-label{font-size:17px' in fixed
+    assert '.y-label,.y-axis-title{font-size:16px}' in fixed
+    assert '.title{font-size:25px' in fixed
+    assert '<text x="700.00" y="27" text-anchor="middle" class="title">' in fixed
 
 
 def test_grouped_cli_writes_opaque_svg(tmp_path):
     similarity, _ = _fixtures(tmp_path)
     image = tmp_path / "comparison.svg"
     config = {
+        "graphOpacity": 0.45, "xLabelSize": 14,
+        "yLabelSize": 15, "titleSize": 23,
         "groups": [{"id": "mona", "name": "MoNA"}],
         "series": [{"id": "tool", "name": "Tool", "color": "#123456"}],
         "entries": [{"groupId": "mona", "seriesId": "tool", "path": str(similarity)}],
@@ -211,7 +237,12 @@ def test_grouped_cli_writes_opaque_svg(tmp_path):
     ])
     result = execute(args)
     assert result["cells"][0]["count"] == 6
-    assert '<rect width="640" height="400" fill="#abcdef"/>' in image.read_text()
+    cli_svg = image.read_text()
+    assert '<rect width="640" height="400" fill="#abcdef"/>' in cli_svg
+    assert '<g class="graph" opacity="0.45">' in cli_svg
+    assert '.x-label{font-size:14px' in cli_svg
+    assert '.y-label,.y-axis-title{font-size:15px}' in cli_svg
+    assert '.title{font-size:23px' in cli_svg
     saved_settings = tmp_path / "grouped-settings.json"
     saved_settings.write_text(json.dumps({
         "schema": "clefts.evaluation.config", "schemaVersion": 1,

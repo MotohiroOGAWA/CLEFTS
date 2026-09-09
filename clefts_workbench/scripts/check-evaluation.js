@@ -32,6 +32,16 @@ assert.match(page, /Collision Energy parser/);
 assert.match(page, /SMILES chemical information/);
 assert.match(page, /HeavyAtomCount/);
 assert.match(page, /Changes are applied only when Generate box plot is pressed/);
+assert.match(page, /id="graphOpacity"/);
+assert.match(page, /id="xLabelSize"/);
+assert.match(page, /id="yLabelSize"/);
+assert.match(page, /id="titleSize"/);
+assert.match(page, /id="groupedGraphOpacity"/);
+assert.match(page, /id="groupedXLabelSize"/);
+assert.match(page, /id="groupedYLabelSize"/);
+assert.match(page, /id="groupedTitleSize"/);
+assert.match(page, /id="input" data-path-kind="file"/);
+assert.match(page, /data-result-path data-path-kind="file"/);
 for (const match of page.matchAll(/<script>([\s\S]*?)<\/script>/g)) new Function(match[1]);
 
 const compare = groupedArgs({
@@ -44,6 +54,7 @@ assert.equal(compare[0], 'compare');
 assert.ok(compare.includes('--request-json'));
 assert.ok(compare.includes('--opaque'));
 assert.ok(compare.includes('/tmp/result.svg'));
+for (const option of ['--graph-opacity', '--x-label-size', '--y-label-size', '--title-size']) assert.ok(compare.includes(option));
 const configDocument = evaluationConfigDocument('column', { input: '/tmp/results.mssim' });
 assert.equal(configDocument.schema, 'clefts.evaluation.config');
 assert.deepEqual(parseEvaluationConfig(JSON.parse(JSON.stringify(configDocument)), 'column'), configDocument.config);
@@ -64,6 +75,7 @@ assert.ok(!args.includes('--opaque'));
 assert.deepEqual(args.slice(args.indexOf('--metadata'), args.indexOf('--metadata') + 2), ['--metadata', '/tmp/source.msds']);
 assert.deepEqual(args.slice(args.indexOf('--join-column'), args.indexOf('--join-column') + 2), ['--join-column', 'SpecID']);
 assert.ok(!args.includes('--bins'));
+for (const option of ['--graph-opacity', '--x-label-size', '--y-label-size', '--title-size']) assert.ok(args.includes(option));
 assert.deepEqual(args.slice(args.indexOf('--transform'), args.indexOf('--transform') + 2), ['--transform', 'none']);
 const transformed = summaryArgs({
   input: '/tmp/results.mssim', groupColumn: 'CollisionEnergy', mode: 'numeric',

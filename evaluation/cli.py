@@ -68,6 +68,10 @@ def build_parser() -> argparse.ArgumentParser:
     summary.add_argument("--width", type=int, default=900)
     summary.add_argument("--height", type=int, default=520)
     summary.add_argument("--color", default="#36c5a2")
+    summary.add_argument("--graph-opacity", type=float, default=1.0)
+    summary.add_argument("--x-label-size", type=float, default=11.0)
+    summary.add_argument("--y-label-size", type=float, default=11.0)
+    summary.add_argument("--title-size", type=float, default=17.0)
     summary.add_argument("--opaque", action="store_true", help="Use a white background instead of transparency.")
     summary.add_argument("--output-image", help="Optional SVG output path.")
     summary.add_argument("--output-json", help="Optional JSON result path.")
@@ -80,6 +84,10 @@ def build_parser() -> argparse.ArgumentParser:
     grouped.add_argument("--opaque", action="store_true", help="Use a solid background instead of transparency.")
     grouped.add_argument("--background-color")
     grouped.add_argument("--text-color")
+    grouped.add_argument("--graph-opacity", type=float)
+    grouped.add_argument("--x-label-size", type=float)
+    grouped.add_argument("--y-label-size", type=float)
+    grouped.add_argument("--title-size", type=float)
     grouped.add_argument("--output-image", help="Optional SVG output path.")
     grouped.add_argument("--output-json", help="Optional JSON result path.")
     return parser
@@ -101,6 +109,10 @@ def execute(args: argparse.Namespace) -> dict:
             group_gap=float(config.get("groupGap", 56)),
             series_gap=float(config.get("seriesGap", 6)),
             box_width=float(config.get("boxWidth", 0)),
+            graph_opacity=args.graph_opacity if args.graph_opacity is not None else float(config.get("graphOpacity", 1)),
+            x_label_size=args.x_label_size if args.x_label_size is not None else float(config.get("xLabelSize", 12)),
+            y_label_size=args.y_label_size if args.y_label_size is not None else float(config.get("yLabelSize", 11)),
+            title_size=args.title_size if args.title_size is not None else float(config.get("titleSize", 18)),
         )
         if args.output_image:
             save_svg(result["svg"], args.output_image)
@@ -119,7 +131,12 @@ def execute(args: argparse.Namespace) -> dict:
         chemical_descriptor=args.chemical_descriptor,
     )
     result = summarize(request)
-    result["svg"] = box_plot_svg(result, width=args.width, height=args.height, color=args.color, transparent=not args.opaque)
+    result["svg"] = box_plot_svg(
+        result, width=args.width, height=args.height, color=args.color,
+        transparent=not args.opaque, graph_opacity=args.graph_opacity,
+        x_label_size=args.x_label_size, y_label_size=args.y_label_size,
+        title_size=args.title_size,
+    )
     if args.output_image:
         save_svg(result["svg"], args.output_image)
         result["imagePath"] = args.output_image

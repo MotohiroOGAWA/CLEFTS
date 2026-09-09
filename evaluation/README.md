@@ -23,6 +23,10 @@ Each group is represented as a Tukey box plot of the `.mssim`
 `cosine_similarity` values. SVG output is transparent by default. Use
 `--opaque` for a white background and `--width`, `--height`, and `--color` to
 customize its appearance.
+Both column and grouped SVGs also support graph opacity independently of the
+background, plus separate x-axis label, y-axis label, and title font sizes.
+The CLI options are `--graph-opacity`, `--x-label-size`, `--y-label-size`, and
+`--title-size`; the same values are editable and persisted by the Workbench.
 
 Column values can be left unchanged, parsed as collision energy using CLEFTS'
 existing CE-to-eV parser, or derived from SMILES using the supported molecular

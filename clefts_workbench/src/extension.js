@@ -3,6 +3,7 @@ const fineTune = require('./features/fragment-tree-finetune/editor');
 const smartsSearch = require('./features/smarts-search/editor');
 const evaluation = require('./features/evaluation/editor');
 const spectrumPrediction = require('./features/spectrum-prediction/editor');
+const pathDrop = require('./webview-path-drop');
 const { createFragmenterEditor } = require('./components/fragmenter-editor');
 const vscode = require('vscode');
 const fs = require('fs');
@@ -734,7 +735,7 @@ const HELP = {
 };
 
 function workbenchHtml(config, fragmenterText, trainingConfig) {
-  return `<!doctype html><html><head><meta charset="UTF-8"><style>${commonCss()}${formCss()}${trainingCss()}.selection-lasso{stroke:#fff}</style></head><body><main>
+  return `<!doctype html><html><head><meta charset="UTF-8"><style>${commonCss()}${formCss()}${trainingCss()}${pathDrop.css()}.selection-lasso{stroke:#fff}</style></head><body><main>
   <header><div><span class="eyebrow">CLEFTS PLATFORM</span><h1>Workbench</h1><p id="appSubtitle" class="muted">Fragment Tree Data Preparation</p></div><div class="actions"><button id="openEvaluation" class="primary">Evaluation</button><div id="dataActions" class="actions"><button id="openResult">Open Result</button><button id="load">Load Configuration</button><button id="save">Save Configuration</button></div></div></header>
   <nav><button class="tab" data-app="smarts">SMARTS Search</button><button class="tab" data-app="cleavage">Cleavage Pattern Set</button><button class="tab active" data-app="data">Data Preparation</button><button class="tab" data-app="training">Training</button><button class="tab" data-app="metrics">Metrics</button><button class="tab" data-app="finetune">Fine-tuning</button><button class="tab" data-app="predict">Predict Spectrum</button></nav>
   ${trainingMetrics.html()}
@@ -765,9 +766,9 @@ function workbenchHtml(config, fragmenterText, trainingConfig) {
     <section><h2>Molecule and conditions</h2><label>SMILES *<input name="smiles" placeholder="CC(=O)Oc1ccccc1C(=O)O"></label><div class="grid">${field('ce','Collision energy (eV) *','text')}<label>Adduct type *<select name="adductType"><option value="">Apply a model first…</option></select></label></div><div class="actions"><button type="button" id="predictPreview">Preview Molecule</button></div><div id="predictMoleculePreview" class="molecule-preview" hidden></div></section>
     <section id="predictResultSection" hidden><h2>Predicted Spectrum</h2><div id="predictResult"></div></section>
     <footer><div><div id="predictStatus" class="status idle">Ready</div></div><div class="actions"><button type="submit" class="primary" id="predictSubmit">Predict Spectrum</button></div></footer>
-  </form><div id="helpTooltip" role="tooltip"></div><script>const vscode=acquireVsCodeApi(); const initial=${safeJson(config)}; const initialTraining=${safeJson(trainingConfig)}; const initialFragmenter=${safeJson(fragmenterText)}; ${webviewScript()}${spectrumPrediction.script()}</script></main></body></html>`;
+  </form><div id="helpTooltip" role="tooltip"></div><script>const vscode=acquireVsCodeApi(); const initial=${safeJson(config)}; const initialTraining=${safeJson(trainingConfig)}; const initialFragmenter=${safeJson(fragmenterText)}; ${webviewScript()}${spectrumPrediction.script()}${pathDrop.script()}</script></main></body></html>`;
 }
-function pathField(name,label,kind,form='data') { return `<label data-help="${HELP[name] || ''}">${label}<div class="path"><input name="${name}"><button type="button" data-pick="${name}" data-kind="${kind}" data-form="${form}">Browse</button></div>${HELP[name]?`<small class="field-help">${HELP[name]}</small>`:''}</label>`; }
+function pathField(name,label,kind,form='data') { return `<label data-help="${HELP[name] || ''}">${label}<div class="path"><input name="${name}" data-path-kind="${kind}"><button type="button" data-pick="${name}" data-kind="${kind}" data-form="${form}">Browse</button></div>${HELP[name]?`<small class="field-help">${HELP[name]}</small>`:''}</label>`; }
 function field(name,label,type,step='1') { return `<label data-help="${HELP[name] || ''}">${label}<input name="${name}" type="${type}"${type==='number'?` step="${step}"`:''}>${HELP[name]?`<small class="field-help">${HELP[name]}</small>`:''}</label>`; }
 function check(name,label) { return `<label class="check" data-help="${HELP[name] || ''}"><input name="${name}" type="checkbox"><span>${label}${HELP[name]?`<small class="field-help">${HELP[name]}</small>`:''}</span></label>`; }
 function safeJson(value) { return JSON.stringify(value).replace(/</g, '\\u003c'); }
