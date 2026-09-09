@@ -114,6 +114,7 @@ class FragmentTreeSpectrumPredictor(nn.Module):
         *,
         include_formula_annotation: bool = False,
         include_fragment_ion_annotation: bool = False,
+        structure_expander: Optional[Callable] = None,
     ) -> FragmentSpectrumGeneratorOutput:
         additional_depth = (
             min(3, max(0, int(self.candidate_selector.fragmenter.tree_max_depth) - 1))
@@ -123,6 +124,7 @@ class FragmentTreeSpectrumPredictor(nn.Module):
         candidate_output = self.candidate_selector.generate_depth_limited_candidates(
             data,
             max_depth=additional_depth,
+            structure_expander=structure_expander,
         )
         formula_intensity_output = self.formula_intensity_predictor.predict_from_candidate_output(candidate_output)
         peaks_by_sample: Dict[int, List[GeneratedSpectrumPeak]] = {}
@@ -258,6 +260,7 @@ class FragmentSpectrumGenerator(ModelBase):
         ranking_intensity_threshold: float = 0.05,
         mol_encoder_checkpoint: Optional[str] = None,
         freeze_mol_encoder: bool = True,
+        fine_tuning: Optional[Dict] = None,
     ) -> None:
         super(FragmentSpectrumGenerator, self).__init__(
             ignore_config_keys=["formula_mz_resolver"],
@@ -315,6 +318,10 @@ class FragmentSpectrumGenerator(ModelBase):
             max_next_cleavage_candidates=max_next_cleavage_candidates,
         )
 
+        if fine_tuning:
+            from .fine_tuning import install_expansion
+            install_expansion(self, fine_tuning)
+
         self.min_peak_intensity = min_peak_intensity
         self.include_precursor_peaks = include_precursor_peaks
         self.include_fragment_peaks = include_fragment_peaks
@@ -340,9 +347,11 @@ class FragmentSpectrumGenerator(ModelBase):
         *,
         include_formula_annotation: bool = False,
         include_fragment_ion_annotation: bool = False,
+        structure_expander: Optional[Callable] = None,
     ) -> FragmentSpectrumGeneratorOutput:
         return self.spectrum_predictor(
             data,
             include_formula_annotation=include_formula_annotation,
             include_fragment_ion_annotation=include_fragment_ion_annotation,
+            structure_expander=structure_expander,
         )

@@ -86,6 +86,10 @@ class FragmentTreePreprocessingContext:
     def tree_max_depth(self) -> int:
         return self.fragmenter.tree_max_depth
 
+    @property
+    def precursor_candidate_max_depth(self) -> int:
+        return self.fragmenter.precursor_candidate_max_depth
+
     def get_index_by_adduct_type(self, adduct_type) -> int:
         return self.fragmenter.get_index_by_adduct_type(adduct_type)
 

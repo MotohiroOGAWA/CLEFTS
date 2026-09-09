@@ -191,9 +191,10 @@ class TestRelativeFormulaIntensity(unittest.TestCase):
                 super().__init__()
                 self.batch_sizes = []
 
-            def forward(self, value):
-                self.batch_sizes.append(int(value.size(1)))
-                return value + value.mean(dim=1, keepdim=True)
+            def forward(self, value, src_key_padding_mask):
+                self.batch_sizes.append(int(value.size(0)))
+                valid = (~src_key_padding_mask)[:, :, None]
+                return value + (value * valid).sum(dim=1, keepdim=True) / valid.sum(dim=1, keepdim=True)
 
         predictor = object.__new__(FormulaIntensityPredictor)
         torch.nn.Module.__init__(predictor)
@@ -201,7 +202,7 @@ class TestRelativeFormulaIntensity(unittest.TestCase):
         rows = torch.tensor([[1.0, 0.0], [3.0, 0.0], [100.0, 0.0]])
         samples = torch.tensor([0, 0, 1])
         encoded = predictor._encode_formula_nodes_by_sample(rows, samples)
-        self.assertEqual(predictor.formula_node_encoder.batch_sizes, [2, 1])
+        self.assertEqual(predictor.formula_node_encoder.batch_sizes, [2])
         self.assertTrue(torch.equal(encoded[2], torch.tensor([200.0, 0.0])))
 
     def test_forward_candidate_output_uses_formula_encoder(self) -> None:
@@ -210,8 +211,8 @@ class TestRelativeFormulaIntensity(unittest.TestCase):
                 super().__init__()
                 self.batch_sizes = []
 
-            def forward(self, value):
-                self.batch_sizes.append(int(value.size(1)))
+            def forward(self, value, src_key_padding_mask):
+                self.batch_sizes.append(int(value.size(0)))
                 return value
 
         predictor = object.__new__(FormulaIntensityPredictor)
@@ -228,7 +229,7 @@ class TestRelativeFormulaIntensity(unittest.TestCase):
             SimpleNamespace(sample_id=1, formula_tensor=torch.tensor([1.0, 0.0]), repr=torch.tensor([100.0, 0.0]), probability=1.0),
         ]
         output = predictor.forward_candidate_output(SimpleNamespace(kept_candidates=candidates, keep_logit=torch.zeros(3)))
-        self.assertEqual(predictor.formula_node_encoder.batch_sizes, [2, 1])
+        self.assertEqual(predictor.formula_node_encoder.batch_sizes, [2])
         self.assertEqual(output.presence_logit.shape, (3,))
         self.assertAlmostEqual(float(output.logit[:2].sum()), 1.0, places=6)
         self.assertAlmostEqual(float(output.logit[2:].sum()), 1.0, places=6)

@@ -10,8 +10,7 @@ authors = [
     { name = "Motohiro Ogawa" }
 ]
 readme = "README.md"
-license = "MIT"
-license-files = ["LICENSE"]
+license = { text = "MIT" }
 requires-python = ">=3.10"
 dependencies = [
     "tqdm",
@@ -24,9 +23,12 @@ dependencies = [
 
 [project.scripts]
 clefts = "clefts.cli.main:main"
+clefts-evaluation = "evaluation.cli:main"
+clefts-predict-spectrum = "clefts.ml.specgen.predict_spectrum:main"
+msentity-predict-clefts = "clefts.ml.specgen.predict_spectrum:main"
 
 [tool.setuptools.packages.find]
-include = ["clefts*"]
+include = ["clefts*", "evaluation*"]
 
 [project.optional-dependencies]
 docs = [
