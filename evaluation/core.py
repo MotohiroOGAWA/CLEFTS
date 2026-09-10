@@ -263,9 +263,6 @@ def summarize(
             f"Calculating group statistics… {done}/{total}",
         )) if progress else None,
     )
-    if request.include is not None:
-        included = set(request.include)
-        rows = [row for row in rows if row["category"] in included]
     if request.order:
         positions = {name: index for index, name in enumerate(request.order)}
         rows.sort(key=lambda row: (positions.get(row["category"], len(positions)), row["category"]))
@@ -274,6 +271,10 @@ def summarize(
             name: index for index, name in enumerate(_numeric_group_order(request.bins))
         }
         rows.sort(key=lambda row: numeric_order.get(row["category"], len(numeric_order)))
+    category_rows = rows
+    if request.include is not None:
+        included = set(request.include)
+        rows = [row for row in rows if row["category"] in included]
     return {
         "input": request.input_path,
         "groupColumn": effective_column,
@@ -282,5 +283,6 @@ def summarize(
         "groupMode": mode,
         "scoreColumn": "cosine_similarity",
         "sourceRows": int(len(frame)),
+        "categoryRows": category_rows,
         "rows": rows,
     }

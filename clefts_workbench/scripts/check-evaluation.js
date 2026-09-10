@@ -44,6 +44,19 @@ assert.match(page, /id="xAxisTitleSize"/);
 assert.match(page, /id="yAxisTitleSize"/);
 assert.match(page, /id="title" placeholder=/);
 assert.match(page, /id="titleSize"/);
+for (const id of ['categorySearch', 'categorySort', 'categorySelection', 'allShown', 'noneShown']) {
+  assert.match(page, new RegExp(`id="${id}"`));
+}
+for (const sort of ['name-asc', 'name-desc', 'count-desc', 'count-asc', 'median-desc', 'median-asc']) {
+  assert.match(page, new RegExp(`value="${sort}"`));
+}
+assert.match(page, /function categorySpark/);
+assert.match(page, /class="category-density"/);
+assert.match(page, /function sortCategories/);
+assert.match(page, /setCategoryChecks\(categoryIndices\(\),true\)/);
+assert.match(page, /updateCategorySelection\(\);markDraft\(\)/);
+assert.match(page, /m\.result\.categoryRows\|\|m\.result\.rows/);
+assert.match(page, /Distribution spans 0–1/);
 assert.match(page, /id="groupedGraphOpacity"/);
 assert.match(page, /id="groupedXLabelSize"/);
 assert.match(page, /id="groupedYLabelSize"/);

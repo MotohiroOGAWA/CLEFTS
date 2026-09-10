@@ -11,7 +11,9 @@ const path = require('path');
 const { spawn } = require('child_process');
 const cleavagePatternSetEditor = require('./features/cleavage-pattern-set/editor');
 
-const { readScores, distributionHtml } = require('./features/fragment-tree-result/score-distribution');
+const {
+  readScores, distributionHtml, normalizeScoreChartSettings, SCORE_CHART_SUFFIX
+} = require('./features/fragment-tree-result/score-distribution');
 
 const RESULT_NAME = 'fragment-tree.pft';
 let runningProcess;
@@ -567,6 +569,66 @@ class ResultEditorProvider {
           panel.webview.postMessage({ type: 'scoreResultsAdded', datasets, error: errors.length ? `Unable to add some results: ${errors.join('; ')}` : '' });
         } catch (error) {
           panel.webview.postMessage({ type: 'scoreResultsAdded', datasets: [], error: `Unable to add results: ${error.message}` });
+        }
+        return;
+      }
+      if (m.type === 'saveScoreDistributionSettings') {
+        try {
+          const config = normalizeScoreChartSettings(m.config);
+          let target = await vscode.window.showSaveDialog({
+            title: 'Save Assignment Score Chart Settings',
+            defaultUri: vscode.Uri.file(m.path || path.join(path.dirname(document.uri.fsPath), `assignment-score${SCORE_CHART_SUFFIX}`)),
+            filters: { 'Assignment score chart settings': ['scorechart.json'] }
+          });
+          if (!target) {
+            panel.webview.postMessage({ type: 'scoreSettingsSaved', cancelled: true });
+            return;
+          }
+          target = vscode.Uri.file(ensureFileSuffix(target.fsPath, SCORE_CHART_SUFFIX));
+          await fs.promises.writeFile(target.fsPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
+          panel.webview.postMessage({ type: 'scoreSettingsSaved', path: target.fsPath });
+        } catch (error) {
+          panel.webview.postMessage({ type: 'scoreSettingsSaved', path: '', error: `Unable to save chart settings: ${error.message}` });
+        }
+        return;
+      }
+      if (m.type === 'loadScoreDistributionSettings') {
+        try {
+          const picked = await vscode.window.showOpenDialog({
+            title: 'Load Assignment Score Chart Settings',
+            defaultUri: vscode.Uri.file(path.dirname(document.uri.fsPath)),
+            filters: { 'Assignment score chart settings': ['scorechart.json', 'json'] },
+            canSelectMany: false
+          });
+          if (!picked || !picked[0]) {
+            panel.webview.postMessage({ type: 'scoreSettingsLoaded', cancelled: true });
+            return;
+          }
+          const config = normalizeScoreChartSettings(JSON.parse(await fs.promises.readFile(picked[0].fsPath, 'utf8')));
+          const datasets = [], errors = [];
+          const resultSeries = new Map();
+          for (const item of config.series) {
+            if (!resultSeries.has(item.resultPath)) resultSeries.set(item.resultPath, []);
+            resultSeries.get(item.resultPath).push(item);
+          }
+          for (const [resultPath, savedSeries] of resultSeries) {
+            try {
+              JSON.parse(await fs.promises.readFile(resultPath, 'utf8'));
+              const wanted = new Set(savedSeries.map(item => item.subset));
+              const source = savedSeries.find(item => item.source)?.source || path.basename(path.dirname(resultPath));
+              const loaded = await readScores(path.dirname(resultPath), { source, resultPath });
+              datasets.push(...loaded.filter(item => wanted.has(item.subset)));
+              for (const subset of wanted) if (!loaded.some(item => item.subset === subset)) errors.push(`${path.basename(resultPath)}: ${subset} scores were not found`);
+            } catch (error) {
+              errors.push(`${path.basename(resultPath)}: ${error.message}`);
+            }
+          }
+          panel.webview.postMessage({
+            type: 'scoreSettingsLoaded', config, datasets, path: picked[0].fsPath,
+            error: errors.length ? `Some saved results could not be loaded: ${errors.join('; ')}` : ''
+          });
+        } catch (error) {
+          panel.webview.postMessage({ type: 'scoreSettingsLoaded', failed: true, error: `Unable to load chart settings: ${error.message}` });
         }
         return;
       }

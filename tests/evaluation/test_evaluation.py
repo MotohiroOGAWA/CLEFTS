@@ -57,6 +57,7 @@ def test_default_spec_id_join_and_categorical_boxplot(tmp_path):
         str(similarity), "AdductType", metadata=str(source), include=("[M+H]+",)
     ))
     assert len(result["rows"]) == 1
+    assert [row["category"] for row in result["categoryRows"]] == ["[M+H]+", "[M+Na]+"]
     box = result["rows"][0]
     assert box["category"] == "[M+H]+"
     assert box["count"] == 5
@@ -68,9 +69,11 @@ def test_default_spec_id_join_and_categorical_boxplot(tmp_path):
     violin = box_plot_svg(result, plot_type="violin")
     assert 'class="violin"' in violin
     assert 'class="whisker"' not in violin
-    assert summarize(EvaluationRequest(
+    empty = summarize(EvaluationRequest(
         str(similarity), "AdductType", metadata=str(source), include=()
-    ))["rows"] == []
+    ))
+    assert empty["rows"] == []
+    assert len(empty["categoryRows"]) == 2
 
 
 def test_numeric_ranges_are_grouped_and_ordered(tmp_path):
