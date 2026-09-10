@@ -24,6 +24,10 @@ function ensureEvaluationConfigSuffix(filePath, kind) {
   return stem + suffix;
 }
 
+function ensureSvgSuffix(filePath) {
+  return filePath.toLowerCase().endsWith('.svg') ? filePath : `${filePath}.svg`;
+}
+
 function configFileStem(value, fallback) {
   const stem = String(value || fallback).trim().replace(/[^\p{L}\p{N}._-]+/gu, '-').replace(/^-+|-+$/g, '');
   return stem || fallback;
@@ -90,6 +94,11 @@ function summaryArgs(request, outputImage) {
   args.push('--y-label-size', String(request.yLabelSize ?? 11));
   args.push('--x-axis-title-size', String(request.xAxisTitleSize ?? 12));
   args.push('--y-axis-title-size', String(request.yAxisTitleSize ?? 12));
+  args.push('--x-axis-title-gap', String(request.xAxisTitleGap ?? 8));
+  args.push('--y-axis-title-gap', String(request.yAxisTitleGap ?? 8));
+  if (request.showXAxisTitle === false) args.push('--hide-x-axis-title');
+  if (request.showYAxisTitle === false) args.push('--hide-y-axis-title');
+  args.push('--x-label-rotation', request.xLabelRotation || 'auto');
   args.push('--title-size', String(request.titleSize ?? 17));
   args.push('--title', request.title || '');
   args.push('--plot-type', request.plotType || 'box');
@@ -142,7 +151,7 @@ function attach(panel, context, output, projectRoot, initialDocument = null) {
           path: initialDocument.path
         });
       } else if (message.type === 'saveEvaluationConfig') {
-        const document = evaluationConfigDocument(message.kind, message.config);
+        const configDocument = evaluationConfigDocument(message.kind, message.config);
         const suffix = evaluationConfigSuffix(message.kind);
         const suggestedName = message.kind === 'column'
           ? configFileStem(message.config.title || message.config.groupColumn, 'evaluation')
@@ -151,16 +160,39 @@ function attach(panel, context, output, projectRoot, initialDocument = null) {
           filters: { 'CLEFTS evaluation configuration': [suffix.slice(1)] },
           defaultUri: initialDocument && initialDocument.kind === message.kind
             ? vscode.Uri.file(initialDocument.path)
-            : vscode.Uri.file(suggestedName + suffix)
+            : vscode.Uri.file(ensureEvaluationConfigSuffix(suggestedName, message.kind))
         });
         if (selected) {
           const target = vscode.Uri.file(ensureEvaluationConfigSuffix(selected.fsPath, message.kind));
           await vscode.workspace.fs.writeFile(
-            target, Buffer.from(JSON.stringify(document, null, 2) + '\n', 'utf8')
+            target, Buffer.from(JSON.stringify(configDocument, null, 2) + '\n', 'utf8')
           );
           panel.webview.postMessage({ type: `${message.kind}ConfigSaved`, path: target.fsPath });
           vscode.window.showInformationMessage(`Saved ${path.basename(target.fsPath)}`);
         }
+      } else if (message.type === 'quickSaveEvaluationConfig') {
+        const configDocument = evaluationConfigDocument(message.kind, message.config);
+        const suffix = evaluationConfigSuffix(message.kind);
+        let targetPath = message.path;
+        if (!targetPath) {
+          const suggestedName = message.kind === 'column'
+            ? configFileStem(message.config.title || message.config.groupColumn, 'evaluation')
+            : configFileStem(message.config.title, 'evaluation');
+          const selected = await vscode.window.showSaveDialog({
+            filters: { 'CLEFTS evaluation configuration': [suffix.slice(1)] },
+            defaultUri: initialDocument && initialDocument.kind === message.kind
+              ? vscode.Uri.file(initialDocument.path)
+              : vscode.Uri.file(ensureEvaluationConfigSuffix(suggestedName, message.kind))
+          });
+          if (!selected) return;
+          targetPath = selected.fsPath;
+        }
+        const target = vscode.Uri.file(ensureEvaluationConfigSuffix(targetPath, message.kind));
+        await vscode.workspace.fs.writeFile(
+          target, Buffer.from(JSON.stringify(configDocument, null, 2) + '\n', 'utf8')
+        );
+        panel.webview.postMessage({ type: `${message.kind}ConfigSaved`, path: target.fsPath });
+        vscode.window.showInformationMessage(`Saved ${path.basename(target.fsPath)}`);
       } else if (message.type === 'loadEvaluationConfig') {
         const suffix = evaluationConfigSuffix(message.kind);
         const selected = await vscode.window.showOpenDialog({
@@ -187,15 +219,17 @@ function attach(panel, context, output, projectRoot, initialDocument = null) {
         const result = await runCli(context, projectRoot, groupedArgs(message.request), output, reportProgress('groupedProgress'));
         panel.webview.postMessage({ type: 'groupedSummary', result });
       } else if (message.type === 'saveGroupedImage') {
+        const suggestedName = ensureSvgSuffix(configFileStem(message.request.title, 'clefts-grouped-evaluation'));
         const target = await vscode.window.showSaveDialog({
           filters: { 'Scalable Vector Graphics': ['svg'] },
-          defaultUri: vscode.Uri.file('clefts-grouped-evaluation.svg')
+          defaultUri: vscode.Uri.file(suggestedName)
         });
         if (target) {
+          const targetPath = ensureSvgSuffix(target.fsPath);
           panel.webview.postMessage({ type: 'groupedBusy', text: 'Preparing SVG save…', percent: 2 });
-          const result = await runCli(context, projectRoot, groupedArgs(message.request, target.fsPath), output, reportProgress('groupedProgress'));
-          panel.webview.postMessage({ type: 'groupedSaved', path: result.imagePath || target.fsPath });
-          vscode.window.showInformationMessage(`Saved ${path.basename(target.fsPath)}`);
+          const result = await runCli(context, projectRoot, groupedArgs(message.request, targetPath), output, reportProgress('groupedProgress'));
+          panel.webview.postMessage({ type: 'groupedSaved', path: result.imagePath || targetPath });
+          vscode.window.showInformationMessage(`Saved ${path.basename(targetPath)}`);
         }
       } else if (message.type === 'pickInput' || message.type === 'pickMetadata') {
         const metadata = message.type === 'pickMetadata';
@@ -218,15 +252,17 @@ function attach(panel, context, output, projectRoot, initialDocument = null) {
         const result = await runCli(context, projectRoot, summaryArgs(message.request), output, reportProgress('progress'));
         panel.webview.postMessage({ type: 'summary', result });
       } else if (message.type === 'saveImage') {
+        const suggestedName = ensureSvgSuffix(configFileStem(message.request.title || message.request.groupColumn, 'clefts-evaluation'));
         const target = await vscode.window.showSaveDialog({
           filters: { 'Scalable Vector Graphics': ['svg'] },
-          defaultUri: vscode.Uri.file('clefts-evaluation.svg')
+          defaultUri: vscode.Uri.file(suggestedName)
         });
         if (target) {
+          const targetPath = ensureSvgSuffix(target.fsPath);
           panel.webview.postMessage({ type: 'busy', text: 'Preparing SVG save…', percent: 2 });
-          const result = await runCli(context, projectRoot, summaryArgs(message.request, target.fsPath), output, reportProgress('progress'));
-          panel.webview.postMessage({ type: 'saved', path: result.imagePath || target.fsPath });
-          vscode.window.showInformationMessage(`Saved ${path.basename(target.fsPath)}`);
+          const result = await runCli(context, projectRoot, summaryArgs(message.request, targetPath), output, reportProgress('progress'));
+          panel.webview.postMessage({ type: 'saved', path: result.imagePath || targetPath });
+          vscode.window.showInformationMessage(`Saved ${path.basename(targetPath)}`);
         }
       }
     } catch (error) {
@@ -264,22 +300,30 @@ function register(context, output, projectRoot) {
 function html() {
   return `<!doctype html><html><head><meta charset="UTF-8"><style>
   :root{color-scheme:light dark;--accent:#36c5a2;--border:color-mix(in srgb,var(--vscode-editor-foreground) 18%,transparent);--panel:color-mix(in srgb,var(--vscode-editor-background) 90%,var(--vscode-editor-foreground))}
-  *{box-sizing:border-box}body{margin:0;color:var(--vscode-editor-foreground);background:var(--vscode-editor-background);font-family:var(--vscode-font-family)}main{max-width:1400px;margin:auto;padding:28px}header{display:flex;justify-content:space-between;align-items:start;margin-bottom:20px}h1{margin:3px 0;font-size:28px}h2{font-size:16px;margin:0 0 14px}.eyebrow{font-size:11px;letter-spacing:.14em;font-weight:700;color:var(--accent)}.muted{opacity:.65;margin:4px 0}.layout,.grouped-layout{display:grid;grid-template-columns:340px minmax(0,1fr);gap:16px}.panel{padding:18px;border:1px solid var(--border);border-radius:9px;background:var(--panel);margin-bottom:14px}label{font-size:12px;display:block;margin:11px 0}input,select{width:100%;display:block;margin-top:5px;padding:8px;color:var(--vscode-input-foreground);background:var(--vscode-input-background);border:1px solid var(--vscode-input-border,var(--border));border-radius:5px}.path{display:flex;gap:6px}.path input{flex:1}.path button{margin-top:5px}button{font:inherit;color:inherit;background:var(--vscode-button-secondaryBackground);border:1px solid var(--border);border-radius:6px;padding:7px 11px;cursor:pointer}.primary{background:var(--vscode-button-background);color:var(--vscode-button-foreground);font-weight:600}.actions{display:flex;gap:7px;flex-wrap:wrap}.check,.radio-option{display:flex;align-items:center;gap:7px}.check input,.radio-option input{width:auto;margin:0}.transform-options{border:1px solid var(--border);border-radius:6px;margin:12px 0;padding:8px 10px}.transform-options legend{font-size:12px;padding:0 4px}.radio-option{margin:7px 0}.category-list{max-height:285px;overflow:auto;border:1px solid var(--border);border-radius:6px}.category{display:grid;grid-template-columns:auto minmax(0,1fr) auto auto;align-items:center;gap:7px;padding:6px;border-bottom:1px solid var(--border)}.category input{width:auto;margin:0}.category button{padding:2px 7px}.chart{overflow:auto;min-height:260px;border:1px dashed var(--border);border-radius:7px;display:grid;place-items:center}.chart svg{max-width:100%;height:auto}.status{font-weight:600}.error{color:var(--vscode-errorForeground)}.eval-progress{width:100%;height:7px;margin:10px 0 2px;accent-color:var(--accent)}table{width:100%;border-collapse:collapse;margin-top:14px;font-size:12px}th,td{text-align:left;padding:7px;border-bottom:1px solid var(--border)}.size-row{display:grid;grid-template-columns:1fr 1fr;gap:9px}.eval-tabs{display:flex;gap:8px;margin-bottom:22px;border-bottom:1px solid var(--border);padding-bottom:10px}.eval-tabs button.active{background:var(--vscode-button-background);color:var(--vscode-button-foreground)}.edit-list{display:grid;gap:7px;margin-bottom:10px}.edit-row{display:grid;grid-template-columns:minmax(0,1fr) auto auto auto;gap:5px;align-items:center}.edit-row input{margin:0}.edit-row button{padding:6px 8px}.series-row{grid-template-columns:minmax(0,1fr) 40px auto auto auto}.series-row input[type=color]{height:34px;padding:3px}.result-matrix-scroll{overflow:auto}.result-matrix{min-width:700px}.result-matrix td:nth-child(3){min-width:330px}.series-dot{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:7px}${pathDrop.css()}@media(max-width:800px){.layout,.grouped-layout{grid-template-columns:1fr}}
-  </style></head><body><main><nav class="eval-tabs"><button class="active" data-eval-tab="column">Column Evaluation</button><button data-eval-tab="grouped">Grouped Box Plot</button></nav><section id="columnEvaluation"><header><div><span class="eyebrow">CLEFTS EVALUATION</span><h1>Column Evaluation</h1><p class="muted">Group a result table by categories or numeric ranges.</p></div><div class="actions"><button id="loadColumnConfig">Load Settings</button><button id="saveColumnConfig">Save Settings</button><button id="saveImage" disabled>Save SVG</button></div></header>
+  *{box-sizing:border-box}body{margin:0;color:var(--vscode-editor-foreground);background:var(--vscode-editor-background);font-family:var(--vscode-font-family)}main{max-width:1400px;margin:auto;padding:28px}header{display:flex;justify-content:space-between;align-items:start;margin-bottom:20px}h1{margin:3px 0;font-size:28px}h2{font-size:16px;margin:0 0 14px}.eyebrow{font-size:11px;letter-spacing:.14em;font-weight:700;color:var(--accent)}.muted{opacity:.65;margin:4px 0}.layout,.grouped-layout{display:grid;grid-template-columns:340px minmax(0,1fr);gap:16px}.panel{padding:18px;border:1px solid var(--border);border-radius:9px;background:var(--panel);margin-bottom:14px}label{font-size:12px;display:block;margin:11px 0}input,select{width:100%;display:block;margin-top:5px;padding:8px;color:var(--vscode-input-foreground);background:var(--vscode-input-background);border:1px solid var(--vscode-input-border,var(--border));border-radius:5px}.path{display:flex;gap:6px}.path input{flex:1}.path button{margin-top:5px}button{font:inherit;color:inherit;background:var(--vscode-button-secondaryBackground);border:1px solid var(--border);border-radius:6px;padding:7px 11px;cursor:pointer}.primary{background:var(--vscode-button-background);color:var(--vscode-button-foreground);font-weight:600}.actions{display:flex;gap:7px;flex-wrap:wrap}.check,.radio-option{display:flex;align-items:center;gap:7px}.check input,.radio-option input{width:auto;margin:0}.transform-options{border:1px solid var(--border);border-radius:6px;margin:12px 0;padding:8px 10px}.transform-options legend{font-size:12px;padding:0 4px}.radio-option{margin:7px 0}.category-list{max-height:285px;overflow:auto;border:1px solid var(--border);border-radius:6px}.category{display:grid;grid-template-columns:auto minmax(0,1fr) auto auto;align-items:center;gap:7px;padding:6px;border-bottom:1px solid var(--border)}.category input{width:auto;margin:0}.category button{padding:2px 7px}.chart{overflow:auto;min-height:260px;border:1px dashed var(--border);border-radius:7px;display:grid;place-items:center}.chart svg{max-width:100%;height:auto}.status{font-weight:600}.error{color:var(--vscode-errorForeground)}.eval-progress{width:100%;height:7px;margin:10px 0 2px;accent-color:var(--accent)}table{width:100%;border-collapse:collapse;margin-top:14px;font-size:12px}th,td{text-align:left;padding:7px;border-bottom:1px solid var(--border)}.size-row{display:grid;grid-template-columns:1fr 1fr;gap:9px}.eval-tabs{display:flex;gap:8px;margin-bottom:22px;border-bottom:1px solid var(--border);padding-bottom:10px}.eval-tabs button.active{background:var(--vscode-button-background);color:var(--vscode-button-foreground)}.edit-list{display:grid;gap:7px;margin-bottom:10px}.edit-row{display:grid;grid-template-columns:minmax(0,1fr) auto auto auto;gap:5px;align-items:center}.edit-row input{margin:0}.edit-row button{padding:6px 8px}.series-row{grid-template-columns:minmax(0,1fr) 40px auto auto auto}.series-row input[type=color]{height:34px;padding:3px}.result-matrix-scroll{overflow:auto}.result-matrix{min-width:700px}.result-matrix td:nth-child(3){min-width:330px}.series-dot{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:7px}.save-toast{position:fixed;top:14px;right:18px;background:var(--accent);color:#0b1f19;padding:8px 14px;border-radius:7px;font-size:12px;font-weight:700;opacity:0;transform:translateY(-6px);pointer-events:none;transition:opacity .2s ease,transform .2s ease;z-index:1000;box-shadow:0 4px 14px rgba(0,0,0,.28)}.save-toast.show{opacity:1;transform:translateY(0)}${pathDrop.css()}@media(max-width:800px){.layout,.grouped-layout{grid-template-columns:1fr}}
+  </style></head><body><div id="saveToast" class="save-toast" role="status" aria-live="polite"></div><script>
+  window.showSaveToast=function(text){
+    var toast=document.getElementById('saveToast');
+    toast.textContent=text||'✓ Saved';
+    toast.classList.add('show');
+    clearTimeout(window.showSaveToast._t);
+    window.showSaveToast._t=setTimeout(function(){toast.classList.remove('show')},1600);
+  };
+  </script><main><nav class="eval-tabs"><button class="active" data-eval-tab="column">Column Evaluation</button><button data-eval-tab="grouped">Grouped Box Plot</button></nav><section id="columnEvaluation"><header><div><span class="eyebrow">CLEFTS EVALUATION</span><h1>Column Evaluation</h1><p class="muted">Group a result table by categories or numeric ranges.</p></div><div class="actions"><button id="loadColumnConfig">Load Settings</button><button id="saveColumnConfig">Save Settings</button><button id="saveImage" disabled>Save SVG</button></div></header>
   <div class="layout"><aside>
     <section class="panel"><h2>Dataset</h2><label>Similarity result (.mssim)<div class="path"><input id="input" data-path-kind="file" placeholder="results.mssim"><button id="browse">Browse</button></div></label><label>Metadata source (.msds or table)<div class="path"><input id="metadata" data-path-kind="file" placeholder="metadata.msds"><button data-browse-metadata>Browse</button></div></label><label>Join column<input id="joinColumn" value="SpecID" placeholder="SpecID"></label><p class="muted">The join column must exist in both files. SpecID is used by default when available.</p><button id="load" class="primary">Load columns</button><p id="datasetInfo" class="muted"></p></section>
     <section class="panel"><h2>Grouping</h2><label>Column<select id="groupColumn" disabled></select></label><fieldset class="transform-options"><legend>Value conversion</legend><label class="radio-option"><input type="radio" name="transform" value="none" checked>None</label><label class="radio-option"><input type="radio" name="transform" value="collision-energy">Collision Energy parser</label><label class="radio-option"><input type="radio" name="transform" value="chemical">SMILES chemical information</label></fieldset><div id="ceOptions" hidden><label>Precursor m/z column<input id="precursorMzColumn" value="PrecursorMZ"></label><label>Instrument column (optional)<input id="instrumentColumn"></label></div><div id="chemicalOptions" hidden><label>SMILES column<input id="smilesColumn" value="SMILES"></label><label>Chemical descriptor<select id="chemicalDescriptor"><option>HeavyAtomCount</option><option>ExactMolWt</option><option>TPSA</option><option>MolLogP</option><option>NumHAcceptors</option><option>NumHDonors</option><option>NumRotatableBonds</option><option>RingCount</option><option>NumAromaticRings</option><option>NumAliphaticRings</option><option>FractionCSP3</option><option>NumHeteroatoms</option><option>FormalCharge</option><option>BertzCT</option></select></label></div><label>Mode<select id="mode"><option value="auto">Auto</option><option value="categorical">Category</option><option value="numeric">Numeric ranges</option></select></label><label id="binsLabel" hidden>Range boundaries<input id="bins" value="0,10,20" placeholder="0,10,20" disabled><small class="muted">0,10,20 creates [0,10), [10,20), [20,~).</small></label><p class="muted">Changes are applied only when Generate plot is pressed.</p><button id="generate" class="primary" disabled>Generate plot</button></section>
     <section class="panel"><h2>Categories</h2><div class="actions"><button id="all">All</button><button id="none">None</button></div><div id="categories" class="category-list"><p class="muted" style="padding:8px">Generate once to list categories.</p></div></section>
-    <section class="panel"><h2>Image</h2><label>Title<input id="title" placeholder="Cosine similarity by grouping column"></label><label>Plot type<select id="plotType"><option value="box">Box plot</option><option value="violin">Violin plot</option></select></label><div class="size-row"><label>Width<input id="width" type="number" min="240" value="900"></label><label>Height<input id="height" type="number" min="200" value="520"></label></div><label>Graph opacity<input id="graphOpacity" type="number" min="0" max="1" step="0.05" value="1"></label><div class="size-row"><label>X-axis label size<input id="xLabelSize" type="number" min="6" max="96" value="11"></label><label>Y-axis label size<input id="yLabelSize" type="number" min="6" max="96" value="11"></label></div><div class="size-row"><label>X-axis title size<input id="xAxisTitleSize" type="number" min="6" max="96" value="12"></label><label>Y-axis title size<input id="yAxisTitleSize" type="number" min="6" max="96" value="12"></label></div><label>Chart title size<input id="titleSize" type="number" min="6" max="96" value="17"></label><label>Plot color<input id="color" type="color" value="#36c5a2"></label><label class="check"><input id="transparent" type="checkbox" checked>Transparent background</label></section>
+    <section class="panel"><h2>Image</h2><label>Title<input id="title" placeholder="Cosine similarity by grouping column"></label><label>Plot type<select id="plotType"><option value="box">Box plot</option><option value="violin">Violin plot</option></select></label><div class="size-row"><label>Width<input id="width" type="number" min="240" value="900"></label><label>Height<input id="height" type="number" min="200" value="520"></label></div><label>Graph opacity<input id="graphOpacity" type="number" min="0" max="1" step="0.05" value="1"></label><div class="size-row"><label>X-axis label size<input id="xLabelSize" type="number" min="6" max="96" value="11"></label><label>Y-axis label size<input id="yLabelSize" type="number" min="6" max="96" value="11"></label></div><div class="size-row"><label>X-axis title size<input id="xAxisTitleSize" type="number" min="6" max="96" value="12"></label><label>Y-axis title size<input id="yAxisTitleSize" type="number" min="6" max="96" value="12"></label></div><div class="size-row"><label>X-axis title distance<input id="xAxisTitleGap" type="number" min="0" max="200" value="8"></label><label>Y-axis title distance<input id="yAxisTitleGap" type="number" min="0" max="200" value="8"></label></div><div class="size-row"><label class="check"><input id="showXAxisTitle" type="checkbox" checked>Show X-axis title</label><label class="check"><input id="showYAxisTitle" type="checkbox" checked>Show Y-axis title</label></div><label>X-axis label rotation<select id="xLabelRotation"><option value="auto">Auto</option><option value="0">0°</option><option value="30">30°</option><option value="45">45°</option><option value="60">60°</option><option value="90">90°</option></select></label><label>Chart title size<input id="titleSize" type="number" min="6" max="96" value="17"></label><label>Plot color<input id="color" type="color" value="#36c5a2"></label><label class="check"><input id="transparent" type="checkbox" checked>Transparent background</label></section>
   </aside><section class="panel"><div class="actions"><span id="status" class="status">Choose a dataset.</span></div><progress id="progress" class="eval-progress" max="100" hidden></progress><div id="chart" class="chart"><p class="muted">The plot will appear here.</p></div><table id="table" hidden><thead><tr><th>Category / range</th><th>n</th><th>Min</th><th>Q1</th><th>Median</th><th>Q3</th><th>Max</th></tr></thead><tbody></tbody></table></section></div>
   <script>
   const vscode=acquireVsCodeApi(),input=document.getElementById('input'),group=document.getElementById('groupColumn'),mode=document.getElementById('mode'),binsLabel=document.getElementById('binsLabel'),bins=document.getElementById('bins'),categories=document.getElementById('categories'),status=document.getElementById('status'),progressBar=document.getElementById('progress'),chart=document.getElementById('chart'),table=document.getElementById('table');
-  let categoryState=[],pendingColumnConfig=null,lastAppliedRequest=null,pendingAppliedRequest=null;
+  let categoryState=[],pendingColumnConfig=null,lastAppliedRequest=null,pendingAppliedRequest=null,currentPath=null;
   const esc=x=>String(x??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
   const transform=()=>document.querySelector('input[name="transform"]:checked').value;
   function setStatus(text,error=false){status.textContent=text;status.className='status'+(error?' error':'');progressBar.hidden=true}
   function setProgress(text,percent){status.textContent=text;status.className='status';progressBar.hidden=false;progressBar.value=Math.max(0,Math.min(100,Number(percent)||0));document.getElementById('generate').disabled=true}
-  function request(){const smilesColumn=document.getElementById('smilesColumn').value;return{input:input.value,metadata:document.getElementById('metadata').value,joinColumn:document.getElementById('joinColumn').value,groupColumn:transform()==='chemical'?smilesColumn:group.value,transform:transform(),precursorMzColumn:document.getElementById('precursorMzColumn').value,instrumentColumn:document.getElementById('instrumentColumn').value,smilesColumn,chemicalDescriptor:document.getElementById('chemicalDescriptor').value,mode:mode.value,bins:mode.value==='numeric'?bins.value:'',title:document.getElementById('title').value,plotType:document.getElementById('plotType').value,width:Number(document.getElementById('width').value),height:Number(document.getElementById('height').value),graphOpacity:Number(document.getElementById('graphOpacity').value),xLabelSize:Number(document.getElementById('xLabelSize').value),yLabelSize:Number(document.getElementById('yLabelSize').value),xAxisTitleSize:Number(document.getElementById('xAxisTitleSize').value),yAxisTitleSize:Number(document.getElementById('yAxisTitleSize').value),titleSize:Number(document.getElementById('titleSize').value),color:document.getElementById('color').value,transparent:document.getElementById('transparent').checked,include:categoryState.filter(x=>x.checked).map(x=>x.name),order:categoryState.map(x=>x.name)}}
+  function request(){const smilesColumn=document.getElementById('smilesColumn').value;return{input:input.value,metadata:document.getElementById('metadata').value,joinColumn:document.getElementById('joinColumn').value,groupColumn:transform()==='chemical'?smilesColumn:group.value,transform:transform(),precursorMzColumn:document.getElementById('precursorMzColumn').value,instrumentColumn:document.getElementById('instrumentColumn').value,smilesColumn,chemicalDescriptor:document.getElementById('chemicalDescriptor').value,mode:mode.value,bins:mode.value==='numeric'?bins.value:'',title:document.getElementById('title').value,plotType:document.getElementById('plotType').value,width:Number(document.getElementById('width').value),height:Number(document.getElementById('height').value),graphOpacity:Number(document.getElementById('graphOpacity').value),xLabelSize:Number(document.getElementById('xLabelSize').value),yLabelSize:Number(document.getElementById('yLabelSize').value),xAxisTitleSize:Number(document.getElementById('xAxisTitleSize').value),yAxisTitleSize:Number(document.getElementById('yAxisTitleSize').value),xAxisTitleGap:Number(document.getElementById('xAxisTitleGap').value),yAxisTitleGap:Number(document.getElementById('yAxisTitleGap').value),showXAxisTitle:document.getElementById('showXAxisTitle').checked,showYAxisTitle:document.getElementById('showYAxisTitle').checked,xLabelRotation:document.getElementById('xLabelRotation').value,titleSize:Number(document.getElementById('titleSize').value),color:document.getElementById('color').value,transparent:document.getElementById('transparent').checked,include:categoryState.filter(x=>x.checked).map(x=>x.name),order:categoryState.map(x=>x.name)}}
   function markDraft(){if(lastAppliedRequest)setStatus('Unapplied changes · press Generate plot')}
   function resetCategories(){categoryState=[];categories.innerHTML='<p class="muted" style="padding:8px">Press Generate to list categories.</p>';markDraft()}
   function updateMode(){const numeric=mode.value==='numeric';binsLabel.hidden=!numeric;bins.disabled=!numeric;markDraft()}
@@ -302,6 +346,7 @@ function html() {
   document.getElementById('all').onclick=()=>{categoryState.forEach(x=>x.checked=true);renderCategories(categoryState.map(x=>({category:x.name})));markDraft()};
   document.getElementById('none').onclick=()=>{categoryState.forEach(x=>x.checked=false);renderCategories(categoryState.map(x=>({category:x.name})));markDraft()};
   document.getElementById('saveImage').onclick=()=>{if(lastAppliedRequest)vscode.postMessage({type:'saveImage',request:lastAppliedRequest})};
+  window.evalColumn={request:()=>request(),getPath:()=>currentPath};
   window.addEventListener('message',e=>{
     const m=e.data;
     if(m.type==='inputPicked'){input.value=m.path;return}
@@ -309,10 +354,11 @@ function html() {
     if(m.type==='columnConfigLoaded'){
       const c=m.config;input.value=c.input||'';document.getElementById('metadata').value=c.metadata||'';document.getElementById('joinColumn').value=c.joinColumn||'SpecID';
       const radio=document.querySelector('input[name="transform"][value="'+(c.transform||'none')+'"]');if(radio)radio.checked=true;
-      document.getElementById('precursorMzColumn').value=c.precursorMzColumn||'PrecursorMZ';document.getElementById('instrumentColumn').value=c.instrumentColumn||'';document.getElementById('smilesColumn').value=c.smilesColumn||'SMILES';document.getElementById('chemicalDescriptor').value=c.chemicalDescriptor||'HeavyAtomCount';mode.value=c.mode||'auto';bins.value=c.bins||'';document.getElementById('title').value=c.title||'';document.getElementById('plotType').value=c.plotType||'box';document.getElementById('width').value=c.width||900;document.getElementById('height').value=c.height||520;document.getElementById('graphOpacity').value=c.graphOpacity??1;document.getElementById('xLabelSize').value=c.xLabelSize??11;document.getElementById('yLabelSize').value=c.yLabelSize??11;document.getElementById('xAxisTitleSize').value=c.xAxisTitleSize??c.xLabelSize??12;document.getElementById('yAxisTitleSize').value=c.yAxisTitleSize??c.yLabelSize??12;document.getElementById('titleSize').value=c.titleSize??17;document.getElementById('color').value=c.color||'#36c5a2';document.getElementById('transparent').checked=c.transparent!==false;pendingColumnConfig=c;updateTransform(false);
+      document.getElementById('precursorMzColumn').value=c.precursorMzColumn||'PrecursorMZ';document.getElementById('instrumentColumn').value=c.instrumentColumn||'';document.getElementById('smilesColumn').value=c.smilesColumn||'SMILES';document.getElementById('chemicalDescriptor').value=c.chemicalDescriptor||'HeavyAtomCount';mode.value=c.mode||'auto';bins.value=c.bins||'';document.getElementById('title').value=c.title||'';document.getElementById('plotType').value=c.plotType||'box';document.getElementById('width').value=c.width||900;document.getElementById('height').value=c.height||520;document.getElementById('graphOpacity').value=c.graphOpacity??1;document.getElementById('xLabelSize').value=c.xLabelSize??11;document.getElementById('yLabelSize').value=c.yLabelSize??11;document.getElementById('xAxisTitleSize').value=c.xAxisTitleSize??c.xLabelSize??12;document.getElementById('yAxisTitleSize').value=c.yAxisTitleSize??c.yLabelSize??12;document.getElementById('xAxisTitleGap').value=c.xAxisTitleGap??8;document.getElementById('yAxisTitleGap').value=c.yAxisTitleGap??8;document.getElementById('showXAxisTitle').checked=c.showXAxisTitle!==false;document.getElementById('showYAxisTitle').checked=c.showYAxisTitle!==false;document.getElementById('xLabelRotation').value=c.xLabelRotation||'auto';document.getElementById('titleSize').value=c.titleSize??17;document.getElementById('color').value=c.color||'#36c5a2';document.getElementById('transparent').checked=c.transparent!==false;pendingColumnConfig=c;updateTransform(false);
+      currentPath=m.path;
       if(input.value){setStatus('Loaded '+m.path+' · inspecting columns…');document.getElementById('load').click()}else{pendingColumnConfig=null;setStatus('Loaded settings '+m.path+' · press Generate to apply')}return
     }
-    if(m.type==='columnConfigSaved'){setStatus('Saved settings '+m.path);return}
+    if(m.type==='columnConfigSaved'){currentPath=m.path;setStatus('Saved settings '+m.path);if(window.showSaveToast)window.showSaveToast('✓ Saved '+m.path.split(/[\\/]/).pop());return}
     if(m.type==='busy'||m.type==='progress'){setProgress(m.message||m.text,m.percent??5);return}
     if(m.type==='inspected'){
       const cols=m.result.columns.filter(c=>!['index1','index2','cosine_similarity'].includes(c.name));group.innerHTML=cols.map(c=>'<option value="'+esc(c.name)+'" data-kind="'+c.kind+'">'+esc(c.name)+' ('+c.kind+')</option>').join('');group.disabled=document.getElementById('generate').disabled=!cols.length;document.getElementById('datasetInfo').textContent=m.result.rows+' pairs · '+cols.length+' grouping columns';
@@ -328,6 +374,15 @@ function html() {
   document.querySelectorAll('[data-eval-tab]').forEach(button=>button.onclick=()=>{const grouped=button.dataset.evalTab==='grouped';document.getElementById('columnEvaluation').hidden=grouped;document.getElementById('groupedEvaluation').hidden=!grouped;document.querySelectorAll('[data-eval-tab]').forEach(item=>item.classList.toggle('active',item===button))});
   (${groupedClient.toString()})();
   window.addEventListener('message',event=>{if(event.data.type==='evaluationConfigOpened'){const tab=document.querySelector('[data-eval-tab="'+event.data.kind+'"]');if(tab)tab.click()}});
+  document.addEventListener('keydown',e=>{
+    const key=(e.key||'').toLowerCase();
+    if(!(e.ctrlKey||e.metaKey)||e.shiftKey||e.altKey||key!=='s')return;
+    e.preventDefault();
+    const grouped=!document.getElementById('groupedEvaluation').hidden;
+    const api=grouped?window.evalGrouped:window.evalColumn;
+    if(!api)return;
+    vscode.postMessage({type:'quickSaveEvaluationConfig',kind:grouped?'grouped':'column',config:api.request(),path:api.getPath()});
+  });
   ${pathDrop.script()}
   vscode.postMessage({type:'evaluationReady'});
   </script></main></body></html>`;
@@ -335,5 +390,5 @@ function html() {
 
 module.exports = {
   open, register, html, summaryArgs, groupedArgs, evaluationConfigDocument,
-  parseEvaluationConfig, evaluationConfigSuffix, ensureEvaluationConfigSuffix
+  parseEvaluationConfig, evaluationConfigSuffix, ensureEvaluationConfigSuffix, ensureSvgSuffix
 };

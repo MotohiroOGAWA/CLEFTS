@@ -238,9 +238,9 @@ def test_grouped_boxplot_compares_series_and_preserves_order(tmp_path):
     assert "No data" in svg
     assert 'class="separator"' in svg
     assert '<rect width="900" height="500"' not in svg
-    assert '<rect x="70.00" y="48.00" width="14" height="10" fill="#ff00aa"/>' in svg
-    assert '<text x="90.00" y="58.00" class="legend">FIORA</text>' in svg
-    assert '<rect x="140.50" y="48.00" width="14" height="10" fill="#00aacc"/>' in svg
+    assert '<rect x="62.52" y="48.00" width="14" height="10" fill="#ff00aa"/>' in svg
+    assert '<text x="82.52" y="58.00" class="legend">FIORA</text>' in svg
+    assert '<rect x="133.02" y="48.00" width="14" height="10" fill="#00aacc"/>' in svg
     violin = grouped_box_plot_svg(result, width=900, height=500, plot_type="violin")
     assert violin.count('class="violin"') == 3
     assert 'class="whisker"' not in violin

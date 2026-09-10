@@ -76,6 +76,11 @@ def build_parser() -> argparse.ArgumentParser:
     summary.add_argument("--y-label-size", type=float, default=11.0)
     summary.add_argument("--x-axis-title-size", type=float, default=12.0)
     summary.add_argument("--y-axis-title-size", type=float, default=12.0)
+    summary.add_argument("--x-axis-title-gap", type=float, default=8.0)
+    summary.add_argument("--y-axis-title-gap", type=float, default=8.0)
+    summary.add_argument("--hide-x-axis-title", action="store_true")
+    summary.add_argument("--hide-y-axis-title", action="store_true")
+    summary.add_argument("--x-label-rotation", default="auto", help="auto or an angle in degrees (0-90).")
     summary.add_argument("--title-size", type=float, default=17.0)
     summary.add_argument("--title", default="")
     summary.add_argument("--plot-type", choices=("box", "violin"), default="box")
@@ -96,6 +101,11 @@ def build_parser() -> argparse.ArgumentParser:
     grouped.add_argument("--y-label-size", type=float)
     grouped.add_argument("--x-axis-title-size", type=float)
     grouped.add_argument("--y-axis-title-size", type=float)
+    grouped.add_argument("--x-axis-title-gap", type=float)
+    grouped.add_argument("--y-axis-title-gap", type=float)
+    grouped.add_argument("--hide-x-axis-title", action="store_true")
+    grouped.add_argument("--hide-y-axis-title", action="store_true")
+    grouped.add_argument("--x-label-rotation", default=None, help="auto or an angle in degrees (0-90).")
     grouped.add_argument("--title-size", type=float)
     grouped.add_argument("--plot-type", choices=("box", "violin"))
     grouped.add_argument("--output-image", help="Optional SVG output path.")
@@ -136,6 +146,11 @@ def execute(
             y_label_size=args.y_label_size if args.y_label_size is not None else float(config.get("yLabelSize", 11)),
             x_axis_title_size=args.x_axis_title_size if args.x_axis_title_size is not None else float(config.get("xAxisTitleSize", config.get("xLabelSize", 12))),
             y_axis_title_size=args.y_axis_title_size if args.y_axis_title_size is not None else float(config.get("yAxisTitleSize", config.get("yLabelSize", 12))),
+            x_axis_title_gap=args.x_axis_title_gap if args.x_axis_title_gap is not None else float(config.get("xAxisTitleGap", 8)),
+            y_axis_title_gap=args.y_axis_title_gap if args.y_axis_title_gap is not None else float(config.get("yAxisTitleGap", 8)),
+            show_x_axis_title=not args.hide_x_axis_title and bool(config.get("showXAxisTitle", True)),
+            show_y_axis_title=not args.hide_y_axis_title and bool(config.get("showYAxisTitle", True)),
+            x_label_rotation=args.x_label_rotation if args.x_label_rotation is not None else config.get("xLabelRotation", "auto"),
             title_size=args.title_size if args.title_size is not None else float(config.get("titleSize", 18)),
             plot_type=args.plot_type or str(config.get("plotType", "box")),
         )
@@ -168,6 +183,11 @@ def execute(
         x_label_size=args.x_label_size, y_label_size=args.y_label_size,
         x_axis_title_size=args.x_axis_title_size,
         y_axis_title_size=args.y_axis_title_size,
+        x_axis_title_gap=args.x_axis_title_gap,
+        y_axis_title_gap=args.y_axis_title_gap,
+        show_x_axis_title=not args.hide_x_axis_title,
+        show_y_axis_title=not args.hide_y_axis_title,
+        x_label_rotation=args.x_label_rotation,
         title_size=args.title_size,
         plot_type=args.plot_type, title=args.title,
     )

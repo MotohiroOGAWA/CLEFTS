@@ -11,7 +11,7 @@ import pandas as pd
 
 from .io import read_table
 from .core import _density_profile
-from .chart import _label_angle, _text_width
+from .chart import _resolve_label_angle, _text_width
 
 
 def _validate_items(items: Any, label: str) -> list[dict[str, str]]:
@@ -142,6 +142,9 @@ def grouped_box_plot_svg(
     y_label_size: float = 11.0, title_size: float = 18.0,
     x_axis_title_size: float = 12.0, y_axis_title_size: float = 12.0,
     plot_type: str = "box",
+    x_label_rotation: str | float | None = "auto",
+    x_axis_title_gap: float = 8.0, y_axis_title_gap: float = 8.0,
+    show_x_axis_title: bool = True, show_y_axis_title: bool = True,
 ) -> str:
     if width < 400 or height < 300 or width > 8192 or height > 8192:
         raise ValueError("Image size must be between 400 x 300 and 8192 x 8192 pixels.")
@@ -153,13 +156,17 @@ def grouped_box_plot_svg(
     font_sizes = (x_label_size, y_label_size, x_axis_title_size, y_axis_title_size, title_size)
     if any(not math.isfinite(value) or value < 6 or value > 96 for value in font_sizes):
         raise ValueError("Label and title sizes must be between 6 and 96 pixels.")
+    if any(not math.isfinite(value) or value < 0 or value > 200 for value in (x_axis_title_gap, y_axis_title_gap)):
+        raise ValueError("Axis title distance must be between 0 and 200 pixels.")
     if plot_type not in {"box", "violin"}:
         raise ValueError("Plot type must be box or violin.")
     cell_by_pair = {(cell["groupId"], cell["seriesId"]): cell for cell in cells}
     group_labels = [group["name"] for group in groups]
     max_x_label_width = max((_text_width(label, x_label_size) for label in group_labels), default=0.0)
     y_label_width = _text_width("0.25", y_label_size)
-    margin_left = max(70.0, y_axis_title_size * 1.35 + y_label_width + 26.0)
+    y_tick_zone = y_label_width + 9.0
+    margin_left = max(56.0, y_tick_zone + (y_axis_title_gap + y_axis_title_size + 8.0 if show_y_axis_title else 12.0))
+    y_axis_title_x = margin_left - y_tick_zone - y_axis_title_gap - y_axis_title_size * 0.35
     margin_right = max(28.0, x_label_size * .5)
     title_y = max(27.0, title_size + 6.0)
     legend_baseline = max(58.0, title_y + 22.0)
@@ -182,11 +189,12 @@ def grouped_box_plot_svg(
     maximum_box_width = max(1.0, (group_width - resolved_series_gap * (len(series) - 1)) / len(series))
     resolved_box_width = maximum_box_width if box_width == 0 else min(box_width, maximum_box_width)
     cluster_width = resolved_box_width * len(series) + resolved_series_gap * (len(series) - 1)
-    label_angle = _label_angle(max_x_label_width, group_width + resolved_group_gap, x_label_size)
+    label_angle = _resolve_label_angle(x_label_rotation, max_x_label_width, group_width + resolved_group_gap, x_label_size)
     radians = math.radians(label_angle)
     label_height = max_x_label_width * math.sin(radians) + x_label_size * math.cos(radians)
     label_offset = x_label_size * (1.0 if label_angle == 0 else .45)
-    margin_bottom = max(82.0, label_offset + label_height + x_axis_title_size * 1.35 + 24.0)
+    x_axis_title_block = (x_axis_title_gap + x_axis_title_size * 1.3) if show_x_axis_title else 10.0
+    margin_bottom = max(64.0, label_offset + label_height + x_axis_title_block + 14.0)
     canvas_height = max(float(height), margin_top + margin_bottom + 100.0)
     plot_height = canvas_height - margin_top - margin_bottom
     plot_bottom = margin_top + plot_height
@@ -250,13 +258,20 @@ def grouped_box_plot_svg(
         legend_x += 20.0 + label_width + 18.0
     legend = "".join(legend_parts)
     background = "" if transparent else f'<rect width="{canvas_width:g}" height="{canvas_height:g}" fill="{escape(background_color)}"/>'
-    x_axis_title_y = canvas_height - max(8.0, x_axis_title_size * .18)
+    x_axis_title_y = plot_bottom + label_offset + label_height + x_axis_title_gap + x_axis_title_size * 0.85
+    x_axis_title_svg = (
+        f'<text x="{canvas_width / 2:.2f}" y="{x_axis_title_y:.2f}" text-anchor="middle" class="x-axis-title">Group</text>'
+        if show_x_axis_title else ""
+    )
+    y_axis_title_svg = (
+        f'<text transform="translate({y_axis_title_x:.2f},{margin_top + plot_height / 2:.2f}) rotate(-90)" text-anchor="middle" class="y-axis-title">Cosine similarity</text>'
+        if show_y_axis_title else ""
+    )
     return (
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{canvas_width:g}" height="{canvas_height:g}" viewBox="0 0 {canvas_width:g} {canvas_height:g}">'
         f'<style>text{{font-family:system-ui,-apple-system,sans-serif;fill:{escape(text_color)}}}.title{{font-size:{title_size:g}px;font-weight:600}}.legend{{font-size:11px}}.x-label{{font-size:{x_label_size:g}px;font-weight:600}}.y-label{{font-size:{y_label_size:g}px}}.x-axis-title{{font-size:{x_axis_title_size:g}px}}.y-axis-title{{font-size:{y_axis_title_size:g}px}}.axis{{stroke:{escape(text_color)}}}.grid{{stroke:{escape(text_color)};stroke-opacity:.2}}.separator{{stroke:{escape(text_color)};stroke-opacity:.12}}.whisker{{stroke:{escape(text_color)};stroke-width:1.4}}.median{{stroke-width:3}}.no-data{{stroke:{escape(text_color)};stroke-width:1.5;stroke-opacity:.65}}.no-data-label{{font-size:9px;fill:{escape(text_color)};fill-opacity:.75}}</style>'
         f'{background}<g class="graph" opacity="{graph_opacity:g}"><text x="{canvas_width / 2:.2f}" y="{title_y:.2f}" text-anchor="middle" class="title">{escape(result["title"])}</text>{legend}'
         f'<path class="axis" fill="none" d="M{margin_left:g} {margin_top:g}V{plot_bottom:g}H{margin_left + plot_width:.2f}"/>'
-        f'<text x="{canvas_width / 2:.2f}" y="{x_axis_title_y:.2f}" text-anchor="middle" class="x-axis-title">Group</text>'
-        f'<text transform="translate({y_axis_title_size * .65:.2f},{margin_top + plot_height / 2:.2f}) rotate(-90)" text-anchor="middle" class="y-axis-title">Cosine similarity</text>'
+        f'{x_axis_title_svg}{y_axis_title_svg}'
         f'{"".join(marks)}</g></svg>'
     )
