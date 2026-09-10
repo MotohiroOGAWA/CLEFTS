@@ -144,7 +144,7 @@ def grouped_box_plot_svg(
     plot_type: str = "box",
     x_label_rotation: str | float | None = "auto",
     x_axis_title_gap: float = 8.0, y_axis_title_gap: float = 8.0,
-    show_x_axis_title: bool = True, show_y_axis_title: bool = True,
+    show_x_axis_title: bool = False, show_y_axis_title: bool = True,
 ) -> str:
     if width < 400 or height < 300 or width > 8192 or height > 8192:
         raise ValueError("Image size must be between 400 x 300 and 8192 x 8192 pixels.")

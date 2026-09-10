@@ -19,10 +19,20 @@ const { histogram, readScores, distributionHtml } = require('../src/features/fra
   try {
     fs.mkdirSync(path.join(directory, 'train_structures'));
     fs.writeFileSync(path.join(directory, 'train_structures', 'assignment_scores.tsv'), '\uFEFFid\tassignment_score\r\na\t0\r\nb\t1\r\nc\t\r\nd\tNaN\r\ne\t1.1\r\nf\t-1\r\n');
-    const datasets = await readScores(directory);
+    const resultPath = path.join(directory, 'fragment-tree.pft');
+    const datasets = await readScores(directory, { source: 'run-a', resultPath });
     assert.deepEqual(datasets[0].scores, [0, 1]);
     assert.equal(datasets[0].skipped, 4);
+    assert.equal(datasets[0].label, 'run-a — train_structures');
+    assert.equal(datasets[0].resultPath, resultPath);
+    assert.match(datasets[0].id, /fragment-tree\.pft::train_structures$/);
     const html = distributionHtml(datasets);
+    assert.match(html, /id="scoreAdd"/);
+    assert.match(html, /type: 'addScoreResults'/);
+    assert.match(html, /scoreResultsAdded/);
+    assert.match(html, /datasets overlaid/);
+    assert.match(html, /dataset\\tbin_lower_inclusive/);
+    assert.match(html, /dataset\.scoreVisible/);
     assert.match(html, /id="scoreImageWidth"[^>]*value="1200"/);
     assert.match(html, /id="scoreImageHeight"[^>]*value="640"/);
     assert.match(html, /id="scoreTransparent"[^>]*checked/);

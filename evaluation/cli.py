@@ -148,7 +148,7 @@ def execute(
             y_axis_title_size=args.y_axis_title_size if args.y_axis_title_size is not None else float(config.get("yAxisTitleSize", config.get("yLabelSize", 12))),
             x_axis_title_gap=args.x_axis_title_gap if args.x_axis_title_gap is not None else float(config.get("xAxisTitleGap", 8)),
             y_axis_title_gap=args.y_axis_title_gap if args.y_axis_title_gap is not None else float(config.get("yAxisTitleGap", 8)),
-            show_x_axis_title=not args.hide_x_axis_title and bool(config.get("showXAxisTitle", True)),
+            show_x_axis_title=not args.hide_x_axis_title and bool(config.get("showXAxisTitle", False)),
             show_y_axis_title=not args.hide_y_axis_title and bool(config.get("showYAxisTitle", True)),
             x_label_rotation=args.x_label_rotation if args.x_label_rotation is not None else config.get("xLabelRotation", "auto"),
             title_size=args.title_size if args.title_size is not None else float(config.get("titleSize", 18)),

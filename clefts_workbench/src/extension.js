@@ -540,6 +540,36 @@ class ResultEditorProvider {
       catch (e) { panel.webview.html = errorHtml(e.message); }
     };
     panel.webview.onDidReceiveMessage(async m => {
+      if (m.type === 'addScoreResults') {
+        try {
+          const picked = await vscode.window.showOpenDialog({
+            title: 'Add Data Preparation Results',
+            defaultUri: vscode.Uri.file(path.dirname(document.uri.fsPath)),
+            filters: { 'CLEFTS result': ['pft', 'clefts-result'] },
+            canSelectFiles: true,
+            canSelectFolders: false,
+            canSelectMany: true
+          });
+          if (!picked || !picked.length) {
+            panel.webview.postMessage({ type: 'scoreResultsAdded', datasets: [], cancelled: true });
+            return;
+          }
+          const datasets = [], errors = [];
+          for (const uri of picked) {
+            try {
+              JSON.parse(await fs.promises.readFile(uri.fsPath, 'utf8'));
+              const root = path.dirname(uri.fsPath);
+              datasets.push(...await readScores(root, { source: path.basename(root), resultPath: uri.fsPath }));
+            } catch (error) {
+              errors.push(`${path.basename(uri.fsPath)}: ${error.message}`);
+            }
+          }
+          panel.webview.postMessage({ type: 'scoreResultsAdded', datasets, error: errors.length ? `Unable to add some results: ${errors.join('; ')}` : '' });
+        } catch (error) {
+          panel.webview.postMessage({ type: 'scoreResultsAdded', datasets: [], error: `Unable to add results: ${error.message}` });
+        }
+        return;
+      }
       if (m.type === 'exportScoreDistribution') {
         try {
           if (!['png', 'tsv'].includes(m.format) || typeof m.data !== 'string') return;
@@ -574,7 +604,7 @@ async function resultHtml(manifestPath) {
   const root = path.dirname(manifestPath);
   const files = await scan(root, root, 3, 500);
   const manifests = await readStructureManifests(root);
-  const scoreDatasets = await readScores(root);
+  const scoreDatasets = await readScores(root, { source: path.basename(root), resultPath: manifestPath });
   const summary = summarize(files);
   summary.preft = manifests.reduce((total, item) => total + item.rows.filter(row => row.exists).length, 0);
   return `<!doctype html><html><head><meta charset="UTF-8"><style>${commonCss()}:root{--detected:#ff8a3d}.result-main{max-width:none;width:100%}.tree-scroll{overflow:auto;max-height:70vh;overscroll-behavior:contain;border:1px solid var(--border);border-radius:8px;background:var(--vscode-editor-background);scrollbar-gutter:stable}.fragment-tree{display:block;width:100%;min-width:700px}.tree-edge{stroke:color-mix(in srgb,var(--vscode-editor-foreground) 35%,transparent);stroke-width:1.5}.tree-edge.detected{stroke:var(--detected);stroke-width:3}.tree-node circle{fill:var(--vscode-editor-background);stroke:var(--vscode-editor-foreground);stroke-width:1.5}.tree-node.detected circle{fill:color-mix(in srgb,var(--detected) 28%,var(--vscode-editor-background));stroke:var(--detected);stroke-width:3}.tree-node text{fill:var(--vscode-editor-foreground);font-size:9px;pointer-events:none}.tree-node{cursor:pointer}.molecule-preview{width:100%;max-height:360px;overflow:hidden;background:#fff;border-radius:6px}.molecule-preview svg{display:block;width:100%;height:auto}.chem-info{width:100%;font-size:11px}.chem-info th,.chem-info td{padding:5px}.used-adduct{background:color-mix(in srgb,var(--accent) 24%,transparent);outline:1px solid var(--accent)}.used-adduct.modified-state{background:color-mix(in srgb,#b06cff 30%,transparent);outline-color:#b06cff}.used-adduct td:first-child::before{content:'✓ ';color:var(--accent);font-weight:700}.used-adduct.modified-state td:first-child::before{color:#b06cff}.manifest-grid{margin-top:18px}.manifest-controls{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:8px}.manifest-controls input{min-width:260px;flex:1;padding:7px;color:var(--vscode-input-foreground);background:var(--vscode-input-background);border:1px solid var(--border);border-radius:5px}.manifest-controls label{display:flex;align-items:center;gap:6px}.manifest-controls select{width:auto;margin:0}.manifest-scroll{max-height:none;overflow-x:auto;overflow-y:visible}.column-filters input{width:100%;min-width:80px;padding:4px;color:var(--vscode-input-foreground);background:var(--vscode-input-background);border:1px solid var(--border)}.missing-file{display:block;color:var(--vscode-errorForeground)}.tree-controls,.detail-controls{display:flex;justify-content:flex-end;align-items:center;gap:8px;flex-wrap:wrap;margin:8px 0}.tree-controls select{width:auto}.tree-controls button{padding:5px 9px}.detail-controls input{width:180px;margin:0}.sortable{cursor:pointer;user-select:none}.sortable:hover{color:var(--accent)}.detail-layout{display:grid;grid-template-columns:minmax(0,1fr) var(--molecule-width,35%);gap:18px;align-items:start}.molecule-side{position:sticky;top:12px;max-height:calc(100vh - 24px);overflow:auto;border:1px solid var(--border);border-radius:8px;padding:14px}.molecule-side[hidden]{display:block;visibility:hidden}.molecule-side code{display:block;overflow-wrap:anywhere;margin:8px 0}.target-diagnostic{font-size:11px;padding:3px 0;border:0}.target-diagnostic summary{font-weight:400}.target-diagnostic code{display:block;white-space:normal;margin:2px 0}@media(max-width:900px){.detail-layout{grid-template-columns:1fr}.molecule-side{position:static;max-height:none}.molecule-side[hidden]{display:none}}</style></head><body><main class="result-main">

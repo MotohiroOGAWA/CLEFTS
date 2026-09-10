@@ -236,6 +236,9 @@ def test_grouped_boxplot_compares_series_and_preserves_order(tmp_path):
     assert 'width="900" height="500"' in svg
     assert svg.count("#ff00aa") >= 2
     assert "No data" in svg
+    assert '>Group</text>' not in svg
+    assert '>MassBank</text>' in svg
+    assert '>MoNA</text>' in svg
     assert 'class="separator"' in svg
     assert '<rect width="900" height="500"' not in svg
     assert '<rect x="62.52" y="48.00" width="14" height="10" fill="#ff00aa"/>' in svg
