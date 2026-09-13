@@ -127,17 +127,26 @@ Packages are written to `artifacts/clefts_workbench-<version>.vsix`, keeping gen
 ### Assignment score distribution
 
 The result viewer reads all sample rows from `assignment_scores.tsv` in the result
-folder and its `train_structures` / `validation_structures` folders. Select a dataset
-in **Assignment Score Distribution** and adjust the bin width (0.001–1; default
-0.1 gives 10 bins). Bars show sample counts on the left axis; the line shows the
-cumulative percentage from low to high scores on the right axis. Bins include
-their lower boundary, with score 1 included in the final bin. Missing, nonnumeric,
-and out-of-range scores are excluded and their count is displayed.
+folder and its `train_structures` / `validation_structures` folders. Use **Add
+Result…** to load one or more additional Data Preparation result files. Checked
+datasets are overlaid in the same chart; each dataset can be renamed, hidden,
+removed, assigned separate bar and line colors, and given its own opacity and visual
+bar width. Opacity and bar width default to 1 and 100%, respectively. The histogram
+bin count is configurable independently from those visual bar widths (default: 10).
+The semi-transparent bars show sample counts on the left axis, while matching lines
+show cumulative percentages on the right axis. Bins
+include their lower boundary, with score 1 included in the final bin. Missing,
+nonnumeric, and out-of-range scores are excluded and their count is displayed.
 
-Bar, line, background, and text colors are editable. **Save PNG** saves the current
-chart at 1200 × 640 pixels; **Save TSV** exports bin bounds, counts, cumulative
-counts, and cumulative percentages. The same distribution is available in the
-expandable table. Use **Refresh** after score files are generated or updated.
+Chart title, subtitle, axis titles, legend, and tick labels can be renamed where
+applicable, resized, spaced, or hidden. Minimum outer spacing and image size are
+editable; the canvas grows automatically when visible labels need more room.
+Background and text colors are also editable. **Save Settings…** writes the chart,
+series, and referenced result paths to a `*.scorechart.json` file, and **Load
+Settings…** restores the complete comparison. **Save PNG** saves the rendered
+comparison; **Save TSV** exports the dataset name, bin bounds, counts, cumulative
+counts, and cumulative percentages for all visible datasets. Use **Refresh** after
+score files are generated or updated.
 
 ### SMARTS Search
 

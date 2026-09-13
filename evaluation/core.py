@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 import numpy as np
 import pandas as pd
@@ -131,7 +131,8 @@ def _collision_energy_values(frame: pd.DataFrame, request: EvaluationRequest) ->
 
 
 def _chemical_descriptor_values(
-    frame: pd.DataFrame, request: EvaluationRequest
+    frame: pd.DataFrame, request: EvaluationRequest,
+    progress: Callable[[int, int], None] | None = None,
 ) -> pd.Series:
     if request.smiles_column not in frame.columns:
         raise ValueError(f"SMILES column was not found: {request.smiles_column}")
@@ -141,7 +142,9 @@ def _chemical_descriptor_values(
         )
     cache: dict[str, float | None] = {}
     values = []
-    for raw_smiles in frame[request.smiles_column]:
+    total = len(frame)
+    report_every = max(1, total // 20)
+    for index, raw_smiles in enumerate(frame[request.smiles_column], start=1):
         smiles = "" if pd.isna(raw_smiles) else str(raw_smiles)
         if smiles not in cache:
             mol = Chem.MolFromSmiles(smiles) if smiles else None
@@ -150,10 +153,16 @@ def _chemical_descriptor_values(
                 if mol is not None else None
             )
         values.append(cache[smiles])
+        if progress and (index == total or index % report_every == 0):
+            progress(index, total)
     return pd.Series(values, index=frame.index, dtype=float)
 
 
-def _boxplot_rows(frame: pd.DataFrame, group_key: pd.Series) -> list[dict[str, Any]]:
+def _boxplot_rows(
+    frame: pd.DataFrame, group_key: pd.Series,
+    progress: Callable[[int, int], None] | None = None,
+    outlier_limit: int = 250,
+) -> list[dict[str, Any]]:
     if "cosine_similarity" not in frame.columns:
         raise ValueError("Input must contain the .mssim cosine_similarity column.")
     values = pd.to_numeric(frame["cosine_similarity"], errors="coerce")
@@ -161,37 +170,79 @@ def _boxplot_rows(frame: pd.DataFrame, group_key: pd.Series) -> list[dict[str, A
         "__group", sort=False, dropna=False
     )
     rows = []
-    for category, group in grouped:
+    total = grouped.ngroups
+    for index, (category, group) in enumerate(grouped, start=1):
         scores = group["__value"].dropna().sort_values()
         if scores.empty:
             rows.append({"category": str(category), "count": 0, "min": None, "q1": None,
                          "median": None, "q3": None, "max": None,
-                         "whiskerLow": None, "whiskerHigh": None, "outliers": []})
+                         "whiskerLow": None, "whiskerHigh": None, "outliers": [],
+                         "outlierCount": 0, "density": []})
+            if progress:
+                progress(index, total)
             continue
         q1, median, q3 = (float(scores.quantile(q)) for q in (0.25, 0.5, 0.75))
         iqr = q3 - q1
         central = scores[(scores >= q1 - 1.5 * iqr) & (scores <= q3 + 1.5 * iqr)]
         outliers = scores[~scores.index.isin(central.index)].tolist()
+        if len(outliers) > outlier_limit:
+            indices = np.linspace(0, len(outliers) - 1, outlier_limit, dtype=int)
+            displayed_outliers = [float(outliers[outlier_index]) for outlier_index in indices]
+        else:
+            displayed_outliers = [float(value) for value in outliers]
         rows.append({
             "category": str(category), "count": int(len(scores)),
             "min": float(scores.min()), "q1": q1, "median": median, "q3": q3,
             "max": float(scores.max()), "whiskerLow": float(central.min()),
-            "whiskerHigh": float(central.max()), "outliers": [float(value) for value in outliers],
+            "whiskerHigh": float(central.max()), "outliers": displayed_outliers,
+            "outlierCount": len(outliers),
+            "density": _density_profile(scores),
         })
+        if progress:
+            progress(index, total)
     return rows
 
 
-def summarize(request: EvaluationRequest) -> dict[str, Any]:
+def _density_profile(values: pd.Series, points: int = 65) -> list[list[float]]:
+    """Return a normalized Gaussian KDE sampled across the similarity axis."""
+    samples = values.to_numpy(dtype=float)
+    if len(samples) > 5000:
+        samples = np.sort(samples)[np.linspace(0, len(samples) - 1, 5000, dtype=int)]
+    grid = np.linspace(0.0, 1.0, points)
+    spread = float(np.std(samples, ddof=1)) if len(samples) > 1 else 0.0
+    bandwidth = max(0.025, 1.06 * spread * len(samples) ** -0.2)
+    density = np.exp(-0.5 * ((grid[:, None] - samples[None, :]) / bandwidth) ** 2).sum(axis=1)
+    maximum = float(density.max())
+    normalized = density / maximum if maximum else density
+    return [[float(value), float(weight)] for value, weight in zip(grid, normalized)]
+
+
+def summarize(
+    request: EvaluationRequest,
+    progress: Callable[[int, str], None] | None = None,
+) -> dict[str, Any]:
+    if progress:
+        progress(5, "Reading evaluation data…")
     frame = read_table(
         request.input_path, metadata=request.metadata, join_column=request.join_column
     )
+    if progress:
+        progress(20, f"Loaded {len(frame):,} similarity pairs")
     if request.group_column not in frame.columns:
         raise ValueError(f"Group column was not found: {request.group_column}")
     if request.transform == "collision-energy":
+        if progress:
+            progress(28, "Converting collision energies…")
         source = _collision_energy_values(frame, request)
         effective_column = f"{request.group_column} (eV)"
     elif request.transform == "chemical":
-        source = _chemical_descriptor_values(frame, request)
+        source = _chemical_descriptor_values(
+            frame, request,
+            progress=(lambda done, total: progress(
+                25 + int(30 * done / max(1, total)),
+                f"Computing chemical descriptors… {done:,}/{total:,}",
+            )) if progress else None,
+        )
         effective_column = request.chemical_descriptor
     elif request.transform == "none":
         source = frame[request.group_column]
@@ -203,10 +254,15 @@ def summarize(request: EvaluationRequest) -> dict[str, Any]:
     if mode not in {"categorical", "numeric"}:
         raise ValueError("Grouping mode must be auto, categorical, or numeric.")
     group_key = _numeric_groups(source, request.bins) if mode == "numeric" else _categorical_groups(source)
-    rows = _boxplot_rows(frame, group_key)
-    if request.include is not None:
-        included = set(request.include)
-        rows = [row for row in rows if row["category"] in included]
+    if progress:
+        progress(58, "Calculating group statistics…")
+    rows = _boxplot_rows(
+        frame, group_key,
+        progress=(lambda done, total: progress(
+            58 + int(24 * done / max(1, total)),
+            f"Calculating group statistics… {done}/{total}",
+        )) if progress else None,
+    )
     if request.order:
         positions = {name: index for index, name in enumerate(request.order)}
         rows.sort(key=lambda row: (positions.get(row["category"], len(positions)), row["category"]))
@@ -215,6 +271,10 @@ def summarize(request: EvaluationRequest) -> dict[str, Any]:
             name: index for index, name in enumerate(_numeric_group_order(request.bins))
         }
         rows.sort(key=lambda row: numeric_order.get(row["category"], len(numeric_order)))
+    category_rows = rows
+    if request.include is not None:
+        included = set(request.include)
+        rows = [row for row in rows if row["category"] in included]
     return {
         "input": request.input_path,
         "groupColumn": effective_column,
@@ -223,5 +283,6 @@ def summarize(request: EvaluationRequest) -> dict[str, Any]:
         "groupMode": mode,
         "scoreColumn": "cosine_similarity",
         "sourceRows": int(len(frame)),
+        "categoryRows": category_rows,
         "rows": rows,
     }

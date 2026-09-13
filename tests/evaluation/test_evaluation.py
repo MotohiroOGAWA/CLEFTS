@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 
 from evaluation.chart import box_plot_svg
-from evaluation.cli import build_parser, execute
+from evaluation.cli import PROGRESS_PREFIX, build_parser, execute, main
 from evaluation.core import EvaluationRequest, inspect_dataset, summarize
 from evaluation.grouped import compare, grouped_box_plot_svg
 
@@ -57,15 +57,23 @@ def test_default_spec_id_join_and_categorical_boxplot(tmp_path):
         str(similarity), "AdductType", metadata=str(source), include=("[M+H]+",)
     ))
     assert len(result["rows"]) == 1
+    assert [row["category"] for row in result["categoryRows"]] == ["[M+H]+", "[M+Na]+"]
     box = result["rows"][0]
     assert box["category"] == "[M+H]+"
     assert box["count"] == 5
     assert box["median"] == 0.3
     assert box["whiskerHigh"] == 0.4
     assert box["outliers"] == [1.0]
-    assert summarize(EvaluationRequest(
+    assert len(box["density"]) == 65
+    assert max(point[1] for point in box["density"]) == 1.0
+    violin = box_plot_svg(result, plot_type="violin")
+    assert 'class="violin"' in violin
+    assert 'class="whisker"' not in violin
+    empty = summarize(EvaluationRequest(
         str(similarity), "AdductType", metadata=str(source), include=()
-    ))["rows"] == []
+    ))
+    assert empty["rows"] == []
+    assert len(empty["categoryRows"]) == 2
 
 
 def test_numeric_ranges_are_grouped_and_ordered(tmp_path):
@@ -76,6 +84,19 @@ def test_numeric_ranges_are_grouped_and_ordered(tmp_path):
     ))
     assert [row["category"] for row in result["rows"]] == ["[20,~)", "[0,10)", "[10,20)"]
     assert [row["count"] for row in result["rows"]] == [2, 2, 2]
+
+
+def test_cli_emits_machine_readable_progress(tmp_path, capsys):
+    similarity, _ = _fixtures(tmp_path)
+    main(["inspect", "--input", str(similarity)])
+    captured = capsys.readouterr()
+    updates = [
+        json.loads(line.removeprefix(PROGRESS_PREFIX))
+        for line in captured.err.splitlines() if line.startswith(PROGRESS_PREFIX)
+    ]
+    assert updates[0]["percent"] == 10
+    assert updates[-1] == {"percent": 100, "message": "Columns loaded"}
+    assert json.loads(captured.out)["ok"] is True
 
 
 def test_collision_energy_parser_converts_metadata_before_grouping(tmp_path):
@@ -116,29 +137,47 @@ def test_cli_writes_transparent_colored_boxplot(tmp_path):
         "--group-column", "AdductType", "--include", json.dumps(["[M+Na]+"]),
         "--width", "500", "--height", "300", "--color", "#ff00aa",
         "--graph-opacity", "0.4", "--x-label-size", "15",
-        "--y-label-size", "16", "--title-size", "24",
+        "--y-label-size", "16", "--x-axis-title-size", "18",
+        "--y-axis-title-size", "19", "--title-size", "24",
+        "--title", "Custom evaluation",
         "--output-image", str(image),
     ])
-    result = execute(args)
+    progress = []
+    result = execute(args, progress=lambda percent, message: progress.append((percent, message)))
     svg = image.read_text(encoding="utf-8")
     assert result["rows"][0]["category"] == "[M+Na]+"
+    assert progress[-1] == (100, "Evaluation complete")
+    assert any(message == "Rendering evaluation SVG…" for _, message in progress)
     assert 'width="500" height="300"' in svg
     assert 'fill="#ff00aa"' in svg
     assert '<rect width="500" height="300" fill="#ffffff"/>' not in svg
     assert '<g class="graph" opacity="0.4">' in svg
     assert '.x-label{font-size:15px}' in svg
-    assert '.y-label,.y-axis-title{font-size:16px}' in svg
+    assert '.y-label{font-size:16px}' in svg
+    assert '.x-axis-title{font-size:18px}' in svg
+    assert '.y-axis-title{font-size:19px}' in svg
     assert '.title{font-size:24px' in svg
-    assert '<text x="250.00" y="25" text-anchor="middle" class="title">' in svg
+    assert '<text x="250.00" y="30.00" text-anchor="middle" class="title">Custom evaluation</text>' in svg
     assert box_plot_svg(result, transparent=False).count('fill="#ffffff"') == 1
     styled = box_plot_svg(
         result, graph_opacity=0.4, x_label_size=15,
-        y_label_size=16, title_size=24,
+        y_label_size=16, x_axis_title_size=18,
+        y_axis_title_size=19, title_size=24,
     )
     assert '<g class="graph" opacity="0.4">' in styled
     assert '.x-label{font-size:15px}' in styled
-    assert '.y-label,.y-axis-title{font-size:16px}' in styled
+    assert '.y-label{font-size:16px}' in styled
+    assert '.x-axis-title{font-size:18px}' in styled
+    assert '.y-axis-title{font-size:19px}' in styled
     assert '.title{font-size:24px' in styled
+    large = box_plot_svg(
+        result, width=240, height=200, x_label_size=96, y_label_size=96,
+        x_axis_title_size=96, y_axis_title_size=96, title_size=96,
+    )
+    large_size = re.search(r'<svg[^>]+width="([^"]+)" height="([^"]+)"', large)
+    assert float(large_size.group(1)) > 240
+    assert float(large_size.group(2)) > 200
+    assert 'rotate(90)' in large
 
 
 def test_explicit_join_column_supports_msds_metadata(tmp_path):
@@ -200,24 +239,41 @@ def test_grouped_boxplot_compares_series_and_preserves_order(tmp_path):
     assert 'width="900" height="500"' in svg
     assert svg.count("#ff00aa") >= 2
     assert "No data" in svg
+    assert '>Group</text>' not in svg
+    assert '>MassBank</text>' in svg
+    assert '>MoNA</text>' in svg
     assert 'class="separator"' in svg
     assert '<rect width="900" height="500"' not in svg
-    assert '<rect x="70.00" y="48" width="14" height="10" fill="#ff00aa"/>' in svg
-    assert '<text x="90.00" y="58" class="legend">FIORA</text>' in svg
-    assert '<rect x="140.50" y="48" width="14" height="10" fill="#00aacc"/>' in svg
+    assert '<rect x="62.52" y="48.00" width="14" height="10" fill="#ff00aa"/>' in svg
+    assert '<text x="82.52" y="58.00" class="legend">FIORA</text>' in svg
+    assert '<rect x="133.02" y="48.00" width="14" height="10" fill="#00aacc"/>' in svg
+    violin = grouped_box_plot_svg(result, width=900, height=500, plot_type="violin")
+    assert violin.count('class="violin"') == 3
+    assert 'class="whisker"' not in violin
     wider = grouped_box_plot_svg(result, width=1400, height=500)
     box_pattern = r'<rect x="[^"]+" y="[^"]+" width="([^"]+)"[^>]+fill-opacity'
     assert float(re.search(box_pattern, wider).group(1)) > float(re.search(box_pattern, svg).group(1))
     fixed = grouped_box_plot_svg(
         result, width=1400, height=500, group_gap=90, series_gap=4, box_width=28,
-        graph_opacity=0.35, x_label_size=17, y_label_size=16, title_size=25,
+        graph_opacity=0.35, x_label_size=17, y_label_size=16,
+        x_axis_title_size=18, y_axis_title_size=19, title_size=25,
     )
     assert re.search(box_pattern, fixed).group(1) == "28.00"
     assert '<g class="graph" opacity="0.35">' in fixed
     assert '.x-label{font-size:17px' in fixed
-    assert '.y-label,.y-axis-title{font-size:16px}' in fixed
+    assert '.y-label{font-size:16px}' in fixed
+    assert '.x-axis-title{font-size:18px}' in fixed
+    assert '.y-axis-title{font-size:19px}' in fixed
     assert '.title{font-size:25px' in fixed
-    assert '<text x="700.00" y="27" text-anchor="middle" class="title">' in fixed
+    assert '<text x="700.00" y="31.00" text-anchor="middle" class="title">' in fixed
+    large = grouped_box_plot_svg(
+        result, width=400, height=300, x_label_size=96, y_label_size=96,
+        x_axis_title_size=96, y_axis_title_size=96, title_size=96,
+    )
+    large_size = re.search(r'<svg[^>]+width="([^"]+)" height="([^"]+)"', large)
+    assert float(large_size.group(1)) > 400
+    assert float(large_size.group(2)) > 300
+    assert 'rotate(90)' in large
 
 
 def test_grouped_cli_writes_opaque_svg(tmp_path):
@@ -225,7 +281,8 @@ def test_grouped_cli_writes_opaque_svg(tmp_path):
     image = tmp_path / "comparison.svg"
     config = {
         "graphOpacity": 0.45, "xLabelSize": 14,
-        "yLabelSize": 15, "titleSize": 23,
+        "yLabelSize": 15, "xAxisTitleSize": 18,
+        "yAxisTitleSize": 19, "titleSize": 23,
         "groups": [{"id": "mona", "name": "MoNA"}],
         "series": [{"id": "tool", "name": "Tool", "color": "#123456"}],
         "entries": [{"groupId": "mona", "seriesId": "tool", "path": str(similarity)}],
@@ -235,13 +292,18 @@ def test_grouped_cli_writes_opaque_svg(tmp_path):
         "--height", "400", "--opaque", "--background-color", "#abcdef",
         "--output-image", str(image),
     ])
-    result = execute(args)
+    progress = []
+    result = execute(args, progress=lambda percent, message: progress.append((percent, message)))
     assert result["cells"][0]["count"] == 6
+    assert progress[-1] == (100, "Grouped evaluation complete")
+    assert any(message == "Rendering grouped SVG…" for _, message in progress)
     cli_svg = image.read_text()
     assert '<rect width="640" height="400" fill="#abcdef"/>' in cli_svg
     assert '<g class="graph" opacity="0.45">' in cli_svg
     assert '.x-label{font-size:14px' in cli_svg
-    assert '.y-label,.y-axis-title{font-size:15px}' in cli_svg
+    assert '.y-label{font-size:15px}' in cli_svg
+    assert '.x-axis-title{font-size:18px}' in cli_svg
+    assert '.y-axis-title{font-size:19px}' in cli_svg
     assert '.title{font-size:23px' in cli_svg
     saved_settings = tmp_path / "grouped-settings.json"
     saved_settings.write_text(json.dumps({

@@ -11,6 +11,7 @@
     "onCommand:clefts.openResult",
     "onCommand:clefts.openEvaluation",
     "onCustomEditor:clefts.resultViewer",
+    "onCustomEditor:clefts.evaluationConfigEditor",
     "onCustomEditor:clefts.cleavagePatternSetEditor"
   ],
   "main": "./src/extension.js",
@@ -25,6 +26,15 @@
         "viewType": "clefts.resultViewer",
         "displayName": "CLEFTS Result",
         "selector": [{ "filenamePattern": "*.pft" }, { "filenamePattern": "*.clefts-result" }],
+        "priority": "default"
+      },
+      {
+        "viewType": "clefts.evaluationConfigEditor",
+        "displayName": "CLEFTS Evaluation",
+        "selector": [
+          { "filenamePattern": "*.evalcol.json" },
+          { "filenamePattern": "*.evalgroup.json" }
+        ],
         "priority": "default"
       },
       {
