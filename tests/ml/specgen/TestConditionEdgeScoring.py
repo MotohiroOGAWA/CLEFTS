@@ -320,7 +320,7 @@ def test_edge_depth_budget_count_must_match_fragmenter_depth():
     try:
         FragmentTreeFeatureModel(**params)
     except ValueError as exc:
-        assert "fragmenter.tree_max_depth=3" in str(exc)
+        assert "fragmenter.tree_max_action_count=3" in str(exc)
     else:
         raise AssertionError("Expected max_edges_per_depth length validation.")
 

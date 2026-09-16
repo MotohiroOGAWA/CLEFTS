@@ -771,7 +771,7 @@ Fragmenter, MolEncoder, shortest-path calculation, attention, and Graphormer.
 
 `edge_feature_dim` must be divisible by `edge_attention_heads`. The effective
 node limit is `max_next_cleavage_candidates`. The number of
-`max_edges_per_depth` values must exactly equal `fragmenter.tree_max_depth`; model
+`max_edges_per_depth` values must exactly equal `fragmenter.tree_max_action_count`; model
 construction raises `ValueError` otherwise.
 
 ### Absolute ranker and edge budgets

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Tuple, List, Dict, Optional, Iterable
+from typing import Tuple, List, Dict, Iterable
+from collections import deque
 
 from ....libs.mmkit.mmkit import Adduct
 
@@ -19,8 +20,8 @@ def build_pathway_items_for_node(
     target_node_index: int,
     precursor_adduct_types: Dict[int, Iterable[Adduct]],
     *,
-    max_depth: int,
-    precursor_candidate_max_depth: int,
+    max_action_count: int,
+    precursor_candidate_max_action_count: int,
 ) -> Tuple[Tuple[PathwayItem, ...], ...]:
     """Build pathway items for one target node.
 
@@ -31,21 +32,46 @@ def build_pathway_items_for_node(
     expands the pathway into multiple item sequences.
     """
 
-    precursor_node_indices = set(precursor_adduct_types.keys())
+    # Traverse compatible Source histories for presentation. Edge distance is
+    # never used as an action budget, and no intermediate molecule is reacted.
+    root_is_precursor = 0 in precursor_adduct_types
+    queue = deque([(0, None, (0,), frozenset((0,)) if root_is_precursor else frozenset())])
+    best_depth = {(0, None, root_is_precursor): 0}
+    paths = []
+    shortest = None
+    while queue:
+        node_index, sequence, path, precursor_positions = queue.popleft()
+        depth = (len(path) - 1) // 2
+        if shortest is not None and depth > shortest:
+            break
+        if node_index == target_node_index and precursor_positions:
+            shortest = depth
+            paths.append((path, precursor_positions))
+            continue
+        for edge in fragment_tree.get_out_edges(node_index):
+            for transition in edge.transitions:
+                if transition.parent_action_sequence != sequence:
+                    continue
+                child_sequence = transition.action_sequence
+                count = len(child_sequence.actions)
+                if count > max_action_count:
+                    continue
+                qualifies = (edge.target_index in precursor_adduct_types
+                             and count <= precursor_candidate_max_action_count)
+                positions = precursor_positions | (frozenset((len(path) + 1,)) if qualifies else frozenset())
+                state = (edge.target_index, child_sequence, bool(positions))
+                if best_depth.get(state, depth + 1) < depth + 1:
+                    continue
+                best_depth[state] = depth + 1
+                queue.append((edge.target_index, child_sequence,
+                              (*path, edge.index, edge.target_index), positions))
 
-    paths = fragment_tree.collect_global_shortest_node_paths_from_root_via(
-        target_node_index,
-        precursor_node_indices,
-        max_depth=max_depth,
-        max_via_depth=precursor_candidate_max_depth,
-    )
-
-    if len(paths) == 0:
+    if not paths:
         return tuple()
 
     all_pathway_items: List[Tuple[PathwayItem, ...]] = []
 
-    for path in paths:
+    for path, precursor_positions in paths:
         pathway_item_candidates: List[List[PathwayItem]] = [[]]
 
         for i, path_index in enumerate(path):
@@ -53,7 +79,7 @@ def build_pathway_items_for_node(
                 node_index = path_index
                 node = fragment_tree.get_node(node_index)
 
-                if node_index in precursor_adduct_types:
+                if i in precursor_positions:
                     adduct_candidates = tuple(
                         precursor_adduct_types.get(node_index, ())
                     )

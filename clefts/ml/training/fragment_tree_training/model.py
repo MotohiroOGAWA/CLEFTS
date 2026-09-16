@@ -1310,7 +1310,7 @@ class FragmentTreeTrainingModel(nn.Module):
             previous = output
 
         max_depth = min(
-            max(0, int(self.candidate_selector.fragmenter.tree_max_depth) - 1),
+            max(0, int(self.candidate_selector.fragmenter.tree_max_action_count) - 1),
             len(self.candidate_selector.fragment_edge_encoder.max_edges_per_depth) - 1,
         )
         final = self.candidate_selector.generate_depth_limited_candidates(

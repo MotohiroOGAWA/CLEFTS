@@ -36,15 +36,15 @@ class FragmentTreeBuilder:
     """
     max_action_count: int
     cleavage_pattern_set: CleavagePatternSet
-    only_add_min_depth: bool = True
+    only_add_min_action_count: bool = True
 
     def __post_init__(self) -> None:
         if type(self.max_action_count) is not int or self.max_action_count <= 0:
             raise ValueError("max_action_count must be a positive integer.")
         if not isinstance(self.cleavage_pattern_set, CleavagePatternSet):
             raise TypeError("cleavage_pattern_set must be a CleavagePatternSet.")
-        if not isinstance(self.only_add_min_depth, bool):
-            raise TypeError("only_add_min_depth must be a bool.")
+        if not isinstance(self.only_add_min_action_count, bool):
+            raise TypeError("only_add_min_action_count must be a bool.")
 
     @property
     def cleavage_patterns(self) -> tuple[_CleavagePattern, ...]:
@@ -178,7 +178,7 @@ class FragmentTreeBuilder:
             seed_action_sequences=seed_action_sequences, max_action_count=max_action_count)
         results = self._materialize(source_compound, search, candidates)
         state = _FragmentTreeBuildState(source_compound.smiles, max_node=max_node, max_edge=max_edge,
-                                        only_add_min_depth=self.only_add_min_depth)
+                                        only_add_min_action_count=self.only_add_min_action_count)
         compounds = {0: source_compound.copy()}
         expansion_by_sequence: dict[CleavageActionSequence | None, _FragmentExpansionState] = {
             None: _FragmentExpansionState(0, None)}
@@ -250,17 +250,17 @@ class FragmentTreeBuilder:
     def to_dict(self) -> dict[str, Any]:
         return {"max_action_count": self.max_action_count,
                 "cleavage_pattern_set": self.cleavage_pattern_set.to_dict(),
-                "only_add_min_depth": self.only_add_min_depth}
+                "only_add_min_action_count": self.only_add_min_action_count}
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> FragmentTreeBuilder:
         return cls(max_action_count=data["max_action_count"],
                    cleavage_pattern_set=CleavagePatternSet.from_dict(data["cleavage_pattern_set"]),
-                   only_add_min_depth=data.get("only_add_min_depth", True))
+                   only_add_min_action_count=data.get("only_add_min_action_count", True))
 
     def copy(self) -> FragmentTreeBuilder:
         return FragmentTreeBuilder(self.max_action_count, self.cleavage_pattern_set.copy(),
-                                   self.only_add_min_depth)
+                                   self.only_add_min_action_count)
 
 
 class _FragmentTreeBuildState:
@@ -272,12 +272,12 @@ class _FragmentTreeBuildState:
         *,
         max_node: int = -1,
         max_edge: int = -1,
-        only_add_min_depth: bool = True,
+        only_add_min_action_count: bool = True,
     ) -> None:
         self.root_smiles = root_smiles
         self.max_node = max_node
         self.max_edge = max_edge
-        self.only_add_min_depth = only_add_min_depth
+        self.only_add_min_action_count = only_add_min_action_count
         self.nodes: dict[int, FragmentNode] = {}
         self.edges: dict[tuple[int, int], FragmentEdge] = {}
         self.smiles_to_node_index: dict[str, int] = {}
@@ -306,7 +306,7 @@ class _FragmentTreeBuildState:
         key = (source_index, target_index)
         # Minimum action count filters edge presentation only. Every distinct
         # action history remains eligible for expansion, even for a merged node.
-        if (self.only_add_min_depth and not transition.is_seed
+        if (self.only_add_min_action_count and not transition.is_seed
                 and len(transition.action_sequence.actions) > self.node_action_counts[target_index]):
             return
         if key in self.edges:

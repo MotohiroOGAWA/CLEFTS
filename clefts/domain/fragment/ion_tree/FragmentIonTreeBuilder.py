@@ -211,7 +211,7 @@ class FragmentIonTreeBuilder(FragmentTreeBuilder):
             cleavage_pattern_set=CleavagePatternSet.from_dict(
                 data["cleavage_pattern_set"]
             ),
-            only_add_min_depth=data.get("only_add_min_depth", True),
+            only_add_min_action_count=data.get("only_add_min_action_count", True),
             fragment_ion_adduct_rule_set=FragmentIonAdductRuleSet.from_dict(
                 data["fragment_ion_adduct_rule_set"]
             ),
@@ -221,7 +221,7 @@ class FragmentIonTreeBuilder(FragmentTreeBuilder):
         return FragmentIonTreeBuilder(
             max_action_count=self.max_action_count,
             cleavage_pattern_set=self.cleavage_pattern_set.copy(),
-            only_add_min_depth=self.only_add_min_depth,
+            only_add_min_action_count=self.only_add_min_action_count,
             fragment_ion_adduct_rule_set=(
                 self.fragment_ion_adduct_rule_set.copy()
             ),

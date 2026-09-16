@@ -26,11 +26,11 @@ class Fragmenter:
     fragment_ion_tree_builder: FragmentIonTreeBuilder
     mass_tolerance: MassTolerance
     # Pathway candidate selection belongs to Fragmenter, not the tree builder.
-    precursor_candidate_max_depth: int = 0
+    precursor_candidate_max_action_count: int = 0
 
     def __post_init__(self) -> None:
-        if type(self.precursor_candidate_max_depth) is not int or self.precursor_candidate_max_depth < 0:
-            raise ValueError("precursor_candidate_max_depth must be a non-negative integer")
+        if type(self.precursor_candidate_max_action_count) is not int or self.precursor_candidate_max_action_count < 0:
+            raise ValueError("precursor_candidate_max_action_count must be a non-negative integer")
 
     @property
     def adduct_types(self) -> Tuple[Adduct, ...]:
@@ -44,11 +44,6 @@ class Fragmenter:
     def tree_max_action_count(self) -> int:
         return self.fragment_ion_tree_builder.max_action_count
 
-    @property
-    def tree_max_depth(self) -> int:
-        """Legacy traversal budget accessor for existing pathway/ML callers."""
-        return self.tree_max_action_count
-    
     @property
     def cleavage_pattern_set(self) -> CleavagePatternSet:
         return self.fragment_ion_tree_builder.cleavage_pattern_set
@@ -92,8 +87,8 @@ class Fragmenter:
         # A selected precursor can have a longer action history than another
         # route to the same chemical node. Preserve those transitions instead
         # of applying a minimum action count presentation filter.
-        if self.precursor_candidate_max_depth > 0:
-            return replace(self.fragment_ion_tree_builder, only_add_min_depth=False)
+        if self.precursor_candidate_max_action_count > 0:
+            return replace(self.fragment_ion_tree_builder, only_add_min_action_count=False)
         return self.fragment_ion_tree_builder
 
     def build_fragment_tree(
@@ -388,7 +383,7 @@ class Fragmenter:
     ) -> Set[Tuple[int, Adduct]]:
         precursor_node_candidates: Set[Tuple[int, Adduct]] = set()
 
-        nodes_by_depth = fragment_ion_tree.get_nodes_by_depth()
+        node_action_counts = fragment_ion_tree.get_min_action_counts()
         neutral_delta_h_adducts = (
             fragment_ion_tree
             .get_hydrogen_state_candidate_delta_h_adduct_for_adduct_type(
@@ -396,26 +391,27 @@ class Fragmenter:
             )
         )
 
-        for precursor_depth in range(self.precursor_candidate_max_depth + 1):
-            for node_index in nodes_by_depth.get(precursor_depth, []):
-                node_compound = self._get_fragment_compound(
-                    fragment_ion_tree=fragment_ion_tree,
-                    fragment_compound_by_index=fragment_compound_by_index,
-                    node_index=node_index,
-                )
+        for node_index, action_count in node_action_counts.items():
+            if action_count > self.precursor_candidate_max_action_count:
+                continue
+            node_compound = self._get_fragment_compound(
+                fragment_ion_tree=fragment_ion_tree,
+                fragment_compound_by_index=fragment_compound_by_index,
+                node_index=node_index,
+            )
 
-                for neutral_delta_h_adduct in neutral_delta_h_adducts:
-                    shifted_formula = neutral_delta_h_adduct.apply_to_formula(
-                        node_compound.formula
-                    ).normalized
-                    shifted_formula = main_adduct_type.apply_to_formula(
-                        shifted_formula
-                    ).normalized
+            for neutral_delta_h_adduct in neutral_delta_h_adducts:
+                shifted_formula = neutral_delta_h_adduct.apply_to_formula(
+                    node_compound.formula
+                ).normalized
+                shifted_formula = main_adduct_type.apply_to_formula(
+                    shifted_formula
+                ).normalized
 
-                    if shifted_formula == precursor_formula:
-                        precursor_node_candidates.add(
-                            (node_index, neutral_delta_h_adduct)
-                        )
+                if shifted_formula == precursor_formula:
+                    precursor_node_candidates.add(
+                        (node_index, neutral_delta_h_adduct)
+                    )
 
         return precursor_node_candidates
 
@@ -444,8 +440,8 @@ class Fragmenter:
                 fragment_tree=fragment_ion_tree,
                 target_node_index=precursor_node_index,
                 precursor_adduct_types=precursor_adduct_types,
-                max_depth=self.tree_max_depth,
-                precursor_candidate_max_depth=self.precursor_candidate_max_depth,
+                max_action_count=self.tree_max_action_count,
+                precursor_candidate_max_action_count=self.precursor_candidate_max_action_count,
             )
 
             if len(pathway_items_list) == 0:
@@ -578,8 +574,8 @@ class Fragmenter:
                 fragment_tree=fragment_ion_tree,
                 target_node_index=node_index,
                 precursor_adduct_types=context.precursor_adduct_types,
-                max_depth=self.tree_max_depth,
-                precursor_candidate_max_depth=self.precursor_candidate_max_depth,
+                max_action_count=self.tree_max_action_count,
+                precursor_candidate_max_action_count=self.precursor_candidate_max_action_count,
             )
         )
 
@@ -590,11 +586,11 @@ class Fragmenter:
         builder_dict = self.fragment_ion_tree_builder.to_dict()
 
         # Hide builder-internal options from the external Fragmenter save format.
-        builder_dict.pop("only_add_min_depth", None)
+        builder_dict.pop("only_add_min_action_count", None)
 
         return {
             "fragment_ion_tree_builder": builder_dict,
-            "precursor_candidate_max_depth": self.precursor_candidate_max_depth,
+            "precursor_candidate_max_action_count": self.precursor_candidate_max_action_count,
             "mass_tolerance": format_mass_tolerance(self.mass_tolerance),
         }
 
@@ -603,17 +599,19 @@ class Fragmenter:
         cls,
         data: dict[str, Any],
     ) -> Fragmenter:
+        if "precursor_candidate_max_depth" in data:
+            raise ValueError("Use precursor_candidate_max_action_count instead of precursor_candidate_max_depth")
         builder_dict = dict(data["fragment_ion_tree_builder"])
 
         # Presentation and pathway-selection options have separate owners.
-        builder_dict["only_add_min_depth"] = True
+        builder_dict["only_add_min_action_count"] = True
 
         return cls(
             fragment_ion_tree_builder=FragmentIonTreeBuilder.from_dict(
                 builder_dict
             ),
             mass_tolerance=parse_mass_tolerance(data["mass_tolerance"]),
-            precursor_candidate_max_depth=int(data.get("precursor_candidate_max_depth", 0)),
+            precursor_candidate_max_action_count=data.get("precursor_candidate_max_action_count", 0),
         )
 
     def to_json(self, path: str | Path) -> None:
@@ -644,7 +642,7 @@ class Fragmenter:
         return Fragmenter(
             fragment_ion_tree_builder=self.fragment_ion_tree_builder.copy(),
             mass_tolerance=self.mass_tolerance,
-            precursor_candidate_max_depth=self.precursor_candidate_max_depth,
+            precursor_candidate_max_action_count=self.precursor_candidate_max_action_count,
         )
 
 @dataclass(frozen=True)

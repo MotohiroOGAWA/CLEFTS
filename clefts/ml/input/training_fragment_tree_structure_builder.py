@@ -96,7 +96,7 @@ class TrainingFragmentTreeStructureBuilder(SingleFragmentTreeStructureBuilder):
         instrument_column: Optional[str] = None,
         max_node: int = -1,
         max_edge: int = -1,
-        max_depth: Optional[int] = None,
+        max_action_count: Optional[int] = None,
         require_precursor_path_targets: bool = True,
     ) -> np.ndarray:
         """Add same-SMILES MSDataset records as training samples."""
@@ -116,7 +116,7 @@ class TrainingFragmentTreeStructureBuilder(SingleFragmentTreeStructureBuilder):
                 smiles=smiles,
                 max_node=max_node,
                 max_edge=max_edge,
-                max_depth=max_depth,
+                max_action_count=max_action_count,
             )
         )
 
@@ -187,7 +187,7 @@ class TrainingFragmentTreeStructureBuilder(SingleFragmentTreeStructureBuilder):
         smiles: str,
         max_node: int = -1,
         max_edge: int = -1,
-        max_depth: Optional[int] = None,
+        max_action_count: Optional[int] = None,
         require_precursor_path_targets: bool = True,
     ) -> np.ndarray:
         """Rebuild training samples from a saved structure and current model."""
@@ -196,7 +196,7 @@ class TrainingFragmentTreeStructureBuilder(SingleFragmentTreeStructureBuilder):
                 smiles=smiles,
                 max_node=max_node,
                 max_edge=max_edge,
-                max_depth=max_depth,
+                max_action_count=max_action_count,
             )
         )
         sample_rows = self._sample_rows_from_structure(structure)
@@ -227,17 +227,17 @@ class TrainingFragmentTreeStructureBuilder(SingleFragmentTreeStructureBuilder):
         smiles: str,
         max_node: int,
         max_edge: int,
-        max_depth: Optional[int],
+        max_action_count: Optional[int],
     ) -> Tuple[FragmentIonTree, Dict[str, Compound]]:
         compound = Compound.from_smiles(smiles)
-        if max_depth is None:
-            max_depth = self._context.tree_max_depth
+        if max_action_count is None:
+            max_action_count = self._context.tree_max_action_count
 
         fragment_ion_tree = self._context.fragmenter.build_fragment_ion_tree(
             compound=compound,
             max_node=max_node,
             max_edge=max_edge,
-            max_action_count=max_depth,
+            max_action_count=max_action_count,
             _include_fragment_compound_cache=True,
         )
         fragment_compound_by_smiles = self._make_fragment_compound_by_smiles(
@@ -626,7 +626,7 @@ class TrainingFragmentTreeStructureBuilder(SingleFragmentTreeStructureBuilder):
         for precursor_pathway in precursor_fragment_pathways:
             precursor_edge_index_path = self._fragment_pathway_to_edge_index_path(
                 fragment_pathway=precursor_pathway,
-                padding_length=self._context.fragmenter.precursor_candidate_max_depth,
+                padding_length=self._context.fragmenter.precursor_candidate_max_action_count,
                 fragment_compound_by_smiles=fragment_compound_by_smiles,
             )
             precursor_node = precursor_pathway.precursor_node

@@ -327,8 +327,8 @@ class TestFragmentIonTreeBuilder(unittest.TestCase):
             self.assertIsInstance(copied, FragmentIonTreeBuilder)
             self.assertEqual(copied.max_action_count, builder.max_action_count)
             self.assertEqual(
-                copied.only_add_min_depth,
-                builder.only_add_min_depth,
+                copied.only_add_min_action_count,
+                builder.only_add_min_action_count,
             )
             self.assertIsNot(
                 copied.cleavage_pattern_set,
@@ -387,7 +387,7 @@ class TestFragmentIonTreeBuilder(unittest.TestCase):
         return FragmentIonTreeBuilder(
             max_action_count=question.builder.max_action_count,
             cleavage_pattern_set=question.builder.cleavage_pattern_set.copy(),
-            only_add_min_depth=question.builder.only_add_min_depth,
+            only_add_min_action_count=question.builder.only_add_min_action_count,
             fragment_ion_adduct_rule_set=(
                 question.fragment_ion_adduct_rule_set.copy()
             ),

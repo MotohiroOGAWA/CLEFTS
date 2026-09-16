@@ -576,7 +576,7 @@ class SingleFragmentTreeStructureBuilder:
         # -------------------------
         fragment_ion_tree = self._context.fragmenter.build_fragment_ion_tree(
             compound=compound,
-            max_action_count=self._context.precursor_candidate_max_depth,
+            max_action_count=self._context.precursor_candidate_max_action_count,
             _include_fragment_compound_cache=True,
         )
 
@@ -766,7 +766,7 @@ class SingleFragmentTreeStructureBuilder:
             for precursor_pathway in precursor_fragment_pathways:
                 precursor_edge_index_path = self._fragment_pathway_to_edge_index_path(
                     fragment_pathway=precursor_pathway,
-                    padding_length=self._context.fragmenter.precursor_candidate_max_depth,
+                    padding_length=self._context.fragmenter.precursor_candidate_max_action_count,
                     fragment_compound_by_smiles=fragment_compound_by_smiles,
                 )
                 if len(precursor_edge_index_path) == 0:

@@ -64,7 +64,7 @@ class FragmentTreeBuilderQuestion:
     - FragmentTreeBuilderCase list
 
     This allows each question to define not only cleavage patterns,
-    but also builder options such as max_action_count and only_add_min_depth.
+    but also builder options such as max_action_count and only_add_min_action_count.
     """
 
     name: str
@@ -90,7 +90,7 @@ def make_single_bond_cleavage_question(
     builder = FragmentTreeBuilder(
         max_action_count=1,
         cleavage_pattern_set=_make_single_bond_cleavage_pattern_set(),
-        only_add_min_depth=True,
+        only_add_min_action_count=True,
     )
     fragment_ion_adduct_rule_set = _make_hydrogen_rearrangement_fragment_ion_adduct_rule_set()
 

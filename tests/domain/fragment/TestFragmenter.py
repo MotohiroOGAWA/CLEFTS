@@ -261,7 +261,7 @@ class TestFragmenter(unittest.TestCase):
                     format_mass_tolerance(fragmenter.mass_tolerance),
                 )
                 self.assertEqual(restored.name, fragmenter.name)
-                self.assertEqual(restored.tree_max_depth, fragmenter.tree_max_depth)
+                self.assertEqual(restored.tree_max_action_count, fragmenter.tree_max_action_count)
 
     def test_to_json_and_from_json(self) -> None:
         for question in make_fragment_tree_builder_questions():
@@ -287,7 +287,7 @@ class TestFragmenter(unittest.TestCase):
                         format_mass_tolerance(fragmenter.mass_tolerance),
                     )
                     self.assertEqual(restored.name, fragmenter.name)
-                    self.assertEqual(restored.tree_max_depth, fragmenter.tree_max_depth)
+                    self.assertEqual(restored.tree_max_action_count, fragmenter.tree_max_action_count)
 
     def test_copy(self) -> None:
         for question in make_fragment_tree_builder_questions():
@@ -311,7 +311,7 @@ class TestFragmenter(unittest.TestCase):
                     format_mass_tolerance(fragmenter.mass_tolerance),
                 )
                 self.assertEqual(copied.name, fragmenter.name)
-                self.assertEqual(copied.tree_max_depth, fragmenter.tree_max_depth)
+                self.assertEqual(copied.tree_max_action_count, fragmenter.tree_max_action_count)
 
     def test_assign_fragment_pathways_to_peaks_finds_pathways_for_all_peaks(
         self,
@@ -426,22 +426,88 @@ class TestFragmenter(unittest.TestCase):
                             expected_unassigned_peaks=case.get("expected_unassigned_peaks", ()),
                         )
 
+    def test_multi_action_seed_precursor_limit_counts_actions_not_edges(self) -> None:
+        from dataclasses import replace
+        from unittest.mock import patch
+        question = make_fragment_tree_builder_questions()[0]
+        builder = self._make_fragment_ion_tree_builder(question)
+        builder = replace(builder, max_action_count=2)
+        source = Compound.from_smiles("CCCCO")
+        seed_result = next(result for result in builder.cleave_all(source, max_action_count=2)
+                           if len(result.action_sequence.actions) == 2)
+        fragmenter = Fragmenter(builder, parse_mass_tolerance("0.01Da"),
+                                precursor_candidate_max_action_count=1)
+        tree = fragmenter.build_fragment_ion_tree(
+            source, seed_action_sequences=(seed_result.action_sequence,),
+            max_action_count=2, _include_fragment_compound_cache=True)
+        seed_edge = tree.get_out_edges(0)[0]
+        index = seed_edge.target_index
+        self.assertEqual(tree.node_depths[index], 1)
+        self.assertEqual(tree.get_min_action_counts()[index], 2)
+        main_adduct = fragmenter.adduct_types[0]
+        formula = main_adduct.apply_to_formula(seed_result.compound.formula).normalized
+        cache = fragmenter._make_fragment_compound_cache(tree)
+        with patch.object(FragmentIonTree, "get_nodes_by_depth", side_effect=AssertionError("graph depth used")):
+            candidates = fragmenter._find_precursor_node_candidates(tree, main_adduct, formula, cache)
+            self.assertFalse(any(node == index for node, _ in candidates))
+            allowed = replace(fragmenter, precursor_candidate_max_action_count=2)
+            candidates = allowed._find_precursor_node_candidates(tree, main_adduct, formula, cache)
+            self.assertTrue(any(node == index for node, _ in candidates))
+        self.assertEqual(len(fragmenter._build_precursor_fragment_pathways(tree, {index: [main_adduct]})), 0)
+        self.assertGreater(len(allowed._build_precursor_fragment_pathways(tree, {index: [main_adduct]})), 0)
+        copied = tree.copy()
+        self.assertEqual(copied.get_min_action_counts(), tree.get_min_action_counts())
+
+    def test_pathway_does_not_mix_histories_of_merged_chemical_nodes(self) -> None:
+        from clefts.domain.fragment.cleavage import CleavageActionSequence
+        from clefts.domain.fragment.tree.FragmentNode import FragmentNode
+        from clefts.domain.fragment.tree.FragmentEdge import FragmentEdge
+        from clefts.domain.fragment.tree.CleavageActionTransition import CleavageActionTransition
+        from clefts.domain.fragment.pathway.build_pathway import build_pathway_items_for_node
+        question = make_fragment_tree_builder_questions()[0]
+        builder = self._make_fragment_ion_tree_builder(question)
+        source = Compound.from_smiles("CCCCC")
+        result = next(result for result in builder.cleave_all(source, max_action_count=2)
+                      if len(result.action_sequence.actions) == 2
+                      and all(len(action.retained_atom_maps) == 4 for action in result.action_sequence.actions))
+        a, b = result.action_sequence.actions
+        seq_a, seq_b = CleavageActionSequence((a,)), CleavageActionSequence((b,))
+        # Both primitive histories produce CCCC, but AB has a specific parent history.
+        nodes = (FragmentNode(0, -1, source.smiles), FragmentNode(1, -1, "CCCC"),
+                 FragmentNode(2, -1, result.compound.smiles))
+        extension = FragmentEdge(1, -1, 1, 2, -1, -1, transitions=(
+            CleavageActionTransition(b, result.action_sequence, seq_a),))
+        adduct = Adduct.parse("[M+H]+")
+        for seed, expected in ((seq_b, 0), (seq_a, 1)):
+            with self.subTest(seed=seed):
+                root_edge = FragmentEdge(0, -1, 0, 1, -1, -1, transitions=(
+                    CleavageActionTransition(None, seed, is_seed=True),))
+                tree = FragmentTree.from_nodes_and_edges(smiles=source.smiles, nodes=nodes,
+                                                         edges=(root_edge, extension))
+                paths = build_pathway_items_for_node(tree, 2, {0: [adduct]},
+                    max_action_count=2, precursor_candidate_max_action_count=0)
+                self.assertEqual(len(paths), expected)
+
     def test_precursor_selection_setting_roundtrip_and_copy(self) -> None:
         question = make_fragment_tree_builder_questions()[0]
         builder = self._make_fragment_ion_tree_builder(question)
-        fragmenter = Fragmenter(builder, parse_mass_tolerance('0.01Da'), precursor_candidate_max_depth=1)
+        fragmenter = Fragmenter(builder, parse_mass_tolerance('0.01Da'), precursor_candidate_max_action_count=1)
         data = fragmenter.to_dict()
-        self.assertEqual(data['precursor_candidate_max_depth'], 1)
+        self.assertEqual(data['precursor_candidate_max_action_count'], 1)
         self.assertEqual(data['fragment_ion_tree_builder']['max_action_count'], builder.max_action_count)
         self.assertNotIn('min_depth_only_from', data['fragment_ion_tree_builder'])
-        self.assertEqual(Fragmenter.from_dict(data).precursor_candidate_max_depth, 1)
-        self.assertEqual(fragmenter.copy().precursor_candidate_max_depth, 1)
-        self.assertEqual(fragmenter.tree_max_action_count, builder.max_action_count)
-        self.assertEqual(fragmenter.tree_max_depth, fragmenter.tree_max_action_count)
-        self.assertTrue(builder.only_add_min_depth)
-        self.assertFalse(fragmenter._builder_for_pathway_selection().only_add_min_depth)
+        self.assertEqual(Fragmenter.from_dict(data).precursor_candidate_max_action_count, 1)
+        self.assertEqual(fragmenter.copy().precursor_candidate_max_action_count, 1)
         with self.assertRaises(ValueError):
-            Fragmenter(builder, fragmenter.mass_tolerance, precursor_candidate_max_depth=-1)
+            Fragmenter.from_dict({**data, "precursor_candidate_max_depth": 1})
+        for value in (True, 1.5, "1"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                Fragmenter.from_dict({**data, "precursor_candidate_max_action_count": value})
+        self.assertEqual(fragmenter.tree_max_action_count, builder.max_action_count)
+        self.assertTrue(builder.only_add_min_action_count)
+        self.assertFalse(fragmenter._builder_for_pathway_selection().only_add_min_action_count)
+        with self.assertRaises(ValueError):
+            Fragmenter(builder, fragmenter.mass_tolerance, precursor_candidate_max_action_count=-1)
 
     def test_batched_and_individual_assignment_keep_precursor_contexts_separate(self) -> None:
         source = Compound.from_smiles('CC(=O)N[C@@H](CC1=CC=CC=C1)C2=CC(=CC(=O)O2)OC')
@@ -613,7 +679,7 @@ class TestFragmenter(unittest.TestCase):
         return FragmentIonTreeBuilder(
             max_action_count=question.builder.max_action_count,
             cleavage_pattern_set=question.builder.cleavage_pattern_set.copy(),
-            only_add_min_depth=question.builder.only_add_min_depth,
+            only_add_min_action_count=question.builder.only_add_min_action_count,
             fragment_ion_adduct_rule_set=(
                 question.fragment_ion_adduct_rule_set.copy()
             ),
@@ -710,10 +776,10 @@ class TestFragmenter(unittest.TestCase):
                 ]
 
                 self.assertTrue(
-                    all(length <= fragmenter.tree_max_depth + 1 for length in pathway_lengths),
+                    all(length <= fragmenter.tree_max_action_count + 1 for length in pathway_lengths),
                     msg=(
                         f"Some fragment pathways exceed max depth "
-                        f"{fragmenter.tree_max_depth}: {pathway_lengths}"
+                        f"{fragmenter.tree_max_action_count}: {pathway_lengths}"
                     ),
                 )
 

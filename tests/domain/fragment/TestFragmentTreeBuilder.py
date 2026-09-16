@@ -24,7 +24,7 @@ def pattern(reactant: str, product: str) -> _CleavagePattern:
 
 def builder(*patterns: _CleavagePattern, limit: int = 3) -> FragmentTreeBuilder:
     return FragmentTreeBuilder(limit, CleavagePatternSet.from_patterns(patterns),
-                               only_add_min_depth=False)
+                               only_add_min_action_count=False)
 
 
 def action(
