@@ -1,16 +1,23 @@
 """Order-independent, validated combinations of concrete cleavage actions."""
 from __future__ import annotations
 
+from collections.abc import Iterable
+from typing import TYPE_CHECKING
 from dataclasses import dataclass
+from rdkit import Chem
+from clefts.libs.mmkit.mmkit import Compound
 from itertools import combinations
 from .CleavageAction import CleavageAction
+
+if TYPE_CHECKING:
+    from .CompositeCleavageReaction import CompositeCleavageReaction
 
 
 @dataclass(frozen=True, init=False)
 class CleavageActionSequence:
     actions: tuple[CleavageAction, ...]
 
-    def __init__(self, actions):
+    def __init__(self, actions: Iterable[CleavageAction]) -> None:
         unique = tuple(sorted(set(actions), key=lambda a: a.key))
         if not unique:
             raise ValueError("At least one CleavageAction is required")
@@ -48,7 +55,7 @@ class CleavageActionSequence:
         object.__setattr__(self, "actions", tuple(kept))
 
     @classmethod
-    def from_actions(cls, actions):
+    def from_actions(cls, actions: Iterable[CleavageAction]) -> CleavageActionSequence:
         return cls(actions)
 
     @property
@@ -60,9 +67,9 @@ class CleavageActionSequence:
         return frozenset().union(*(a.cut_bond_maps for a in self.actions))
 
     @property
-    def bond_updates(self):
+    def bond_updates(self) -> frozenset[tuple[int, int, Chem.BondType]]:
         return frozenset().union(*(a.bond_updates for a in self.actions))
 
-    def compile(self, source):
+    def compile(self, source: Compound | Chem.Mol) -> CompositeCleavageReaction:
         from .CompositeCleavageReaction import CompositeCleavageReaction
         return CompositeCleavageReaction.from_sequence(source=source, action_sequence=self)

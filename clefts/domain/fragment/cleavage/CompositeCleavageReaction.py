@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from clefts.libs.mmkit.mmkit import Compound
 from rdkit import Chem
 from rdkit.Chem import rdChemReactions, rdqueries
 from .CleavageAction import mapped_source
@@ -18,7 +19,12 @@ class CompositeCleavageReaction:
     _source_smiles: str = field(repr=False)
 
     @classmethod
-    def from_sequence(cls, *, source, action_sequence):
+    def from_sequence(
+        cls,
+        *,
+        source: Compound | Chem.Mol,
+        action_sequence: CleavageActionSequence,
+    ) -> CompositeCleavageReaction:
         mol = mapped_source(source)
         by_map = {a.GetAtomMapNum(): a.GetIdx() for a in mol.GetAtoms()}
         source_bonds = {tuple(sorted((b.GetBeginAtom().GetAtomMapNum(), b.GetEndAtom().GetAtomMapNum())))
@@ -68,7 +74,7 @@ class CompositeCleavageReaction:
         return cls(action_sequence, reactant, product, smirks, rxn,
                    Chem.MolToSmiles(mol, canonical=True))
 
-    def run(self, source) -> tuple[Chem.Mol, ...]:
+    def run(self, source: Compound | Chem.Mol) -> tuple[Chem.Mol, ...]:
         """Run once on the exact mapped Source and restore Source atom identities."""
         mol = mapped_source(source)
         if Chem.MolToSmiles(mol, canonical=True) != self._source_smiles:

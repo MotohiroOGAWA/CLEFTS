@@ -1,11 +1,15 @@
 """Concrete edits at one manually selected reactant SMARTS match."""
 from __future__ import annotations
 
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
+
+from clefts.libs.mmkit.mmkit import Compound
+from ._CleavagePattern import _CleavagePattern
 from rdkit import Chem
 
 
-def mapped_source(source) -> Chem.Mol:
+def mapped_source(source: Compound | Chem.Mol) -> Chem.Mol:
     mol = Chem.Mol(source if isinstance(source, Chem.Mol) else source.mapped_mol)
     maps = [atom.GetAtomMapNum() for atom in mol.GetAtoms()]
     if not maps or any(m <= 0 for m in maps) or len(set(maps)) != len(maps):
@@ -34,7 +38,7 @@ class CleavageAction:
     bond_updates: frozenset[tuple[int, int, Chem.BondType]] = frozenset()
     changed_bond_maps: frozenset[tuple[int, int]] = frozenset()
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         if self.product_molecule_id < 0:
             raise ValueError("product_molecule_id must be nonnegative")
         object.__setattr__(self, "bond_updates", frozenset((*bond_key(u, v), order)
@@ -74,16 +78,29 @@ class CleavageAction:
         object.__setattr__(self, "changed_bond_maps", changed)
 
     @property
-    def key(self) -> tuple:
+    def key(self) -> tuple[
+        int, int, int, tuple[int, ...], tuple[int, ...], tuple[int, ...],
+        tuple[tuple[int, int], ...], tuple[tuple[int, int], ...],
+        tuple[tuple[int, int, Chem.BondType], ...], tuple[tuple[int, int], ...],
+    ]:
         return (self.cleavage_pattern_id, self.reaction_id, self.product_molecule_id, self.source_atom_maps,
                 tuple(sorted(self.retained_atom_maps)), tuple(sorted(self.discarded_atom_maps)),
                 tuple(sorted(self.matched_bond_maps)), tuple(sorted(self.cut_bond_maps)),
                 tuple(sorted(self.bond_updates)), tuple(sorted(self.changed_bond_maps)))
 
     @classmethod
-    def from_match(cls, *, source, cleavage_pattern, source_atom_maps,
-                   retained_atom_maps, product_molecule_id, cleavage_pattern_id=None, reaction_id=0,
-                   cut_bond_maps=()):
+    def from_match(
+        cls,
+        *,
+        source: Compound | Chem.Mol,
+        cleavage_pattern: _CleavagePattern,
+        source_atom_maps: Sequence[int],
+        retained_atom_maps: Iterable[int],
+        product_molecule_id: int,
+        cleavage_pattern_id: int | None = None,
+        reaction_id: int = 0,
+        cut_bond_maps: Iterable[tuple[int, int]] = (),
+    ) -> CleavageAction:
         """Bind an existing pattern to an explicitly selected match (no enumeration).
 
         Retention is supplied manually; template bond cuts and order changes are extracted.
