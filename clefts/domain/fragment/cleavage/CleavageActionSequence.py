@@ -70,6 +70,31 @@ class CleavageActionSequence:
     def bond_updates(self) -> frozenset[tuple[int, int, Chem.BondType]]:
         return frozenset().union(*(a.bond_updates for a in self.actions))
 
+    @property
+    def key(self) -> tuple[tuple[object, ...], ...]:
+        """Canonical action history, distinct from the final effect."""
+        return tuple(action.key for action in self.actions)
+
+    @property
+    def effective_cut_bond_maps(self) -> frozenset[tuple[int, int]]:
+        retained = self.retained_atom_maps
+        return frozenset(edge for edge in self.cut_bond_maps if set(edge) <= retained)
+
+    @property
+    def effective_bond_updates(self) -> frozenset[tuple[int, int, Chem.BondType]]:
+        retained = self.retained_atom_maps
+        return frozenset((u, v, order) for u, v, order in self.bond_updates
+                         if {u, v} <= retained)
+
+    @property
+    def effect_key(self) -> tuple[
+        tuple[int, ...], tuple[tuple[int, int], ...],
+        tuple[tuple[int, int, Chem.BondType], ...],
+    ]:
+        return (tuple(sorted(self.retained_atom_maps)),
+                tuple(sorted(self.effective_cut_bond_maps)),
+                tuple(sorted(self.effective_bond_updates)))
+
     def compile(self, source: Compound | Chem.Mol) -> CompositeCleavageReaction:
         from .CompositeCleavageReaction import CompositeCleavageReaction
         return CompositeCleavageReaction.from_sequence(source=source, action_sequence=self)

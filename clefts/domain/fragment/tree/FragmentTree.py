@@ -23,6 +23,9 @@ class FragmentTree:
     Notes
     -----
     Local indices are used for tree traversal.
+    Node 0 is Original Source. Chemical nodes may merge multiple Source action
+    histories; edge transitions retain those histories in memory. Graph depth
+    measures edge distance and is distinct from the normalized action count.
 
     Database IDs are stored separately.
 
@@ -214,6 +217,7 @@ class FragmentTree:
                 source_ids=source_ids,
                 target_ids=target_ids,
                 event_store=event_store,
+                transitions_by_edge=tuple(edge.transitions for edge in edges),
             ),
         )
 
@@ -331,6 +335,11 @@ class FragmentTree:
     def num_edges(self) -> int:
         """Number of edges."""
         return self.edge_store.num_edges
+
+    @property
+    def num_transitions(self) -> int:
+        """Number of in-memory Source action transitions; excludes legacy events."""
+        return sum(len(group) for group in self.edge_store.transitions_by_edge)
 
     @property
     def num_events(self) -> int:
@@ -460,6 +469,20 @@ class FragmentTree:
     def node_depths(self) -> np.ndarray:
         """Minimal depth from root nodes for each local node index."""
         return self._ensure_depths().node_depths
+
+    def get_min_action_counts(self) -> Dict[int, int]:
+        """Minimum normalized Source action count per chemical node.
+
+        Seed links count all actions in their sequence, regardless of graph
+        distance. Nodes with no action history are excluded except Source.
+        """
+        counts: Dict[int, int] = {0: 0}
+        for edge_index in range(self.num_edges):
+            edge = self.get_edge(edge_index)
+            for transition in edge.transitions:
+                count = len(transition.action_sequence.actions)
+                counts[edge.target_index] = min(counts.get(edge.target_index, count), count)
+        return counts
 
     def get_nodes_by_depth(self) -> Dict[int, np.ndarray]:
         """Group local node indices by minimal depth."""

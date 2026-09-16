@@ -27,7 +27,7 @@ class ExpectedFragmentTreeEdge:
 
     source_smiles: str
     target_smiles: str
-    min_event_count: int = 1
+    min_transition_count: int = 1
 
 
 @dataclass(frozen=True)
@@ -42,7 +42,7 @@ class FragmentTreeBuilderCase:
 
     expected_num_nodes: int
     expected_num_edges: int
-    expected_min_events: int
+    expected_min_transitions: int
 
     # Optional expectations for FragmentIonTreeBuilder.
     # Key is fragment SMILES, not node index.
@@ -64,7 +64,7 @@ class FragmentTreeBuilderQuestion:
     - FragmentTreeBuilderCase list
 
     This allows each question to define not only cleavage patterns,
-    but also builder options such as max_depth and only_add_min_depth.
+    but also builder options such as max_action_count and only_add_min_action_count.
     """
 
     name: str
@@ -88,10 +88,9 @@ def make_fragment_tree_builder_questions(
 def make_single_bond_cleavage_question(
 ) -> FragmentTreeBuilderQuestion:
     builder = FragmentTreeBuilder(
-        max_depth=1,
+        max_action_count=1,
         cleavage_pattern_set=_make_single_bond_cleavage_pattern_set(),
-        only_add_min_depth=True,
-        min_depth_only_from=0,
+        only_add_min_action_count=True,
     )
     fragment_ion_adduct_rule_set = _make_hydrogen_rearrangement_fragment_ion_adduct_rule_set()
 
@@ -112,27 +111,27 @@ def make_single_bond_cleavage_question(
                 ExpectedFragmentTreeEdge(
                     source_smiles="CCO",
                     target_smiles="C",
-                    min_event_count=1,
+                    min_transition_count=1,
                 ),
                 ExpectedFragmentTreeEdge(
                     source_smiles="CCO",
                     target_smiles="CO",
-                    min_event_count=1,
+                    min_transition_count=1,
                 ),
                 ExpectedFragmentTreeEdge(
                     source_smiles="CCO",
                     target_smiles="CC",
-                    min_event_count=1,
+                    min_transition_count=1,
                 ),
                 ExpectedFragmentTreeEdge(
                     source_smiles="CCO",
                     target_smiles="O",
-                    min_event_count=1,
+                    min_transition_count=1,
                 ),
             ),
             expected_num_nodes=5,
             expected_num_edges=4,
-            expected_min_events=4,
+            expected_min_transitions=4,
 
             expected_ion_states_by_smiles={
                 "CCO": ((2, 1),),
@@ -182,37 +181,37 @@ def make_single_bond_cleavage_question(
                 ExpectedFragmentTreeEdge(
                     source_smiles="CCCO",
                     target_smiles="C",
-                    min_event_count=1,
+                    min_transition_count=1,
                 ),
                 ExpectedFragmentTreeEdge(
                     source_smiles="CCCO",
                     target_smiles="CCO",
-                    min_event_count=1,
+                    min_transition_count=1,
                 ),
                 ExpectedFragmentTreeEdge(
                     source_smiles="CCCO",
                     target_smiles="CC",
-                    min_event_count=1,
+                    min_transition_count=1,
                 ),
                 ExpectedFragmentTreeEdge(
                     source_smiles="CCCO",
                     target_smiles="CO",
-                    min_event_count=1,
+                    min_transition_count=1,
                 ),
                 ExpectedFragmentTreeEdge(
                     source_smiles="CCCO",
                     target_smiles="CCC",
-                    min_event_count=1,
+                    min_transition_count=1,
                 ),
                 ExpectedFragmentTreeEdge(
                     source_smiles="CCCO",
                     target_smiles="O",
-                    min_event_count=1,
+                    min_transition_count=1,
                 ),
             ),
             expected_num_nodes=7,
             expected_num_edges=6,
-            expected_min_events=6,
+            expected_min_transitions=6,
 
             expected_ion_states_by_smiles={
                 "CCCO": ((2, 1),),
@@ -270,27 +269,27 @@ def make_single_bond_cleavage_question(
                 ExpectedFragmentTreeEdge(
                     source_smiles="CCOCC",
                     target_smiles="C",
-                    min_event_count=2,
+                    min_transition_count=2,
                 ),
                 ExpectedFragmentTreeEdge(
                     source_smiles="CCOCC",
                     target_smiles="CCOC",
-                    min_event_count=2,
+                    min_transition_count=2,
                 ),
                 ExpectedFragmentTreeEdge(
                     source_smiles="CCOCC",
                     target_smiles="CC",
-                    min_event_count=2,
+                    min_transition_count=2,
                 ),
                 ExpectedFragmentTreeEdge(
                     source_smiles="CCOCC",
                     target_smiles="CCO",
-                    min_event_count=2,
+                    min_transition_count=2,
                 ),
             ),
             expected_num_nodes=5,
             expected_num_edges=4,
-            expected_min_events=8,
+            expected_min_transitions=8,
 
             expected_ion_states_by_smiles={
                 "CCOCC": ((2, 1),),

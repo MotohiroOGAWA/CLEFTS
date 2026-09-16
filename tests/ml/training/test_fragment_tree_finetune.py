@@ -103,7 +103,7 @@ def test_cli_dry_run_and_invalid_set(prepared):
     assert report['frozen_parameters'] > report['trainable_parameters'] > 0
     assert not (tmp / 'output').exists()
     changed = deepcopy(preprocessing)
-    changed['fragmenter_params']['fragment_ion_tree_builder']['max_depth'] += 1
+    changed['fragmenter_params']['fragment_ion_tree_builder']['max_action_count'] += 1
     with pytest.raises(ValueError, match='Only the cleavage pattern set'):
         prepare_model_config(tmp / 'base.pt', pattern_file, changed)
     data = json.loads(pattern_file.read_text())

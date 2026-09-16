@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+from unittest.mock import patch
 import json
 from pathlib import Path
 
@@ -127,6 +128,9 @@ class _Selector(nn.Module):
 
 
 class _ConstantLoss(nn.Module):
+    def _precursor_keep_loss(self, output, target, *, device):
+        return torch.zeros((), device=device)
+
     def forward(self, output, target):
         return output.edge_absolute_logit.sum() * 0.0 + 2.0
 
@@ -134,7 +138,12 @@ class _ConstantLoss(nn.Module):
 def test_zero_ranking_weight_removes_ranking_from_total_loss():
     output, target = _ranking_fixture([1.0, 0.0])
     model = FragmentTreeTrainingModel(_Selector(output), loss_fn=_ConstantLoss())
-    result = model(target)
+    # This fixture isolates loss weighting; selection metrics need full peak metadata.
+    with patch.object(model, "_selected_peak_metrics", return_value={}), patch(
+        "clefts.ml.training.fragment_tree_training.model.DepthEvaluation"
+    ) as depth_evaluation:
+        depth_evaluation.return_value.evaluate.return_value = {}
+        result = model(target)
     assert torch.allclose(result["edge_total_loss"], result["edge_retain_loss"])
 
 
@@ -311,7 +320,7 @@ def test_edge_depth_budget_count_must_match_fragmenter_depth():
     try:
         FragmentTreeFeatureModel(**params)
     except ValueError as exc:
-        assert "fragmenter.tree_max_depth=3" in str(exc)
+        assert "fragmenter.tree_max_action_count=3" in str(exc)
     else:
         raise AssertionError("Expected max_edges_per_depth length validation.")
 
@@ -319,6 +328,7 @@ def test_edge_depth_budget_count_must_match_fragmenter_depth():
 def test_training_edge_sampler_keeps_one_alternative_and_zero_edges():
     encoder = StructuralEdgeEncoder.__new__(StructuralEdgeEncoder)
     nn.Module.__init__(encoder)
+    encoder.max_edges_per_step = 4
     encoder.training_edges_per_sample = 4
     encoder.training_zero_edge_fraction = 0.5
     structure = SimpleNamespace(

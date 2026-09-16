@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from clefts.domain.fragment.cleavage import CleavageActionSequence
 
 from clefts.libs.mmkit.mmkit import Compound
 
@@ -102,13 +103,13 @@ class TestFragmentIonTreeBuilder(unittest.TestCase):
 
                         self.assertIsNotNone(edge)
 
-                        event_count = len(edge.events)
+                        transition_count = len(edge.transitions)
                         self.assertGreaterEqual(
-                            event_count,
-                            expected_edge.min_event_count,
+                            transition_count,
+                            expected_edge.min_transition_count,
                         )
 
-    def test_build_has_expected_min_events(self) -> None:
+    def test_build_has_expected_min_transitions(self) -> None:
         for question in make_fragment_tree_builder_questions():
             if question.fragment_ion_adduct_rule_set is None:
                 continue
@@ -121,14 +122,14 @@ class TestFragmentIonTreeBuilder(unittest.TestCase):
                         Compound.from_smiles(case.smiles)
                     )
 
-                    actual_event_count = sum(
-                        len(fragment_ion_tree.get_edge(edge_index).events)
+                    actual_transition_count = sum(
+                        len(fragment_ion_tree.get_edge(edge_index).transitions)
                         for edge_index in range(fragment_ion_tree.num_edges)
                     )
 
                     self.assertGreaterEqual(
-                        actual_event_count,
-                        case.expected_min_events,
+                        actual_transition_count,
+                        case.expected_min_transitions,
                     )
 
     def test_build_has_expected_hydrogen_state_candidates(self) -> None:
@@ -324,14 +325,10 @@ class TestFragmentIonTreeBuilder(unittest.TestCase):
             copied = builder.copy()
 
             self.assertIsInstance(copied, FragmentIonTreeBuilder)
-            self.assertEqual(copied.max_depth, builder.max_depth)
+            self.assertEqual(copied.max_action_count, builder.max_action_count)
             self.assertEqual(
-                copied.only_add_min_depth,
-                builder.only_add_min_depth,
-            )
-            self.assertEqual(
-                copied.min_depth_only_from,
-                builder.min_depth_only_from,
+                copied.only_add_min_action_count,
+                builder.only_add_min_action_count,
             )
             self.assertIsNot(
                 copied.cleavage_pattern_set,
@@ -341,6 +338,42 @@ class TestFragmentIonTreeBuilder(unittest.TestCase):
                 copied.fragment_ion_adduct_rule_set,
                 builder.fragment_ion_adduct_rule_set,
             )
+
+    def test_ion_tree_copy_preserves_transitions_and_source_compound_cache(self) -> None:
+        question = make_fragment_tree_builder_questions()[0]
+        builder = self._make_fragment_ion_tree_builder(question)
+        source = Compound.from_smiles("CCO")
+        tree = builder.build(source, max_action_count=1, _include_fragment_compound_cache=True)
+        copied = tree.copy()
+        self.assertEqual(copied.num_transitions, tree.num_transitions)
+        for index in range(tree.num_edges):
+            self.assertEqual(copied.get_edge(index).transitions, tree.get_edge(index).transitions)
+        self.assertIs(copied._fragment_compound_by_index[0], tree._fragment_compound_by_index[0])
+        self.assertIsNot(copied._fragment_compound_by_index, tree._fragment_compound_by_index)
+        copied._fragment_compound_by_index.clear()
+        self.assertTrue(tree._fragment_compound_by_index)
+
+    def test_action_limit_and_seeds_forwarded_to_tree_builder(self) -> None:
+        question = make_fragment_tree_builder_questions()[0]
+        builder = self._make_fragment_ion_tree_builder(question)
+        source = Compound.from_smiles('CCO')
+        actions = builder.create_cleavage_actions(source)
+        oxygen_map = next(a.GetAtomMapNum() for a in source.mapped_mol.GetAtoms() if a.GetSymbol() == 'O')
+        retained = next(a for a in actions if a.discarded_atom_maps == frozenset((oxygen_map,)))
+        seed = CleavageActionSequence((retained,))
+        for method in (builder.build, builder.build_fragment_tree):
+            with self.subTest(method=method.__name__):
+                tree = method(source, seed_action_sequences=(seed,), max_action_count=2)
+                self.assertEqual(tree.num_nodes, 3)
+                self.assertEqual(len(tree.get_out_edges(0)), 1)
+                self.assertTrue(tree.get_out_edges(0)[0].transitions[0].is_seed)
+                self.assertEqual(tree.get_out_edges(0)[0].transitions[0].action_sequence, seed)
+        data = builder.to_dict()
+        self.assertEqual(data['max_action_count'], builder.max_action_count)
+        self.assertNotIn('max_depth', data)
+        self.assertNotIn('min_depth_only_from', data)
+        self.assertEqual(FragmentIonTreeBuilder.from_dict(data).to_dict(), data)
+        self.assertEqual(builder.copy().to_dict(), data)
 
     def _make_fragment_ion_tree_builder(
         self,
@@ -352,10 +385,9 @@ class TestFragmentIonTreeBuilder(unittest.TestCase):
             )
 
         return FragmentIonTreeBuilder(
-            max_depth=question.builder.max_depth,
+            max_action_count=question.builder.max_action_count,
             cleavage_pattern_set=question.builder.cleavage_pattern_set.copy(),
-            only_add_min_depth=question.builder.only_add_min_depth,
-            min_depth_only_from=question.builder.min_depth_only_from,
+            only_add_min_action_count=question.builder.only_add_min_action_count,
             fragment_ion_adduct_rule_set=(
                 question.fragment_ion_adduct_rule_set.copy()
             ),

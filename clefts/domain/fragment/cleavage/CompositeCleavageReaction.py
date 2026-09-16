@@ -70,7 +70,9 @@ class CompositeCleavageReaction:
         # Atom maps alone do not constrain RDKit matching; bind the concrete locations.
         for atom in rxn.GetReactantTemplate(0).GetAtoms():
             atom.ExpandQuery(rdqueries.HasIntPropWithValueQueryAtom("molAtomMapNumber", atom.GetAtomMapNum()))
-        rxn.Initialize()
+        # Atom deletion intentionally leaves Source maps absent from the target.
+        # RDKit's unmapped-product warning is expected; exceptions still propagate.
+        rxn.Initialize(silent=True)
         return cls(action_sequence, reactant, product, smirks, rxn,
                    Chem.MolToSmiles(mol, canonical=True))
 

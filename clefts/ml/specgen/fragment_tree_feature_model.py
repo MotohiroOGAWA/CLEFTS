@@ -104,12 +104,12 @@ class FragmentTreeFeatureModel(nn.Module):
             **fragment_edge_encoder_params
         )
         edge_depth_budgets = self.fragment_edge_encoder.max_edges_per_depth
-        if len(edge_depth_budgets) != self._fragmenter.tree_max_depth:
+        if len(edge_depth_budgets) != self._fragmenter.tree_max_action_count:
             raise ValueError(
                 "max_edges_per_depth must contain exactly one value per "
                 "fragmenter depth: "
                 f"got {len(edge_depth_budgets)} values, "
-                f"fragmenter.tree_max_depth={self._fragmenter.tree_max_depth}."
+                f"fragmenter.tree_max_action_count={self._fragmenter.tree_max_action_count}."
             )
 
         tree_encoder_params = tree_encoder_params.copy()
@@ -117,8 +117,8 @@ class FragmentTreeFeatureModel(nn.Module):
             tree_encoder_params["hidden_dim"] = tree_encoder_params.pop("dim")
         tree_encoder_params["node_dim"] = self.mol_encoder.graph_dim + 3
         tree_encoder_params["edge_dim"] = self.fragment_edge_encoder.feature_dim
-        tree_encoder_params["max_spatial_dist"] = self.fragmenter.tree_max_depth + 1
-        tree_encoder_params["max_edge_dist"] = self.fragmenter.tree_max_depth + 1
+        tree_encoder_params["max_spatial_dist"] = self.fragmenter.tree_max_action_count + 1
+        tree_encoder_params["max_edge_dist"] = self.fragmenter.tree_max_action_count + 1
         tree_encoder_params["dropout"] = dropout
         tree_encoder_params["condition_dim"] = self._condition_encoder.feature_dim
         tree_encoder_params.setdefault("condition_token_count", 1)
@@ -310,12 +310,12 @@ class FragmentTreeFeatureModel(nn.Module):
         return self._mol_encoder._graph_dim
 
     @property
-    def tree_max_depth(self) -> int:
-        return self._fragmenter.tree_max_depth
+    def tree_max_action_count(self) -> int:
+        return self._fragmenter.tree_max_action_count
 
     @property
-    def precursor_candidate_max_depth(self) -> int:
-        return self._fragmenter.precursor_candidate_max_depth
+    def precursor_candidate_max_action_count(self) -> int:
+        return self._fragmenter.precursor_candidate_max_action_count
 
     @property
     def mol_encoder(self) -> MolEncoder:

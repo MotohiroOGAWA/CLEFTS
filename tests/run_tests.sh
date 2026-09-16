@@ -1,3 +1,3 @@
 #!/bin/bash
-# Run all unittests in tests/ folder
-python -m unittest discover -s tests -p "Test*.py"
+# Run the shared verbose, buffered test runner from any working directory.
+exec python "$(dirname -- "$0")/run_tests.py" "$@"

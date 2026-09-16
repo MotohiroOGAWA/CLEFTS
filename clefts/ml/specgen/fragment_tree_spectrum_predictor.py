@@ -117,7 +117,7 @@ class FragmentTreeSpectrumPredictor(nn.Module):
         structure_expander: Optional[Callable] = None,
     ) -> FragmentSpectrumGeneratorOutput:
         additional_depth = (
-            min(3, max(0, int(self.candidate_selector.fragmenter.tree_max_depth) - 1))
+            min(3, max(0, int(self.candidate_selector.fragmenter.tree_max_action_count) - 1))
             if self.expand_cleavages
             else 0
         )

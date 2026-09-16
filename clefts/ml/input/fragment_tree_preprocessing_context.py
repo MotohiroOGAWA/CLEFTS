@@ -83,12 +83,12 @@ class FragmentTreePreprocessingContext:
         )
 
     @property
-    def tree_max_depth(self) -> int:
-        return self.fragmenter.tree_max_depth
+    def tree_max_action_count(self) -> int:
+        return self.fragmenter.tree_max_action_count
 
     @property
-    def precursor_candidate_max_depth(self) -> int:
-        return self.fragmenter.precursor_candidate_max_depth
+    def precursor_candidate_max_action_count(self) -> int:
+        return self.fragmenter.precursor_candidate_max_action_count
 
     def get_index_by_adduct_type(self, adduct_type) -> int:
         return self.fragmenter.get_index_by_adduct_type(adduct_type)
