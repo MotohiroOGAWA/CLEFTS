@@ -34,6 +34,18 @@ class SourceActionFeatureModel(nn.Module):
         self.top_k, self.max_k, self.threshold = action_prefilter_top_k, action_prefilter_max_k, action_prefilter_threshold_logit
         self.max_action_count = max_action_count
 
+    def freeze_mol_encoder(self) -> None:
+        self._freeze_mol_encoder = True
+        self.mol_encoder.eval()
+        for parameter in self.mol_encoder.parameters():
+            parameter.requires_grad_(False)
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if getattr(self, "_freeze_mol_encoder", False):
+            self.mol_encoder.eval()
+        return self
+
     def forward(self, data: object, training_pool: bool = False) -> SourceActionFeatures:
         if data.max_action_role_count > self.action_encoder.roles.num_embeddings:
             raise ValueError("Configure max_roles for the largest SMARTS query in the action universe")

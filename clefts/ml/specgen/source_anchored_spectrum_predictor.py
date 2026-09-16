@@ -36,7 +36,7 @@ class SourceAnchoredFragmentSpectrumGenerator(nn.Module):
 
     def __init__(self, fragmenter_params: dict, mol_encoder_params: dict,
                  action_model_params: dict | None = None, post_model_params: dict | None = None,
-                 adduct_type_strs: Sequence[str] | None = None) -> None:
+                 adduct_type_strs: Sequence[str] | None = None, fine_tuning: dict | None = None) -> None:
         super().__init__()
         self.fragmenter = Fragmenter.from_dict(fragmenter_params)
         self.adduct_type_strs = tuple(dict.fromkeys(str(Adduct.parse(value)) for value in
@@ -59,6 +59,9 @@ class SourceAnchoredFragmentSpectrumGenerator(nn.Module):
         post_params.setdefault("hidden_dim",hidden)
         self.post_model=PostMaterializationFragmentTreeModel(self.mol_encoder,hidden,condition_dim,self.tensorizer.dim,
             max_action_count=self.fragmenter.tree_max_action_count,**post_params)
+        if fine_tuning:
+            from .action_fine_tuning import install_action_expansion
+            install_action_expansion(self, fine_tuning)
 
     def forward(self, data: SourceActionStructure) -> SourceAnchoredSelectionOutput:
         """Neural forward, including validation, never invokes RDKit."""
