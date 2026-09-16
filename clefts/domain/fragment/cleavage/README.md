@@ -28,8 +28,6 @@ Sequences reject overlapping `changed_bond_maps` after duplicate removal and bef
 
 `reaction.run` accepts the original mapped Source, calls RunReactants once, and restores Source atom maps. RDKit atom maps alone do not constrain match locations, so the compiled `rxn` includes additional queries matching Source atom map properties. Reconstructing a reaction from the `smirks` string loses these additional queries. Use `run` to execute the reaction at its concrete locations.
 
-Run validation from `mnt/app`:
-
 ```bash
 PYTHONPATH=. python -m unittest tests.domain.fragment.TestCleavageAction tests.domain.fragment.TestCleavagePattern tests.domain.fragment.TestCleavagePatternSet
 ```
