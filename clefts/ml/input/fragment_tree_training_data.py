@@ -14,6 +14,7 @@ from tqdm import tqdm
 
 from ...libs.msentity.msentity import MSDataset
 from .fragment_tree_structure import FragmentTreeStructure
+from .source_action_structure import SourceActionStructure, SCHEMA, SCHEMA_VERSION, FRAGMENTATION_SCHEMA
 from .training_fragment_tree_structure import TrainingFragmentTreeStructure
 from .training_fragment_tree_structure_builder import TrainingFragmentTreeStructureBuilder
 
@@ -26,7 +27,7 @@ class FragmentTreeStructureFileItem:
     """One saved SMILES-group fragment tree structure."""
 
     path: Path
-    structure: FragmentTreeStructure
+    structure: FragmentTreeStructure | SourceActionStructure
     metadata: Dict[str, object]
 
 
@@ -73,6 +74,12 @@ def save_fragment_tree_structure(
 ) -> None:
     """Save one structure and small metadata sidecar into a torch file."""
 
+    if isinstance(structure, SourceActionStructure):
+        output_path=Path(output_file)
+        output_path.parent.mkdir(parents=True,exist_ok=True)
+        torch.save(dict(schema=SCHEMA,schema_version=SCHEMA_VERSION,fragmentation_schema=FRAGMENTATION_SCHEMA,
+                        structure=structure.to("cpu"),metadata=dict(metadata or {})),output_path)
+        return
     output_path = Path(output_file)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
@@ -95,6 +102,14 @@ def load_fragment_tree_structure_file(
     file_path = Path(path)
     payload = torch.load(file_path, map_location=map_location)
 
+    if isinstance(payload,dict) and (payload.get("schema_version")==4 or isinstance(payload.get("structure"),SourceActionStructure)):
+        if (payload.get("schema"),payload.get("schema_version"),payload.get("fragmentation_schema")) != (SCHEMA,SCHEMA_VERSION,FRAGMENTATION_SCHEMA):
+            raise ValueError("Source action data requires schema v4; regenerate from original MSDataset")
+        structure=payload["structure"]
+        if not isinstance(structure,SourceActionStructure):
+            raise TypeError("schema v4 must contain SourceActionStructure")
+        if device is not None: structure=structure.to(device)
+        return FragmentTreeStructureFileItem(file_path,structure,dict(payload.get("metadata",{})))
     if isinstance(payload, FragmentTreeStructure):
         structure = payload
         metadata: Dict[str, object] = {}

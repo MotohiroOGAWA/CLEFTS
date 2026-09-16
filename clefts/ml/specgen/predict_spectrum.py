@@ -215,8 +215,19 @@ def load_generator(
 ) -> FragmentSpectrumGenerator:
     checkpoint = torch.load(model_path, map_location=device, weights_only=False)
     params = model_params_from_checkpoint(checkpoint, params_path=params_path)
-    generator = FragmentSpectrumGenerator(**params).to(device)
+    from .fragment_tree_spectrum_predictor import create_spectrum_generator
+    generator = create_spectrum_generator(params).to(device)
     state_dict = extract_state_dict(checkpoint)
+
+    from .source_anchored_spectrum_predictor import SourceAnchoredFragmentSpectrumGenerator
+    if isinstance(generator,SourceAnchoredFragmentSpectrumGenerator):
+        if any(key.startswith("downstream_model.") for key in state_dict):
+            from ..training.fragment_tree_training.action_model import ActionFragmentTreeTrainingModel
+            wrapper=ActionFragmentTreeTrainingModel(generator.feature_model,downstream_model=generator.post_model)
+            wrapper.load_state_dict(state_dict,strict=strict)
+        else:
+            generator.load_state_dict(state_dict,strict=strict)
+        return generator.eval()
 
     # Fragment-tree training checkpoints contain the training wrapper, whose
     # modules are shared with the generator.  Load through that wrapper so a
@@ -616,6 +627,12 @@ def predict_msdataset(
     include_fragment_ion_annotation: bool,
 ) -> tuple[MSDataset, pd.DataFrame]:
     """Finish each cached compound, expanding only model-selected fragments."""
+    from .source_anchored_spectrum_predictor import SourceAnchoredFragmentSpectrumGenerator
+    if isinstance(generator,SourceAnchoredFragmentSpectrumGenerator):
+        from .source_action_msdataset import predict_source_msdataset
+        return predict_source_msdataset(dataset,generator,smiles_column=smiles_column,adduct_type_column=adduct_type_column,
+            collision_energy_column=collision_energy_column,precursor_mz_column=precursor_mz_column,
+            instrument_column=instrument_column,include_formula_annotation=include_formula_annotation)
     predicted_parts: list[MSDataset] = []
     failures = [dict(row) for row in precompute_failures]
     next_sequence = 1
@@ -833,20 +850,24 @@ def main() -> None:
     ))
     try:
         overall.set_description("[4/7] Precomputing first-cleavage structures")
-        cache_paths, precompute_failures = precompute_first_cleavage_caches(
-            dataset=dataset,
-            generator=generator,
-            smiles_values=smiles_values,
-            cache_dir=cache_dir,
-            workers=args.precompute_workers,
-            batch_size=args.batch_size,
-            smiles_column=args.smiles_column,
-            precursor_mz_column=args.precursor_mz_column,
-            adduct_type_column=args.adduct_type_column,
-            collision_energy_column=args.collision_energy_column,
-            instrument_column=args.instrument_column,
-            spec_id_column=args.spec_id_column,
-        )
+        from .source_anchored_spectrum_predictor import SourceAnchoredFragmentSpectrumGenerator
+        if isinstance(generator,SourceAnchoredFragmentSpectrumGenerator):
+            cache_paths,precompute_failures=[],[]
+        else:
+            cache_paths, precompute_failures = precompute_first_cleavage_caches(
+                dataset=dataset,
+                generator=generator,
+                smiles_values=smiles_values,
+                cache_dir=cache_dir,
+                workers=args.precompute_workers,
+                batch_size=args.batch_size,
+                smiles_column=args.smiles_column,
+                precursor_mz_column=args.precursor_mz_column,
+                adduct_type_column=args.adduct_type_column,
+                collision_energy_column=args.collision_energy_column,
+                instrument_column=args.instrument_column,
+                spec_id_column=args.spec_id_column,
+            )
         overall.update(1)
 
         overall.set_description("[5/7] Predicting and expanding selected fragments")

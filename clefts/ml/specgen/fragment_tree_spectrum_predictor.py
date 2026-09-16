@@ -355,3 +355,19 @@ class FragmentSpectrumGenerator(ModelBase):
             include_fragment_ion_annotation=include_fragment_ion_annotation,
             structure_expander=structure_expander,
         )
+
+
+def create_spectrum_generator(params: Dict):
+    """Dispatch the new Source/action architecture or an explicit legacy schema.
+
+    Probability-model parameter files are legacy-only and remain readable for
+    existing checkpoints; action configurations never enter their selector.
+    """
+    from .source_anchored_spectrum_predictor import SourceAnchoredFragmentSpectrumGenerator
+    config = dict(params)
+    architecture = config.pop("architecture", None)
+    if architecture == SourceAnchoredFragmentSpectrumGenerator.architecture or (architecture is None and "fragmenter_params" in config):
+        return SourceAnchoredFragmentSpectrumGenerator(**config)
+    if architecture not in (None,"legacy-fragment-tree-edge-v3"):
+        raise ValueError(f"Unknown spectrum generator architecture: {architecture}")
+    return FragmentSpectrumGenerator(**config)

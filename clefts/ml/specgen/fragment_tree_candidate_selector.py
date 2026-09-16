@@ -1,3 +1,7 @@
+"""Legacy-only full-tree edge architecture; new models use SourceActionFeatureModel.
+
+Kept for v3 checkpoint readers during the Source/action migration.
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass, replace

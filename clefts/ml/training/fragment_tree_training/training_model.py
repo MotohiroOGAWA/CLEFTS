@@ -386,7 +386,8 @@ def build_model_config_from_pretrained(
 
 def load_generator(model_config: Dict[str, Any], device: torch.device) -> FragmentSpectrumGenerator:
     params = model_config.get("params", model_config)
-    generator = FragmentSpectrumGenerator(**params).to(device)
+    from ...specgen.fragment_tree_spectrum_predictor import create_spectrum_generator
+    generator = create_spectrum_generator(params).to(device)
     return generator
 
 
@@ -443,6 +444,12 @@ def build_training_model(
     device: torch.device,
 ) -> FragmentTreeTrainingModel:
     generator = load_generator(model_config, device=device)
+    from ...specgen.source_anchored_spectrum_predictor import SourceAnchoredFragmentSpectrumGenerator
+    if isinstance(generator,SourceAnchoredFragmentSpectrumGenerator):
+        from .action_model import ActionFragmentTreeTrainingModel
+        model=ActionFragmentTreeTrainingModel(generator.feature_model,downstream_model=generator.post_model).to(device)
+        model.set_checkpoint_model_config(model_config)
+        return model
     model = FragmentTreeTrainingModel(
         generator.candidate_selector,
         intensity_predictor=generator.formula_intensity_predictor,
@@ -2993,6 +3000,27 @@ def run_training(
         )
     if workbench_config is not None:
         save_config(workbench_config, run_dir / "fragment_tree.pfttrain.json")
+
+    model_config = (dict(model_config_inline) if model_config_inline is not None
+                    else load_config(model_config_resolved))
+    model_config.update(dict(model_overrides or {}))
+    action_config = model_config.get("params", model_config)
+    if action_config.get("architecture") == "source-anchored-action-autoregressive-v1" or (
+        "fragmenter_params" in action_config and "probability_model_params" not in action_config
+    ):
+        from .action_training import train_actions
+        save_config(model_config, run_dir / DEFAULT_PROJECT_MODEL_CONFIG_NAME)
+        train_actions(
+            model_config=model_config,
+            train_dir=dataset_info["training_structure_dir"],
+            val_dir=dataset_info["validation_structure_dir"],
+            output_dir=run_dir,
+            epochs=epochs,
+            batch_size=batch_size,
+            device=str(device),
+            lr=float(optimizer_info.get("lr", optimizer_info.get("params", {}).get("lr", 1e-4))),
+        )
+        return
 
     _, _, train_loader, val_loader, extra_data = setup_dataset(
         dataset_info,
