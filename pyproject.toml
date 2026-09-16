@@ -18,7 +18,6 @@ dependencies = [
     "pandas",
     "h5py",
     "pyarrow",
-    "gradio",
 ]
 
 [project.scripts]
