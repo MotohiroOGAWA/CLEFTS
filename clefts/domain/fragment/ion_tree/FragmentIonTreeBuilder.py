@@ -190,29 +190,8 @@ class FragmentIonTreeBuilder(FragmentTreeBuilder):
     def _get_compound_atom_symbols(
         compound: Compound,
     ) -> frozenset[str]:
-        """Return atom symbols contained in one Compound.
-
-        This assumes mmkit Compound exposes an RDKit-like mol object.
-        If your Compound API is different, only this method needs to be
-        adjusted.
-        """
-
-        if hasattr(compound, "mol"):
-            mol = compound.mol
-        elif hasattr(compound, "rdmol"):
-            mol = compound.rdmol
-        elif hasattr(compound, "to_mol"):
-            mol = compound.to_mol()
-        else:
-            raise TypeError(
-                "Compound must expose mol, rdmol, or to_mol() to collect "
-                "atom symbols."
-            )
-
-        return frozenset(
-            atom.GetSymbol()
-            for atom in mol.GetAtoms()
-        )
+        """Return atom symbols contained in one Compound."""
+        return frozenset(atom.GetSymbol() for atom in compound.mol.GetAtoms())
 
     def to_dict(self) -> dict[str, Any]:
         return {

@@ -339,6 +339,20 @@ class TestFragmentIonTreeBuilder(unittest.TestCase):
                 builder.fragment_ion_adduct_rule_set,
             )
 
+    def test_ion_tree_copy_preserves_transitions_and_source_compound_cache(self) -> None:
+        question = make_fragment_tree_builder_questions()[0]
+        builder = self._make_fragment_ion_tree_builder(question)
+        source = Compound.from_smiles("CCO")
+        tree = builder.build(source, max_action_count=1, _include_fragment_compound_cache=True)
+        copied = tree.copy()
+        self.assertEqual(copied.num_transitions, tree.num_transitions)
+        for index in range(tree.num_edges):
+            self.assertEqual(copied.get_edge(index).transitions, tree.get_edge(index).transitions)
+        self.assertIs(copied._fragment_compound_by_index[0], tree._fragment_compound_by_index[0])
+        self.assertIsNot(copied._fragment_compound_by_index, tree._fragment_compound_by_index)
+        copied._fragment_compound_by_index.clear()
+        self.assertTrue(tree._fragment_compound_by_index)
+
     def test_action_limit_and_seeds_forwarded_to_tree_builder(self) -> None:
         question = make_fragment_tree_builder_questions()[0]
         builder = self._make_fragment_ion_tree_builder(question)

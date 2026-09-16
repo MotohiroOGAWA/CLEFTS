@@ -32,6 +32,21 @@ class TestFragmenter(unittest.TestCase):
     implemented yet.
     """
 
+    def test_fragment_all_uses_source_action_histories_and_limits(self) -> None:
+        from clefts.domain.fragment.cleavage import CleavageActionResult
+        question = make_fragment_tree_builder_questions()[0]
+        builder = self._make_fragment_ion_tree_builder(question)
+        fragmenter = self._make_fragmenter(builder)
+        source = Compound.from_smiles("CCO")
+        results = fragmenter.fragment_all(source, max_action_count=1)
+        self.assertTrue(results)
+        self.assertTrue(all(isinstance(result, CleavageActionResult) for result in results))
+        self.assertTrue(all(len(result.action_sequence.actions) == 1 for result in results))
+        seed = results[0].action_sequence
+        seeded = fragmenter.fragment_all(source, seed_action_sequences=(seed,), max_action_count=1)
+        self.assertEqual(tuple(result.action_sequence for result in seeded), (seed,))
+        self.assertEqual(fragmenter.fragment_all(source, max_action_count=0), ())
+
     def test_fragmenter_fields_for_questions(self) -> None:
         for question in make_fragment_tree_builder_questions():
             if question.fragment_ion_adduct_rule_set is None:

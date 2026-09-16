@@ -576,7 +576,7 @@ class SingleFragmentTreeStructureBuilder:
         # -------------------------
         fragment_ion_tree = self._context.fragmenter.build_fragment_ion_tree(
             compound=compound,
-            max_depth=self._context.precursor_candidate_max_depth,
+            max_action_count=self._context.precursor_candidate_max_depth,
             _include_fragment_compound_cache=True,
         )
 

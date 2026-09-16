@@ -69,7 +69,7 @@ class TestPrimitiveCleavageActions(unittest.TestCase):
         self.assertEqual(a.cut_bond_maps, frozenset(((10, 20),)))
 
     def test_template_inspection_once_for_all_matches(self) -> None:
-        import clefts.domain.fragment.cleavage.CleavageActionGenerator as generator
+        from clefts.domain.fragment.cleavage import CleavageActionGenerator as generator
         source = Compound.from_smiles('CCCCCC')
         build = builder(pattern('[C:1]-[C:2]', '[C:1]'))
         with patch.object(generator, '_action_templates', wraps=generator._action_templates) as parsed:

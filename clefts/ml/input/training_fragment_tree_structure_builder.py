@@ -237,7 +237,7 @@ class TrainingFragmentTreeStructureBuilder(SingleFragmentTreeStructureBuilder):
             compound=compound,
             max_node=max_node,
             max_edge=max_edge,
-            max_depth=max_depth,
+            max_action_count=max_depth,
             _include_fragment_compound_cache=True,
         )
         fragment_compound_by_smiles = self._make_fragment_compound_by_smiles(

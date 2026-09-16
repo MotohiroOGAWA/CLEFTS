@@ -1,20 +1,21 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from typing import Any, Iterable, List, Tuple, Dict, Set, Optional, Sequence
+from typing import Any, Iterable, List, Tuple, Dict, Set, Sequence
 import json
 from pathlib import Path
 from collections import defaultdict
 
-from ...libs.mmkit.mmkit import Adduct, Compound
+from ...libs.mmkit.mmkit import Adduct, Compound, Formula
 
 from ..mass.tolerance import MassTolerance, parse_mass_tolerance, format_mass_tolerance
 from ..formula import utils as formula_utils
-from .tree import *
-from .ion_tree import *
-from .pathway import *
+from .tree import FragmentTree
+from .ion_tree import FragmentIonTree, FragmentIonTreeBuilder, FragmentIonAdductRuleSet
+from .pathway import FragmentPathway, FragmentPathwayGroup
+from .ion_tree._private._FragmentIonFormulaCandidateGroup import _FragmentIonFormulaCandidateGroup
 from .pathway.build_pathway import build_pathway_items_for_node, PathwayItem
-from .cleavage import CleavagePatternSet, CleavagePattern, CleavageResult, CleavageActionSequence
+from .cleavage import CleavagePatternSet, CleavageActionResult, CleavageActionSequence
 
 
 PathwayItemsCacheKey = Tuple[Adduct, int, Tuple[Tuple[int, Tuple[Adduct, ...]], ...]]
@@ -200,7 +201,7 @@ class Fragmenter:
 
         pathway_items_cache: Dict[
             PathwayItemsCacheKey,
-            Tuple[Tuple[Any, ...], ...],
+            Tuple[Tuple[PathwayItem, ...], ...],
         ] = {}
 
         for main_adduct_type, record_indices in record_indices_by_main_adduct_type.items():
@@ -267,8 +268,16 @@ class Fragmenter:
     def fragment_all(
         self,
         compound: Compound,
-    ) -> Tuple[CleavageResult, ...]:
-        return self.cleavage_pattern_set.fragment_all(compound)
+        *,
+        seed_action_sequences: Sequence[CleavageActionSequence] | None = None,
+        max_action_count: int | None = None,
+    ) -> Tuple[CleavageActionResult, ...]:
+        """Apply action histories to the original Source compound."""
+        return self.fragment_ion_tree_builder.cleave_all(
+            compound,
+            seed_action_sequences=seed_action_sequences,
+            max_action_count=max_action_count,
+        )
 
     def _make_fragment_compound_cache(
         self,
@@ -374,7 +383,7 @@ class Fragmenter:
         self,
         fragment_ion_tree: FragmentIonTree,
         main_adduct_type: Adduct,
-        precursor_formula,
+        precursor_formula: Formula,
         fragment_compound_by_index: Dict[int, Compound],
     ) -> Set[Tuple[int, Adduct]]:
         precursor_node_candidates: Set[Tuple[int, Adduct]] = set()
@@ -474,9 +483,9 @@ class Fragmenter:
 
     def _assign_formula_matches_to_peak_indices(
         self,
-        assigned_peaks,
+        assigned_peaks: Sequence[Dict[str, Any]],
         flat_peak_refs: List[Tuple[int, int]],
-        formula_candidates,
+        formula_candidates: _FragmentIonFormulaCandidateGroup,
     ) -> Dict[int, Dict[int, Dict[Adduct, Set[int]]]]:
         peak_indices_by_record_node_and_adduct: Dict[
             int,
@@ -509,7 +518,7 @@ class Fragmenter:
             Dict[int, Dict[Adduct, Set[int]]],
         ],
         context_by_record_index: Dict[int, _PrecursorAssignmentContext],
-        pathway_items_cache: Dict[PathwayItemsCacheKey, Tuple[Tuple[Any, ...], ...]],
+        pathway_items_cache: Dict[PathwayItemsCacheKey, Tuple[Tuple[PathwayItem, ...], ...]],
         fragment_pathway_lists_by_record_and_peak: List[List[List[FragmentPathway]]],
     ) -> None:
         for record_index, peak_indices_by_node_and_adduct in (
@@ -549,8 +558,8 @@ class Fragmenter:
         fragment_ion_tree: FragmentIonTree,
         context: _PrecursorAssignmentContext,
         node_index: int,
-        pathway_items_cache: Dict[PathwayItemsCacheKey, Tuple[Tuple[Any, ...], ...]],
-    ) -> Tuple[Tuple[Any, ...], ...]:
+        pathway_items_cache: Dict[PathwayItemsCacheKey, Tuple[Tuple[PathwayItem, ...], ...]],
+    ) -> Tuple[Tuple[PathwayItem, ...], ...]:
         cache_key = (
             context.main_adduct_type,
             node_index,
