@@ -239,8 +239,8 @@ class TestGraphormerEncoder(unittest.TestCase):
         batch = Batch.from_data_list([graph_1, graph_2])
 
         encoder = GraphormerEncoder(
-            in_dim=in_dim,
-            dim=dim,
+            node_dim=in_dim,
+            hidden_dim=dim,
             edge_dim=edge_dim,
             num_heads=num_heads,
             num_layers=2,
@@ -248,7 +248,7 @@ class TestGraphormerEncoder(unittest.TestCase):
             max_spatial_dist=5,
             max_edge_dist=5,
             dropout=0.0,
-            add_virtual_node=True,
+            graph_token_count=1,
             start_cap=4,
             cap_growth=2.0,
         )

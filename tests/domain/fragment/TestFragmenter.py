@@ -415,7 +415,7 @@ class TestFragmenter(unittest.TestCase):
         return [
             {
                 "name": "positive",
-                "fragmenter_json": "clefts/domain/fragment/presets/fragmenter_pos.json",
+                "fragmenter_json": Path(__file__).resolve().parents[3] / "clefts/domain/fragment/presets/fragmenter_single_bond_pos.json",
                 "test_cases": [
                     {
                         "name": "protonated",
@@ -490,7 +490,7 @@ class TestFragmenter(unittest.TestCase):
             },
             {
                 "name": "negative",
-                "fragmenter_json": "clefts/domain/fragment/presets/fragmenter_neg.json",
+                "fragmenter_json": Path(__file__).resolve().parents[3] / "clefts/domain/fragment/presets/fragmenter_single_bond_neg.json",
                 "test_cases": [
                     {
                         "name": "deprotonated",
