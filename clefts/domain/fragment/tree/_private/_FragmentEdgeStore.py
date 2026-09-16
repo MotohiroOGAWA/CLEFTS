@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from ..FragmentEdge import FragmentEdge
+from ..CleavageActionTransition import CleavageActionTransition
 from ._CleavageEventStore import _CleavageEventStore
 
 
@@ -36,6 +37,8 @@ class _FragmentEdgeStore:
     source_ids: np.ndarray
     target_ids: np.ndarray
     event_store: _CleavageEventStore
+
+    transitions_by_edge: tuple[tuple[CleavageActionTransition, ...], ...] = ()
 
     def __post_init__(self) -> None:
         edge_ids = np.asarray(self.edge_ids, dtype=np.int64)
@@ -79,6 +82,13 @@ class _FragmentEdgeStore:
         if self.event_store.num_edges != num_edges:
             raise ValueError("event_store must match edge_ids.")
 
+        transitions = self.transitions_by_edge or tuple(() for _ in range(num_edges))
+        transitions = tuple(tuple(group) for group in transitions)
+        if len(transitions) != num_edges:
+            raise ValueError("transitions_by_edge must match edge_ids")
+        if any(not isinstance(t, CleavageActionTransition) for group in transitions for t in group):
+            raise TypeError("Invalid action transition")
+        object.__setattr__(self, "transitions_by_edge", transitions)
         object.__setattr__(self, "edge_ids", edge_ids)
         object.__setattr__(self, "source_indices", source_indices)
         object.__setattr__(self, "target_indices", target_indices)
@@ -112,6 +122,7 @@ class _FragmentEdgeStore:
             source_id=int(self.source_ids[index]),
             target_id=int(self.target_ids[index]),
             events=self.event_store.get_events(index),
+            transitions=self.transitions_by_edge[index],
         )
 
     def copy(self) -> "_FragmentEdgeStore":
@@ -122,4 +133,5 @@ class _FragmentEdgeStore:
             source_ids=self.source_ids.copy(),
             target_ids=self.target_ids.copy(),
             event_store=self.event_store.copy(),
+            transitions_by_edge=self.transitions_by_edge,
         )

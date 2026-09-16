@@ -23,6 +23,9 @@ class FragmentTree:
     Notes
     -----
     Local indices are used for tree traversal.
+    Node 0 is Original Source. Chemical nodes may merge multiple Source action
+    histories; edge transitions retain those histories in memory. Graph depth
+    measures edge distance and is distinct from the normalized action count.
 
     Database IDs are stored separately.
 
@@ -214,6 +217,7 @@ class FragmentTree:
                 source_ids=source_ids,
                 target_ids=target_ids,
                 event_store=event_store,
+                transitions_by_edge=tuple(edge.transitions for edge in edges),
             ),
         )
 
@@ -331,6 +335,11 @@ class FragmentTree:
     def num_edges(self) -> int:
         """Number of edges."""
         return self.edge_store.num_edges
+
+    @property
+    def num_transitions(self) -> int:
+        """Number of in-memory Source action transitions; excludes legacy events."""
+        return sum(len(group) for group in self.edge_store.transitions_by_edge)
 
     @property
     def num_events(self) -> int:

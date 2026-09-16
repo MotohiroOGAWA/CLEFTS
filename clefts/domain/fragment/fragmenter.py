@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any, Iterable, List, Tuple, Dict, Set, Optional
+from dataclasses import dataclass, replace
+from typing import Any, Iterable, List, Tuple, Dict, Set, Optional, Sequence
 import json
 from pathlib import Path
 from collections import defaultdict
@@ -14,13 +14,22 @@ from .tree import *
 from .ion_tree import *
 from .pathway import *
 from .pathway.build_pathway import build_pathway_items_for_node, PathwayItem
-from .cleavage import CleavagePatternSet, CleavagePattern, CleavageResult
+from .cleavage import CleavagePatternSet, CleavagePattern, CleavageResult, CleavageActionSequence
+
+
+PathwayItemsCacheKey = Tuple[Adduct, int, Tuple[Tuple[int, Tuple[Adduct, ...]], ...]]
 
 
 @dataclass(frozen=True)
 class Fragmenter:
     fragment_ion_tree_builder: FragmentIonTreeBuilder
     mass_tolerance: MassTolerance
+    # Pathway candidate selection belongs to Fragmenter, not the tree builder.
+    precursor_candidate_max_depth: int = 0
+
+    def __post_init__(self) -> None:
+        if type(self.precursor_candidate_max_depth) is not int or self.precursor_candidate_max_depth < 0:
+            raise ValueError("precursor_candidate_max_depth must be a non-negative integer")
 
     @property
     def adduct_types(self) -> Tuple[Adduct, ...]:
@@ -31,12 +40,13 @@ class Fragmenter:
         return self.fragment_ion_tree_builder.fragment_ion_adduct_rule_set
     
     @property
-    def tree_max_depth(self) -> int:
-        return self.fragment_ion_tree_builder.max_depth
+    def tree_max_action_count(self) -> int:
+        return self.fragment_ion_tree_builder.max_action_count
 
     @property
-    def precursor_candidate_max_depth(self) -> int:
-        return self.fragment_ion_tree_builder.min_depth_only_from
+    def tree_max_depth(self) -> int:
+        """Legacy traversal budget accessor for existing pathway/ML callers."""
+        return self.tree_max_action_count
     
     @property
     def cleavage_pattern_set(self) -> CleavagePatternSet:
@@ -77,20 +87,30 @@ class Fragmenter:
             main_adduct_type
         )
 
+    def _builder_for_pathway_selection(self) -> FragmentIonTreeBuilder:
+        # A selected precursor can have a longer action history than another
+        # route to the same chemical node. Preserve those transitions instead
+        # of applying a minimum action count presentation filter.
+        if self.precursor_candidate_max_depth > 0:
+            return replace(self.fragment_ion_tree_builder, only_add_min_depth=False)
+        return self.fragment_ion_tree_builder
+
     def build_fragment_tree(
         self,
         compound: Compound,
         *,
         max_node: int = -1,
         max_edge: int = -1,
-        max_depth: Optional[int] = None,
+        max_action_count: int | None = None,
+        seed_action_sequences: Sequence[CleavageActionSequence] | None = None,
         print_info: bool = False,
     ) -> FragmentTree:
-        return self.fragment_ion_tree_builder.build_fragment_tree(
+        return self._builder_for_pathway_selection().build_fragment_tree(
             compound,
             max_node=max_node,
             max_edge=max_edge,
-            max_depth=max_depth,
+            max_action_count=max_action_count,
+            seed_action_sequences=seed_action_sequences,
             print_info=print_info,
         )
     
@@ -100,15 +120,17 @@ class Fragmenter:
         *,
         max_node: int = -1,
         max_edge: int = -1,
-        max_depth: Optional[int] = None,
+        max_action_count: int | None = None,
+        seed_action_sequences: Sequence[CleavageActionSequence] | None = None,
         print_info: bool = False,
         _include_fragment_compound_cache: bool = False,
     ) -> FragmentIonTree:
-        return self.fragment_ion_tree_builder.build(
+        return self._builder_for_pathway_selection().build(
             compound,
             max_node=max_node,
             max_edge=max_edge,
-            max_depth=max_depth,
+            max_action_count=max_action_count,
+            seed_action_sequences=seed_action_sequences,
             print_info=print_info,
             _include_fragment_compound_cache=_include_fragment_compound_cache,
         )
@@ -177,7 +199,7 @@ class Fragmenter:
         ]
 
         pathway_items_cache: Dict[
-            Tuple[Adduct, int],
+            PathwayItemsCacheKey,
             Tuple[Tuple[Any, ...], ...],
         ] = {}
 
@@ -487,7 +509,7 @@ class Fragmenter:
             Dict[int, Dict[Adduct, Set[int]]],
         ],
         context_by_record_index: Dict[int, _PrecursorAssignmentContext],
-        pathway_items_cache: Dict[Tuple[Adduct, int], Tuple[Tuple[Any, ...], ...]],
+        pathway_items_cache: Dict[PathwayItemsCacheKey, Tuple[Tuple[Any, ...], ...]],
         fragment_pathway_lists_by_record_and_peak: List[List[List[FragmentPathway]]],
     ) -> None:
         for record_index, peak_indices_by_node_and_adduct in (
@@ -527,11 +549,13 @@ class Fragmenter:
         fragment_ion_tree: FragmentIonTree,
         context: _PrecursorAssignmentContext,
         node_index: int,
-        pathway_items_cache: Dict[Tuple[Adduct, int], Tuple[Tuple[Any, ...], ...]],
+        pathway_items_cache: Dict[PathwayItemsCacheKey, Tuple[Tuple[Any, ...], ...]],
     ) -> Tuple[Tuple[Any, ...], ...]:
         cache_key = (
             context.main_adduct_type,
             node_index,
+            tuple((index, tuple(sorted(set(adducts), key=str)))
+                  for index, adducts in sorted(context.precursor_adduct_types.items())),
         )
 
         pathway_items_list = pathway_items_cache.get(cache_key)
@@ -558,7 +582,6 @@ class Fragmenter:
 
         # Hide builder-internal options from the external Fragmenter save format.
         builder_dict.pop("only_add_min_depth", None)
-        builder_dict.pop("min_depth_only_from", None)
 
         return {
             "fragment_ion_tree_builder": builder_dict,
@@ -573,17 +596,15 @@ class Fragmenter:
     ) -> Fragmenter:
         builder_dict = dict(data["fragment_ion_tree_builder"])
 
-        # Restore FragmentTreeBuilder-internal options from the Fragmenter-level option.
+        # Presentation and pathway-selection options have separate owners.
         builder_dict["only_add_min_depth"] = True
-        builder_dict["min_depth_only_from"] = int(
-            data.get("precursor_candidate_max_depth", 0)
-        )
 
         return cls(
             fragment_ion_tree_builder=FragmentIonTreeBuilder.from_dict(
                 builder_dict
             ),
             mass_tolerance=parse_mass_tolerance(data["mass_tolerance"]),
+            precursor_candidate_max_depth=int(data.get("precursor_candidate_max_depth", 0)),
         )
 
     def to_json(self, path: str | Path) -> None:
@@ -614,6 +635,7 @@ class Fragmenter:
         return Fragmenter(
             fragment_ion_tree_builder=self.fragment_ion_tree_builder.copy(),
             mass_tolerance=self.mass_tolerance,
+            precursor_candidate_max_depth=self.precursor_candidate_max_depth,
         )
 
 @dataclass(frozen=True)

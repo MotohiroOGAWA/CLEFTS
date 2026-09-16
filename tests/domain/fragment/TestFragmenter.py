@@ -48,7 +48,7 @@ class TestFragmenter(unittest.TestCase):
                     fragmenter.adduct_types,
                     builder.fragment_ion_adduct_rule_set.adduct_types,
                 )
-                self.assertEqual(fragmenter.tree_max_depth, builder.max_depth)
+                self.assertEqual(fragmenter.tree_max_action_count, builder.max_action_count)
                 self.assertIs(
                     fragmenter.cleavage_pattern_set,
                     builder.cleavage_pattern_set,
@@ -79,8 +79,8 @@ class TestFragmenter(unittest.TestCase):
                     self.assertEqual(fragment_tree.num_nodes, case.expected_num_nodes)
                     self.assertEqual(fragment_tree.num_edges, case.expected_num_edges)
                     self.assertGreaterEqual(
-                        fragment_tree.num_events,
-                        case.expected_min_events,
+                        fragment_tree.num_transitions,
+                        case.expected_min_transitions,
                     )
 
     def test_build_fragment_ion_tree_returns_fragment_ion_tree_for_all_cases(
@@ -338,6 +338,7 @@ class TestFragmenter(unittest.TestCase):
                                 "precursor_main_adduct_type",
                                 case["precursor_type"],
                             ),
+                            expected_unassigned_peaks=case.get("expected_unassigned_peaks", ()),
                         )
 
     def test_assign_fragment_pathways_to_peak_sets_finds_pathways_for_all_peaks(
@@ -407,7 +408,56 @@ class TestFragmenter(unittest.TestCase):
                                 "precursor_main_adduct_type",
                                 case["precursor_type"],
                             ),
+                            expected_unassigned_peaks=case.get("expected_unassigned_peaks", ()),
                         )
+
+    def test_precursor_selection_setting_roundtrip_and_copy(self) -> None:
+        question = make_fragment_tree_builder_questions()[0]
+        builder = self._make_fragment_ion_tree_builder(question)
+        fragmenter = Fragmenter(builder, parse_mass_tolerance('0.01Da'), precursor_candidate_max_depth=1)
+        data = fragmenter.to_dict()
+        self.assertEqual(data['precursor_candidate_max_depth'], 1)
+        self.assertEqual(data['fragment_ion_tree_builder']['max_action_count'], builder.max_action_count)
+        self.assertNotIn('min_depth_only_from', data['fragment_ion_tree_builder'])
+        self.assertEqual(Fragmenter.from_dict(data).precursor_candidate_max_depth, 1)
+        self.assertEqual(fragmenter.copy().precursor_candidate_max_depth, 1)
+        self.assertEqual(fragmenter.tree_max_action_count, builder.max_action_count)
+        self.assertEqual(fragmenter.tree_max_depth, fragmenter.tree_max_action_count)
+        self.assertTrue(builder.only_add_min_depth)
+        self.assertFalse(fragmenter._builder_for_pathway_selection().only_add_min_depth)
+        with self.assertRaises(ValueError):
+            Fragmenter(builder, fragmenter.mass_tolerance, precursor_candidate_max_depth=-1)
+
+    def test_batched_and_individual_assignment_keep_precursor_contexts_separate(self) -> None:
+        source = Compound.from_smiles('CC(=O)N[C@@H](CC1=CC=CC=C1)C2=CC(=CC(=O)O2)OC')
+        fragmenter = Fragmenter.from_json(
+            Path(__file__).resolve().parents[3] / 'clefts/domain/fragment/presets/fragmenter_single_bond_pos.json')
+        tree = fragmenter.build_fragment_ion_tree(source, _include_fragment_compound_cache=True)
+        records = ((Adduct.parse('[M+H]+'), (125.0233, 154.0499)),
+                   (Adduct.parse('[M+H-C6H6]+'), (125.0233, 154.0499)))
+        batch = fragmenter.assign_fragment_pathways_to_peak_sets(tree, records)
+        individual = tuple(fragmenter.assign_fragment_pathways_to_peaks(tree, adduct, peaks)
+                           for adduct, peaks in records)
+        for batched, single in zip(batch, individual):
+            for batch_group, single_group in zip((batched[0], *batched[1]), (single[0], *single[1])):
+                self.assertEqual({p.to_json_str() for p in batch_group},
+                                 {p.to_json_str() for p in single_group})
+        self.assertGreater(len(batch[0][1][0]), 0)
+        self.assertEqual(len(batch[1][1][0]), 0)
+        self.assertGreater(len(batch[1][1][1]), 0)
+        # The missing aromatic-only history is prohibited by the new hard
+        # conflict before redundancy removal, rather than lost by the cache.
+        precursor_type = records[1][0]
+        context = fragmenter._build_precursor_assignment_context(
+            tree, precursor_type, fragmenter._make_fragment_compound_cache(tree))
+        precursor_index = next(iter(context.precursor_adduct_types))
+        precursor = tree.get_in_edges(precursor_index)[0].transitions[0].action_sequence
+        target_index = tree.get_node_by_smiles('COc1ccoc(=O)c1').index
+        target = tree.get_in_edges(target_index)[0].transitions[0].action_sequence
+        self.assertTrue(precursor.actions[0].changed_bond_maps & target.actions[0].changed_bond_maps)
+        from clefts.domain.fragment.cleavage import CleavageActionSequence
+        with self.assertRaisesRegex(ValueError, 'share changed Source bonds'):
+            CleavageActionSequence((*precursor.actions, *target.actions))
 
     def _make_fragment_pathway_assignment_test_case_groups(self):
         """Create common test cases for fragment pathway assignment tests."""
@@ -475,6 +525,9 @@ class TestFragmenter(unittest.TestCase):
                     },
                     {
                         "name": "benzene_loss",
+                        # Source-anchored changed-bond conflicts prohibit the
+                        # aromatic-only product after this precursor history.
+                        "expected_unassigned_peaks": (125.0233,),
                         "precursor_type": Adduct.parse("[M+H-C6H6]+"),
                         "peak_mz_list": [
                             125.0233,
@@ -543,10 +596,9 @@ class TestFragmenter(unittest.TestCase):
             )
 
         return FragmentIonTreeBuilder(
-            max_depth=question.builder.max_depth,
+            max_action_count=question.builder.max_action_count,
             cleavage_pattern_set=question.builder.cleavage_pattern_set.copy(),
             only_add_min_depth=question.builder.only_add_min_depth,
-            min_depth_only_from=question.builder.min_depth_only_from,
             fragment_ion_adduct_rule_set=(
                 question.fragment_ion_adduct_rule_set.copy()
             ),
@@ -563,9 +615,9 @@ class TestFragmenter(unittest.TestCase):
         expected_precursor_formula: Formula,
         expected_precursor_pathway_length: int = 1,
         expected_precursor_main_adduct_type: Adduct | None = None,
+        expected_unassigned_peaks: Tuple[float, ...] = (),
     ) -> None:
         """Assert that fragment pathways are found for all given peaks."""
-        pass
         precursor_fragment_pathways, fragment_pathways_by_peak = (
             fragmenter.assign_fragment_pathways_to_peaks(
                 fragment_ion_tree=fragment_ion_tree,
@@ -587,6 +639,7 @@ class TestFragmenter(unittest.TestCase):
             fragmenter=fragmenter,
             fragment_pathways_by_peak=fragment_pathways_by_peak,
             peak_mz_list=peak_mz_list,
+            expected_unassigned_peaks=expected_unassigned_peaks,
         )
 
     def _assert_precursor_fragment_pathways(
@@ -617,6 +670,7 @@ class TestFragmenter(unittest.TestCase):
         fragmenter: Fragmenter,
         fragment_pathways_by_peak: list[FragmentPathwayGroup],
         peak_mz_list: list[float],
+        expected_unassigned_peaks: Tuple[float, ...] = (),
     ) -> None:
         """Assert that each peak has valid fragment pathways."""
 
@@ -626,6 +680,9 @@ class TestFragmenter(unittest.TestCase):
             zip(peak_mz_list, fragment_pathways_by_peak)
         ):
             with self.subTest(peak_index=peak_index, peak_mz=peak_mz):
+                if peak_mz in expected_unassigned_peaks:
+                    self.assertEqual(len(fragment_pathways), 0)
+                    continue
                 self.assertGreaterEqual(
                     len(fragment_pathways),
                     1,
@@ -693,6 +750,7 @@ class TestFragmenter(unittest.TestCase):
         expected_precursor_formula: Formula,
         expected_precursor_pathway_length: int = 1,
         expected_precursor_main_adduct_type: Adduct | None = None,
+        expected_unassigned_peaks: Tuple[float, ...] = (),
     ) -> None:
         peak_mz_list = tuple(peak_mz_list)
 
@@ -728,6 +786,9 @@ class TestFragmenter(unittest.TestCase):
             fragment_pathways_by_peak,
         ):
             with self.subTest(peak_mz=peak_mz):
+                if peak_mz in expected_unassigned_peaks:
+                    self.assertEqual(len(fragment_pathway_group.pathways), 0)
+                    continue
                 self.assertGreater(
                     len(fragment_pathway_group.pathways),
                     0,

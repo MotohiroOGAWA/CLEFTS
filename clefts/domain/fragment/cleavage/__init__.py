@@ -11,3 +11,7 @@ __all__ = [
     "CleavagePattern",
     "CleavageResult",
 ]
+
+from .CleavageActionResult import CleavageActionResult
+from .CleavageActionGenerator import create_cleavage_actions
+from .CleavageActionSearch import CleavageActionSearchStats

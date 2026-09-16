@@ -1,14 +1,21 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Tuple
 
 from .CleavageEvent import CleavageEvent
+from .CleavageActionTransition import CleavageActionTransition
 
 
 @dataclass(frozen=True)
 class FragmentEdge:
     """Edge in a FragmentTree.
+
+    Action transitions describe a parent action state plus one primitive action
+    (or a complete seed sequence), normalized into a child action state. They
+    do not mean that a chemical reaction was applied to the parent fragment;
+    every combined reaction is applied to Original Source.
+    Legacy events remain available for previously stored trees.
 
     Parameters
     ----------
@@ -45,8 +52,14 @@ class FragmentEdge:
     target_id: int
     events: Tuple[CleavageEvent, ...] = ()
 
+    transitions: Tuple[CleavageActionTransition, ...] = ()
+
     def __post_init__(self) -> None:
 
+        object.__setattr__(self, "events", tuple(self.events))
+        object.__setattr__(self, "transitions", tuple(self.transitions))
+        if not all(isinstance(t, CleavageActionTransition) for t in self.transitions):
+            raise TypeError("transitions must contain CleavageActionTransition instances")
         if not all(isinstance(event, CleavageEvent) for event in self.events):
             raise TypeError("events must contain only CleavageEvent instances.")
 
@@ -71,7 +84,15 @@ class FragmentEdge:
             source_id=self.source_id,
             target_id=self.target_id,
             events=self.events + (event,),
+            transitions=self.transitions,
         )
+
+    def with_transition(self, transition: CleavageActionTransition) -> FragmentEdge:
+        if not isinstance(transition, CleavageActionTransition):
+            raise TypeError("transition must be a CleavageActionTransition")
+        if transition in self.transitions:
+            return self.copy()
+        return replace(self, transitions=self.transitions + (transition,))
 
     def __repr__(self) -> str:
         return "FragmentEdge" + self.__str__()
@@ -84,7 +105,7 @@ class FragmentEdge:
             f"target_index={self.target_index}; "
             f"source_id={self.source_id}; "
             f"target_id={self.target_id}; "
-            f"events={len(self.events)})"
+            f"events={len(self.events)}; transitions={len(self.transitions)})"
         )
 
     def copy(self) -> "FragmentEdge":
@@ -97,4 +118,5 @@ class FragmentEdge:
             source_id=self.source_id,
             target_id=self.target_id,
             events=self.events,
+            transitions=self.transitions,
         )

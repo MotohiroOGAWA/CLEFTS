@@ -1,6 +1,6 @@
 {
   "fragment_ion_tree_builder": {
-    "max_depth": 3,
+    "max_action_count": 3,
     "cleavage_pattern_set": {
       "name": "single_bond_cleavage_pattern_set",
       "patterns": [

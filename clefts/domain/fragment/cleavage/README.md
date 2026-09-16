@@ -31,3 +31,11 @@ Sequences reject overlapping `changed_bond_maps` after duplicate removal and bef
 ```bash
 PYTHONPATH=. python -m unittest tests.domain.fragment.TestCleavageAction tests.domain.fragment.TestCleavagePattern tests.domain.fragment.TestCleavagePatternSet
 ```
+
+
+`FragmentTreeBuilder` now provides bulk primitive action generation and unordered
+combination search on Original Source. Unlike manual `from_match`, this path
+computes retention from the connected Source component after the entire
+reaction's cuts and never performs per-action SMARTS validation or reaction
+execution. See [the tree workflow](../tree/README.md) for seeds, effect caching,
+transition storage, performance counters, and the downstream migration boundary.
