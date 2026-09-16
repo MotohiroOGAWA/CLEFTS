@@ -51,19 +51,24 @@ class ActionStructureBuilder:
         tree=fragmenter.build_fragment_ion_tree(source,_include_fragment_compound_cache=True)
         assignments=fragmenter.assign_fragment_pathways_to_peak_sets(tree,zip(precursor_types,peaks_mz))
         targets=[]
-        precursor_action_indices=[]
-        for precursor_group,groups in assignments:
+        for _,groups in assignments:
             sequences=set()
             for group in groups:
                 for pathway in group:
                     sequences.update(_walk_pathway(tree,fragmenter,pathway))
             targets.append(tuple(sorted(sequences,key=lambda seq:seq.key if seq else ())))
-            precursor_sequences={seq for pathway in precursor_group for seq in _walk_pathway(tree,fragmenter,pathway) if seq is not None}
-            precursor_action_indices.append(frozenset(actions.index(a) for seq in precursor_sequences for a in seq.actions))
+        # Recorded once per sample, from the SAME already-built tree: which
+        # Source action set(s) already select this sample's precursor ion.
+        # Real MS2 fragmentation always happens on that selected ion, so
+        # prepare_source_actions requires every other teacher state to be
+        # consistent with one of these alternatives.
+        precursor_sequences=[tuple(pa.action_sequence for pa in fragmenter.resolve_precursor_actions(tree,precursor_type))
+                             for precursor_type in precursor_types]
         conditions=torch.tensor([[generator.adduct_type_strs.index(str(adduct)),ce]
                                  for adduct,ce in zip(precursor_types,collision_energy)],dtype=torch.float32)
         data=prepare_source_actions(source=source,actions=actions,graph_builder=generator.mol_encoder.graph_builder,
-            condition_features=conditions,max_action_count=fragmenter.tree_max_action_count,target_sequences=targets)
+            condition_features=conditions,max_action_count=fragmenter.tree_max_action_count,target_sequences=targets,
+            precursor_sequences=precursor_sequences)
         # Reconstruct a preparation-only DAG from all teacher states. Parent
         # traversal includes all valid orders for supervision; materialization
         # chooses a representative ancestor chain for graph presentation.
@@ -90,14 +95,10 @@ class ActionStructureBuilder:
                 terminal.append(bool(data.teacher_positive_eos[known[state]]))
                 original=known[state]
                 start,stop=data.teacher_positive_action_ptr[original:original+2].tolist()
-                # Prefer actions that define this sample's own assigned precursor,
-                # so the representative chain passes through the precursor node
-                # before branching into deeper fragments (needed for MS2 pathway
-                # consistency downstream, since fragmentation happens on the
-                # selected precursor ion, not directly on the neutral Source).
-                candidates=sorted(data.teacher_positive_action_index[start:stop].tolist(),
-                                  key=lambda index:index not in precursor_action_indices[sample])
-                for action_index in candidates:
+                # prepare_source_actions already guarantees every teacher state
+                # here is precursor-consistent, so any traversal order yields a
+                # representative chain that passes through the precursor node.
+                for action_index in data.teacher_positive_action_index[start:stop].tolist():
                     child=CleavageActionSequence((*(state.actions if state else ()),actions[action_index]))
                     if child in known and child not in visited:
                         visited.add(child)

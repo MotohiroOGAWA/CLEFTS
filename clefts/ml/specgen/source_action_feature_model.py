@@ -46,5 +46,5 @@ class SourceActionFeatureModel(nn.Module):
                      if isinstance(self.condition_encoder, MS2ConditionEncoder) else self.condition_encoder(data.condition_features))
         absolute = self.scorer(action, condition)
         pool = build_action_pool(action, absolute, data, top_k=self.top_k, max_k=self.max_k,
-                                 threshold=self.threshold, training=training_pool)
+                                 threshold=self.threshold, training=training_pool, max_action_count=self.max_action_count)
         return SourceActionFeatures(action, condition, absolute, pool)

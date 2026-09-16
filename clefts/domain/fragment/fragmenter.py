@@ -14,7 +14,8 @@ from .tree import FragmentTree
 from .ion_tree import FragmentIonTree, FragmentIonTreeBuilder, FragmentIonAdductRuleSet
 from .pathway import FragmentPathway, FragmentPathwayGroup
 from .ion_tree._private._FragmentIonFormulaCandidateGroup import _FragmentIonFormulaCandidateGroup
-from .pathway.build_pathway import build_pathway_items_for_node, PathwayItem
+from .pathway.build_pathway import build_pathway_items_for_node, resolve_action_sequences_for_node, PathwayItem
+from .pathway.PrecursorAction import PrecursorAction
 from .cleavage import CleavagePatternSet, CleavageActionResult, CleavageActionSequence
 
 
@@ -373,6 +374,48 @@ class Fragmenter:
             precursor_adduct_types=precursor_adduct_types,
             precursor_fragment_pathways=precursor_fragment_pathways,
         )
+
+    def resolve_precursor_actions(
+        self,
+        fragment_ion_tree: FragmentIonTree,
+        precursor_type: Adduct,
+        fragment_compound_by_index: Dict[int, Compound] | None = None,
+    ) -> frozenset[PrecursorAction]:
+        """The Source action set(s) that already select precursor_type's ion.
+
+        Reuses the given fragment_ion_tree exactly as built (never rebuilt or
+        reseeded per precursor type). Every further-fragmentation action
+        recorded for this precursor_type must contain one of these returned
+        action sets as a subset: real MS2 fragmentation always happens on the
+        selected precursor ion, never on the bare neutral Source. An empty
+        result means no candidate node satisfies precursor_type within
+        precursor_candidate_max_action_count actions.
+        """
+        context = self._build_precursor_assignment_context(
+            fragment_ion_tree=fragment_ion_tree,
+            precursor_type=precursor_type,
+            fragment_compound_by_index=(
+                fragment_compound_by_index
+                if fragment_compound_by_index is not None
+                else self._make_fragment_compound_cache(fragment_ion_tree)
+            ),
+        )
+
+        precursor_actions: Set[PrecursorAction] = set()
+
+        for node_index in context.precursor_adduct_types:
+            precursor_actions.update(
+                PrecursorAction(node_index=node_index, action_sequence=sequence)
+                for sequence in resolve_action_sequences_for_node(
+                    fragment_ion_tree,
+                    node_index,
+                    context.precursor_adduct_types,
+                    max_action_count=self.tree_max_action_count,
+                    precursor_candidate_max_action_count=self.precursor_candidate_max_action_count,
+                )
+            )
+
+        return frozenset(precursor_actions)
 
     def _find_precursor_node_candidates(
         self,

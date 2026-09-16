@@ -20,6 +20,13 @@ class ActionPool:
     retained: Tensor
     source_atom_valid: Tensor
     positive_recall: Tensor
+    # Pool-local seeds for beam initialization: real MS2 fragmentation always
+    # happens on the selected precursor ion, never on the bare Source, so
+    # decoding starts from these states instead of always the empty <BOS>.
+    # One row per (sample, precursor alternative); a sample with none of its
+    # own (Source itself is the precursor) contributes no row here.
+    precursor_row_sample_index: Tensor
+    precursor_row_action_index: Tensor
 
 
 def positive_mask(ptr: Tensor, index: Tensor, rows: int, columns: int) -> Tensor:
@@ -30,7 +37,7 @@ def positive_mask(ptr: Tensor, index: Tensor, rows: int, columns: int) -> Tensor
 
 
 def build_action_pool(action_h: Tensor, absolute: Tensor, data: object, *, top_k: int,
-                      max_k: int, threshold: float, training: bool) -> ActionPool:
+                      max_k: int, threshold: float, training: bool, max_action_count: int) -> ActionPool:
     s, a = absolute.shape
     device = absolute.device
     eligible = data.action_tree_index[None, :] == data.sample_tree_index[:, None]
@@ -41,11 +48,21 @@ def build_action_pool(action_h: Tensor, absolute: Tensor, data: object, *, top_k
     inference.scatter_(1, ids, torch.isfinite(values))
     positive = positive_mask(data.sample_positive_action_ptr, data.sample_positive_action_index, s, a)
     recall = (inference & positive).sum(dim=1) / positive.sum(dim=1).clamp_min(1)
-    selection = inference | positive if training else inference
+    # Precursor actions are deterministic chemistry facts, not learned scores:
+    # force them into the pool at both training and inference time so beam
+    # decoding can always be seeded from the precursor state.
+    row_counts = data.sample_precursor_row_ptr[1:] - data.sample_precursor_row_ptr[:-1]
+    row_sample = torch.repeat_interleave(torch.arange(s, device=device), row_counts)
+    row_action_counts = data.precursor_row_action_ptr[1:] - data.precursor_row_action_ptr[:-1]
+    precursor_action_sample = torch.repeat_interleave(row_sample, row_action_counts)
+    precursor = torch.zeros((s, a), dtype=torch.bool, device=device)
+    precursor[precursor_action_sample, data.precursor_row_action_index] = True
+    selection = inference | precursor | (positive if training else torch.zeros_like(inference))
     if training and torch.any(selection.sum(dim=1) > max_k):
         raise ValueError("Training pool union exceeds 128; split samples or reduce first-stage top-k")
     width = max_k if training else top_k
-    priority = absolute.masked_fill(~selection, -torch.inf)
+    # A recorded precursor action must never be dropped by top-k truncation.
+    priority = absolute.masked_fill(~selection, -torch.inf) + precursor.float() * 1e6
     chosen_ids = torch.argsort(priority,dim=1,descending=True,stable=True)[:,:min(width,a)]
     chosen_values = priority.gather(1,chosen_ids)
     valid = torch.isfinite(chosen_values)
@@ -60,6 +77,16 @@ def build_action_pool(action_h: Tensor, absolute: Tensor, data: object, *, top_k
     inverse.scatter_(1, chosen_ids, slots)
     inverse[:, a] = -1
     sample = torch.arange(s, device=device)[:, None]
+
+    # Pool-local precursor rows for beam seeding: one row per (sample,
+    # precursor alternative), each a padded [max_action_count] local index list.
+    row_of_action = torch.repeat_interleave(torch.arange(row_sample.numel(), device=device), row_action_counts)
+    local_precursor_actions = inverse[row_sample[row_of_action], data.precursor_row_action_index]
+    if torch.any(local_precursor_actions < 0):
+        raise ValueError("Recorded precursor action was not included in the action pool")
+    position_in_row = torch.arange(row_of_action.numel(), device=device) - data.precursor_row_action_ptr[row_of_action]
+    precursor_row_action_index = torch.full((row_sample.numel(), max_action_count), -1, dtype=torch.long, device=device)
+    precursor_row_action_index[row_of_action, position_in_row] = local_precursor_actions
 
     def dense(pairs: Tensor) -> Tensor:
         matrix = torch.zeros((s, width, width), dtype=torch.bool, device=device)
@@ -90,7 +117,7 @@ def build_action_pool(action_h: Tensor, absolute: Tensor, data: object, *, top_k
     return ActionPool(chosen_ids.masked_fill(~valid, -1), valid, padded_h[chosen_ids],
                       padded_absolute.gather(1, chosen_ids), dense(data.action_conflict_index),
                       dense(data.action_precedence_index), dense(data.action_dominance_index),
-                      retained, atom_valid, recall)
+                      retained, atom_valid, recall, row_sample, precursor_row_action_index)
 
 
 def deduplicate(sample: Tensor, state: Tensor, score: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
@@ -155,10 +182,18 @@ class ActionSequenceDecoder(nn.Module):
     def forward(self, pool: ActionPool, conditions: Tensor) -> ActionDecoderOutput:
         s, k = pool.valid.shape
         device = conditions.device
-        state = torch.full((s, self.max_action_count), -1, dtype=torch.long, device=device)
-        sample = torch.arange(s, device=device)
-        score = conditions.new_zeros(s)
-        global_parent = torch.full((s,), -1, dtype=torch.long, device=device)
+        # Real MS2 fragmentation happens on the selected precursor ion, not the
+        # bare Source: seed decoding from every recorded precursor alternative
+        # instead of always the empty <BOS>. A sample with none (Source itself
+        # is the precursor) falls back to a single empty-state seed.
+        has_precursor_row = torch.zeros(s, dtype=torch.bool, device=device)
+        has_precursor_row[pool.precursor_row_sample_index] = True
+        bos_sample = torch.arange(s, device=device)[~has_precursor_row]
+        bos_state = torch.full((bos_sample.shape[0], self.max_action_count), -1, dtype=torch.long, device=device)
+        sample = torch.cat((pool.precursor_row_sample_index, bos_sample))
+        state = torch.cat((pool.precursor_row_action_index, bos_state), dim=0)
+        score = conditions.new_zeros(sample.shape[0])
+        global_parent = torch.full((sample.shape[0],), -1, dtype=torch.long, device=device)
         added = torch.full_like(global_parent, -1)
         all_sample, all_state, all_score, all_parent, all_added, all_terminal = [], [], [], [], [], []
         offset = 0

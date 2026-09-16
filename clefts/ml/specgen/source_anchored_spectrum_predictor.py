@@ -76,8 +76,16 @@ class SourceAnchoredFragmentSpectrumGenerator(nn.Module):
             source=sources[rows[0]]
             actions=self.fragmenter.fragment_ion_tree_builder.create_cleavage_actions(source)
             conditions=torch.tensor([[self.adduct_type_strs.index(str(precursor_types[i])),collision_energy[i]] for i in rows],dtype=torch.float32)
+            # Bounded by precursor_candidate_max_action_count (not the full
+            # tree_max_action_count), so resolving a given precursor stays a
+            # small, fixed-cost preparation step, never an exhaustive search.
+            precursor_tree=self.fragmenter.build_fragment_ion_tree(source,
+                max_action_count=self.fragmenter.precursor_candidate_max_action_count,_include_fragment_compound_cache=True)
+            precursor_sequences=[tuple(pa.action_sequence for pa in
+                self.fragmenter.resolve_precursor_actions(precursor_tree,precursor_types[i])) for i in rows]
             structures.append(prepare_source_actions(source=source,actions=actions,graph_builder=self.mol_encoder.graph_builder,
-                condition_features=conditions,max_action_count=self.feature_model.max_action_count))
+                condition_features=conditions,max_action_count=self.feature_model.max_action_count,
+                precursor_sequences=precursor_sequences))
             unique_sources.append(source)
             universes.append(actions)
             ordered_adducts.extend(precursor_types[i] for i in rows)

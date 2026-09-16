@@ -3,7 +3,9 @@ from __future__ import annotations
 from typing import Any, Tuple, List, Dict, Iterable
 from pathlib import Path
 from dataclasses import replace
+from unittest.mock import patch
 from rdkit import Chem
+from rdkit.Chem import rdChemReactions
 import tempfile
 import unittest
 
@@ -1044,6 +1046,27 @@ class TestFragmenter(unittest.TestCase):
                             f"{fragmenter.mass_tolerance.unit}"
                         ),
                     )
+
+    def test_resolve_precursor_actions_reuses_same_tree_without_rdkit(self) -> None:
+        """Precursor resolution walks the already-built tree; it never reacts again."""
+        fragmenter = Fragmenter.from_json("clefts/domain/fragment/presets/fragmenter_single_bond_pos.json")
+        source = Compound.from_smiles("CCCO")
+        tree = fragmenter.build_fragment_ion_tree(source, _include_fragment_compound_cache=True)
+
+        root_only = fragmenter.resolve_precursor_actions(tree, Adduct.parse("[M+H]+"))
+        self.assertEqual({(pa.node_index, pa.action_sequence) for pa in root_only}, {(0, None)})
+
+        with patch.object(rdChemReactions.ChemicalReaction, "RunReactants",
+                          side_effect=AssertionError("RDKit re-invoked")):
+            dehydrated = fragmenter.resolve_precursor_actions(tree, Adduct.parse("[M+H-H2O]+"))
+
+        self.assertEqual(len(dehydrated), 1)
+        precursor_action = next(iter(dehydrated))
+        self.assertIsNotNone(precursor_action.action_sequence)
+        self.assertNotEqual(precursor_action.node_index, 0)
+        product = precursor_action.action_sequence.compile(source).run(source)[0]
+        self.assertEqual(Compound(product).smiles, "CCC")
+
 
 if __name__ == "__main__":
     unittest.main()

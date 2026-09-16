@@ -50,14 +50,14 @@ class TestActionPipeline(unittest.TestCase):
         model, data, _, _ = model_and_data()
         encoded = model(data)
         absolute = torch.full_like(encoded.absolute_logits, -10.)
-        pool = build_action_pool(encoded.action_h, absolute, data, top_k=1, max_k=16, threshold=0., training=True)
+        pool = build_action_pool(encoded.action_h, absolute, data, top_k=1, max_k=16, threshold=0., training=True, max_action_count=model.max_action_count)
         self.assertEqual(pool.positive_recall.tolist(), [0., 0.])
         for sample in range(data.num_samples):
             start, stop = data.sample_positive_action_ptr[sample:sample+2]
             self.assertTrue(set(data.sample_positive_action_index[start:stop].tolist()) <= set(pool.action_index[sample][pool.valid[sample]].tolist()))
         with self.assertRaises(ValueError):
-            build_action_pool(encoded.action_h, absolute, data, top_k=1, max_k=1, threshold=0., training=True)
-        empty = build_action_pool(encoded.action_h, absolute, data, top_k=1, max_k=16, threshold=0., training=False)
+            build_action_pool(encoded.action_h, absolute, data, top_k=1, max_k=1, threshold=0., training=True, max_action_count=model.max_action_count)
+        empty = build_action_pool(encoded.action_h, absolute, data, top_k=1, max_k=16, threshold=0., training=False, max_action_count=model.max_action_count)
         output = model.decoder(empty, encoded.condition_h)
         self.assertEqual(output.terminal.sum().item(), data.num_samples)
         self.assertTrue((output.state_action_index == -1).all())
@@ -142,3 +142,23 @@ class TestActionPipeline(unittest.TestCase):
             loaded = load_generator(model_path=str(root/'run'/'last.pt'), params_path=None,
                                     device=torch.device('cpu'), strict=True)
             self.assertEqual(loaded.architecture, generator.architecture)
+
+    def test_predict_seeds_beam_decoding_from_precursor_state(self) -> None:
+        # Real MS2 fragmentation happens on the selected precursor ion, never
+        # on the bare Source: for [M+H-H2O]+, every further fragment must be
+        # explained as a descendant of the dehydrated ion (CCC), and the
+        # decoder must never be free to skip straight from Source to it.
+        generator = create_spectrum_generator(config()).eval()
+        source = Compound.from_smiles('CCCO')
+        result = generator.predict([source, source],
+            [Adduct.parse('[M+H]+'), Adduct.parse('[M+H-H2O]+')], [20., 40.])
+        pool = result.selection.features.pool
+        self.assertEqual(pool.precursor_row_sample_index.tolist(), [1])
+        decoded = result.fragments
+        sample_index = decoded.node_sample_index.tolist()
+        compounds = [compound.smiles for compound in decoded.compounds]
+        dehydrated_sample = [i for i, s in enumerate(sample_index) if s == 1]
+        source_node = next(i for i in dehydrated_sample if compounds[i] == 'CCCO')
+        edges = decoded.edge_index.t().tolist()
+        self.assertFalse(any(src == source_node and compounds[dst] != 'CCC'
+                             for src, dst in edges if src in dehydrated_sample))
