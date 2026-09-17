@@ -62,6 +62,7 @@ class SourceActionStructure:
     max_action_role_count: int = field(default=0,kw_only=True)
     source_atom_capacity: int = field(default=0,kw_only=True)
     action_source_atom_features: Tensor | None = field(default=None,kw_only=True)
+    sample_annotations: tuple[dict, ...] = field(default=(),kw_only=True)
     downstream: object | None = None
     transition_parent_state_index: Tensor = field(default_factory=lambda: torch.empty(0,dtype=torch.long),kw_only=True)
     transition_child_state_index: Tensor = field(default_factory=lambda: torch.empty(0,dtype=torch.long),kw_only=True)
@@ -104,12 +105,17 @@ class SourceActionStructure:
         precursor_rows, sample_precursor_row_counts = [], []
         atom_offset = action_offset = tree_offset = sample_offset = state_offset = node_offset = 0
         downstream_items, action_offsets, parents, children, added_actions, state_nodes = [], [], [], [], [], []
+        annotations=[]
         for item in structures:
             action_offsets.append(action_offset)
             parents.append(item.transition_parent_state_index+state_offset)
             children.append(item.transition_child_state_index+state_offset)
             added_actions.append(item.transition_added_action_index+action_offset)
             state_nodes.append(torch.where(item.state_fragment_node_index>=0,item.state_fragment_node_index+node_offset,item.state_fragment_node_index))
+            for sample in getattr(item,'sample_annotations',()):
+                annotations.append({**sample,'peaks':[{**peak,'matches':[
+                    {**match,'nodeIndices':[index+node_offset for index in match['nodeIndices']]}
+                    for match in peak['matches']]} for peak in sample['peaks']]})
             state_offset+=item.teacher_state_sample_index.numel()
             if item.downstream is not None:
                 downstream_items.append(item.downstream)
@@ -161,6 +167,7 @@ class SourceActionStructure:
                    downstream,transition_parent_state_index=torch.cat(parents),
                    transition_child_state_index=torch.cat(children),transition_added_action_index=torch.cat(added_actions),
                    state_fragment_node_index=torch.cat(state_nodes),
+                   sample_annotations=tuple(annotations) if len(annotations)==sum(item.num_samples for item in structures) else (),
                    max_action_role_count=max(item.max_action_role_count for item in structures),
                    source_atom_capacity=max(item.source_atom_capacity for item in structures),
                    action_source_atom_features=torch.cat([item.action_source_atom_features for item in structures]))

@@ -51,13 +51,17 @@ def _prepare_group(task, builder, options):
         intensities.append([value/maximum if normalize_intensities and maximum>0 else value for _,value in retained])
     structure=builder.build(Compound.from_smiles(smiles),adducts,energies,mzs,intensities)
     path=output/'data'/(make_structure_file_stem(smiles,index=tree)+'.preft.pt')
-    save_fragment_tree_structure(structure=structure,output_file=path,metadata=dict(smiles=smiles,record_indexes=rows))
-    return path
+    save_fragment_tree_structure(structure=structure,output_file=path,metadata=dict(smiles=smiles,record_indexes=rows,sample_annotations=structure.sample_annotations))
+    return path,structure.sample_annotations
 
 
 def _prepare_group_safely(task, builder, options):
     try:
-        return dict(path=_prepare_group(task,builder,options),record_count=len(task[2]),smiles=task[1],record_indexes=task[2])
+        path,annotations=_prepare_group(task,builder,options)
+        scores=[dict(structure_file=path.name,sample_index=index,record_index=record_index,
+                     assignment_score=sample['assignmentScore'],assignment_score_without_precursor=sample['assignmentScoreWithoutPrecursor'])
+                for index,(record_index,sample) in enumerate(zip(task[2],annotations))]
+        return dict(path=path,record_count=len(task[2]),smiles=task[1],record_indexes=task[2],assignment_scores=scores)
     except FragmentTreeLimitExceeded as error:
         return dict(skipped=dict(source_index=task[0],smiles=task[1],record_indexes=task[2],reason=str(error)))
 
@@ -95,7 +99,7 @@ def create_action_training_data(*, dataset: MSDataset, model_config: dict, outpu
     if preparation_config is None:
         (output/'preparation_config.json').write_text(json.dumps(dict(split=split,model_config=model_config,
             smiles_column=smiles_column,num_workers=num_workers,chunk_size=chunk_size,overwrite=overwrite,**options),indent=2))
-    files=[];skipped=[];prepared_records=0;manifest_rows=[]
+    files=[];skipped=[];prepared_records=0;manifest_rows=[];score_rows=[]
     completed_sources=0
     def collect_result(result):
         nonlocal prepared_records,completed_sources
@@ -107,6 +111,7 @@ def create_action_training_data(*, dataset: MSDataset, model_config: dict, outpu
             print(json.dumps(dict(event='source_skipped',split=split,**result['skipped'])),flush=True)
         else:
             files.append(Path(result['path']));prepared_records+=result['record_count']
+            score_rows.extend(result['assignment_scores'])
             manifest_rows.append(dict(file=Path(result['path']).name,smiles=result['smiles'],record_indexes=json.dumps(result['record_indexes']),num_input_records=result['record_count'],num_valid_samples=result['record_count'],status='completed',reason=''))
         print(json.dumps(dict(event='progress',split=split,current=completed_sources,total=len(grouped),
                               prepared=len(files),skipped=len(skipped))),flush=True)
@@ -143,6 +148,9 @@ def create_action_training_data(*, dataset: MSDataset, model_config: dict, outpu
     with (output/'manifest.tsv').open('w',newline='') as stream:
         writer=csv.DictWriter(stream,fieldnames=['file','smiles','record_indexes','num_input_records','num_valid_samples','status','reason'],delimiter='\t')
         writer.writeheader();writer.writerows(sorted(manifest_rows,key=lambda row:row['smiles']))
+    with (output/'assignment_scores.tsv').open('w',newline='') as stream:
+        writer=csv.DictWriter(stream,fieldnames=['structure_file','sample_index','record_index','assignment_score','assignment_score_without_precursor'],delimiter='\t')
+        writer.writeheader();writer.writerows(sorted(score_rows,key=lambda row:(row['structure_file'],row['sample_index'])))
     (output/'skipped_sources.json').write_text(json.dumps(skipped,indent=2))
     (output/'action_statistics.json').write_text(json.dumps(dict(schema_version=4,fragmentation_schema=generator.architecture,
         num_sources=len(files),num_samples=prepared_records,num_metadata_valid_records=len(dataset),num_skipped_sources=len(skipped),
@@ -221,11 +229,15 @@ def main(argv: list[str] | None = None) -> None:
         raise FileExistsError('Output already contains training structures. Enable overwrite or choose another directory.')
     workbench_path=output/'fragment-tree.pft.json'
     try:
-        previous=json.loads(workbench_path.read_text()) if workbench_path.exists() else {}
+        if workbench_path.exists(): previous=json.loads(workbench_path.read_text())
+        elif (output/'preparation_config.json').exists(): previous=json.loads((output/'preparation_config.json').read_text()).get('workbench_config',{})
+        elif (output/'train_structures/fragment-tree.pft.json').exists(): previous=json.loads((output/'train_structures/fragment-tree.pft.json').read_text())
+        else: previous={}
         if not isinstance(previous,dict): previous={}
     except (OSError,json.JSONDecodeError):
         previous={}
     _reset_output(output,bool(args.overwrite),[value for value in (args.input,args.validation_input,args.params) if value])
+    workbench_path.unlink(missing_ok=True)
     aliases={'validation_input':'validationInput','validation_ratio':'validationRatio','validation_seed':'validationSeed',
         'output_dir':'outputDir','smiles_column':'smilesColumn','adduct_type_column':'adductTypeColumn',
         'collision_energy_column':'collisionEnergyColumn','precursor_mz_column':'precursorMzColumn',
@@ -238,15 +250,19 @@ def main(argv: list[str] | None = None) -> None:
         restored[aliases.get(key,key)]=value
     restored.update(fragmenterParams=config['fragmenter_params'],symbols=config['mol_encoder_params']['symbols'])
     restored.pop('modelConfig',None);restored.pop('params',None)
-    (output/'fragment-tree.pft.json').write_text(json.dumps(restored,indent=2))
+    preparation_config['workbench_config']=restored
     (output/'preparation_config.json').write_text(json.dumps(preparation_config,indent=2))
-    if validation is None:
-        kwargs['overwrite']=False
-        create_action_training_data(dataset=train,output_dir=output,**kwargs)
-    else:
-        for name,split_dataset in (('train',train),('validation',validation)):
-            create_action_training_data(dataset=split_dataset,output_dir=output/(name+'_structures'),split=name,**kwargs)
-    (output/'fragment-tree.pft.json').write_text(json.dumps(restored,indent=2))
+    splits=[('train',train)]
+    if validation is not None: splits.append(('validation',validation))
+    for name,split_dataset in splits:
+        directory=output/(name+'_structures')
+        directory.mkdir(parents=True,exist_ok=True)
+        split_config={**restored,'split':name,'status':'running'}
+        (directory/'fragment-tree.pft.json').write_text(json.dumps(split_config,indent=2))
+        # The split is newly empty after resetting Output Directory. Do not delete its configuration.
+        create_action_training_data(dataset=split_dataset,output_dir=directory,split=name,**{**kwargs,'overwrite':False})
+        split_config['status']='completed'
+        (directory/'fragment-tree.pft.json').write_text(json.dumps(split_config,indent=2))
     (output/'invalid_records.json').write_text(json.dumps(reports,indent=2))
     (output/'preparation_config.json').write_text(json.dumps(preparation_config,indent=2))
 

@@ -162,7 +162,7 @@ class TestPreparationWorkflow(unittest.TestCase):
                     '--normalize-intensities','0','--minimum-relative-intensity','0.2','--validation-seed','7'])
             self.assertFalse((output/'orphan.txt').exists())
             self.assertFalse((output/'train_structures/stale').exists())
-            saved=json.loads((output/'fragment-tree.pft.json').read_text())
+            saved=json.loads((output/'train_structures/fragment-tree.pft.json').read_text())
             self.assertEqual(saved['validationInput'],str(validation_file))
             self.assertEqual(saved['validationRatio'],0.25)
             self.assertEqual(saved['validationSeed'],7)
@@ -171,6 +171,65 @@ class TestPreparationWorkflow(unittest.TestCase):
             self.assertFalse(saved['normalizeIntensities'])
             self.assertEqual(saved['minimumRelativeIntensity'],0.2)
             self.assertFalse(list(output.glob('*/preparation_config.json')))
+
+    def test_assignment_scores_handle_precursor_only_and_zero_intensity(self):
+        from clefts.libs.mmkit.mmkit import Adduct, Formula
+        from clefts.ml.data_preparation.fragment_tree.context import create_preparation_context
+        from clefts.ml.input.structure_builder import ActionStructureBuilder
+        from clefts.ml.input.source_action_structure import SourceActionStructure
+        model=config();model['fragmenter_params']['fragment_ion_tree_builder']['max_action_count']=1
+        builder=ActionStructureBuilder(create_preparation_context(model))
+        source=Compound.from_smiles('CCO');adduct=Adduct.parse('[M+H]+')
+        mz=Formula.parse('C2H7O+').exact_mass
+        data=builder.build(source,[adduct,adduct],[20.,20.],[[mz],[mz]],[[1.],[0.]])
+        first,second=data.sample_annotations
+        self.assertEqual(first['assignmentScore'],1.)
+        self.assertIsNone(first['assignmentScoreWithoutPrecursor'])
+        self.assertIsNone(second['assignmentScore'])
+        self.assertIsNone(second['assignmentScoreWithoutPrecursor'])
+        self.assertGreater(len(first['peaks'][0]['matches']),0)
+        collated=SourceActionStructure.from_structures([data,data])
+        self.assertEqual(len(collated.sample_annotations),4)
+        offset=len(data.downstream.decoded.compounds)
+        original=first['peaks'][0]['matches'][0]['nodeIndices']
+        shifted=collated.sample_annotations[2]['peaks'][0]['matches'][0]['nodeIndices']
+        self.assertEqual(shifted,[node+offset for node in original])
+
+    def test_result_inspection_uses_unique_fragment_nodes_and_action_references(self):
+        from clefts.libs.mmkit.mmkit import Formula
+        from clefts.ml.data_preparation.fragment_tree.create_training_data import create_action_training_data
+        result_spec=importlib.util.spec_from_file_location('result_backend','clefts_workbench/src/features/fragment-tree-result/backend.py')
+        result_backend=importlib.util.module_from_spec(result_spec);result_spec.loader.exec_module(result_backend)
+        peaks=np.array([[Formula.parse(value).exact_mass,10. if value=='C2H7O+' else 1.] for value in ['C2H7O+','CH5O+','H3O+','C2H7+']]+[[1000.,2.]])
+        data=MSDataset(pd.DataFrame({'SMILES':['CCO'],'AdductType':['[M+H]+'],'CollisionEnergy':[20.25],'PrecursorMZ':[47]}),PeakSeries(peaks,np.array([0,5],dtype=np.int64)))
+        model=config();model['fragmenter_params']['fragment_ion_tree_builder']['max_action_count']=1
+        with tempfile.TemporaryDirectory() as directory,contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()):
+            files=create_action_training_data(dataset=data,model_config=model,output_dir=directory)
+            result=result_backend.inspect_structure(files[0])
+            scores=pd.read_csv(Path(directory)/'assignment_scores.tsv',sep='\t')
+            self.assertEqual(len(scores),1)
+            self.assertAlmostEqual(scores.assignment_score.iloc[0],13/15)
+            self.assertAlmostEqual(scores.assignment_score_without_precursor.iloc[0],3/5)
+        sample=result['samples'][0]
+        self.assertEqual(sample['adduct'],'[M+H]+')
+        self.assertEqual(sample['mainAdduct'],'[M+H]+')
+        self.assertEqual(sample['collisionEnergyDisplay'],'20.3')
+        self.assertEqual(len(sample['peaks']),5)
+        self.assertEqual(sample['peaks'][-1]['matches'],[])
+        self.assertTrue(sample['peaks'][0]['precursor'])
+        self.assertAlmostEqual(sample['assignmentScore'],13/15)
+        self.assertAlmostEqual(sample['assignmentScoreWithoutPrecursor'],3/5)
+        self.assertTrue(all('hydrogenShift' in match and match['nodeIds'] for peak in sample['peaks'][:-1] for match in peak['matches']))
+        self.assertEqual(len({node['id'] for node in sample['nodes']}),sample['nodeCount'])
+        self.assertGreater(sample['edgeCount'],0)
+        self.assertTrue(next(node for node in sample['nodes'] if node['id']==0)['precursor'])
+        self.assertEqual(result['summary']['nodes'],sample['nodeCount'])
+        self.assertEqual(result['summary']['edgeTransitions'],sample['edgeTransitionCount'])
+        self.assertTrue(all(isinstance(node['actionSets'],list) for node in sample['nodes']))
+        registry={action['id'] for action in result['actions']}
+        self.assertTrue(all(transition['addedAction'] in registry for edge in sample['edges'] for transition in edge['transitions']))
+        self.assertTrue(all(action['sourceAtomMaps'] for action in result['actions']))
+        self.assertIn('<svg',result['sourceSvg'])
 
     def test_split_cli_creates_both_structure_directories(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -184,7 +243,9 @@ class TestPreparationWorkflow(unittest.TestCase):
             self.assertTrue((root/'out/preparation_config.json').is_file())
             self.assertFalse((root/'out/train_structures/preparation_config.json').exists())
             self.assertFalse((root/'out/validation_structures/preparation_config.json').exists())
-            self.assertTrue((root/'out/fragment-tree.pft.json').exists())
+            self.assertFalse((root/'out/fragment-tree.pft.json').exists())
+            self.assertTrue((root/'out/train_structures/fragment-tree.pft.json').exists())
+            self.assertTrue((root/'out/validation_structures/fragment-tree.pft.json').exists())
             for split in ('train','validation'):
                 folder=root/'out'/f'{split}_structures'
                 self.assertEqual(len(list((folder/'data').glob('*.preft.pt'))),2)

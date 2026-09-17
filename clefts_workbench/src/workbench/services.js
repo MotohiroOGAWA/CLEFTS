@@ -54,7 +54,7 @@ function attach(panel,context,projectRoot){
  if(message.type==='library/copy'){if(typeof message.path==='string')await vscode.env.clipboard.writeText(message.path);}
  if(message.type==='library/open'){
  if(typeof message.path!=='string')throw new Error('Invalid resource path.');const stat=await fs.promises.stat(message.path);
- if(stat.isDirectory())await vscode.commands.executeCommand('revealInExplorer',vscode.Uri.file(message.path));else if(/\.(pft|clefts-result)$/.test(message.path))await vscode.commands.executeCommand('vscode.openWith',vscode.Uri.file(message.path),'clefts.resultViewer');else await vscode.commands.executeCommand('revealInExplorer',vscode.Uri.file(message.path));
+ if(stat.isDirectory())await vscode.commands.executeCommand('revealInExplorer',vscode.Uri.file(message.path));else if(/\.(pft(?:\.json)?|clefts-result)$/.test(message.path))await vscode.commands.executeCommand('vscode.openWith',vscode.Uri.file(message.path),'clefts.resultViewer');else await vscode.commands.executeCommand('revealInExplorer',vscode.Uri.file(message.path));
  }
  if(message.type==='library/pick'){
  const allowed=['quickTrainDir','quickValDir','quickTrainOutput','quickCheckpoint','quickPredictModel'];if(!allowed.includes(message.target))return;

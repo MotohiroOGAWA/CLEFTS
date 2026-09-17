@@ -125,5 +125,30 @@ class ActionStructureBuilder:
         node_by_state={(dense_sample[row],tuple(i for i in dense_rows[row] if i>=0)):node
                        for row,node in zip(decoded.materialized_state_index.tolist(),decoded.materialized_node_index.tolist())}
         state_nodes=torch.tensor([node_by_state.get((sample,tuple(row)),-1) for sample,row in zip(samples,rows)],dtype=torch.long)
-        return replace(data,state_fragment_node_index=state_nodes,
+        annotations=[]
+        for sample,((_,groups),adduct,energy,mzs,intensities) in enumerate(zip(assignments,precursor_types,collision_energy,peaks_mz,peaks_intensity)):
+            main=fragmenter._resolve_main_adduct_type(adduct)
+            precursor_mz=adduct.apply_to_formula(source.formula).normalized.exact_mass
+            peaks=[]
+            for peak_index,(mz,intensity,group) in enumerate(zip(mzs,intensities,groups)):
+                matches=[]
+                for pathway in group:
+                    sequences=_walk_pathway(tree,fragmenter,pathway)
+                    local_nodes=sorted({node_by_state[(sample,tuple(sorted(actions.index(action) for action in seq.actions)) if seq else ())]
+                                        for seq in sequences if (sample,tuple(sorted(actions.index(action) for action in seq.actions)) if seq else ()) in node_by_state})
+                    match=dict(nodeIndices=local_nodes,smiles=pathway.terminal_node.smiles,
+                               formula=str(pathway.formula),theoreticalMz=float(pathway.formula.exact_mass),
+                               massErrorPpm=(float(mz)-pathway.formula.exact_mass)/pathway.formula.exact_mass*1e6,
+                               adduct=str(pathway.adduct),hydrogenShift=pathway.adduct.element_diff.get('H',0)-main.element_diff.get('H',0))
+                    if match not in matches:matches.append(match)
+                peaks.append(dict(index=peak_index,mz=float(mz),intensity=float(intensity),
+                                  precursor=bool(fragmenter.mass_tolerance.within(float(mz),precursor_mz)),matches=matches))
+            def score(selected):
+                total=sum(peak['intensity'] for peak in selected)
+                return sum(peak['intensity'] for peak in selected if peak['matches'])/total if total>0 else None
+            annotations.append(dict(adduct=str(adduct),mainAdduct=str(main),collisionEnergy=float(energy),
+                                    precursorMz=float(precursor_mz),peaks=peaks,
+                                    assignmentScore=score(peaks),
+                                    assignmentScoreWithoutPrecursor=score([peak for peak in peaks if not peak['precursor']])))
+        return replace(data,state_fragment_node_index=state_nodes,sample_annotations=tuple(annotations),
                        downstream=replace(downstream,target_intensity=torch.tensor(target)))
