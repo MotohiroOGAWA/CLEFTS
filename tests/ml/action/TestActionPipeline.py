@@ -14,15 +14,15 @@ from rdkit.Chem import rdChemReactions
 from clefts.domain.fragment import Fragmenter
 from clefts.domain.fragment.cleavage import CleavageActionSequence
 from clefts.libs.mmkit.mmkit import Adduct, Compound, Formula
-from clefts.ml.input.action_structure_builder import ActionStructureBuilder
+from clefts.ml.input.structure_builder import ActionStructureBuilder
 from clefts.ml.input.source_action_structure import prepare_source_actions
-from clefts.ml.specgen.action_materialization import materialize_action_states
-from clefts.ml.specgen.fragment_tree_spectrum_predictor import create_spectrum_generator
+from clefts.ml.specgen.materialization import materialize_action_states
+from clefts.ml.specgen.spectrum_generator import create_spectrum_generator
 from clefts.ml.specgen.components.action.action_decoder import build_action_pool, deduplicate
 from clefts.ml.specgen.source_anchored_spectrum_predictor import SourceAnchoredFragmentSpectrumGenerator
-from clefts.ml.training.fragment_tree_training.action_model import ActionFragmentTreeTrainingModel
-from clefts.ml.training.fragment_tree_training.action_training import train_actions
-from clefts.ml.training.fragment_tree_training.action_fine_tuning import prepare_action_model_config, parameter_report
+from clefts.ml.training.fragment_tree_training.model import ActionFragmentTreeTrainingModel
+from clefts.ml.training.fragment_tree_training.training import train_actions
+from clefts.ml.training.fragment_tree_training.fine_tuning import prepare_model_config, parameter_report
 from .TestSourceAction import model_and_data
 
 
@@ -197,7 +197,7 @@ class TestActionPipeline(unittest.TestCase):
             new_params_file = root/'new_params.json'
             new_params_file.write_text(json.dumps(new_config))
 
-            fine_tuned_config = prepare_action_model_config(checkpoint_path=base_checkpoint,
+            fine_tuned_config = prepare_model_config(checkpoint_path=base_checkpoint,
                 pattern_set_path=pattern_file, new_params_path=new_params_file, width=2)
             self.assertEqual(fine_tuned_config['fine_tuning']['width'], 2)
             self.assertIn('categories.0', fine_tuned_config['fine_tuning']['category_mapping'])

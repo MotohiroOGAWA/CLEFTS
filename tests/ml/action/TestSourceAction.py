@@ -14,7 +14,7 @@ from clefts.ml.input.source_action_structure import SourceActionStructure, prepa
 from clefts.ml.mol.mol_encoder import MolEncoder
 from clefts.ml.specgen.source_action_feature_model import SourceActionFeatureModel
 from clefts.ml.specgen.components.action import ActionCompatibilityEngine, ActionStateEncoder
-from clefts.ml.training.fragment_tree_training.action_model import ActionFragmentTreeTrainingModel, multi_positive_loss
+from clefts.ml.training.fragment_tree_training.model import ActionFragmentTreeTrainingModel, multi_positive_loss
 
 
 def model_and_data() -> tuple[SourceActionFeatureModel, SourceActionStructure, tuple[CleavageAction, ...], Compound]:

@@ -5,9 +5,9 @@ from pathlib import Path
 from clefts.libs.mmkit.mmkit import Compound,Adduct
 from clefts.libs.msentity.msentity import MSDataset
 from clefts.domain.mass.parse_ce import parse_ce_to_ev
-from clefts.ml.input.action_structure_builder import ActionStructureBuilder
-from clefts.ml.input.fragment_tree_training_data import save_fragment_tree_structure,make_structure_file_stem
-from clefts.ml.specgen.fragment_tree_spectrum_predictor import create_spectrum_generator
+from clefts.ml.input.structure_builder import ActionStructureBuilder
+from clefts.ml.input.source_action_structure import save_fragment_tree_structure,make_structure_file_stem
+from clefts.ml.specgen.spectrum_generator import create_spectrum_generator
 
 
 def create_action_training_data(*, dataset: MSDataset, model_config: dict, output_dir: str | Path,
@@ -40,10 +40,14 @@ def create_action_training_data(*, dataset: MSDataset, model_config: dict, outpu
     return files
 
 
-def main() -> None:
+def build_arg_parser() -> argparse.ArgumentParser:
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--input',required=True);parser.add_argument('--params',required=True);parser.add_argument('--output-dir',required=True)
-    args=parser.parse_args()
+    return parser
+
+
+def main(argv: list[str] | None = None) -> None:
+    args=build_arg_parser().parse_args(argv)
     create_action_training_data(dataset=MSDataset.load(args.input),model_config=json.loads(Path(args.params).read_text()),output_dir=args.output_dir)
 
 if __name__=='__main__':main()

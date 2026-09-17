@@ -12,7 +12,7 @@ from clefts.libs.mmkit.mmkit import Adduct, Compound
 from ..common.layers.graphormer import GraphormerEncoder
 from ..mol.formula_encoder import FormulaTensorizer
 from .fragment_tree_formula_intensity_model import FragmentTreeFormulaIntensityPredictor
-from .action_materialization import DecodedFragmentTreeBatch
+from .materialization import DecodedFragmentTreeBatch
 
 
 @dataclass(frozen=True)

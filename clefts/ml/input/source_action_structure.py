@@ -1,5 +1,6 @@
 """Schema v4 Source/action tensors. RDKit is confined to preparation."""
 from __future__ import annotations
+import hashlib
 from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
 from collections.abc import Iterable, Sequence
@@ -299,3 +300,18 @@ def prepare_source_actions(*, source: Compound, actions: tuple[CleavageAction, .
         state_fragment_node_index=torch.full((len(states),),-1,dtype=torch.long),
         source_atom_capacity=mol.GetNumAtoms(),action_source_atom_features=role_features,
         max_action_role_count=max((len(a.source_atom_maps) for a in actions),default=0))
+
+
+def make_structure_file_stem(smiles: str, *, index: int) -> str:
+    """Make a stable readable file stem for one SMILES group."""
+    digest = hashlib.sha1(smiles.encode("utf-8")).hexdigest()[:16]
+    return f"smiles_{index:06d}_{digest}"
+
+
+def save_fragment_tree_structure(*, structure: SourceActionStructure, output_file: str | Path,
+                                 metadata: dict[str, object] | None = None) -> None:
+    """Save one structure and a small metadata sidecar into a torch file."""
+    output_path = Path(output_file)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(dict(schema=SCHEMA, schema_version=SCHEMA_VERSION, fragmentation_schema=FRAGMENTATION_SCHEMA,
+                    structure=structure.to("cpu"), metadata=dict(metadata or {})), output_path)

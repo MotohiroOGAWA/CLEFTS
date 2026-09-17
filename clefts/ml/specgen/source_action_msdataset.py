@@ -5,7 +5,7 @@ import torch
 from clefts.libs.mmkit.mmkit import Adduct, Compound
 from clefts.domain.mass.parse_ce import parse_ce_to_ev
 from .source_anchored_spectrum_predictor import SourceAnchoredFragmentSpectrumGenerator
-from .fragment_tree_spectrum_predictor import GeneratedMassSpectrum,GeneratedSpectrumPeak,FragmentSpectrumGeneratorOutput,fragment_spectrum_output_to_msdataset
+from .spectrum_generator import GeneratedMassSpectrum,GeneratedSpectrumPeak,FragmentSpectrumGeneratorOutput,fragment_spectrum_output_to_msdataset
 
 
 def predict_source_msdataset(dataset: object, generator: SourceAnchoredFragmentSpectrumGenerator, *,

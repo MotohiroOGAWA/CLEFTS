@@ -35,13 +35,19 @@ class NewCategoryRows(nn.Module):
 
 
 def install_expansion(generator, config):
-    """Called by the generator constructor, before any optimizer is created."""
+    """Called by the generator constructor, before any optimizer is created.
+
+    ActionEncoder.categories is an nn.ModuleList indexed
+    (pattern_id, reaction_id, product_molecule_id); category_mapping() in
+    training/fragment_tree_training/fine_tuning.py returns semantic names, so
+    callers translate them to this positional attribute path before calling in.
+    """
     if config.get('version') != 1 or int(config.get('width', 0)) < 1:
         raise ValueError('Unsupported fine-tuning version or nonpositive adapter width.')
     width = int(config['width'])
     for parameter in generator.parameters():
         parameter.requires_grad_(False)
-    mol_modules = {id(module) for module in generator.feature_model.mol_encoder.modules()}
+    mol_modules = {id(module) for module in generator.mol_encoder.modules()}
     # Snapshot first: newly registered low-rank parameters must not be expanded again.
     for _, module in list(generator.named_modules()):
         if id(module) in mol_modules:
@@ -52,9 +58,9 @@ def install_expansion(generator, config):
                      if getattr(module, name, None) is not None]
         for name in names:
             parametrize.register_parametrization(module, name, LowRankExpansion(getattr(module, name), width))
-    edge = generator.feature_model.fragment_edge_encoder
+    categories = generator.feature_model.action_encoder.categories
     for name, mapping in config['category_mapping'].items():
-        embedding = getattr(edge, name)
+        embedding = categories[int(name.rsplit('.', 1)[1])]
         parametrize.register_parametrization(
             embedding, 'weight', NewCategoryRows(embedding.weight, [pair[1] for pair in mapping]))
     generator.feature_model.freeze_mol_encoder()

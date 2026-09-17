@@ -12,8 +12,8 @@ from ..mol.formula_encoder import FormulaTensorizer
 from .components.condition.condition_encoder import MS2ConditionEncoder
 from .components.action.action_decoder import ActionDecoderOutput
 from .source_action_feature_model import SourceActionFeatureModel, SourceActionFeatures
-from .action_materialization import materialize_action_states, DecodedFragmentTreeBatch
-from .post_materialization_model import PostMaterializationFragmentTreeModel, prepare_post_materialization, PostMaterializationOutput
+from .materialization import materialize_action_states, DecodedFragmentTreeBatch
+from .post_materialization_model import PostMaterializationFragmentTreeModel, prepare_post_materialization, PostMaterializationOutput, PostMaterializationBatch
 
 
 @dataclass(frozen=True)
@@ -27,6 +27,10 @@ class SourceAnchoredSpectrumOutput:
     selection: SourceAnchoredSelectionOutput
     fragments: DecodedFragmentTreeBatch
     spectra: PostMaterializationOutput
+    # ion_node_index/ion_formula_index link each candidate ion to its
+    # fragment-tree node and formula; consumers that need that mapping (e.g.
+    # a fragment-tree viewer) read it from here instead of re-deriving it.
+    downstream: PostMaterializationBatch
     # Grouped preparation may reorder records; this maps internal -> input.
     sample_input_index: tuple[int, ...]
 
@@ -60,8 +64,8 @@ class SourceAnchoredFragmentSpectrumGenerator(nn.Module):
         self.post_model=PostMaterializationFragmentTreeModel(self.mol_encoder,hidden,condition_dim,self.tensorizer.dim,
             max_action_count=self.fragmenter.tree_max_action_count,**post_params)
         if fine_tuning:
-            from .action_fine_tuning import install_action_expansion
-            install_action_expansion(self, fine_tuning)
+            from .fine_tuning import install_expansion
+            install_expansion(self, fine_tuning)
 
     def forward(self, data: SourceActionStructure) -> SourceAnchoredSelectionOutput:
         """Neural forward, including validation, never invokes RDKit."""
@@ -107,4 +111,4 @@ class SourceAnchoredFragmentSpectrumGenerator(nn.Module):
         decoded=materialize_action_states(selection.decoded,sources,actions,data.sample_tree_index,self.mol_encoder.graph_builder)
         downstream=prepare_post_materialization(decoded,self.fragmenter,adducts,self.tensorizer).to(device)
         spectra=self.post_model(downstream,action_h=selection.features.action_h,condition_h=selection.features.condition_h)
-        return SourceAnchoredSpectrumOutput(selection,decoded,spectra,indices)
+        return SourceAnchoredSpectrumOutput(selection,decoded,spectra,downstream,indices)

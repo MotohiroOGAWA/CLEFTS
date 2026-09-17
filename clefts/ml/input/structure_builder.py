@@ -9,7 +9,7 @@ from clefts.domain.fragment.cleavage import CleavageActionSequence
 from .source_action_structure import SourceActionStructure, prepare_source_actions
 from ..specgen.source_anchored_spectrum_predictor import SourceAnchoredFragmentSpectrumGenerator
 from ..specgen.components.action.action_decoder import ActionDecoderOutput
-from ..specgen.action_materialization import materialize_action_states
+from ..specgen.materialization import materialize_action_states
 from ..specgen.post_materialization_model import prepare_post_materialization
 
 
