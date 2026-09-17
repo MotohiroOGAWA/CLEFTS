@@ -119,7 +119,7 @@ class AtomFeatureLayer(nn.Module):
         return one_hot
     
     def encode_num_hydrogens(self, atom: Chem.rdchem.Atom) -> torch.Tensor:
-        num_h = atom.GetTotalNumHs()
+        num_h = atom.GetTotalNumHs(includeNeighbors=True)
         one_hot = self.base_num_hydrogens_vector.clone()
         if num_h in self.feature_sets['num_hydrogens']:
             one_hot[self.feature_sets['num_hydrogens'].index(num_h)] = 1.0

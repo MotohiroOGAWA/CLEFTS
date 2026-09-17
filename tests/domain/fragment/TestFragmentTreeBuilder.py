@@ -406,6 +406,22 @@ class TestFragmentTreeBuilder(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'node limit'):
             build.build(source, max_node=1)
 
+    def test_node_and_edge_limits_stop_combination_search_and_reactions_early(self):
+        baseline=self.builder._build_result(self.source)['search_stats']
+        original=CleavageActionSearch.iter_candidates
+        for limit in ({'max_node':1},{'max_edge':0}):
+            searches=[]
+            def stream(search):
+                searches.append(search)
+                yield from original(search)
+            with self.subTest(limit=limit),patch.object(CleavageActionSearch,'iter_candidates',stream), \
+                 patch.object(CleavageActionSearch,'enumerate',side_effect=AssertionError('Eager search is forbidden')):
+                with self.assertRaisesRegex(ValueError,'limit exceeded'):
+                    self.builder.build(self.source,**limit)
+            stats=searches[0].stats
+            self.assertLess(stats.num_raw_combinations,baseline['num_raw_combinations'])
+            self.assertLess(stats.num_rdkit_run_reactants,baseline['num_rdkit_run_reactants'])
+
     def test_limits_seed_validation_and_removed_apis(self) -> None:
         for limit in (0, -1, True):
             with self.assertRaises(ValueError):

@@ -142,10 +142,10 @@ function openWorkbench(context, output, initialPage = "home") {
       } else if (message.type === 'loadConfig') {
         const picked = await vscode.window.showOpenDialog({ filters: { 'CLEFTS run configuration': ['pft.json', 'json'] }, canSelectMany: false });
         if (picked && picked[0]) {
-          const config = JSON.parse(await fs.promises.readFile(picked[0].fsPath, 'utf8'));
+          const config = normalizeConfig(JSON.parse(await fs.promises.readFile(picked[0].fsPath, 'utf8')));
           if (!config.modelConfig && config.params) config.modelConfig = parameterService.merge(parameterService.defaults(projectRoot(context)), parameterService.unpack(JSON.parse(await fs.promises.readFile(path.resolve(path.dirname(picked[0].fsPath), config.params), 'utf8'))));
           if(!config.modelConfig && config.fragmenterParams && !config.symbols) config.modelConfig=parameterService.merge(parameterService.defaults(projectRoot(context)),{fragmenter_params:config.fragmenterParams});
-          panel.webview.postMessage({ type: 'config', config: { ...defaultConfig(context), ...config } });
+          panel.webview.postMessage({ type: 'config', config: normalizeConfig({ ...defaultConfig(context), ...config }) });
         }
       } else if (message.type === 'saveTrainingConfig') {
         const target = await vscode.window.showSaveDialog({ filters: { 'CLEFTS training configuration': ['pfttrain.json'] }, defaultUri: vscode.Uri.file('fragment_tree.pfttrain.json') });
@@ -334,6 +334,14 @@ function runSpectrumPredictionBackend(context, payload) {
 
 function normalizeConfig(config) {
   const result={...config};
+  const aliases={validation_input:'validationInput',validation_ratio:'validationRatio',validation_seed:'validationSeed',
+    output_dir:'outputDir',smiles_column:'smilesColumn',adduct_type_column:'adductTypeColumn',collision_energy_column:'collisionEnergyColumn',
+    precursor_mz_column:'precursorMzColumn',minimum_relative_intensity:'minimumRelativeIntensity',normalize_intensities:'normalizeIntensities',
+    num_workers:'numWorkers',chunk_size:'chunkSize',max_node:'maxNode',max_edge:'maxEdge',model_config:'modelConfig'};
+  for(const [from,to] of Object.entries(aliases)){if(result[from]!==undefined&&result[to]===undefined)result[to]=result[from];delete result[from];}
+  if(result.modelConfig){const model=result.modelConfig.params||result.modelConfig;result.fragmenterParams??=model.fragmenter_params;result.symbols??=model.symbols||model.mol_encoder_params?.symbols;result.maxNode??=model.max_node;result.maxEdge??=model.max_edge;if(result.fragmenterParams)delete result.modelConfig;}
+  if(result.validationRatio==null)delete result.validationRatio;
+  if(result.validationInput==null)result.validationInput='';
   if (result.modelConfig || result.fragmenterParams) delete result.params;
   result.input ||= result.trainInput;
   return result;
@@ -522,6 +530,18 @@ async function readStructureManifests(root) {
       return row;
     });
     results.push({ directory, relativeBase: directory, rows });
+  }
+  // Older preparation outputs did not write manifest.tsv. Inspect their saved metadata.
+  for(const directory of ['', 'train_structures','validation_structures']){
+    if(results.some(item=>item.relativeBase===directory))continue;
+    const folder=path.join(root,directory);if(!fs.existsSync(folder))continue;
+    const locations=[folder,path.join(folder,'data')];let hasStructures=false;
+    for(const location of locations)if(fs.existsSync(location)&&(await fs.promises.readdir(location)).some(name=>name.endsWith('.preft.pt')))hasStructures=true;
+    if(!hasStructures)continue;
+    const context={extensionPath:path.resolve(__dirname,'..')};
+    const rows=await workbenchServices.backend(context,projectRoot(context),'structure-manifest',{directory:folder});
+    for(const row of rows){row.relative=path.join(directory,row.file);row.exists=fs.existsSync(path.join(root,row.relative));}
+    results.push({directory:directory||path.basename(root),relativeBase:directory,rows});
   }
   return results;
 }

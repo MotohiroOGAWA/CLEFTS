@@ -105,11 +105,24 @@ def model(payload: dict) -> dict:
     if not isinstance(config,dict): raise ValueError('Checkpoint does not contain a model configuration.')
     return {'modelConfig':config.get('params',config),'path':payload['path']}
 
+def structure_manifest(payload):
+    import torch
+    directory=Path(payload['directory'])
+    rows=[]
+    files=sorted(set(directory.glob('*.preft.pt'))|set((directory/'data').glob('*.preft.pt')))
+    for file in files:
+        saved=torch.load(file,map_location='cpu')
+        metadata=saved.get('metadata',{})
+        indexes=metadata.get('record_indexes',[])
+        rows.append(dict(file=str(file.relative_to(directory)),smiles=metadata.get('smiles',''),
+            record_indexes=json.dumps(indexes),num_input_records=len(indexes),num_valid_samples=len(indexes),status='completed'))
+    return rows
+
 def main():
     request=json.loads(sys.stdin.read())
     try:
         with contextlib.redirect_stdout(sys.stderr):
-            result={'preview':preview,'validate':validate,'validate-config':lambda payload:validate(payload,check_datasets=False),'model':model}[request['command']](request['payload'])
+            result={'structure-manifest':structure_manifest,'preview':preview,'validate':validate,'validate-config':lambda payload:validate(payload,check_datasets=False),'model':model}[request['command']](request['payload'])
         print(json.dumps({'ok':True,'result':result},allow_nan=False))
     except Exception as error:
         import traceback

@@ -58,7 +58,8 @@ loaded configurations take priority. Normalize Intensities defaults to enabled.
 
 Open **Data → Output → Parallel Processing**. **Worker Processes** selects the
 number of independent subprocesses processing SMILES groups; `1` runs serially.
-**Chunk Size** selects how many groups are sent per dispatch. Chunks are capped to
+**Chunk Size** selects how many groups are handled by each subprocess command.
+Data preparation uses the shared `clefts/utils/parallel_subprocess.py` runner. Chunks are capped to
 keep enough work for the available workers. Training and validation run separately.
 The CLI equivalents are `--num-workers 4 --chunk-size 1`. Stopping preparation also
 terminates its worker processes.

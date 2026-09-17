@@ -85,7 +85,7 @@ class TestPreparationWorkflow(unittest.TestCase):
             self.assertEqual(len(files),1)
             self.assertEqual(len(json.loads((root/'direct/invalid_records.json').read_text())),4)
             self.assertEqual(len(json.loads((root/'cli/invalid_records.json').read_text())['train']),4)
-            self.assertEqual(len(list((root/'cli').glob('*.preft.pt'))),1)
+            self.assertEqual(len(list((root/'cli').rglob('*.preft.pt'))),1)
             saved=json.loads((root/'cli/preparation_config.json').read_text())
             self.assertEqual(saved['input'],str(file))
             self.assertEqual(saved['max_node'],-1)
@@ -118,6 +118,60 @@ class TestPreparationWorkflow(unittest.TestCase):
                         self.assertTrue((output/'preparation_config.json').is_file())
                         self.assertIn('100%',stderr.getvalue())
 
+    def test_explicit_hydrogen_preparation_preserves_graph_and_action_alignment(self):
+        from clefts.ml.input.structure_builder import ActionStructureBuilder
+        from clefts.ml.specgen.spectrum_generator import create_spectrum_generator
+        from clefts.libs.mmkit.mmkit import Adduct
+        import torch
+        model=config();model['fragmenter_params']['fragment_ion_tree_builder']['max_action_count']=1
+        generator=create_spectrum_generator(model).eval()
+        source=Compound.from_smiles('C([2H])O')
+        from clefts.ml.input.source_action_structure import prepare_source_actions
+        actions=generator.fragmenter.fragment_ion_tree_builder.create_cleavage_actions(source)
+        data=prepare_source_actions(source=source,actions=actions,graph_builder=generator.mol_encoder.graph_builder,
+            condition_features=torch.tensor([[0.,20.]]),max_action_count=1)
+        self.assertEqual(data.source_graph.num_nodes,2)
+        self.assertEqual(data.source_atom_capacity,2)
+        self.assertTrue(torch.all(data.action_source_atom_index<2))
+        self.assertEqual(data.action_source_atom_features.shape[0],data.action_source_atom_index.numel())
+        batch,indices=generator.mol_encoder.encode_batch([source,Compound.from_smiles('[H]')])
+        self.assertEqual(indices.tolist(),[0,1])
+        self.assertEqual(batch.embeddings.shape[0],2)
+
+    def test_shared_subprocess_runner_reports_completion_order(self):
+        import sys
+        from clefts.utils.parallel_subprocess import run_parallel_subprocesses
+        commands=[[sys.executable,'-c','import time; time.sleep(0.3)'],[sys.executable,'-c','pass']]
+        completed=[]
+        with contextlib.redirect_stderr(io.StringIO()):
+            run_parallel_subprocesses(commands,max_workers=2,on_complete=completed.append)
+        self.assertEqual(completed,[commands[1],commands[0]])
+
+    def test_overwrite_removes_all_previous_outputs_and_preserves_complete_root_config(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);input_file=root/'train.msds';validation_file=root/'validation.msds'
+            data=self.dataset();data[[0,1,2]].save(str(input_file));data[[3,4]].save(str(validation_file))
+            output=root/'out';(output/'train_structures/stale').mkdir(parents=True)
+            (output/'train_structures/stale/old.bin').write_text('stale')
+            (output/'orphan.txt').write_text('old')
+            (output/'fragment-tree.pft.json').write_text(json.dumps({'validationRatio':0.25}))
+            model=config();model['fragmenter_params']['fragment_ion_tree_builder']['max_action_count']=1
+            with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()):
+                main(['--input',str(input_file),'--validation-input',str(validation_file),'--output-dir',str(output),
+                    '--params-json',json.dumps(model),'--max-node','100','--max-edge','200','--overwrite','1',
+                    '--normalize-intensities','0','--minimum-relative-intensity','0.2','--validation-seed','7'])
+            self.assertFalse((output/'orphan.txt').exists())
+            self.assertFalse((output/'train_structures/stale').exists())
+            saved=json.loads((output/'fragment-tree.pft.json').read_text())
+            self.assertEqual(saved['validationInput'],str(validation_file))
+            self.assertEqual(saved['validationRatio'],0.25)
+            self.assertEqual(saved['validationSeed'],7)
+            self.assertEqual(saved['maxNode'],100)
+            self.assertEqual(saved['maxEdge'],200)
+            self.assertFalse(saved['normalizeIntensities'])
+            self.assertEqual(saved['minimumRelativeIntensity'],0.2)
+            self.assertFalse(list(output.glob('*/preparation_config.json')))
+
     def test_split_cli_creates_both_structure_directories(self):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory);file=root/'dataset.msds';self.dataset().save(str(file))
@@ -125,9 +179,18 @@ class TestPreparationWorkflow(unittest.TestCase):
             with contextlib.redirect_stdout(io.StringIO()) as log:
                 main(['--input',str(file),'--output-dir',str(root/'out'),'--validation-ratio','0.5',
                       '--params-json',json.dumps(model),'--minimum-relative-intensity','0.1','--normalize-intensities','1','--overwrite','0'])
-            self.assertEqual(len(list((root/'out/train_structures').glob('*.preft.pt'))),2)
-            self.assertEqual(len(list((root/'out/validation_structures').glob('*.preft.pt'))),2)
+            self.assertEqual(len(list((root/'out/train_structures').rglob('*.preft.pt'))),2)
+            self.assertEqual(len(list((root/'out/validation_structures').rglob('*.preft.pt'))),2)
             self.assertTrue((root/'out/preparation_config.json').is_file())
+            self.assertFalse((root/'out/train_structures/preparation_config.json').exists())
+            self.assertFalse((root/'out/validation_structures/preparation_config.json').exists())
+            self.assertTrue((root/'out/fragment-tree.pft.json').exists())
+            for split in ('train','validation'):
+                folder=root/'out'/f'{split}_structures'
+                self.assertEqual(len(list((folder/'data').glob('*.preft.pt'))),2)
+                rows=pd.read_csv(folder/'manifest.tsv',sep='\t')
+                self.assertEqual(len(rows),2)
+                self.assertTrue(all((folder/'data'/file).exists() for file in rows['file']))
             self.assertIn('"event": "progress"',log.getvalue())
             with self.assertRaises(FileExistsError),contextlib.redirect_stdout(io.StringIO()):
                 main(['--input',str(file),'--output-dir',str(root/'out'),'--validation-ratio','0.5',

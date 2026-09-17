@@ -180,14 +180,13 @@ def prepare_source_actions(*, source: Compound, actions: tuple[CleavageAction, .
     itself be a subset or superset of one of these alternatives.
     """
     relations = CleavageActionRelations.from_actions(actions)
-    mol = source.mapped_mol
-    maps = {atom.GetAtomMapNum(): atom.GetIdx() for atom in mol.GetAtoms()}
-    atom_ptr, atom_index = csr([tuple(maps[v] for v in a.source_atom_maps) for a in actions])
+    maps = {atom.GetAtomMapNum(): index for index, atom in enumerate(graph_builder.graph_atoms(source))}
+    atom_ptr, atom_index = csr([tuple(maps[v] for v in a.source_atom_maps if v in maps) for a in actions])
     role_features=torch.tensor([[float(v in a.retained_atom_maps),float(v in a.discarded_atom_maps),
         sum(v in edge for edge in a.matched_bond_maps),sum(v in edge for edge in a.cut_bond_maps),
         sum(v in edge for edge in a.changed_bond_maps),sum(v in (u,w) for u,w,_ in a.bond_updates)]
-        for a in actions for v in a.source_atom_maps],dtype=torch.float32).reshape(-1,6)
-    retained = coo([(i, maps[v]) for i, a in enumerate(actions) for v in sorted(a.retained_atom_maps)])
+        for a in actions for v in a.source_atom_maps if v in maps],dtype=torch.float32).reshape(-1,6)
+    retained = coo([(i, maps[v]) for i, a in enumerate(actions) for v in sorted(a.retained_atom_maps) if v in maps])
     samples, states, positive_next, eos, sample_positive = [], [], [], [], []
     transition_parents,transition_children,transition_actions=[],[],[]
     index = {a: i for i, a in enumerate(actions)}
@@ -298,7 +297,7 @@ def prepare_source_actions(*, source: Compound, actions: tuple[CleavageAction, .
         transition_child_state_index=torch.tensor(transition_children,dtype=torch.long),
         transition_added_action_index=torch.tensor(transition_actions,dtype=torch.long),
         state_fragment_node_index=torch.full((len(states),),-1,dtype=torch.long),
-        source_atom_capacity=mol.GetNumAtoms(),action_source_atom_features=role_features,
+        source_atom_capacity=len(maps),action_source_atom_features=role_features,
         max_action_role_count=max((len(a.source_atom_maps) for a in actions),default=0))
 
 
