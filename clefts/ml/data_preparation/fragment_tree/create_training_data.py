@@ -1,10 +1,12 @@
 """Regenerate schema-v4 action teachers directly from original MSDataset."""
 from __future__ import annotations
-import argparse,json,math,multiprocessing
+import argparse,json,math,multiprocessing,sys
 from concurrent.futures import ProcessPoolExecutor
 from collections import deque
 from itertools import islice
 from pathlib import Path
+from tqdm import tqdm
+from clefts.domain.fragment.tree.FragmentTreeBuilder import FragmentTreeLimitExceeded
 from clefts.libs.mmkit.mmkit import Compound,Adduct
 from clefts.libs.msentity.msentity import MSDataset
 from clefts.domain.mass.parse_ce import parse_ce_to_ev
@@ -13,6 +15,7 @@ from clefts.ml.input.source_action_structure import save_fragment_tree_structure
 from .context import create_preparation_context, validate_limits
 from clefts.ml.specgen.config_options import configure_model_options, resolve_model_options
 from .datasets import load_spectrum_dataset, split_by_smiles
+from .record_validation import inspect_records
 
 
 def _prepare_group(task, builder, options):
@@ -43,6 +46,13 @@ def _prepare_group(task, builder, options):
     return path
 
 
+def _prepare_group_safely(task, builder, options):
+    try:
+        return dict(path=_prepare_group(task,builder,options),record_count=len(task[2]))
+    except FragmentTreeLimitExceeded as error:
+        return dict(skipped=dict(source_index=task[0],smiles=task[1],record_indexes=task[2],reason=str(error)))
+
+
 def _initialize_worker(model_config, observed_adducts, options):
     import torch
     torch.set_num_threads(1)
@@ -53,7 +63,7 @@ def _initialize_worker(model_config, observed_adducts, options):
 
 
 def _prepare_worker_chunk(tasks):
-    return [_prepare_group(task,_worker_builder,_worker_options) for task in tasks]
+    return [_prepare_group_safely(task,_worker_builder,_worker_options) for task in tasks]
 
 def _parallel_results(pool,tasks,chunk_size,num_workers):
     # Bound pending subsets instead of retaining a second copy of the whole dataset.
@@ -72,12 +82,18 @@ def create_action_training_data(*, dataset: MSDataset, model_config: dict, outpu
                                 smiles_column: str = 'SMILES', adduct_type_column: str = 'AdductType',
                                 collision_energy_column: str = 'CollisionEnergy', precursor_mz_column: str = 'PrecursorMZ',
                                 minimum_relative_intensity: float = 0.0, normalize_intensities: bool = True,
-                                overwrite: bool = True, split: str = 'dataset', max_node: int = -1, max_edge: int = -1, num_workers: int = 1, chunk_size: int = 1) -> list[Path]:
+                                overwrite: bool = True, split: str = 'dataset', max_node: int = -1, max_edge: int = -1, num_workers: int = 1, chunk_size: int = 1, preparation_config: dict | None = None) -> list[Path]:
     if not math.isfinite(minimum_relative_intensity) or not 0<=minimum_relative_intensity<=1:
         raise ValueError('Minimum relative intensity must be between 0 and 1.')
     validate_limits(max_node,max_edge)
     if type(num_workers) is not int or num_workers<1 or type(chunk_size) is not int or chunk_size<1:
         raise ValueError('Worker processes and chunk size must be positive integers.')
+    inspection=inspect_records(dataset,create_preparation_context(model_config).fragmenter,
+        dict(smilesColumn=smiles_column,adductTypeColumn=adduct_type_column,
+             collisionEnergyColumn=collision_energy_column,precursorMzColumn=precursor_mz_column))
+    original_rows=inspection['validIndexes']
+    dataset=dataset[original_rows]
+    if not len(dataset): raise ValueError('The dataset contains no valid records to prepare.')
     generator=create_preparation_context(model_config,observed_adducts=dataset[adduct_type_column].unique())
     builder=ActionStructureBuilder(generator,max_node=max_node,max_edge=max_edge)
     grouped={}
@@ -86,23 +102,38 @@ def create_action_training_data(*, dataset: MSDataset, model_config: dict, outpu
     if not overwrite:
         existing=list(output.glob('*.preft.pt'))
         if existing: raise FileExistsError('Output already contains training structures. Enable overwrite or choose another directory.')
+    (output/'invalid_records.json').write_text(json.dumps(inspection['invalidRecords'],indent=2))
     options=dict(output_dir=str(output),adduct_type_column=adduct_type_column,collision_energy_column=collision_energy_column,
         precursor_mz_column=precursor_mz_column,minimum_relative_intensity=minimum_relative_intensity,
         normalize_intensities=normalize_intensities,max_node=max_node,max_edge=max_edge)
-    tasks=((tree,smiles,rows,dataset[rows]) for tree,(smiles,rows) in enumerate(grouped.items()))
-    files=[]
+    tasks=((tree,smiles,[original_rows[index] for index in rows],dataset[rows]) for tree,(smiles,rows) in enumerate(grouped.items()))
+    (output/'preparation_config.json').write_text(json.dumps(preparation_config or dict(split=split,model_config=model_config,
+        smiles_column=smiles_column,num_workers=num_workers,chunk_size=chunk_size,overwrite=overwrite,**options),indent=2))
+    files=[];skipped=[];prepared_records=0
     def collect(results):
-        for current,path in enumerate(results,1):
-            files.append(path)
-            print(json.dumps(dict(event='progress',split=split,current=current,total=len(grouped))),flush=True)
+        nonlocal prepared_records
+        with tqdm(total=len(grouped),desc=f'Fragment trees ({split})',unit='tree',file=sys.stderr) as progress:
+            for current,result in enumerate(results,1):
+                if 'skipped' in result:
+                    skipped.append(result['skipped'])
+                    tqdm.write('Skipping '+result['skipped']['smiles']+': '+result['skipped']['reason'],file=progress.fp)
+                    print(json.dumps(dict(event='source_skipped',split=split,**result['skipped'])),flush=True)
+                else:
+                    files.append(result['path']);prepared_records+=result['record_count']
+                progress.set_postfix(prepared=len(files),skipped=len(skipped),refresh=False)
+                progress.update(1)
+                print(json.dumps(dict(event='progress',split=split,current=current,total=len(grouped),prepared=len(files),skipped=len(skipped))),flush=True)
+
     if num_workers==1 or len(grouped)<2:
-        collect(_prepare_group(task,builder,options) for task in tasks)
+        collect(_prepare_group_safely(task,builder,options) for task in tasks)
     else:
         with ProcessPoolExecutor(max_workers=min(num_workers,len(grouped)),mp_context=multiprocessing.get_context('spawn'),
             initializer=_initialize_worker,initargs=(model_config,generator.adduct_type_strs,options)) as pool:
             collect(_parallel_results(pool,tasks,min(chunk_size,max(1,len(grouped)//num_workers)),min(num_workers,len(grouped))))
+    (output/'skipped_sources.json').write_text(json.dumps(skipped,indent=2))
     (output/'action_statistics.json').write_text(json.dumps(dict(schema_version=4,fragmentation_schema=generator.architecture,
-        num_sources=len(files),num_samples=len(dataset),num_workers=num_workers,chunk_size=chunk_size,model_config=model_config,minimum_relative_intensity=minimum_relative_intensity,normalize_intensities=normalize_intensities),indent=2))
+        num_sources=len(files),num_samples=prepared_records,num_metadata_valid_records=len(dataset),num_skipped_sources=len(skipped),
+        num_skipped_records=sum(len(source['record_indexes']) for source in skipped),num_excluded_records=inspection['excludedRecords'],num_workers=num_workers,chunk_size=chunk_size,model_config=model_config,minimum_relative_intensity=minimum_relative_intensity,normalize_intensities=normalize_intensities),indent=2))
     return files
 
 
@@ -137,9 +168,24 @@ def main(argv: list[str] | None = None) -> None:
     imported_symbols=config.pop('symbols',None)
     if args.symbols_json: config['mol_encoder_params']['symbols']=json.loads(args.symbols_json)
     elif imported_symbols is not None: config['mol_encoder_params']['symbols']=imported_symbols
-    # Stable condition indices across training and validation, including neutral-loss precursors.
+    # Exclude invalid metadata before collecting adducts or splitting molecules.
+    validation_dataset=load_spectrum_dataset(args.validation_input) if args.validation_input else None
+    checker=create_preparation_context(config).fragmenter
+    mapping=dict(smilesColumn=args.smiles_column,adductTypeColumn=args.adduct_type_column,
+                 collisionEnergyColumn=args.collision_energy_column,precursorMzColumn=args.precursor_mz_column)
+    reports={}
+    for name,data in (('train',dataset),('validation',validation_dataset)):
+        if data is None: continue
+        report=inspect_records(data,checker,mapping)
+        reports[name]=report['invalidRecords']
+        filtered=data[report['validIndexes']]
+        if not len(filtered): raise ValueError(name+' dataset contains no valid records to prepare.')
+        if name=='train': dataset=filtered
+        else: validation_dataset=filtered
+    output=Path(args.output_dir);output.mkdir(parents=True,exist_ok=True)
+    print(json.dumps(dict(event='excluded_records',counts={name:len(rows) for name,rows in reports.items()})),flush=True)
     observed=list(dataset[args.adduct_type_column].unique())
-    if args.validation_input: observed.extend(load_spectrum_dataset(args.validation_input)[args.adduct_type_column].unique())
+    if validation_dataset is not None: observed.extend(validation_dataset[args.adduct_type_column].unique())
     config['adduct_type_strs']=list(create_preparation_context(config,observed_adducts=observed).adduct_type_strs)
     kwargs=dict(model_config=config,smiles_column=args.smiles_column,adduct_type_column=args.adduct_type_column,
         collision_energy_column=args.collision_energy_column,precursor_mz_column=args.precursor_mz_column,
@@ -147,12 +193,21 @@ def main(argv: list[str] | None = None) -> None:
         overwrite=bool(args.overwrite),max_node=args.max_node,max_edge=args.max_edge,num_workers=args.num_workers,chunk_size=args.chunk_size)
     if args.validation_input and args.validation_ratio is not None:
         raise ValueError('Use a separate validation input or a SMILES split, not both.')
+    preparation_config=dict(input=args.input,validation_input=args.validation_input,
+        validation_ratio=args.validation_ratio,validation_seed=args.validation_seed,output_dir=args.output_dir,**kwargs)
+    destinations=[output/'train_structures',output/'validation_structures'] if args.validation_input or args.validation_ratio is not None else [output]
+    if not args.overwrite and any(list(destination.glob('*.preft.pt')) for destination in destinations):
+        raise FileExistsError('Output already contains training structures. Enable overwrite or choose another directory.')
+    (output/'preparation_config.json').write_text(json.dumps(preparation_config,indent=2))
+    kwargs['preparation_config']=preparation_config
     if args.validation_input:
-        train,validation=dataset,load_spectrum_dataset(args.validation_input)
+        train,validation=dataset,validation_dataset
     elif args.validation_ratio is not None:
         train,validation=split_by_smiles(dataset,args.smiles_column,args.validation_ratio,args.validation_seed)
     else:
         create_action_training_data(dataset=dataset,output_dir=args.output_dir,**kwargs)
+        (output/'invalid_records.json').write_text(json.dumps(reports,indent=2))
+        (output/'preparation_config.json').write_text(json.dumps(preparation_config,indent=2))
         return
     if set(train[args.smiles_column].astype(str)) & set(validation[args.smiles_column].astype(str)):
         raise ValueError('Training and validation datasets share SMILES. Choose molecule-disjoint datasets.')
@@ -160,9 +215,9 @@ def main(argv: list[str] | None = None) -> None:
     # Check both destinations before producing either split.
     if not args.overwrite and any((output/name).exists() and list((output/name).glob('*.preft.pt')) for name in ('train_structures','validation_structures')):
         raise FileExistsError('Output already contains training structures. Enable overwrite or choose another directory.')
+    (output/'invalid_records.json').write_text(json.dumps(reports,indent=2))
     for name,split_dataset in (('train',train),('validation',validation)):
         create_action_training_data(dataset=split_dataset,output_dir=output/(name+'_structures'),split=name,**kwargs)
-    (output/'preparation_config.json').write_text(json.dumps(dict(input=args.input,validation_input=args.validation_input,
-        validation_ratio=args.validation_ratio,validation_seed=args.validation_seed,**kwargs),indent=2))
+    (output/'preparation_config.json').write_text(json.dumps(preparation_config,indent=2))
 
 if __name__=='__main__':main()

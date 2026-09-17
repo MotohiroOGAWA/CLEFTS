@@ -46,3 +46,13 @@ Workbench passes the edited configuration snapshot, so a later form edit takes p
 ## Outputs
 
 Structures are saved as `.preft.pt` files, with source and record metadata. `action_statistics.json` records counts and configuration. Existing structure files are rejected unless overwrite is explicitly enabled. JSON Lines progress events let Workbench display the current source and split.
+
+Invalid SMILES, unsupported or malformed adducts, unparseable collision energies and invalid precursor m/z values exclude the affected records. They do not block preparation when usable records remain. **Invalid Records** in Workbench shows the original zero-based record number, ID, column value and exclusion reason, with search and pagination. A record with multiple invalid fields is excluded once. Required columns must still exist, and each input must contain usable records. Automatic splitting requires at least two usable unique SMILES.
+
+The CLI applies the same checks before splitting or collecting adduct conditions. `invalid_records.json` in the output root lists excluded records from each original input for review.
+
+A source tree that exceeds `max_node` or `max_edge` is skipped, and preparation continues with the next source, including with multiple worker processes. `skipped_sources.json` lists skipped SMILES, record indexes and reasons. `action_statistics.json` records successfully prepared records as `num_samples`, metadata-valid records as `num_metadata_valid_records`, and skipped source/record counts separately.
+
+The parent process displays a `tqdm` progress bar on stderr, including prepared/skipped source counts, and also emits JSON Lines for Workbench. Progress advances for each attempted source, including skipped sources.
+
+Resolved preparation settings are saved as `preparation_config.json` before computation in both single-dataset and train/validation modes. Workbench additionally saves `fragment-tree.pft.json` in the output root before starting the CLI; use **Load Configuration** to restore the preparation form from this file.

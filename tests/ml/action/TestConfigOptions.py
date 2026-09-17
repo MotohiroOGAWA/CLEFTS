@@ -7,6 +7,15 @@ from unittest.mock import patch
 from pathlib import Path
 from clefts.ml.specgen.config_options import configure_model_options, resolve_model_options, namespace_argv
 
+def preparation_dataset(smiles_column='SMILES'):
+    import pandas as pd
+    import numpy as np
+    from clefts.libs.msentity.msentity import MSDataset
+    from clefts.libs.msentity.msentity.core.PeakSeries import PeakSeries
+    return MSDataset(pd.DataFrame({smiles_column:['CCO'],'AdductType':['[M+H]+'],
+                                   'CollisionEnergy':[20],'PrecursorMZ':[47]}),
+                     PeakSeries(np.array([[47.,1.]]),np.array([0,1],dtype=np.int64)))
+
 class TestConfigOptions(unittest.TestCase):
     def parser(self):
         parser=argparse.ArgumentParser()
@@ -50,7 +59,8 @@ class TestConfigOptions(unittest.TestCase):
                                '--max-action-count','2','--max-node','500','--max-edge','1000','--num-workers','2','--chunk-size','3','--symbols-json','["C","O"]','--smiles-column','CanonicalSMILES',
                                '--set','action_model_params.beam_size=7'])
         import pandas as pd
-        with patch.object(preparation.MSDataset,'load',return_value=pd.DataFrame({'AdductType':['[M+H]+']})), patch.object(preparation,'create_action_training_data') as run:
+        with tempfile.TemporaryDirectory() as directory, patch.object(preparation.MSDataset,'load',return_value=preparation_dataset('CanonicalSMILES')), patch.object(preparation,'create_action_training_data') as run:
+            args.output_dir=directory
             CreateFragmentTreeDataCommand().run(args)
         kwargs=run.call_args.kwargs
         self.assertEqual(kwargs['smiles_column'],'CanonicalSMILES')
@@ -78,12 +88,12 @@ class TestConfigOptions(unittest.TestCase):
         from clefts.ml.data_preparation.fragment_tree import create_training_data as preparation
         import pandas as pd
         raw={'max_node':20,'max_edge':40,'symbols':['C','O']}
-        with patch.object(preparation,'load_spectrum_dataset',return_value=pd.DataFrame({'AdductType':['[M+H]+']})), patch.object(preparation,'create_action_training_data') as run:
-            preparation.main(['--input','test.msds','--output-dir','out','--params-json',json.dumps(raw)])
+        with tempfile.TemporaryDirectory() as directory, patch.object(preparation,'load_spectrum_dataset',return_value=preparation_dataset()), patch.object(preparation,'create_action_training_data') as run:
+            preparation.main(['--input','test.msds','--output-dir',directory,'--params-json',json.dumps(raw)])
             self.assertEqual(run.call_args.kwargs['max_node'],20)
             self.assertEqual(run.call_args.kwargs['max_edge'],40)
             self.assertEqual(run.call_args.kwargs['model_config']['mol_encoder_params']['symbols'],['C','O'])
-            preparation.main(['--input','test.msds','--output-dir','out','--params-json',json.dumps(raw),'--max-node','10','--max-edge','15','--symbols-json','["C","N"]'])
+            preparation.main(['--input','test.msds','--output-dir',directory,'--params-json',json.dumps(raw),'--max-node','10','--max-edge','15','--symbols-json','["C","N"]'])
             self.assertEqual(run.call_args.kwargs['max_node'],10)
             self.assertEqual(run.call_args.kwargs['max_edge'],15)
             self.assertEqual(run.call_args.kwargs['model_config']['mol_encoder_params']['symbols'],['C','N'])

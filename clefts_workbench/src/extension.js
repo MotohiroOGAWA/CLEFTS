@@ -364,6 +364,7 @@ async function runFragmentTree(context, output, config, panel) {
   const root = projectRoot(context);
   const python = vscode.workspace.getConfiguration('clefts').get('pythonPath', 'python');
   await fs.promises.mkdir(config.outputDir, { recursive: true });
+  await fs.promises.writeFile(path.join(config.outputDir,'fragment-tree.pft.json'),JSON.stringify(config,null,2)+'\n');
   const resultPath = path.join(config.outputDir, RESULT_NAME);
   const args = buildArgs(config);
   const command = shellDisplay(python, args);

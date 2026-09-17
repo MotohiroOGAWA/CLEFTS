@@ -61,6 +61,63 @@ class TestPreparationWorkflow(unittest.TestCase):
             self.assertFalse(invalid['validation']['smilesColumn']['exists'])
             self.assertTrue(invalid['errors'])
 
+    def test_invalid_metadata_is_inspectable_and_excluded_from_preparation(self):
+        data=self.dataset()
+        metadata=pd.DataFrame({'SMILES':['CCO','invalid','CCN','CCC','COC'],
+            'AdductType':['[M+H]+','[M+H]+','invalid','[M+H]+','[M+H]+'],
+            'CollisionEnergy':['20','20','20','invalid','20'],
+            'PrecursorMZ':['100','100','100','100','invalid']})
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);file=root/'invalid.msds'
+            MSDataset(metadata,data.peaks).save(str(file))
+            result=backend.preview({'path':str(file),'validateValues':True,'fragmenterParams':config()['fragmenter_params']})
+            self.assertFalse(result['errors'])
+            self.assertEqual(result['eligibleRecords'],1)
+            self.assertEqual(result['excludedRecords'],4)
+            self.assertEqual([row['index'] for row in result['invalidRecords']],[1,2,3,4])
+            self.assertEqual(result['invalidRecords'][1]['values']['adductTypeColumn'],'invalid')
+            self.assertIn('main adduct',result['invalidRecords'][1]['issues'][0]['reason'])
+            from clefts.ml.data_preparation.fragment_tree.create_training_data import create_action_training_data
+            model=config();model['fragmenter_params']['fragment_ion_tree_builder']['max_action_count']=1
+            with contextlib.redirect_stdout(io.StringIO()):
+                files=create_action_training_data(dataset=MSDataset(metadata,data.peaks),model_config=model,output_dir=root/'direct')
+                main(['--input',str(file),'--output-dir',str(root/'cli'),'--params-json',json.dumps(model)])
+            self.assertEqual(len(files),1)
+            self.assertEqual(len(json.loads((root/'direct/invalid_records.json').read_text())),4)
+            self.assertEqual(len(json.loads((root/'cli/invalid_records.json').read_text())['train']),4)
+            self.assertEqual(len(list((root/'cli').glob('*.preft.pt'))),1)
+            saved=json.loads((root/'cli/preparation_config.json').read_text())
+            self.assertEqual(saved['input'],str(file))
+            self.assertEqual(saved['max_node'],-1)
+
+    def test_tree_limits_skip_only_the_source_and_continue_serial_and_parallel(self):
+        from clefts.ml.data_preparation.fragment_tree.create_training_data import create_action_training_data
+        metadata=pd.DataFrame({'SMILES':['CCO','CCO','C'],'AdductType':['[M+H]+']*3,
+                               'CollisionEnergy':[20]*3,'PrecursorMZ':[47,47,17]})
+        data=MSDataset(metadata,PeakSeries(np.array([[47.,1.],[47.,1.],[17.,1.]]),np.arange(4,dtype=np.int64)))
+        model=config();model['fragmenter_params']['fragment_ion_tree_builder']['max_action_count']=1
+        with tempfile.TemporaryDirectory() as directory:
+            for workers in (1,2):
+                for limit in ({'max_node':1},{'max_edge':0}):
+                    with self.subTest(workers=workers,limit=limit):
+                        output=Path(directory)/f'{workers}-{next(iter(limit))}'
+                        stderr=io.StringIO()
+                        with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(stderr):
+                            files=create_action_training_data(dataset=data,model_config=model,output_dir=output,
+                                num_workers=workers,chunk_size=3,**limit)
+                        self.assertEqual(len(files),1)
+                        skipped=json.loads((output/'skipped_sources.json').read_text())
+                        self.assertEqual(skipped[0]['smiles'],'CCO')
+                        self.assertEqual(skipped[0]['record_indexes'],[0,1])
+                        self.assertIn('limit exceeded',skipped[0]['reason'])
+                        stats=json.loads((output/'action_statistics.json').read_text())
+                        self.assertEqual(stats['num_samples'],1)
+                        self.assertEqual(stats['num_metadata_valid_records'],3)
+                        self.assertEqual(stats['num_skipped_sources'],1)
+                        self.assertEqual(stats['num_skipped_records'],2)
+                        self.assertTrue((output/'preparation_config.json').is_file())
+                        self.assertIn('100%',stderr.getvalue())
+
     def test_split_cli_creates_both_structure_directories(self):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory);file=root/'dataset.msds';self.dataset().save(str(file))
@@ -97,6 +154,9 @@ class TestPreparationWorkflow(unittest.TestCase):
             self.assertEqual(result['validation']['adductTypeColumn']['valid'],3)
             self.assertEqual(result['validation']['collisionEnergyColumn']['valid'],3)
             self.assertEqual(result['validation']['precursorMzColumn']['valid'],3)
+            self.assertEqual(result['excludedRecords'],4)
+            self.assertEqual(len(result['invalidRecords'][1]['issues']),3)
+            self.assertFalse(result['errors'])
 
     def test_preparation_context_ignores_neural_dimensions(self):
         from clefts.ml.data_preparation.fragment_tree.context import create_preparation_context

@@ -20,6 +20,10 @@ from .FragmentNode import FragmentNode
 from .FragmentTree import FragmentTree
 
 
+class FragmentTreeLimitExceeded(ValueError):
+    """A single source tree exceeds configured size limits."""
+
+
 @dataclass(frozen=True)
 class _FragmentExpansionState:
     node_index: int
@@ -291,7 +295,7 @@ class _FragmentTreeBuildState:
             self.node_action_counts[index] = min(self.node_action_counts[index], action_count)
             return index
         if self.max_node >= 0 and len(self.nodes) >= self.max_node:
-            raise ValueError(f"Fragment tree node limit exceeded: max_node={self.max_node}")
+            raise FragmentTreeLimitExceeded(f"Fragment tree node limit exceeded: max_node={self.max_node}")
         index = len(self.nodes)
         self.nodes[index] = FragmentNode(index, -1, smiles)
         self.smiles_to_node_index[smiles] = index
@@ -313,7 +317,7 @@ class _FragmentTreeBuildState:
         if key in self.edges and transition in self.edges[key].transitions:
             return
         if self.max_edge >= 0 and self.transition_count >= self.max_edge:
-            raise ValueError(f"Fragment tree edge limit exceeded: max_edge={self.max_edge}")
+            raise FragmentTreeLimitExceeded(f"Fragment tree edge limit exceeded: max_edge={self.max_edge}")
         self.transition_count += 1
         if key in self.edges:
             self.edges[key] = self.edges[key].with_transition(transition)

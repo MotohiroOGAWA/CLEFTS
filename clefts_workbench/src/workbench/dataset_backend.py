@@ -29,34 +29,19 @@ def preview(payload: dict) -> dict:
         from clefts.ml.specgen.config_options import PRESET
         params=payload.get('fragmenterParams') or payload.get('modelConfig',{}).get('fragmenter_params') or json.loads(PRESET.read_text())['fragmenter_params']
         fragmenter=Fragmenter.from_dict(params)
-    cache={}
-    def valid_smiles(value):
-        text=str(value)
-        if text not in cache: cache[text]=bool(text.strip()) and Chem.MolFromSmiles(text) is not None
-        return cache[text]
-    for key,item in validation.items():
-        if not item['exists'] or not check_values: continue
-        values=dataset[item['column']].tolist()
-        for index,value in enumerate(values):
-            try:
-                if key=='smilesColumn': valid=valid_smiles(value)
-                elif key=='adductTypeColumn': fragmenter.get_index_by_adduct_type(Adduct.parse(str(value)));valid=True
-                elif key=='precursorMzColumn': valid=math.isfinite(float(value)) and float(value)>0
-                else:
-                    mz_name=mapping['precursorMzColumn']
-                    mz=float(dataset[mz_name].iloc[index]) if mz_name in columns else 0.0
-                    energy=parse_ce_to_ev(value,mz)
-                    valid=energy is not None and math.isfinite(float(energy)) and float(energy)>=0
-                item['valid']+=int(valid)
-            except Exception: pass
-        if item['valid']!=len(dataset):
-            reason='invalid adducts or main adducts not registered in the fragmenter' if key=='adductTypeColumn' else 'values that cannot be parsed to finite non-negative eV' if key=='collisionEnergyColumn' else 'values that cannot be parsed to finite positive numbers' if key=='precursorMzColumn' else 'invalid RDKit SMILES'
-            errors.append(f"{item['column']}: {len(dataset)-item['valid']} {reason}")
+    inspection={}
+    if check_values and not errors:
+        from clefts.ml.data_preparation.fragment_tree.record_validation import inspect_records
+        inspection=inspect_records(dataset,fragmenter,mapping)
+        validation=inspection['validation']
+        if not inspection['eligibleRecords']: errors.append('The dataset contains no valid records to prepare.')
     import numpy as np
     lengths=dataset.peaks.lengths
-    if np.any(lengths==0): errors.append(f'{int((lengths==0).sum())} spectra have no peaks.')
-    if not np.isfinite(dataset.peaks.mz).all() or np.any(dataset.peaks.mz<=0): errors.append('Peak m/z values must be finite and positive.')
-    if not np.isfinite(dataset.peaks.intensity).all() or np.any(dataset.peaks.intensity<0): errors.append('Peak intensities must be finite and non-negative.')
+    eligible=set(inspection.get('validIndexes',range(len(dataset))))
+    checked_peaks=dataset[inspection['validIndexes']].peaks if inspection else dataset.peaks
+    if np.any(checked_peaks.lengths==0): errors.append(f'{int((checked_peaks.lengths==0).sum())} spectra have no peaks.')
+    if not np.isfinite(checked_peaks.mz).all() or np.any(checked_peaks.mz<=0): errors.append('Peak m/z values must be finite and positive.')
+    if not np.isfinite(checked_peaks.intensity).all() or np.any(checked_peaks.intensity<0): errors.append('Peak intensities must be finite and non-negative.')
     adducts=dataset[mapping['adductTypeColumn']].astype(str).value_counts().to_dict() if mapping['adductTypeColumn'] in columns else {}
     normalized_adducts=[]
     for value in adducts:
@@ -69,7 +54,7 @@ def preview(payload: dict) -> dict:
         record=dataset[index]
         values={key:str(dataset[name].iloc[index])[:4096] if name in columns else '' for key,name in mapping.items()}
         spectrum=list(record.peaks)
-        if any(not math.isfinite(float(p.mz)) or float(p.mz)<=0 or not math.isfinite(float(p.intensity)) or float(p.intensity)<0 for p in spectrum):
+        if index in eligible and any(not math.isfinite(float(p.mz)) or float(p.mz)<=0 or not math.isfinite(float(p.intensity)) or float(p.intensity)<0 for p in spectrum):
             errors.append(f'Invalid peak values in preview record {index}')
         rows.append({'index':index,'id':str(dataset['SpecID'].iloc[index]) if 'SpecID' in columns else str(index),**values,'numPeaks':int(lengths[index]),
                      'peaks':[{'mz':float(p.mz),'intensity':float(p.intensity)} for p in spectrum[:2000] if math.isfinite(float(p.mz)) and math.isfinite(float(p.intensity))]})
@@ -83,8 +68,8 @@ def preview(payload: dict) -> dict:
     if len(dataset)==0: errors.append('The dataset contains no spectra.')
     return {'path':str(file),'format':file.suffix.lstrip('.').upper(),'size':file.stat().st_size,'records':len(dataset),'columns':columns,
             'summary':{'uniqueSmiles':int(smiles.nunique()) if smiles is not None else None,'adducts':adducts,'normalizedAdducts':normalized_adducts,'averagePeaks':float(lengths.mean()) if len(lengths) else 0},
-            'valuesChecked':check_values,'validation':validation,'errors':list(dict.fromkeys(errors)),'rows':rows,'structure':structure,
-            **({'_smiles':smiles.tolist()} if payload.get('_identifiers') and smiles is not None else {})}
+            'valuesChecked':check_values,**{key:value for key,value in inspection.items() if key!='validIndexes'},'validation':validation,'errors':list(dict.fromkeys(errors)),'rows':rows,'structure':structure,
+            **({'_smiles':[smiles.iloc[index] for index in inspection.get('validIndexes',range(len(dataset)))]} if payload.get('_identifiers') and smiles is not None else {})}
 
 def validate(payload: dict, *, check_datasets: bool = True) -> dict:
     from clefts.ml.data_preparation.fragment_tree.context import create_preparation_context,validate_limits
@@ -107,7 +92,7 @@ def validate(payload: dict, *, check_datasets: bool = True) -> dict:
             result=preview({'path':file,'mapping':mapping,'limit':1,'_identifiers':True,'validateValues':True,'fragmenterParams':generator.fragmenter.to_dict()})
             sources.append(set(result.pop('_smiles',[])))
             if result['errors']: raise ValueError('; '.join(result['errors']))
-            if not payload.get('validationInput') and result['summary']['uniqueSmiles']<2:
+            if not payload.get('validationInput') and len(sources[-1])<2:
                 raise ValueError('Automatic validation splitting requires at least two unique SMILES.')
         if len(sources)==2 and sources[0] & sources[1]: raise ValueError('Training and validation datasets share SMILES. Choose molecule-disjoint datasets.')
     return {'valid':True,'architecture':generator.architecture}
