@@ -15,3 +15,6 @@ __all__ = [
 from .CleavageActionResult import CleavageActionResult
 from .CleavageActionGenerator import create_cleavage_actions
 from .CleavageActionSearch import CleavageActionSearchStats
+
+from .CleavageActionRelations import CleavageActionRelations
+__all__.append("CleavageActionRelations")

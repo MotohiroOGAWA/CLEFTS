@@ -1,0 +1,27 @@
+"""Order-invariant action-set encoding, including the empty BOS state."""
+from __future__ import annotations
+import torch
+from torch import Tensor, nn
+from ....common.layers.set_transformer import SAB
+
+
+class ActionStateEncoder(nn.Module):
+    def __init__(self, hidden_dim: int, num_heads: int = 4, num_layers: int = 2,
+                 dropout: float = 0.0) -> None:
+        super().__init__()
+        self.bos = nn.Parameter(torch.randn(1, 1, hidden_dim) * 0.02)
+        self.blocks = nn.ModuleList(SAB(hidden_dim, num_heads=num_heads, dropout=dropout)
+                                    for _ in range(num_layers))
+
+    def forward(self, action_h_pool: Tensor, state_action_index: Tensor,
+                state_sample_index: Tensor) -> Tensor:
+        if state_action_index.shape[0] == 0:
+            return action_h_pool.new_empty((0, self.bos.shape[-1]))
+        tokens = action_h_pool[state_sample_index[:, None], state_action_index.clamp_min(0)]
+        padding = state_action_index < 0
+        tokens = tokens.masked_fill(padding[:, :, None], 0)
+        tokens = torch.cat((self.bos.expand(tokens.shape[0], -1, -1), tokens), dim=1)
+        padding = torch.cat((padding.new_zeros((padding.shape[0], 1)), padding), dim=1)
+        for block in self.blocks:
+            tokens = block(tokens, key_padding_mask=padding)
+        return tokens[:, 0]

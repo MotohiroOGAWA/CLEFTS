@@ -26,51 +26,8 @@ class CleavageActionSearchStats:
         return dict(vars(self))
 
 
-@dataclass(frozen=True)
-class _ActionRelations:
-    conflict_mask: tuple[int, ...]
-    must_precede_mask: tuple[int, ...]
-    redundancy_hint_mask: tuple[int, ...]
-
-    @classmethod
-    def from_actions(cls, actions: tuple[CleavageAction, ...]) -> _ActionRelations:
-        conflicts = [0] * len(actions)
-        precedence = [0] * len(actions)
-        hints = [0] * len(actions)
-        for i, a in enumerate(actions):
-            for j, b in enumerate(actions):
-                if i == j:
-                    continue
-                if a.changed_bond_maps & b.changed_bond_maps:
-                    conflicts[i] |= 1 << j
-                # If A invalidates B's original match, B must precede A.
-                if (not set(b.source_atom_maps) <= a.retained_atom_maps
-                        or a.changed_bond_maps & b.matched_bond_maps):
-                    precedence[j] |= 1 << i
-                if set(a.source_atom_maps) <= b.discarded_atom_maps:
-                    hints[i] |= 1 << j
-        return cls(tuple(conflicts), tuple(precedence), tuple(hints))
-
-    def rejection(self, indices: tuple[int, ...]) -> str | None:
-        selected = sum(1 << i for i in indices)
-        if any(self.conflict_mask[i] & selected for i in indices):
-            return "hard_conflict"
-        incoming = {i: 0 for i in indices}
-        for i in indices:
-            for j in indices:
-                if self.must_precede_mask[i] & (1 << j):
-                    incoming[j] += 1
-        pending = [i for i, degree in incoming.items() if degree == 0]
-        removed = 0
-        while pending:
-            i = pending.pop()
-            removed += 1
-            for j in indices:
-                if self.must_precede_mask[i] & (1 << j):
-                    incoming[j] -= 1
-                    if incoming[j] == 0:
-                        pending.append(j)
-        return "precedence_cycle" if removed != len(indices) else None
+# Compatibility for legacy imports; chemistry rules live in one public utility.
+from .CleavageActionRelations import CleavageActionRelations as _ActionRelations
 
 
 @dataclass(frozen=True)

@@ -8,6 +8,7 @@ from rdkit import Chem
 from clefts.libs.mmkit.mmkit import Compound
 from itertools import combinations
 from .CleavageAction import CleavageAction
+from .CleavageActionRelations import action_dominates
 
 if TYPE_CHECKING:
     from .CompositeCleavageReaction import CompositeCleavageReaction
@@ -30,28 +31,7 @@ class CleavageActionSequence:
             if shared:
                 raise ValueError(f"Actions {a.key} and {b.key} share changed Source bonds: {sorted(shared)}")
         # Retained-set inclusion alone cannot remove additional cuts between surviving atoms.
-        kept = []
-        for a in unique:
-            redundant = False
-            for b in unique:
-                if a == b or not b.retained_atom_maps <= a.retained_atom_maps:
-                    continue
-                if any({u, v} <= b.retained_atom_maps for u, v, _ in a.bond_updates):
-                    continue
-                surviving_cuts = frozenset(edge for edge in a.cut_bond_maps
-                                           if set(edge) <= b.retained_atom_maps)
-                if not surviving_cuts <= b.cut_bond_maps:
-                    continue
-                if b.retained_atom_maps < a.retained_atom_maps:
-                    redundant = True
-                    break
-                # Equal retained sets: deterministic tie-break, preserving extra edits.
-                b_cuts = frozenset(edge for edge in b.cut_bond_maps if set(edge) <= b.retained_atom_maps)
-                if surviving_cuts < b_cuts or (surviving_cuts == b_cuts and b.key < a.key):
-                    redundant = True
-                    break
-            if not redundant:
-                kept.append(a)
+        kept = [a for a in unique if not any(action_dominates(b, a) for b in unique)]
         object.__setattr__(self, "actions", tuple(kept))
 
     @classmethod

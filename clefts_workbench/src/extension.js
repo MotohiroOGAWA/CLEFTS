@@ -4,16 +4,11 @@ const smartsSearch = require('./features/smarts-search/editor');
 const evaluation = require('./features/evaluation/editor');
 const spectrumPrediction = require('./features/spectrum-prediction/editor');
 const pathDrop = require('./webview-path-drop');
-const { createFragmenterEditor } = require('./components/fragmenter-editor');
 const vscode = require('vscode');
 const fs = require('fs');
 const path = require('path');
 const { spawn } = require('child_process');
 const cleavagePatternSetEditor = require('./features/cleavage-pattern-set/editor');
-
-const {
-  readScores, distributionHtml, normalizeScoreChartSettings, SCORE_CHART_SUFFIX
-} = require('./features/fragment-tree-result/score-distribution');
 
 const RESULT_NAME = 'fragment-tree.pft';
 let runningProcess;
@@ -89,46 +84,22 @@ function isCleftsRoot(candidate) {
 
 function defaultConfig(context) {
   const root = projectRoot(context);
-  const defaultParams = path.join(root, 'clefts', 'domain', 'fragment', 'presets', 'fragmenter_single_bond_pos.json');
+  const defaultParams = path.join(root, 'clefts', 'presets', 'spectrum_generator_params', 'source_anchored_pos_model_config.json');
   return {
     application: 'fragment-tree-data-preparation',
-    trainInput: '', validationInput: '', validationStructuresInputDir: '',
-    validationSmilesRatio: 0.1, tanimotoNumBins: 10, tanimotoRadius: 2,
-    tanimotoNBits: 2048, validationSamplingSeed: 0,
-    outputDir: path.join(root, 'data', 'training', 'fragment_tree_projects', 'gui-run'),
-    params: defaultParams, symbols: ['C', 'N', 'O', 'P', 'S', 'F', 'Cl', 'Br', 'I'],
-    smilesColumn: 'SMILES', precursorMzColumn: 'PrecursorMZ', adductTypeColumn: 'AdductType',
-    collisionEnergyColumn: 'CollisionEnergy', instrumentColumn: '', maxNode: -1, maxEdge: -1,
-    numWorkers: 1, chunkSize: 32, structureRebuildPolicy: 'all-fragments',
-    requirePrecursorPathTargets: true,
-    overwrite: false, overwritePreprocessingConfig: false, saveTrainValidRecords: false,
-    saveValidationValidRecords: true, keepParallelTemp: false
+    input: '', params: defaultParams,
+    outputDir: path.join(root, 'data', 'training', 'fragment_tree_projects', 'gui-run')
   };
 }
 
 function defaultTrainingConfig(context) {
   const root = projectRoot(context);
+  const defaultParams = path.join(root, 'clefts', 'presets', 'spectrum_generator_params', 'source_anchored_pos_model_config.json');
   return {
-    application: 'fragment-tree-training', trainDir: '', valDir: '',
+    application: 'fragment-tree-training', params: defaultParams, trainDir: '', valDir: '',
     outputDir: path.join(root, 'data', 'training', 'fragment_tree_models', 'gui-run'),
-    molEncoderCheckpoint: '', numWorkers: 4,
-    conditionAdductEmbeddingDim: 16, conditionCeFeatureDim: 16,
-    conditionCeFcDims: '32', conditionFeatureDim: 64, conditionFcDims: '128,64',
-    treeHiddenDim: 128, treeNumLayers: 2, treeNumHeads: 8, treeMaxDegree: 16,
-    dropout: 0.5, edgeFeatureDim: 256, edgeCategoryDim: 32,
-    edgeAttentionHeads: 8, attentionMaxGraphDistance: 4,
-    maxEdgesPerDepth: '128,64,32', trainingEdgesPerSample: 32,
-    trainingZeroEdgeFraction: 0.25, assignmentScoreThreshold: 0.8,
-    maxSamples: 100, maxEdgesPerStep: 128,
-    maxRetainedEdges: 30, maxEdgesPerTree: 256, maxNextCleavageCandidates: 3,
-    edgeConditionInteractionDim: 64, rankingLossWeight: 1.0,
-    topN: 10, nearestLowerPartners: 1, extendedLowerPartners: 3, backgroundPartners: 10, rankingIntensityThreshold: 0.05,
-    experimentName: 'exp_main', ckptId: '', batchSize: 1, device: 'cpu',
-    epochs: 10, validationIntervalSteps: 100, stepValidationFraction: 1.0, trainLogIntervalSteps: 50,
-    validateAtStart: false, detectAnomaly: false, profilePerformance: false,
-    saveIntervalEpochs: 1, saveIntervalSteps: 100, optimizer: 'AdamW',
-    lr: 0.00001, weightDecay: 0, gradClipNorm: 1.0,
-    earlyStoppingPatience: '', shuffle: true
+    epochs: 1, batchSize: 4, device: 'cpu', lr: 0.0001, resume: '',
+    fineTuneCheckpoint: '', fineTunePatternSet: '', adapterWidth: 8
   };
 }
 
@@ -142,9 +113,7 @@ function openWorkbench(context, output) {
   trainingMetrics.attach(panel);
   const initialConfig = defaultConfig(context);
   const initialTrainingConfig = defaultTrainingConfig(context);
-  let initialFragmenter = '{}';
-  try { initialFragmenter = fs.readFileSync(initialConfig.params, 'utf8'); } catch (_) {}
-  panel.webview.html = workbenchHtml(initialConfig, initialFragmenter, initialTrainingConfig);
+  panel.webview.html = workbenchHtml(initialConfig, initialTrainingConfig);
   panel.webview.onDidReceiveMessage(async message => {
     try {
       if (message.type === 'pick') {
@@ -152,25 +121,6 @@ function openWorkbench(context, output) {
         const picked = await vscode.window.showOpenDialog({ canSelectFiles: !folders, canSelectFolders: folders, canSelectMany: false });
         if (picked && picked[0]) {
           panel.webview.postMessage({ type: 'picked', form: message.form, field: message.field, value: picked[0].fsPath });
-          if (message.field === 'params') {
-            const text = await fs.promises.readFile(picked[0].fsPath, 'utf8');
-            JSON.parse(text);
-            panel.webview.postMessage({ type: 'fragmenter', path: picked[0].fsPath, text });
-          }
-        }
-      } else if (message.type === 'loadFragmenter') {
-        const picked = await vscode.window.showOpenDialog({ filters: { 'Fragmenter parameters': ['json'] }, canSelectMany: false });
-        if (picked && picked[0]) {
-          const text = await fs.promises.readFile(picked[0].fsPath, 'utf8');
-          JSON.parse(text);
-          panel.webview.postMessage({ type: 'fragmenter', path: picked[0].fsPath, text });
-        }
-      } else if (message.type === 'saveFragmenter') {
-        JSON.parse(message.text);
-        const target = await vscode.window.showSaveDialog({ filters: { 'Fragmenter parameters': ['json'] }, defaultUri: message.path ? vscode.Uri.file(message.path) : vscode.Uri.file('fragmenter-params.json') });
-        if (target) {
-          await fs.promises.writeFile(target.fsPath, JSON.stringify(JSON.parse(message.text), null, 2) + '\n');
-          panel.webview.postMessage({ type: 'fragmenterSaved', path: target.fsPath });
         }
       } else if (message.type === 'saveConfig') {
         const target = await vscode.window.showSaveDialog({ filters: { 'CLEFTS run configuration': ['pft.json', 'json'] }, defaultUri: vscode.Uri.file('fragment-tree.pft.json') });
@@ -209,13 +159,6 @@ function openWorkbench(context, output) {
         panel.webview.postMessage({ type: 'trainingStatus', status: 'idle', text: 'Command copied.', command });
       } else if (message.type === 'runTraining') {
         await runTraining(context, output, normalizeTrainingConfig(message.config), panel);
-      } else if (message.type === 'pickCheckpoint') {
-        const checkpointId = await showCheckpointPicker(
-          message.outputDir, message.experimentName
-        );
-        if (checkpointId !== undefined) {
-          panel.webview.postMessage({ type: 'checkpointPicked', checkpointId });
-        }
       } else if (message.type === 'stop') {
         if (runningProcess) runningProcess.kill('SIGTERM');
       } else if (message.type === 'loadCleavagePatternSet') {
@@ -275,37 +218,6 @@ function openWorkbench(context, output) {
       panel.webview.postMessage({ type: trainingMessage ? 'trainingStatus' : 'status', status: 'error', text: String(error.message || error) });
       vscode.window.showErrorMessage(`CLEFTS: ${error.message || error}`);
     }
-  });
-}
-
-async function showCheckpointPicker(outputDir, experimentName) {
-  if (!outputDir) throw new Error('Select the model output directory first.');
-  const treePath = path.join(
-    outputDir, 'experiments', experimentName || 'exp_main',
-    'checkpoints', 'ckpt_tree.tsv'
-  );
-  if (!fs.existsSync(treePath)) {
-    throw new Error(`Checkpoint history was not found: ${treePath}`);
-  }
-  const lines = (await fs.promises.readFile(treePath, 'utf8')).trim().split(/\r?\n/);
-  const headers = lines.shift().split('\t');
-  const rows = lines.filter(Boolean).map(line => {
-    const values = line.split('\t');
-    return Object.fromEntries(headers.map((header, index) => [header, values[index] || '']));
-  }).reverse();
-  return new Promise(resolve => {
-    const picker = vscode.window.createWebviewPanel(
-      'clefts.checkpointHistory', 'CLEFTS Checkpoint History',
-      vscode.ViewColumn.Active, { enableScripts: true }
-    );
-    const branches = [...new Set(rows.map(row => row.branch_id))];
-    picker.webview.html = `<!doctype html><html><head><meta charset="UTF-8"><style>${commonCss()}.history{max-width:1050px}.toolbar{display:flex;gap:8px;align-items:center}.toolbar input{flex:1;padding:8px;color:var(--vscode-input-foreground);background:var(--vscode-input-background);border:1px solid var(--border)}table{font-size:12px}.graph{display:flex;align-items:center;min-width:${Math.max(branches.length * 20, 30)}px;height:34px}.lane{width:20px;height:34px;position:relative}.lane::before{content:'';position:absolute;left:9px;top:-8px;bottom:-8px;border-left:2px solid color-mix(in srgb,var(--accent) 45%,transparent)}.lane.node::after{content:'';position:absolute;left:4px;top:12px;width:10px;height:10px;border:2px solid var(--accent);border-radius:50%;background:var(--vscode-editor-background)}tr{cursor:pointer}tr:hover td{background:color-mix(in srgb,var(--accent) 10%,transparent)}tr.selected td{background:color-mix(in srgb,var(--accent) 20%,transparent)}code{white-space:nowrap}</style></head><body><main class="history"><header><div><span class="eyebrow">CHECKPOINT GRAPH</span><h1>${escapeHtml(experimentName || 'exp_main')}</h1><p class="muted">${escapeHtml(treePath)}</p></div></header><div class="toolbar"><input id="filter" placeholder="Filter ID, name, epoch, step, or comment"><button id="cancel">Cancel</button><button id="use" class="primary" disabled>Use checkpoint</button></div><table><thead><tr><th>Graph</th><th>ID</th><th>Name</th><th>Epoch</th><th>Step</th><th>Parent</th><th>Comment</th></tr></thead><tbody id="rows"></tbody></table></main><script>const vscode=acquireVsCodeApi(),rows=${safeJson(rows)},branches=${safeJson(branches)},esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));let selected='';const body=document.getElementById('rows'),filter=document.getElementById('filter'),use=document.getElementById('use');function render(){const q=filter.value.toLowerCase();body.innerHTML=rows.filter(r=>Object.values(r).join(' ').toLowerCase().includes(q)).map(r=>'<tr data-id="'+esc(r.id)+'" class="'+(selected===r.id?'selected':'')+'"><td><div class="graph">'+branches.map(b=>'<span class="lane '+(b===r.branch_id?'node':'')+'"></span>').join('')+'</div></td><td><code>'+esc(r.id)+'</code></td><td>'+esc(r.name)+'</td><td>'+esc(r.epoch)+'</td><td>'+esc(r.iter)+'</td><td><code>'+esc(r.parent_id)+'</code></td><td>'+esc(r.comment)+'</td></tr>').join('')}body.onclick=e=>{const row=e.target.closest('tr[data-id]');if(!row)return;selected=row.dataset.id;use.disabled=false;render()};body.ondblclick=e=>{const row=e.target.closest('tr[data-id]');if(row)vscode.postMessage({type:'select',id:row.dataset.id})};filter.oninput=render;use.onclick=()=>vscode.postMessage({type:'select',id:selected});document.getElementById('cancel').onclick=()=>vscode.postMessage({type:'cancel'});render()</script></body></html>`;
-    let settled = false;
-    picker.webview.onDidReceiveMessage(message => {
-      if (message.type === 'select') { settled = true; resolve(message.id); picker.dispose(); }
-      if (message.type === 'cancel') picker.dispose();
-    });
-    picker.onDidDispose(() => { if (!settled) resolve(undefined); });
   });
 }
 
@@ -402,22 +314,20 @@ function runSpectrumPredictionBackend(context, payload) {
 }
 
 function normalizeConfig(config) {
-  const { params, ...values } = config;
-  return { ...values, symbols: Array.isArray(config.symbols) ? config.symbols : String(config.symbols || '').split(/[ ,]+/).filter(Boolean) };
+  return { ...config };
 }
 
 function normalizeTrainingConfig(config) {
-  const fraction = Number(config.stepValidationFraction ?? 1.0);
-  if (!Number.isFinite(fraction) || fraction <= 0 || fraction > 1) {
-    throw new Error('Step validation fraction must be greater than 0 and at most 1.');
-  }
-  return { ...config, stepValidationFraction: fraction };
+  return { ...config };
 }
 
 async function runTraining(context, output, config, panel) {
   if (runningProcess) throw new Error('Another CLEFTS process is already running.');
-  for (const key of ['trainDir', 'valDir', 'outputDir', 'molEncoderCheckpoint']) {
+  for (const key of ['params', 'trainDir', 'valDir', 'outputDir']) {
     if (!config[key]) throw new Error(`${key} is required.`);
+  }
+  if (Boolean(config.fineTuneCheckpoint) !== Boolean(config.fineTunePatternSet)) {
+    throw new Error('fineTuneCheckpoint and fineTunePatternSet must be given together.');
   }
   const root = projectRoot(context);
   const python = vscode.workspace.getConfiguration('clefts').get('pythonPath', 'python');
@@ -441,17 +351,16 @@ async function runTraining(context, output, config, panel) {
 
 async function runFragmentTree(context, output, config, panel) {
   if (runningProcess) throw new Error('Another CLEFTS process is already running.');
-  for (const key of ['trainInput', 'outputDir', 'fragmenterParams']) if (!config[key]) throw new Error(`${key} is required.`);
-  if (!config.symbols.length) throw new Error('At least one symbol is required.');
+  for (const key of ['input', 'params', 'outputDir']) if (!config[key]) throw new Error(`${key} is required.`);
   const root = projectRoot(context);
   const python = vscode.workspace.getConfiguration('clefts').get('pythonPath', 'python');
   await fs.promises.mkdir(config.outputDir, { recursive: true });
-  const configPath = path.join(config.outputDir, 'fragment-tree.pft.json');
-  const resultPath = path.join(config.outputDir, 'train_structures', RESULT_NAME);
-  await fs.promises.writeFile(configPath, JSON.stringify(config, null, 2) + '\n');
+  const resultPath = path.join(config.outputDir, RESULT_NAME);
   const args = buildArgs(config);
-  output.clear(); output.show(true); output.appendLine(`$ ${shellDisplay(python, args)}`);
-  panel.webview.postMessage({ type: 'status', status: 'running', text: 'Running CLI…', command: shellDisplay(python, args) });
+  const command = shellDisplay(python, args);
+  output.clear(); output.show(true); output.appendLine(`$ ${command}`);
+  panel.webview.postMessage({ type: 'status', status: 'running', text: 'Running CLI…', command });
+  const startedAt = new Date().toISOString();
   runningProcess = spawn(python, args, { cwd: root, env: process.env });
   runningProcess.stdout.on('data', chunk => output.append(chunk.toString()));
   runningProcess.stderr.on('data', chunk => output.append(chunk.toString()));
@@ -462,66 +371,29 @@ async function runFragmentTree(context, output, config, panel) {
   runningProcess.on('close', async code => {
     runningProcess = undefined;
     const status = code === 0 ? 'completed' : 'failed';
+    if (code === 0) {
+      await fs.promises.writeFile(resultPath, JSON.stringify({
+        status: 'completed', application: 'fragment-tree-data-preparation',
+        finishedAt: startedAt, exitCode: code, command: args
+      }, null, 2) + '\n');
+    }
     panel.webview.postMessage({ type: 'status', status, text: code === 0 ? 'Completed.' : `Failed with exit code ${code}.`, resultPath });
-    if (code === 0 && fs.existsSync(resultPath)) vscode.window.showInformationMessage('CLEFTS fragment tree data preparation completed.', 'Open Train Result').then(choice => { if (choice) openResult(vscode.Uri.file(resultPath)); });
+    if (code === 0) vscode.window.showInformationMessage('CLEFTS fragment tree data preparation completed.', 'Open Train Result').then(choice => { if (choice) openResult(vscode.Uri.file(resultPath)); });
   });
 }
 
 function buildArgs(c) {
-  const a = ['-m', 'clefts.ml.data_preparation.fragment_tree.create_fragment_tree_training_data', '--train-input', c.trainInput, '--output-dir', c.outputDir, '--params-json', JSON.stringify(c.fragmenterParams), '--symbols', ...c.symbols];
-  const values = {
-    validationInput: '--validation-input', validationStructuresInputDir: '--validation-structures-input-dir',
-    validationSmilesRatio: '--validation-smiles-ratio', tanimotoNumBins: '--tanimoto-num-bins', tanimotoRadius: '--tanimoto-radius', tanimotoNBits: '--tanimoto-n-bits', validationSamplingSeed: '--validation-sampling-seed',
-    smilesColumn: '--smiles-column', precursorMzColumn: '--precursor-mz-column', adductTypeColumn: '--adduct-type-column', collisionEnergyColumn: '--collision-energy-column', instrumentColumn: '--instrument-column',
-    preprocessingConfigOutput: '--preprocessing-config-output', trainValidOutput: '--train-valid-output', validationValidOutput: '--validation-valid-output', trainAssignmentScoreOutput: '--train-assignment-score-output', validationAssignmentScoreOutput: '--validation-assignment-score-output', parallelTempDir: '--parallel-temp-dir',
-    maxNode: '--max-node', maxEdge: '--max-edge', numWorkers: '--num-workers', chunkSize: '--chunk-size', structureRebuildPolicy: '--structure-rebuild-policy'
-  };
-  for (const [key, flag] of Object.entries(values)) if (c[key] !== '' && c[key] !== null && c[key] !== undefined) a.push(flag, String(c[key]));
-  const flags = { overwrite: '--overwrite', overwritePreprocessingConfig: '--overwrite-preprocessing-config', saveTrainValidRecords: '--save-train-valid-records', keepParallelTemp: '--keep-parallel-temp' };
-  for (const [key, flag] of Object.entries(flags)) if (c[key]) a.push(flag);
-  if (c.saveValidationValidRecords === false) a.push('--no-save-validation-valid-records');
-  if (c.requirePrecursorPathTargets === false) a.push('--no-require-precursor-path-targets');
-  return a;
+  return ['-m', 'clefts.ml.data_preparation.fragment_tree.create_training_data',
+    '--input', c.input, '--params', c.params, '--output-dir', c.outputDir];
 }
 
 function buildTrainingArgs(c) {
-  c = normalizeTrainingConfig(c);
-  const a = ['-m', 'clefts.ml.training.fragment_tree_training.training_model',
-    '--train-dir', c.trainDir, '--val-dir', c.valDir, '--output-dir', c.outputDir,
-    '--mol-encoder-checkpoint', c.molEncoderCheckpoint];
-  const values = {
-    numWorkers: '--num-workers', conditionAdductEmbeddingDim: '--condition-adduct-embedding-dim',
-    conditionCeFeatureDim: '--condition-ce-feature-dim', conditionCeFcDims: '--condition-ce-fc-dims',
-    conditionFeatureDim: '--condition-feature-dim', conditionFcDims: '--condition-fc-dims',
-    treeHiddenDim: '--tree-hidden-dim', treeNumLayers: '--tree-num-layers',
-    treeNumHeads: '--tree-num-heads', treeMaxDegree: '--tree-max-degree', dropout: '--dropout',
-    edgeFeatureDim: '--edge-feature-dim', edgeCategoryDim: '--edge-category-dim',
-    edgeAttentionHeads: '--edge-attention-heads', attentionMaxGraphDistance: '--attention-max-graph-distance',
-    maxEdgesPerDepth: '--max-edges-per-depth', trainingEdgesPerSample: '--training-edges-per-sample',
-    trainingZeroEdgeFraction: '--training-zero-edge-fraction',
-    assignmentScoreThreshold: '--assignment-score-threshold', maxSamples: '--max-samples',
-    maxEdgesPerStep: '--max-edges-per-step', maxRetainedEdges: '--max-retained-edges',
-    maxEdgesPerTree: '--max-edges-per-tree',
-    maxNextCleavageCandidates: '--max-next-cleavage-candidates',
-    edgeConditionInteractionDim: '--edge-condition-interaction-dim', rankingLossWeight: '--ranking-loss-weight',
-    topN: '--top-n', nearestLowerPartners: '--nearest-lower-partners',
-    extendedLowerPartners: '--extended-lower-partners', backgroundPartners: '--background-partners',
-    rankingIntensityThreshold: '--ranking-intensity-threshold',
-    experimentName: '--experiment-name', ckptId: '--ckpt-id', batchSize: '--batch-size', device: '--device',
-    epochs: '--epochs', validationIntervalSteps: '--validation-interval-steps',
-    stepValidationFraction: '--step-validation-fraction',
-    trainLogIntervalSteps: '--train-log-interval-steps', saveIntervalEpochs: '--save-interval-epochs',
-    saveIntervalSteps: '--save-interval-steps', optimizer: '--optimizer', lr: '--lr',
-    weightDecay: '--weight-decay', gradClipNorm: '--grad-clip-norm',
-    earlyStoppingPatience: '--early-stopping-patience'
-  };
-  for (const [key, flag] of Object.entries(values)) {
-    if (c[key] !== '' && c[key] !== null && c[key] !== undefined) a.push(flag, String(c[key]));
-  }
-  if (c.validateAtStart) a.push('--validate-at-start');
-  if (c.detectAnomaly) a.push('--detect-anomaly');
-  if (c.profilePerformance) a.push('--profile-performance');
-  if (c.shuffle === false) a.push('--no-shuffle');
+  const a = ['-m', 'clefts.ml.training.fragment_tree_training.training',
+    '--params', c.params, '--train-dir', c.trainDir, '--val-dir', c.valDir, '--output-dir', c.outputDir,
+    '--epochs', String(c.epochs || 1), '--batch-size', String(c.batchSize || 4),
+    '--device', c.device || 'cpu', '--lr', String(c.lr ?? 0.0001)];
+  if (c.resume) a.push('--resume', c.resume);
+  if (c.fineTuneCheckpoint) a.push('--fine-tune-checkpoint', c.fineTuneCheckpoint, '--fine-tune-pattern-set', c.fineTunePatternSet, '--adapter-width', String(c.adapterWidth || 8));
   return a;
 }
 
@@ -542,107 +414,6 @@ class ResultEditorProvider {
       catch (e) { panel.webview.html = errorHtml(e.message); }
     };
     panel.webview.onDidReceiveMessage(async m => {
-      if (m.type === 'addScoreResults') {
-        try {
-          const picked = await vscode.window.showOpenDialog({
-            title: 'Add Data Preparation Results',
-            defaultUri: vscode.Uri.file(path.dirname(document.uri.fsPath)),
-            filters: { 'CLEFTS result': ['pft', 'clefts-result'] },
-            canSelectFiles: true,
-            canSelectFolders: false,
-            canSelectMany: true
-          });
-          if (!picked || !picked.length) {
-            panel.webview.postMessage({ type: 'scoreResultsAdded', datasets: [], cancelled: true });
-            return;
-          }
-          const datasets = [], errors = [];
-          for (const uri of picked) {
-            try {
-              JSON.parse(await fs.promises.readFile(uri.fsPath, 'utf8'));
-              const root = path.dirname(uri.fsPath);
-              datasets.push(...await readScores(root, { source: path.basename(root), resultPath: uri.fsPath }));
-            } catch (error) {
-              errors.push(`${path.basename(uri.fsPath)}: ${error.message}`);
-            }
-          }
-          panel.webview.postMessage({ type: 'scoreResultsAdded', datasets, error: errors.length ? `Unable to add some results: ${errors.join('; ')}` : '' });
-        } catch (error) {
-          panel.webview.postMessage({ type: 'scoreResultsAdded', datasets: [], error: `Unable to add results: ${error.message}` });
-        }
-        return;
-      }
-      if (m.type === 'saveScoreDistributionSettings') {
-        try {
-          const config = normalizeScoreChartSettings(m.config);
-          let target = await vscode.window.showSaveDialog({
-            title: 'Save Assignment Score Chart Settings',
-            defaultUri: vscode.Uri.file(m.path || path.join(path.dirname(document.uri.fsPath), `assignment-score${SCORE_CHART_SUFFIX}`)),
-            filters: { 'Assignment score chart settings': ['scorechart.json'] }
-          });
-          if (!target) {
-            panel.webview.postMessage({ type: 'scoreSettingsSaved', cancelled: true });
-            return;
-          }
-          target = vscode.Uri.file(ensureFileSuffix(target.fsPath, SCORE_CHART_SUFFIX));
-          await fs.promises.writeFile(target.fsPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
-          panel.webview.postMessage({ type: 'scoreSettingsSaved', path: target.fsPath });
-        } catch (error) {
-          panel.webview.postMessage({ type: 'scoreSettingsSaved', path: '', error: `Unable to save chart settings: ${error.message}` });
-        }
-        return;
-      }
-      if (m.type === 'loadScoreDistributionSettings') {
-        try {
-          const picked = await vscode.window.showOpenDialog({
-            title: 'Load Assignment Score Chart Settings',
-            defaultUri: vscode.Uri.file(path.dirname(document.uri.fsPath)),
-            filters: { 'Assignment score chart settings': ['scorechart.json', 'json'] },
-            canSelectMany: false
-          });
-          if (!picked || !picked[0]) {
-            panel.webview.postMessage({ type: 'scoreSettingsLoaded', cancelled: true });
-            return;
-          }
-          const config = normalizeScoreChartSettings(JSON.parse(await fs.promises.readFile(picked[0].fsPath, 'utf8')));
-          const datasets = [], errors = [];
-          const resultSeries = new Map();
-          for (const item of config.series) {
-            if (!resultSeries.has(item.resultPath)) resultSeries.set(item.resultPath, []);
-            resultSeries.get(item.resultPath).push(item);
-          }
-          for (const [resultPath, savedSeries] of resultSeries) {
-            try {
-              JSON.parse(await fs.promises.readFile(resultPath, 'utf8'));
-              const wanted = new Set(savedSeries.map(item => item.subset));
-              const source = savedSeries.find(item => item.source)?.source || path.basename(path.dirname(resultPath));
-              const loaded = await readScores(path.dirname(resultPath), { source, resultPath });
-              datasets.push(...loaded.filter(item => wanted.has(item.subset)));
-              for (const subset of wanted) if (!loaded.some(item => item.subset === subset)) errors.push(`${path.basename(resultPath)}: ${subset} scores were not found`);
-            } catch (error) {
-              errors.push(`${path.basename(resultPath)}: ${error.message}`);
-            }
-          }
-          panel.webview.postMessage({
-            type: 'scoreSettingsLoaded', config, datasets, path: picked[0].fsPath,
-            error: errors.length ? `Some saved results could not be loaded: ${errors.join('; ')}` : ''
-          });
-        } catch (error) {
-          panel.webview.postMessage({ type: 'scoreSettingsLoaded', failed: true, error: `Unable to load chart settings: ${error.message}` });
-        }
-        return;
-      }
-      if (m.type === 'exportScoreDistribution') {
-        try {
-          if (!['png', 'tsv'].includes(m.format) || typeof m.data !== 'string') return;
-          const target = await vscode.window.showSaveDialog({
-            defaultUri: vscode.Uri.file(path.join(path.dirname(document.uri.fsPath), 'assignment-score-distribution.' + m.format)),
-            filters: m.format === 'png' ? { 'PNG image': ['png'] } : { 'TSV table': ['tsv'] }
-          });
-          if (target) await vscode.workspace.fs.writeFile(target, Buffer.from(m.data, m.format === 'png' ? 'base64' : 'utf8'));
-        } catch (error) { vscode.window.showErrorMessage('Unable to save distribution: ' + error.message); }
-        return;
-      }
       if (m.type === 'refresh') refresh();
       if (m.type === 'openFile') {
         const base = path.dirname(document.uri.fsPath), target = path.resolve(base, m.path);
@@ -653,7 +424,8 @@ class ResultEditorProvider {
           catch (error) { panel.webview.postMessage({ type: 'structureError', message: String(error.message || error) }); }
         } else vscode.commands.executeCommand('vscode.open', vscode.Uri.file(target));
       } else if (m.type === 'inspectMolecule') {
-        try { panel.webview.postMessage({ type: 'moleculeDetail', smiles: m.smiles, node: m.node, result: await runChemistryBackend(this.context, 'depict', { smiles: m.smiles, adducts: m.adducts || [], usedAdduct: m.usedAdduct, stateModified: m.stateModified, precursorSmiles: m.precursorSmiles }) }); }
+        if (!m.smiles) { panel.webview.postMessage({ type: 'moleculeDetail', smiles: '', node: m.node }); return; }
+        try { panel.webview.postMessage({ type: 'moleculeDetail', smiles: m.smiles, node: m.node, result: await runChemistryBackend(this.context, 'depict', { smiles: m.smiles }) }); }
         catch (error) { panel.webview.postMessage({ type: 'structureError', message: String(error.message || error) }); }
       }
     });
@@ -666,7 +438,6 @@ async function resultHtml(manifestPath) {
   const root = path.dirname(manifestPath);
   const files = await scan(root, root, 3, 500);
   const manifests = await readStructureManifests(root);
-  const scoreDatasets = await readScores(root, { source: path.basename(root), resultPath: manifestPath });
   const summary = summarize(files);
   summary.preft = manifests.reduce((total, item) => total + item.rows.filter(row => row.exists).length, 0);
   const datasetStats = summarizeStructureManifests(manifests);
@@ -679,9 +450,9 @@ async function resultHtml(manifestPath) {
     <section><h2>Supporting Files <small>${files.length} files</small></h2><div class="files">${files.map(f => `<button class="file" data-open-file="${encodeURIComponent(f.relative)}"><span>${escapeHtml(f.relative)}</span><em>${formatBytes(f.size)}</em></button>`).join('')}</div></section>
     <section id="detail" hidden></section>
     <script>const vscode=acquireVsCodeApi(),detail=document.getElementById('detail'),sortState=new Map();const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-    function graphSvg(g,sample,layout='depth'){if(!g||!g.nodes.length)return '';const detectedEdges=new Set(sample.targetPathEdges),detectedNodes=new Set(sample.targetTerminalNodes),precursors=new Set(sample.precursorNodes),hasStoredDepth=layout==='depth'&&g.nodes.every(n=>Number.isInteger(n.depth)&&n.depth>=0),depth=new Map(g.nodes.map(n=>[n.id,hasStoredDepth?n.depth:0]));if(!hasStoredDepth)for(let pass=0;pass<g.nodes.length;pass++){let changed=false;for(const e of g.edges){const value=(depth.get(e.source)||0)+1;if(value>(depth.get(e.target)||0)){depth.set(e.target,value);changed=true}}if(!changed)break}const levels={};for(const n of g.nodes)(levels[depth.get(n.id)]||(levels[depth.get(n.id)]=[])).push(n);for(const nodes of Object.values(levels))nodes.sort((a,b)=>a.id-b.id);const pos=new Map(),width=Math.max(900,(Math.max(...depth.values(),1)+1)*220),maxRows=Math.max(...Object.values(levels).map(x=>x.length)),height=Math.max(240,maxRows*58+50),maxDepth=Math.max(...depth.values(),1);for(const [d,nodes] of Object.entries(levels))nodes.forEach((n,i)=>pos.set(n.id,{x:45+Number(d)/maxDepth*(width-90),y:30+(i+1)*(height-40)/(nodes.length+1)}));const lines=g.edges.map(e=>{const a=pos.get(e.source),b=pos.get(e.target);return '<line class="tree-edge '+(detectedEdges.has(e.id)?'detected':'')+'" x1="'+a.x+'" y1="'+a.y+'" x2="'+b.x+'" y2="'+b.y+'"><title>edge '+e.id+'</title></line>'}).join('');const nodes=g.nodes.map(n=>{const p=pos.get(n.id),label=(precursors.has(n.id)?'p':'')+n.id;return '<g class="tree-node '+(detectedNodes.has(n.id)?'detected':'')+'" data-node="'+n.id+'" data-smiles="'+esc(n.smiles)+'" transform="translate('+p.x+' '+p.y+')"><circle r="13"><title>'+esc(n.smiles)+'</title></circle><text text-anchor="middle" dominant-baseline="central">'+label+'</text></g>'}).join('');return '<div class="tree-scroll"><svg class="fragment-tree" viewBox="0 0 '+width+' '+height+'">'+lines+nodes+'</svg></div>'+(g.truncated?'<p class="warning">Tree preview is limited to the first 500 nodes.</p>':'')}
-    function render(r){const s=r.summary,t=s.targets;detail.hidden=false;detail.innerHTML='<h2>Structure Detail</h2><p class="muted">'+esc(r.file)+'</p><div class="detail-controls"><label>Molecule pane <input type="range" min="20" max="55" value="35" data-pane-width> <span data-pane-value>35%</span></label></div><div class="cards detail-cards"><article><b>'+s.samples+'</b><span>samples</span></article><article><b>'+s.nodes+'</b><span>all calculated nodes</span></article><article><b>'+s.edges+'</b><span>all edges</span></article><article><b>'+s.assignedPeaks+' / '+s.peaks+'</b><span>assigned peaks</span></article></div><p><b>Depths:</b> '+esc(Object.entries(s.depthCounts).map(x=>(x[0]==='0'?'0':'depth '+x[0])+': '+x[1]).join(', ')||'none')+'</p><p><b>Training targets:</b> schema '+esc(t.schemaVersion)+' · '+t.formulas+' formulas · '+t.assignments+' terminal assignments · '+t.pathEdges+' path-edge references · '+t.expandNodes+' expand-node references<br><small>depth policy: '+esc(t.depthPolicy)+' · precursor path required: '+(t.requirePrecursorPath?'yes':'no')+'</small></p><p><b>State notation:</b> ion / unsaturation / radical candidate index. Target details also show each configured candidate, for example <code>0/1/0 ([M-H]+ / [M-2H] / [M])</code>.</p><div class="detail-layout"><div class="detail-main">'+(r.truncated?'<p class="warning">Sample preview truncated for responsiveness.</p>':'')+r.samples.map(sample=>'<details><summary>sample '+sample.id+' · CE '+esc(sample.collisionEnergyRaw)+' ('+(Number.isFinite(sample.collisionEnergy)?sample.collisionEnergy:'?')+') · adduct '+esc(sample.adduct)+' ('+sample.adductIndex+') · '+sample.peakCount+' peaks · assignment score '+Math.max(0,Math.min(1,sample.assignmentScore)).toFixed(4)+'</summary><p class="muted">Orange edges show the complete detected paths. Only detected terminal nodes are orange; intermediate nodes remain unhighlighted. Click a node to inspect its structure.</p>'+'<div class="tree-controls"><label>Layout <select data-tree-layout><option value="depth">Depth columns (aligned)</option><option value="legacy">Legacy layout</option></select></label><label>Tree nodes <select data-tree-mode><option value="active">Active target paths only</option><option value="all">All calculated nodes (preview)</option></select></label><button data-tree-zoom="out">−</button><button data-tree-zoom="reset">100%</button><button data-tree-zoom="in">＋</button></div>'+graphSvg(sample.activeGraph,sample)+'<table><thead><tr><th>#</th><th class="sortable" data-sort="mz">m/z ↕</th><th class="sortable" data-sort="intensity">intensity ↕</th><th>depth</th><th>target formulas and nodes</th></tr></thead><tbody data-sample="'+sample.id+'">'+peakRows(sample.peaks)+'</tbody></table></details>').join('')+'</div><aside id="moleculeDetail" class="molecule-side" hidden><p class="muted">Click a tree node to display its structure.</p></aside></div>';detail.dataset.result=JSON.stringify(r);detail.scrollIntoView({behavior:'smooth'});}
-    function stateText(a){const indexes=a.ion+'/'+a.unsaturation+'/'+a.radical;if(!a.stateLabels)return indexes;return indexes+' ('+a.stateLabels.ion+' / '+a.stateLabels.unsaturation+' / '+a.stateLabels.radical+')'}function pathText(a){if(!a.pathSteps.length)return '['+a.terminalNode+']';return '['+[a.pathSteps[0].source,...a.pathSteps.map(step=>step.target)].join(' - ')+']'}function peakRows(peaks){return peaks.map(p=>'<tr><td>'+p.index+'</td><td>'+p.mz.toFixed(6)+'</td><td>'+p.intensity.toPrecision(5)+'</td><td>'+(p.depth<0?'empty':p.depth)+'</td><td>'+(p.formulas.map(f=>'<div class="formula"><b>'+esc(f.formula)+'</b><small>nodes '+f.assignments.map(a=>a.terminalNode).sort((a,b)=>a-b).join(', ')+'</small><details class="target-diagnostic"><summary>target details</summary>'+f.assignments.map(a=>'<code>node '+a.terminalNode+' · state '+stateText(a)+' · path '+pathText(a)+' · expand nodes ['+[...a.expandNodes].sort((x,y)=>x-y).join(', ')+']</code>').join('')+'</details></div>').join('')||'<span class="muted">No assignment</span>')+'</td></tr>').join('')}
+    function stateGraphSvg(sample){const states=sample.states;if(!states.length)return '';const depth=new Map(states.map(s=>[s.id,s.actions.length]));const levels={};for(const s of states)(levels[depth.get(s.id)]||(levels[depth.get(s.id)]=[])).push(s);for(const list of Object.values(levels))list.sort((a,b)=>a.id-b.id);const maxDepth=Math.max(...depth.values(),1),width=Math.max(700,(maxDepth+1)*220),maxRows=Math.max(...Object.values(levels).map(x=>x.length)),height=Math.max(200,maxRows*58+50);const pos=new Map();for(const [d,list] of Object.entries(levels))list.forEach((s,i)=>pos.set(s.id,{x:45+Number(d)/maxDepth*(width-90),y:30+(i+1)*(height-40)/(list.length+1)}));const lines=sample.transitions.map(t=>{const a=pos.get(t.parent),b=pos.get(t.child);if(!a||!b)return '';return '<line class="tree-edge" x1="'+a.x+'" y1="'+a.y+'" x2="'+b.x+'" y2="'+b.y+'"><title>action '+t.addedAction+'</title></line>'}).join('');const nodes=states.map(s=>{const p=pos.get(s.id);return '<g class="tree-node'+(s.eos?' detected':'')+'" data-state="'+s.id+'" data-smiles="'+esc(s.fragmentSmiles||'')+'" transform="translate('+p.x+' '+p.y+')"><circle r="13"><title>'+esc(s.fragmentSmiles||'(not materialized)')+'</title></circle><text text-anchor="middle" dominant-baseline="central">'+s.actions.length+'</text></g>'}).join('');return '<div class="tree-scroll"><svg class="fragment-tree" viewBox="0 0 '+width+' '+height+'">'+lines+nodes+'</svg></div>'}
+    function stateRows(states){return states.map(s=>'<tr><td>'+s.id+'</td><td>['+s.actions.join(', ')+']</td><td>'+(s.eos?'yes':'no')+'</td><td>'+(s.fragmentSmiles?esc(s.fragmentSmiles):'<span class="muted">not materialized</span>')+'</td><td>'+(s.positiveNextActions.length?'['+s.positiveNextActions.join(', ')+']':'<span class="muted">none</span>')+'</td></tr>').join('')}
+    function render(r){const s=r.summary;detail.hidden=false;detail.innerHTML='<h2>Structure Detail</h2><p class="muted">'+esc(r.file)+'</p><p class="muted">Source: <code>'+esc(r.sourceSmiles)+'</code></p><div class="cards detail-cards"><article><b>'+s.samples+'</b><span>samples</span></article><article><b>'+s.primitiveActions+'</b><span>primitive actions</span></article><article><b>'+s.teacherStates+'</b><span>teacher states</span></article><article><b>'+s.transitions+'</b><span>transitions</span></article></div><div class="detail-main">'+r.samples.map(sample=>'<details><summary>sample '+sample.id+' · adduct index '+sample.adductIndex+' · CE '+sample.collisionEnergy+' · '+sample.states.length+' teacher states · '+(sample.precursorAlternatives.length?'precursor actions '+sample.precursorAlternatives.map(alt=>'['+alt.join(', ')+']').join(' or '):'Source itself is the precursor')+'</summary><p class="muted">Click a state node to inspect its fragment structure. Filled nodes are valid stopping points (EOS).</p>'+stateGraphSvg(sample)+'<table><thead><tr><th>state</th><th>actions</th><th>EOS</th><th>fragment SMILES</th><th>positive next actions</th></tr></thead><tbody>'+stateRows(sample.states)+'</tbody></table></details>').join('')+'</div><aside id="moleculeDetail" class="molecule-side" hidden><p class="muted">Click a state node to display its structure.</p></aside>';detail.dataset.result=JSON.stringify(r);detail.scrollIntoView({behavior:'smooth'});}
     document.addEventListener('click',e=>{const file=e.target.closest('[data-open-file]');if(file)vscode.postMessage({type:'openFile',path:decodeURIComponent(file.dataset.openFile)})});
     const manifestStates=new WeakMap();
     function updateManifest(grid,resetPage=false){const state=manifestStates.get(grid)||{page:0,sortColumn:-1,sortDirection:1};if(resetPage)state.page=0;const search=grid.querySelector('[data-manifest-search]').value.toLowerCase(),filters=[...grid.querySelectorAll('[data-column-filter]')].map(input=>input.value.toLowerCase()),body=grid.querySelector('tbody'),rows=[...body.rows].filter(row=>{const values=[...row.cells].map(cell=>(cell.dataset.value||'').toLowerCase());return(!search||values.some(value=>value.includes(search)))&&filters.every((filter,index)=>!filter||values[index].includes(filter))});if(state.sortColumn>=0)rows.sort((a,b)=>{const left=a.cells[state.sortColumn].dataset.value||'',right=b.cells[state.sortColumn].dataset.value||'',ln=Number(left),rn=Number(right),result=left!==''&&right!==''&&Number.isFinite(ln)&&Number.isFinite(rn)?ln-rn:left.localeCompare(right,undefined,{numeric:true,sensitivity:'base'});return state.sortDirection*result});for(const row of rows)body.appendChild(row);const pageSize=Number(grid.querySelector('[data-page-size]').value),pages=Math.max(1,Math.ceil(rows.length/pageSize));state.page=Math.min(state.page,pages-1);const pageRows=new Set(rows.slice(state.page*pageSize,(state.page+1)*pageSize));for(const row of body.rows)row.hidden=!pageRows.has(row);grid.querySelector('[data-page-label]').textContent=(rows.length?state.page*pageSize+1:0)+'–'+Math.min((state.page+1)*pageSize,rows.length)+' / '+rows.length+' · page '+(state.page+1)+'/'+pages;grid.querySelector('[data-page-prev]').disabled=state.page===0;grid.querySelector('[data-page-next]').disabled=state.page>=pages-1;manifestStates.set(grid,state)}
@@ -689,9 +460,8 @@ async function resultHtml(manifestPath) {
     document.addEventListener('input',e=>{const grid=e.target.closest('[data-manifest-grid]');if(grid&&(e.target.matches('[data-manifest-search]')||e.target.matches('[data-column-filter]')))updateManifest(grid,true)});
     document.addEventListener('change',e=>{const grid=e.target.closest('[data-manifest-grid]');if(grid&&e.target.matches('[data-page-size]'))updateManifest(grid,true)});
     document.addEventListener('click',e=>{const grid=e.target.closest('[data-manifest-grid]');if(!grid)return;const state=manifestStates.get(grid);if(e.target.closest('[data-page-prev]'))state.page--;else if(e.target.closest('[data-page-next]'))state.page++;else{const header=e.target.closest('[data-manifest-sort]');if(!header)return;const column=Number(header.dataset.manifestSort);state.sortDirection=state.sortColumn===column?-state.sortDirection:1;state.sortColumn=column;grid.querySelectorAll('[data-manifest-sort]').forEach(item=>item.textContent=item.dataset.label+' ↕');header.textContent=header.dataset.label+(state.sortDirection>0?' ↑':' ↓');state.page=0}updateManifest(grid)});
-    detail.onclick=e=>{const node=e.target.closest('[data-node]');if(node){const result=JSON.parse(detail.dataset.result),body=node.closest('details').querySelector('tbody'),sample=result.samples.find(x=>x.id===Number(body.dataset.sample)),nodeId=Number(node.dataset.node),assignments=sample.peaks.flatMap(p=>p.formulas).flatMap(f=>f.assignments).filter(a=>a.terminalNode===nodeId),usedAdduct=result.registeredAdducts[sample.adductIndex]||'',stateModified=assignments.some(a=>a.stateModified);vscode.postMessage({type:'inspectMolecule',node:nodeId,smiles:node.dataset.smiles,adducts:result.registeredAdducts,usedAdduct,stateModified,precursorSmiles:result.metadata.smiles||result.graph.nodes[0].smiles});return}const zoom=e.target.closest('[data-tree-zoom]');if(zoom){const tree=zoom.closest('details').querySelector('.fragment-tree'),old=Number(tree.dataset.zoom||100),next=zoom.dataset.treeZoom==='reset'?100:Math.max(40,Math.min(300,old+(zoom.dataset.treeZoom==='in'?20:-20)));tree.dataset.zoom=next;tree.style.width=next+'%';tree.style.minWidth=(7*next)+'px';zoom.closest('.tree-controls').querySelector('[data-tree-zoom="reset"]').textContent=next+'%';return}const header=e.target.closest('[data-sort]');if(header){const result=JSON.parse(detail.dataset.result),body=header.closest('details').querySelector('tbody'),sample=result.samples.find(x=>x.id===Number(body.dataset.sample)),key=sample.id+':'+header.dataset.sort,previous=sortState.get(key)||0,direction=previous===0?(header.dataset.sort==='mz'?1:-1):-previous;sortState.set(key,direction);header.closest('tr').querySelectorAll('[data-sort]').forEach(item=>item.textContent=item.dataset.sort==='mz'?'m/z ↕':'intensity ↕');header.textContent=(header.dataset.sort==='mz'?'m/z ':'intensity ')+(direction>0?'↑':'↓');const peaks=[...sample.peaks].sort((a,b)=>direction*(header.dataset.sort==='mz'?a.mz-b.mz:a.intensity-b.intensity));body.innerHTML=peakRows(peaks)}if(e.target.id==='copySmiles')navigator.clipboard.writeText(e.target.dataset.smiles)};
-    detail.onchange=e=>{const changed=e.target.closest('[data-tree-mode],[data-tree-layout]');if(!changed)return;const sampleDetail=changed.closest('details'),mode=sampleDetail.querySelector('[data-tree-mode]').value,layout=sampleDetail.querySelector('[data-tree-layout]').value,result=JSON.parse(detail.dataset.result),body=sampleDetail.querySelector('tbody'),sample=result.samples.find(x=>x.id===Number(body.dataset.sample)),current=sampleDetail.querySelector('.tree-scroll'),wrapper=document.createElement('div');wrapper.innerHTML=graphSvg(mode==='active'?sample.activeGraph:result.graph,sample,layout);if(current)current.replaceWith(wrapper.querySelector('.tree-scroll'));sampleDetail.querySelector('[data-tree-zoom="reset"]').textContent='100%'};detail.oninput=e=>{if(e.target.matches('[data-pane-width]')){const layout=detail.querySelector('.detail-layout'),value=e.target.value;layout.style.setProperty('--molecule-width',value+'%');detail.querySelector('[data-pane-value]').textContent=value+'%'}};
-    window.addEventListener('message',e=>{const m=e.data;if(m.type==='structureLoading'){detail.hidden=false;detail.innerHTML='<h2>Loading structure…</h2><p class="muted">'+esc(m.path)+'</p>'}if(m.type==='structureDetail')render(m.result);if(m.type==='moleculeDetail'){const box=document.getElementById('moleculeDetail'),rows=m.result.adducts.map(a=>'<tr class="'+(a.used?'used-adduct ':'')+(a.stateModified?'modified-state':'')+'"><td>'+esc(a.adduct)+'</td><td>'+(a.error?'<span class="warning">'+esc(a.error)+'</span>':esc(a.formula))+'</td><td>'+(a.mz===undefined?'—':a.mz.toFixed(6))+'</td><td>'+(a.neutralLoss===null||a.neutralLoss===undefined?'—':a.neutralLoss.toFixed(6))+'</td></tr>').join('');box.hidden=false;box.innerHTML='<h3>Node '+m.node+'</h3><div class="molecule-preview">'+m.result.svg+'</div><code>'+esc(m.smiles)+'</code> <button id="copySmiles" data-smiles="'+esc(m.smiles)+'">Copy SMILES</button><dl><dt>Formula</dt><dd>'+esc(m.result.formula)+'</dd><dt>Exact mass</dt><dd>'+m.result.exactMass.toFixed(6)+'</dd></dl><h4>Registered adducts</h4><p class="muted">Green ✓: assigned main adduct. Purple ✓: assigned main adduct with unsaturation or radical state.</p><div class="table-scroll"><table class="chem-info"><thead><tr><th>Adduct</th><th>Ion formula</th><th>m/z</th><th>NL</th></tr></thead><tbody>'+rows+'</tbody></table></div>'}if(m.type==='structureError')detail.innerHTML='<h2>Unable to inspect structure</h2><pre>'+esc(m.message)+'</pre>'});</script>${distributionHtml(scoreDatasets)}</main></body></html>`;
+    detail.onclick=e=>{const node=e.target.closest('[data-state]');if(node){vscode.postMessage({type:'inspectMolecule',node:node.dataset.state,smiles:node.dataset.smiles});return}if(e.target.id==='copySmiles')navigator.clipboard.writeText(e.target.dataset.smiles)};
+    window.addEventListener('message',e=>{const m=e.data;if(m.type==='structureLoading'){detail.hidden=false;detail.innerHTML='<h2>Loading structure…</h2><p class="muted">'+esc(m.path)+'</p>'}if(m.type==='structureDetail')render(m.result);if(m.type==='moleculeDetail'){const box=document.getElementById('moleculeDetail');if(!m.smiles){box.hidden=false;box.innerHTML='<p class="muted">This state was not materialized (never reached by beam decoding / training targets).</p>';return}box.hidden=false;box.innerHTML='<h3>State '+m.node+'</h3><div class="molecule-preview">'+m.result.svg+'</div><code>'+esc(m.smiles)+'</code> <button id="copySmiles" data-smiles="'+esc(m.smiles)+'">Copy SMILES</button><dl><dt>Formula</dt><dd>'+esc(m.result.formula)+'</dd><dt>Exact mass</dt><dd>'+m.result.exactMass.toFixed(6)+'</dd></dl>'}if(m.type==='structureError')detail.innerHTML='<h2>Unable to inspect structure</h2><pre>'+esc(m.message)+'</pre>'});</script></main></body></html>`;
 }
 
 async function readStructureManifests(root) {
@@ -886,30 +656,21 @@ const HELP = {
   ,modelPath: 'Trained fragment-tree model checkpoint (model.pt or a raw state_dict) used for spectrum prediction.'
 };
 
-function workbenchHtml(config, fragmenterText, trainingConfig) {
+function workbenchHtml(config, trainingConfig) {
   return `<!doctype html><html><head><meta charset="UTF-8"><style>${commonCss()}${formCss()}${trainingCss()}${pathDrop.css()}.selection-lasso{stroke:#fff}</style></head><body><main>
   <header><div><span class="eyebrow">CLEFTS PLATFORM</span><h1>Workbench</h1><p id="appSubtitle" class="muted">Fragment Tree Data Preparation</p></div><div class="actions"><button id="openEvaluation" class="primary">Evaluation</button><div id="dataActions" class="actions"><button id="openResult">Open Result</button><button id="load">Load Configuration</button><button id="save">Save Configuration</button></div></div></header>
   <nav><button class="tab" data-app="smarts">SMARTS Search</button><button class="tab" data-app="cleavage">Cleavage Pattern Set</button><button class="tab active" data-app="data">Data Preparation</button><button class="tab" data-app="training">Training</button><button class="tab" data-app="metrics">Metrics</button><button class="tab" data-app="finetune">Fine-tuning</button><button class="tab" data-app="predict">Predict Spectrum</button></nav>
   ${trainingMetrics.html()}
   ${fineTune.html()}
   ${smartsSearch.html()}
-  <div id="cleavageApp" hidden><section><div class="section-title"><div><h2>Cleavage Pattern Set Configuration</h2><p id="cleavagePath" class="muted">Not saved</p></div><div class="actions"><button type="button" id="applyFragmenterCleavage" hidden>Apply to Fragmenter</button><button type="button" id="loadCleavage">Load Configuration</button><button type="button" id="saveCleavage">Save Configuration</button></div></div><label>Pattern set name<input id="cleavageSetName" placeholder="single_bond_cleavage_pattern_set"></label></section><section id="visualBuilder" hidden><div class="section-title"><div><h2>Visual Pattern Builder</h2><p class="muted">Click or right-click items individually, or hold either mouse button and draw a loop around atoms and bonds.</p></div><div class="actions"><button type="button" id="clearSelection">Clear all</button><button type="button" id="closeBuilder">Close</button></div></div><div class="row"><label class="grow">Source SMILES<input id="builderSmiles" placeholder="O=c1cc(-c2ccc(O)cc2)oc2cc(O)cc(O)c12"></label><button type="button" id="drawMolecule" class="primary">Draw Structure</button></div><div id="moleculeCanvas" class="molecule-canvas"></div><div class="builder-columns"><div><h3>Atom queries</h3><div id="atomConstraints" class="query-list"></div></div><div><h3>Bond queries</h3><div id="bondConstraints" class="query-list"></div></div></div><label>Pattern name<input id="builderPatternName" placeholder="flavonoid_substructure"></label><div class="actions"><button type="button" id="applyReactant" class="primary">Apply Reactant</button></div><div id="productBuilder" hidden><h3>Product Structure</h3><p class="muted">Draw an independent product skeleton from SMILES or SMARTS. Atoms are shown as mapping numbers; select an atom to change its number, or select a bond to change its type.</p><div class="row"><label class="grow">Product<select id="builderProductSelect"><option value="-1">New product</option></select></label><button type="button" id="newVisualProduct">New Product</button></div><div class="row"><label>Input type<select id="builderProductSourceType"><option value="smiles">SMILES</option><option value="smarts">SMARTS</option></select></label><label class="grow">Product SMILES / SMARTS<input id="builderProductSource" placeholder="O=c1ccccc1"></label><button type="button" id="drawProduct" class="primary">Draw Product</button></div><label class="check"><input type="checkbox" id="allowProductAtomTypes">Allow atom type changes</label><div id="productCanvas" class="molecule-canvas product-canvas"></div><div id="productAtomTools" class="bond-tools"><span>Click an atom to edit its mapping number.</span></div><div id="productBondTools" class="bond-tools"><span>Click a bond to edit its type.</span></div><label>Product name<input id="builderProductName" placeholder="fragment_product"></label><button type="button" id="applyProduct" class="primary">Add Product</button></div></section><div id="cleavagePatterns"></div><div class="actions"><button type="button" id="addCleavagePattern" class="primary">Add Pattern</button><button type="button" id="addVisualPattern">Add Pattern Visually</button><button type="button" id="loadSinglePattern">Load Pattern</button></div></div>
+  <div id="cleavageApp" hidden><section><div class="section-title"><div><h2>Cleavage Pattern Set Configuration</h2><p id="cleavagePath" class="muted">Not saved</p></div><div class="actions"><button type="button" id="loadCleavage">Load Configuration</button><button type="button" id="saveCleavage">Save Configuration</button></div></div><label>Pattern set name<input id="cleavageSetName" placeholder="single_bond_cleavage_pattern_set"></label></section><section id="visualBuilder" hidden><div class="section-title"><div><h2>Visual Pattern Builder</h2><p class="muted">Click or right-click items individually, or hold either mouse button and draw a loop around atoms and bonds.</p></div><div class="actions"><button type="button" id="clearSelection">Clear all</button><button type="button" id="closeBuilder">Close</button></div></div><div class="row"><label class="grow">Source SMILES<input id="builderSmiles" placeholder="O=c1cc(-c2ccc(O)cc2)oc2cc(O)cc(O)c12"></label><button type="button" id="drawMolecule" class="primary">Draw Structure</button></div><div id="moleculeCanvas" class="molecule-canvas"></div><div class="builder-columns"><div><h3>Atom queries</h3><div id="atomConstraints" class="query-list"></div></div><div><h3>Bond queries</h3><div id="bondConstraints" class="query-list"></div></div></div><label>Pattern name<input id="builderPatternName" placeholder="flavonoid_substructure"></label><div class="actions"><button type="button" id="applyReactant" class="primary">Apply Reactant</button></div><div id="productBuilder" hidden><h3>Product Structure</h3><p class="muted">Draw an independent product skeleton from SMILES or SMARTS. Atoms are shown as mapping numbers; select an atom to change its number, or select a bond to change its type.</p><div class="row"><label class="grow">Product<select id="builderProductSelect"><option value="-1">New product</option></select></label><button type="button" id="newVisualProduct">New Product</button></div><div class="row"><label>Input type<select id="builderProductSourceType"><option value="smiles">SMILES</option><option value="smarts">SMARTS</option></select></label><label class="grow">Product SMILES / SMARTS<input id="builderProductSource" placeholder="O=c1ccccc1"></label><button type="button" id="drawProduct" class="primary">Draw Product</button></div><label class="check"><input type="checkbox" id="allowProductAtomTypes">Allow atom type changes</label><div id="productCanvas" class="molecule-canvas product-canvas"></div><div id="productAtomTools" class="bond-tools"><span>Click an atom to edit its mapping number.</span></div><div id="productBondTools" class="bond-tools"><span>Click a bond to edit its type.</span></div><label>Product name<input id="builderProductName" placeholder="fragment_product"></label><button type="button" id="applyProduct" class="primary">Add Product</button></div></section><div id="cleavagePatterns"></div><div class="actions"><button type="button" id="addCleavagePattern" class="primary">Add Pattern</button><button type="button" id="addVisualPattern">Add Pattern Visually</button><button type="button" id="loadSinglePattern">Load Pattern</button></div></div>
   <form id="form" data-app-panel="data">
-    <section><h2>Input and Output</h2>${pathField('trainInput','Training MSDataset *','file')}${pathField('validationInput','Validation MSDataset','file')}${pathField('outputDir','Output directory *','folder')}</section>
-    <section><div class="section-title"><div><h2>Fragmenter Parameters</h2><p class="muted">Edit Fragmenter settings. These values are included in the configuration and passed directly to the CLI.</p></div><div class="actions"><button type="button" id="loadFragmenter">Load Fragmenter</button><button type="button" id="saveFragmenter">Save Fragmenter</button></div></div><div id="fragmenterEditor"></div></section>
-    <section><h2>Fragment tree</h2><div class="grid">${field('symbols','Symbols (space separated)','text')}${field('maxNode','Max nodes','number')}${field('maxEdge','Max edges','number')}${field('smilesColumn','SMILES column','text')}${field('precursorMzColumn','Precursor m/z column','text')}${field('adductTypeColumn','Adduct column','text')}${field('collisionEnergyColumn','Collision energy column','text')}${field('instrumentColumn','Instrument column','text')}</div><div class="checks">${check('requirePrecursorPathTargets','Require precursor in target path')}</div></section>
-    <section><h2>Validation sampling</h2><div class="grid">${field('validationSmilesRatio','SMILES ratio','number','any')}${field('tanimotoNumBins','Tanimoto bins','number')}${field('tanimotoRadius','Morgan radius','number')}${field('tanimotoNBits','Morgan bits','number')}${field('validationSamplingSeed','Random seed','number')}</div>${pathField('validationStructuresInputDir','Existing validation structures','folder')}</section>
-    <section><h2>Performance & output</h2><div class="grid">${field('numWorkers','Workers','number')}${field('chunkSize','Chunk size','number')}<label data-help="${HELP.structureRebuildPolicy}">Rebuild policy<select name="structureRebuildPolicy"><option value="all-fragments">all-fragments (recommended)</option><option value="root">root only</option><option value="always">always</option></select></label></div><div class="checks">${check('overwrite','Overwrite structures')}${check('overwritePreprocessingConfig','Overwrite preprocessing config')}${check('saveTrainValidRecords','Save valid training records')}${check('saveValidationValidRecords','Save valid validation records')}${check('keepParallelTemp','Keep parallel temp')}</div></section>
+    <section><h2>Input and Output</h2><p class="muted">Regenerates schema-v5 action training structures directly from an original MSDataset (clefts.ml.data_preparation.fragment_tree.create_training_data).</p>${pathField('input','Input MSDataset *','file')}${pathField('params','Model config JSON *','file')}${pathField('outputDir','Output directory *','folder')}</section>
     <footer><div><div id="status" class="status idle">Ready</div><code id="command"></code></div><div class="actions"><button type="button" id="copyCommand">Copy Command</button><button type="button" id="stop" disabled>Stop</button><button type="submit" class="primary">Run</button></div></footer>
   </form>
   <form id="trainingForm" data-app-panel="training" hidden>
-    <section class="model-map"><div class="section-title"><div><h2>FragmentTreeTrainingModel architecture</h2><p class="muted">Tensor flow for both learning and progressive prediction. Select any model node to edit the parameters consumed there.</p></div><div class="actions"><button type="button" id="loadTraining">Load Configuration</button><button type="button" id="saveTraining">Save Configuration</button></div></div><div class="architecture"><div class="architecture-input"><button type="button" data-open-model="io"><b>TrainingFragmentTreeStructure</b><code>[node, edge, sample, target, path tensors]</code><span>Prepared tensors + frozen pretrained MolEncoder</span></button></div><div class="architecture-branches"><button type="button" data-open-model="condition"><b>ConditionEncoder</b><code>adduct + collision energy → condition_h</code><span>Adduct embedding and condition MLP</span></button><button type="button" data-open-model="tree"><b>FragmentTreeEncoder</b><code>molecular node graph → node_h</code><span>Tree-aware transformer representation</span></button><button type="button" data-open-model="edge"><b>StructuralEdgeEncoder</b><code>cleavage event + local atoms → edge_h</code><span>Bounded expensive atom attention</span></button></div><div class="architecture-merge"><button type="button" data-open-model="edge"><b>ConditionEdgeScorer + CandidateSelector heads</b><code>edge_h × condition_h + node_h → absolute / retain / cleave / state logits</code><span>Shared learned scores used by both paths below</span></button></div><div class="architecture-modes"><div class="mode training-mode"><strong>TRAINING PATH</strong><button type="button" data-open-model="ranking"><b>Pair and target losses</b><code>intensity-weighted comparisons + path supervision</code><span>ranking + selection + formula intensity → total loss</span></button><button type="button" data-open-model="run"><b>Backward / Optimizer</b><code>total loss → gradients → checkpoint graph</code><span>Scheduled train logs and validation</span></button></div><div class="mode prediction-mode"><strong>PREDICTION PATH</strong><button type="button" data-open-model="edge"><b>Progressive edge selection</b><code>depth 1 → top edges → next cleavage nodes</code><span>Repeat scoring with retained survivors</span></button><button type="button" data-open-model="edge"><b>Spectrum candidates</b><code>absolute scores → formula candidates → intensities</code><span>Inference budgets control compute cost</span></button></div></div></div><p id="modelHint" class="model-hint">Select a model component to locate the parameters consumed by it.</p></section>
-    <section data-model-block="io"><div><h2>Training data and output</h2><p class="muted">The Workbench passes these paths to the existing training CLI.</p></div>${pathField('trainDir','Training structures directory *','folder','training')}${pathField('valDir','Validation structures directory *','folder','training')}${pathField('outputDir','Model output directory *','folder','training')}${pathField('molEncoderCheckpoint','Molecular encoder checkpoint *','file','training')}</section>
-    <section data-model-block="condition"><h2>Condition encoder</h2><div class="grid">${field('conditionAdductEmbeddingDim','Adduct embedding dim','number')}${field('conditionCeFeatureDim','CE feature dim','number')}${field('conditionCeFcDims','CE FC dims (CSV)','text')}${field('conditionFeatureDim','Condition feature dim','number')}${field('conditionFcDims','Condition FC dims (CSV)','text')}${field('dropout','Shared dropout','number','any')}</div></section>
-    <section data-model-block="tree"><h2>Fragment tree encoder</h2><div class="grid">${field('treeHiddenDim','Hidden dimension','number')}${field('treeNumLayers','Transformer layers','number')}${field('treeNumHeads','Attention heads','number')}${field('treeMaxDegree','Maximum node degree','number')}</div></section>
-    <section data-model-block="edge"><h2>Edge scorer and bounded candidate selection</h2><div class="model-notes"><p><b>Structural score:</b> embeds cleavage pattern/reaction/product IDs and the source/target molecular representations. Selected edges then attend only to atoms within the graph-distance limit.</p><p><b>Training budget:</b> intensity-weighted target groups and their path edges are proposed first; background edges fill the remaining per-sample budget. The union is capped by <i>Expensive edges / step</i>.</p><p><b>Prediction budget:</b> <i>Inference edges / depth</i> controls new edges at each cleavage depth, <i>Inference retained edges</i> carries survivors forward, and <i>Next-cleavage nodes</i> controls expansion.</p><p><b>Per-tree budget:</b> <i>Expensive edges / tree</i> is a separate, larger-scope cap shared across every sample that references the same stored tree (not per-sample like the budgets above). Edges are ranked by cross-sample importance (condition-scored, with target/positive edges always favored) and the same cap applies identically during training and inference, replacing the old training-only whole-batch cap and the old "attend every edge" inference default.</p></div><div class="grid">${field('edgeFeatureDim','Edge feature dim','number')}${field('edgeCategoryDim','Category embedding dim','number')}${field('edgeAttentionHeads','Attention heads','number')}${field('attentionMaxGraphDistance','Atom graph distance','number')}${field('maxEdgesPerDepth','Inference edges / depth (CSV)','text')}${field('trainingEdgesPerSample','Candidate edges / sample','number')}${field('trainingZeroEdgeFraction','Background fraction','number','any')}${field('maxSamples','Samples / batch structure','number')}${field('maxEdgesPerStep','Expensive edges / step','number')}${field('maxRetainedEdges','Inference retained edges','number')}${field('maxEdgesPerTree','Expensive edges / tree','number')}${field('maxNextCleavageCandidates','Next-cleavage nodes','number')}${field('edgeConditionInteractionDim','Condition interaction dim','number')}</div></section>
-    <section data-model-block="ranking"><h2>Losses</h2><div class="model-losses"><span>Absolute edge ranking</span><span>+</span><span>Candidate selection</span><span>+</span><span>Formula intensity</span></div><div class="model-notes"><p><b>Absolute edge ranking:</b> for each intensity-sorted anchor group, up to <i>Comparisons / anchor</i> partners are compared in three tiers, filled in order: tier 1 (<i>Tier 1</i> nearest lower-intensity partners), tier 2 (<i>Tier 2</i> more, farther lower-intensity partners), tier 3 (<i>Tier 3</i> unassigned/background edges). <i>Intensity difference threshold</i> gates tiers 1-2 only. Each comparison is weighted by reciprocal rank within the sample (the most intense group counts most), not by raw intensity.</p><p><b>Candidate selection:</b> supervises terminal fragment nodes, ion/unsaturation/radical states, every edge along a target path, and intermediate nodes that must be expanded. Selected-peak intensity coverage measures how much observed intensity remains reachable.</p><p><b>Formula intensity:</b> learns presence and relative abundance after equal-formula candidates are merged. Cosine similarity reports agreement between predicted and observed intensity vectors.</p></div><div class="grid">${field('rankingLossWeight','Ranking loss weight','number','any')}${field('topN','Comparisons / anchor (total)','number')}${field('nearestLowerPartners','Tier 1 (nearest lower)','number')}${field('extendedLowerPartners','Tier 2 (farther lower)','number')}${field('backgroundPartners','Tier 3 (background)','number')}${field('rankingIntensityThreshold','Intensity difference threshold','number','any')}</div></section>
-    <section data-model-block="run"><h2>Training, optimizer, and checkpoints</h2><div class="model-notes"><p><b>Assignment-score filtering:</b> training and filtered validation use spectra at or above the threshold. Unfiltered validation combines disjoint evaluated partitions, so accepted spectra are not evaluated twice.</p></div><div class="grid">${field('experimentName','Experiment name','text')}<label data-help="${HELP.ckptId}">Resume checkpoint ID<div class="path"><input name="ckptId"><button type="button" id="checkpointGraph">Graph…</button></div><small class="field-help">${HELP.ckptId}</small></label>${field('assignmentScoreThreshold','Assignment score threshold','number','any')}${field('batchSize','Batch size','number')}<label>Device<select name="device"><option value="cpu">cpu</option><option value="cuda">cuda</option><option value="mps">mps</option></select><small class="field-help">${HELP.device}</small></label>${field('epochs','Epochs','number')}${field('numWorkers','Data-loader workers','number')}${field('validationIntervalSteps','Validation interval steps','number')}${field('stepValidationFraction','Step validation fraction','number','any')}${field('trainLogIntervalSteps','Log interval steps','number')}${field('saveIntervalEpochs','Save interval epochs','number')}${field('saveIntervalSteps','Save interval steps','number')}${field('earlyStoppingPatience','Early-stopping patience','number')}<label>Optimizer<select name="optimizer"><option value="AdamW">AdamW</option><option value="Adam">Adam</option><option value="SGD">SGD</option></select><small class="field-help">${HELP.optimizer}</small></label>${field('lr','Learning rate','number','any')}${field('weightDecay','Weight decay','number','any')}${field('gradClipNorm','Gradient clipping norm','number','any')}</div><div class="checks">${check('validateAtStart','Validate at start')}${check('detectAnomaly','Detect anomaly')}${check('profilePerformance','Profile performance')}${check('shuffle','Shuffle')}</div></section>
+    <section><div class="section-title"><div><h2>Source-anchored action training</h2><p class="muted">Trains ActionFragmentTreeTrainingModel from schema-v5 .preft.pt structures produced by Data Preparation.</p></div><div class="actions"><button type="button" id="loadTraining">Load Configuration</button><button type="button" id="saveTraining">Save Configuration</button></div></div>${pathField('params','Model config JSON *','file','training')}${pathField('trainDir','Training structures directory *','folder','training')}${pathField('valDir','Validation structures directory *','folder','training')}${pathField('outputDir','Model output directory *','folder','training')}<div class="grid">${field('epochs','Epochs','number')}${field('batchSize','Batch size','number')}<label>Device<select name="device"><option value="cpu">cpu</option><option value="cuda">cuda</option></select></label>${field('lr','Learning rate','number','any')}</div>${pathField('resume','Resume checkpoint (optional)','file','training')}</section>
+    <section><h2>Fine-tuning (optional)</h2><p class="muted">Fill in both fields to expand a frozen base checkpoint with a new cleavage pattern set instead of training from scratch. The model config above must already carry the expanded fragmenter_params, and the training/validation structures above must be regenerated with that same config.</p>${pathField('fineTuneCheckpoint','Base checkpoint','file','training')}${pathField('fineTunePatternSet','New complete Cleavage Pattern Set','file','training')}${field('adapterWidth','Adapter width','number')}</section>
     <footer><div><div id="trainingStatus" class="status idle">Ready</div><code id="trainingCommand"></code></div><div class="actions"><button type="button" id="trainingCopyCommand">Copy Command</button><button type="button" id="trainingStop" disabled>Stop</button><button type="submit" class="primary">Run Training</button></div></footer>
   </form>
   <form id="predictForm" data-app-panel="predict" hidden>
@@ -918,14 +679,13 @@ function workbenchHtml(config, fragmenterText, trainingConfig) {
     <section><h2>Molecule and conditions</h2><label>SMILES *<input name="smiles" placeholder="CC(=O)Oc1ccccc1C(=O)O"></label><div class="grid">${field('ce','Collision energy (eV) *','text')}<label>Adduct type *<select name="adductType"><option value="">Apply a model first…</option></select></label></div><div class="actions"><button type="button" id="predictPreview">Preview Molecule</button></div><div id="predictMoleculePreview" class="molecule-preview" hidden></div></section>
     <section id="predictResultSection" hidden><h2>Predicted Spectrum</h2><div id="predictResult"></div></section>
     <footer><div><div id="predictStatus" class="status idle">Ready</div></div><div class="actions"><button type="submit" class="primary" id="predictSubmit">Predict Spectrum</button></div></footer>
-  </form><div id="helpTooltip" role="tooltip"></div><script>const vscode=acquireVsCodeApi(); const initial=${safeJson(config)}; const initialTraining=${safeJson(trainingConfig)}; const initialFragmenter=${safeJson(fragmenterText)}; ${webviewScript()}${spectrumPrediction.script()}${pathDrop.script()}</script></main></body></html>`;
+  </form><div id="helpTooltip" role="tooltip"></div><script>const vscode=acquireVsCodeApi(); const initial=${safeJson(config)}; const initialTraining=${safeJson(trainingConfig)}; ${webviewScript()}${spectrumPrediction.script()}${pathDrop.script()}</script></main></body></html>`;
 }
 function pathField(name,label,kind,form='data') { return `<label data-help="${HELP[name] || ''}">${label}<div class="path"><input name="${name}" data-path-kind="${kind}"><button type="button" data-pick="${name}" data-kind="${kind}" data-form="${form}">Browse</button></div>${HELP[name]?`<small class="field-help">${HELP[name]}</small>`:''}</label>`; }
 function field(name,label,type,step='1') { return `<label data-help="${HELP[name] || ''}">${label}<input name="${name}" type="${type}"${type==='number'?` step="${step}"`:''}>${HELP[name]?`<small class="field-help">${HELP[name]}</small>`:''}</label>`; }
 function check(name,label) { return `<label class="check" data-help="${HELP[name] || ''}"><input name="${name}" type="checkbox"><span>${label}${HELP[name]?`<small class="field-help">${HELP[name]}</small>`:''}</span></label>`; }
 function safeJson(value) { return JSON.stringify(value).replace(/</g, '\\u003c'); }
 function webviewScript() { return `
-    const createFragmenterEditor = ${createFragmenterEditor.toString()};
     const form=document.getElementById('form'), trainingForm=document.getElementById('trainingForm'), predictForm=document.getElementById('predictForm'), statusEl=document.getElementById('status'), stop=document.getElementById('stop'),trainingStatusEl=document.getElementById('trainingStatus'),trainingStop=document.getElementById('trainingStop');
     let cleavagePath='',cleavageModel={cleavage_pattern_set:{name:'',patterns:[]}};
     ${trainingMetrics.script()}
@@ -935,15 +695,12 @@ function webviewScript() { return `
     function setFormConfig(target,c){for(const [k,v] of Object.entries(c)){const el=target.elements[k];if(!el)continue;if(el.type==='checkbox')el.checked=!!v;else el.value=Array.isArray(v)?v.join(target===trainingForm?',':' '):v??'';}}
     function readForm(target,application){const c={application};for(const el of target.elements){if(!el.name)continue;if(el.type==='checkbox')c[el.name]=el.checked;else if(el.type==='number')c[el.name]=el.value===''?'':Number(el.value);else c[el.name]=el.value;}return c;}
     let extraConfig={};
-    function setConfig(c){extraConfig={...c};setFormConfig(form,c);if(c.fragmenterParams)fragmenterEditor.setValue(c.fragmenterParams)}
-    function getConfig(){const c={...extraConfig,...readForm(form,'fragment-tree-data-preparation')};delete c.params;c.fragmenterParams=fragmenterEditor.getValue();c.symbols=String(c.symbols).split(/[ ,]+/).filter(Boolean);return c;}
+    function setConfig(c){extraConfig={...c};setFormConfig(form,c)}
+    function getConfig(){return {...extraConfig,...readForm(form,'fragment-tree-data-preparation')};}
     function getTrainingConfig(){return readForm(trainingForm,'fragment-tree-training')}
-    let applyFragmenterCleavage=null;
-    const fragmenterEditor=createFragmenterEditor(document.getElementById('fragmenterEditor'),{value:JSON.parse(initialFragmenter),editCleavagePatternSet:(value,apply)=>{cleavageModel={cleavage_pattern_set:value};cleavagePath='';applyFragmenterCleavage=apply;document.getElementById('cleavagePath').textContent='Editing Fragmenter Cleavage Pattern Set';renderCleavage();document.getElementById('applyFragmenterCleavage').hidden=false;document.querySelector('[data-app="cleavage"]').click();}});
     const tooltip=document.getElementById('helpTooltip'); let tooltipTimer;
     document.querySelectorAll('[data-help]').forEach(el=>{el.addEventListener('mouseenter',()=>{tooltipTimer=setTimeout(()=>{const r=el.getBoundingClientRect();tooltip.textContent=el.dataset.help;tooltip.style.left=Math.min(r.left,window.innerWidth-390)+'px';tooltip.style.top=(r.bottom+7)+'px';tooltip.classList.add('visible');},500);});el.addEventListener('mouseleave',()=>{clearTimeout(tooltipTimer);tooltip.classList.remove('visible');});});
     setConfig(initial);setFormConfig(trainingForm,initialTraining);setPredictEnabled(false); document.querySelectorAll('[data-pick]').forEach(b=>b.onclick=()=>vscode.postMessage({type:'pick',form:b.dataset.form||'data',field:b.dataset.pick,kind:b.dataset.kind}));
-    document.querySelectorAll('[data-open-model]').forEach(button=>button.onclick=()=>{const key=button.dataset.openModel,target=trainingForm.querySelector('[data-model-block="'+key+'"]');document.querySelectorAll('[data-open-model]').forEach(x=>x.classList.toggle('selected',x===button));document.querySelectorAll('[data-model-block]').forEach(x=>x.classList.toggle('selected',x===target));document.getElementById('modelHint').textContent=button.querySelector('b').textContent+': '+button.querySelector('span').textContent;target.scrollIntoView({behavior:'smooth',block:'start'});});
     document.querySelectorAll('[data-app]').forEach(button=>button.onclick=()=>{document.querySelectorAll('[data-app]').forEach(x=>x.classList.toggle('active',x===button));const app=button.dataset.app;document.getElementById('metricsApp').hidden=app!=='metrics';document.getElementById('fineTuneApp').hidden=app!=='finetune';document.getElementById('smartsApp').hidden=app!=='smarts';document.getElementById('cleavageApp').hidden=app!=='cleavage';form.hidden=app!=='data';trainingForm.hidden=app!=='training';predictForm.hidden=app!=='predict';document.getElementById('dataActions').hidden=app!=='data';document.getElementById('appSubtitle').textContent=app==='metrics'?'Training Metrics':app==='finetune'?'Fragment Tree Fine-tuning':app==='smarts'?'SMARTS Search':app==='cleavage'?'Cleavage Pattern Set Editor':app==='training'?'Fragment Tree Training':app==='predict'?'Predict Spectrum':'Fragment Tree Data Preparation';});
     document.getElementById('save').onclick=()=>vscode.postMessage({type:'saveConfig',config:getConfig()}); document.getElementById('load').onclick=()=>vscode.postMessage({type:'loadConfig'}); document.getElementById('openResult').onclick=()=>vscode.postMessage({type:'openResult'}); document.getElementById('openEvaluation').onclick=()=>vscode.postMessage({type:'openEvaluation'});
     function renderCleavage(){document.getElementById('cleavageSetName').value=cleavageModel.cleavage_pattern_set.name;document.getElementById('cleavagePatterns').innerHTML=cleavageModel.cleavage_pattern_set.patterns.map((p,pi)=>\`<section class="pattern-card"><div class="section-title"><h2>Pattern \${pi+1}</h2><div class="actions"><button type="button" data-edit-visual="\${pi}">Edit Visually</button><button type="button" data-load-pattern="\${pi}">Load</button><button type="button" data-save-pattern="\${pi}">Save</button><button type="button" class="danger" data-remove-pattern="\${pi}">Remove Pattern</button></div></div><div class="grid"><label>Pattern name<input data-pattern="\${pi}" data-key="name" value="\${htmlEscape(p.name)}" placeholder="single_bond_cleavage"></label><label>Reactant SMARTS<input data-pattern="\${pi}" data-key="reactant_smarts" value="\${htmlEscape(p.reactant_smarts)}" placeholder="[!#1:1]-[!#1:2]"></label></div><div class="section-title product-title"><h3>Products</h3><button type="button" data-add-product="\${pi}">Add Product</button></div><div class="product-list">\${p.products.map((product,xi)=>\`<div class="product-row"><label>Product name<input data-pattern="\${pi}" data-product="\${xi}" data-key="name" value="\${htmlEscape(product.name)}"></label><label>Product SMARTS<input data-pattern="\${pi}" data-product="\${xi}" data-key="smarts" value="\${htmlEscape(product.smarts)}" placeholder="[!#1:1]"></label><button type="button" class="danger" data-remove-product="\${pi}:\${xi}">Remove</button></div>\`).join('')}</div></section>\`).join('');}
@@ -1014,8 +771,6 @@ function webviewScript() { return `
     document.getElementById('builderProductSelect').onchange=e=>loadVisualProduct(Number(e.target.value)).catch(()=>{});
     document.getElementById('newVisualProduct').onclick=()=>loadVisualProduct(-1).catch(()=>{});
     document.getElementById('applyProduct').onclick=async()=>{let pattern,previous,added=false;try{if(!productGraph)throw new Error('Draw a product structure first.');pattern=cleavageModel.cleavage_pattern_set.patterns[visualPatternIndex];const result=await chemistry('productFromStructure',{...productSourcePayload(),reactantSmarts:pattern.reactant_smarts,atomMaps:productAtomMaps,atomOverrides:document.getElementById('allowProductAtomTypes').checked?productAtomOverrides:{},bondOverrides:productBondOverrides,deletedAtoms:[...productDeletedAtoms],addedBonds:productAddedBonds}),next={name:document.getElementById('builderProductName').value,smarts:result.smarts};if(visualProductIndex<0){pattern.products.push(next);visualProductIndex=pattern.products.length-1;added=true}else{previous=pattern.products[visualProductIndex];pattern.products[visualProductIndex]=next}await chemistry('validate',pattern);document.getElementById('builderProductSourceType').value='smarts';document.getElementById('builderProductSource').value=result.smarts;renderCleavage();renderProductChoices()}catch(e){if(added)pattern.products.pop();else if(pattern&&previous)pattern.products[visualProductIndex]=previous}};
-    document.getElementById('applyFragmenterCleavage').onclick=()=>{if(applyFragmenterCleavage)applyFragmenterCleavage(cleavageModel.cleavage_pattern_set);applyFragmenterCleavage=null;document.getElementById('applyFragmenterCleavage').hidden=true;document.querySelector('[data-app="data"]').click();};
-    document.getElementById('loadFragmenter').onclick=()=>vscode.postMessage({type:'loadFragmenter'}); document.getElementById('saveFragmenter').onclick=()=>vscode.postMessage({type:'saveFragmenter',text:JSON.stringify(fragmenterEditor.getValue())});
     form.onsubmit=e=>{e.preventDefault();vscode.postMessage({type:'run',config:getConfig()});}; document.getElementById('copyCommand').onclick=()=>vscode.postMessage({type:'copyCommand',config:getConfig()}); stop.onclick=()=>vscode.postMessage({type:'stop'});
     trainingForm.onsubmit=e=>{e.preventDefault();vscode.postMessage({type:'runTraining',config:getTrainingConfig()})};document.getElementById('trainingCopyCommand').onclick=()=>vscode.postMessage({type:'copyTrainingCommand',config:getTrainingConfig()});trainingStop.onclick=()=>vscode.postMessage({type:'stop'});document.getElementById('saveTraining').onclick=()=>vscode.postMessage({type:'saveTrainingConfig',config:getTrainingConfig()});document.getElementById('loadTraining').onclick=()=>vscode.postMessage({type:'loadTrainingConfig'});
     let predictSequence=0,predictWaiters=new Map(),predictListSequence=0,predictListWaiters=new Map();
@@ -1033,8 +788,7 @@ function webviewScript() { return `
     document.getElementById('predictPreview').onclick=async()=>{const smiles=predictForm.elements.smiles.value.trim(),adductType=predictForm.elements.adductType.value.trim(),box=document.getElementById('predictMoleculePreview');if(!smiles){box.hidden=true;return}try{const result=await chemistry('depict',{smiles,adducts:adductType?[adductType]:[],usedAdduct:adductType});box.hidden=false;const row=result.adducts[0];box.innerHTML='<div>'+result.svg+'</div><dl><dt>Formula</dt><dd>'+htmlEscape(result.formula)+'</dd><dt>Exact mass</dt><dd>'+result.exactMass.toFixed(6)+'</dd>'+(row?'<dt>Precursor m/z ('+htmlEscape(row.adduct)+')</dt><dd>'+(row.error?('<span class="warning">'+htmlEscape(row.error)+'</span>'):row.mz.toFixed(6))+'</dd>':'')+'</dl>'}catch(e){box.hidden=false;box.innerHTML='<p class="warning">'+htmlEscape(e.message||String(e))+'</p>'}};
     predictForm.onsubmit=async e=>{e.preventDefault();const modelPath=predictForm.elements.modelPath.value.trim(),smiles=predictForm.elements.smiles.value.trim(),ce=predictForm.elements.ce.value.trim(),adductType=predictForm.elements.adductType.value.trim(),device=predictForm.elements.device.value,predictStatusEl=document.getElementById('predictStatus'),resultSection=document.getElementById('predictResultSection'),resultBox=document.getElementById('predictResult');if(!modelPath||!smiles||!ce||!adductType){predictStatusEl.textContent='Model checkpoint, SMILES, collision energy, and adduct type are required.';predictStatusEl.className='status error';return}predictStatusEl.textContent='Predicting… this can take a while for large models.';predictStatusEl.className='status running';lastPredictTree=null;try{const result=await predictSpectrumRequest({modelPath,smiles,ce,adductType,device});predictStatusEl.textContent='Predicted '+result.peaks.length+' peaks.';predictStatusEl.className='status completed';resultSection.hidden=false;lastPredictTree=result.tree;resultBox.innerHTML='<div class="predict-layout"><div>'+spectrumSvg(result.peaks)+peakTable(result.peaks)+'<h3>Fragment Tree</h3><p class="muted">Circles are candidate fragments explored while predicting. Accent-colored fragments back at least one predicted peak. Click a fragment to inspect its structure.</p>'+predictTreeSvg(result.tree)+'<div id="predictFragmentDetail" hidden></div></div><aside class="predict-side"><div class="molecule-preview">'+result.svg+'</div><dl><dt>Formula</dt><dd>'+htmlEscape(result.formula)+'</dd><dt>Exact mass</dt><dd>'+result.exactMass.toFixed(6)+'</dd><dt>Adduct</dt><dd>'+htmlEscape(result.adduct)+'</dd><dt>Precursor m/z</dt><dd>'+result.precursorMz.toFixed(6)+'</dd></dl></aside></div>'}catch(error){predictStatusEl.textContent=String(error.message||error);predictStatusEl.className='status error';resultSection.hidden=true}};
     document.getElementById('predictResult').addEventListener('click',async e=>{const nodeEl=e.target.closest('[data-node]');if(!nodeEl||!lastPredictTree)return;const nodeId=Number(nodeEl.dataset.node),node=lastPredictTree.nodes.find(n=>n.id===nodeId);if(!node)return;const detail=document.getElementById('predictFragmentDetail');detail.hidden=false;detail.innerHTML='<p class="muted">Loading…</p>';detail.scrollIntoView({behavior:'smooth',block:'nearest'});try{const adducts=(node.annotations||[]).map(a=>a.adduct);const depicted=await chemistry('depict',{smiles:node.smiles,adducts,usedAdduct:adducts[0]||''});const rows=(node.annotations||[]).map(a=>'<tr><td>'+htmlEscape(a.adduct)+'</td><td>'+htmlEscape(a.ionFormula||'')+'</td><td>'+a.peakMz.toFixed(6)+'</td><td>'+a.peakIntensity.toPrecision(4)+'</td><td>'+(a.probability*100).toFixed(1)+'%</td></tr>').join('');detail.innerHTML='<h4>Fragment node '+nodeId+'</h4><div class="predict-layout"><div class="molecule-preview">'+depicted.svg+'</div><div><dl><dt>SMILES</dt><dd>'+htmlEscape(node.smiles)+'</dd><dt>Formula</dt><dd>'+htmlEscape(node.formula)+'</dd><dt>Exact mass</dt><dd>'+node.exactMass.toFixed(6)+'</dd></dl>'+(rows?('<table><thead><tr><th>Adduct</th><th>Ion formula</th><th>m/z</th><th>intensity</th><th>probability</th></tr></thead><tbody>'+rows+'</tbody></table>'):'<p class="muted">This fragment did not directly back a predicted peak.</p>')+'</div></div>'}catch(error){detail.innerHTML='<p class="warning">'+htmlEscape(error.message||String(error))+'</p>'}});
-    document.getElementById('checkpointGraph').onclick=()=>vscode.postMessage({type:'pickCheckpoint',outputDir:trainingForm.elements.outputDir.value,experimentName:trainingForm.elements.experimentName.value});
-    window.addEventListener('message',e=>{const m=e.data;if(m.type==='picked'){const target=m.form==='training'?trainingForm:m.form==='predict'?predictForm:form;if(target.elements[m.field])target.elements[m.field].value=m.value;if(m.form==='predict'&&m.field==='modelPath')resetPredictModelState()}if(m.type==='checkpointPicked')trainingForm.elements.ckptId.value=m.checkpointId;if(m.type==='config')setConfig(m.config);if(m.type==='trainingConfig')setFormConfig(trainingForm,m.config);if(m.type==='fragmenter'){fragmenterEditor.setValue(JSON.parse(m.text));}if(m.type==='cleavagePatternSet'){cleavageModel=m.value;cleavagePath=m.path;document.getElementById('cleavagePath').textContent=m.path;renderCleavage()}if(m.type==='cleavagePatternSetSaved'){cleavagePath=m.path;document.getElementById('cleavagePath').textContent=m.path}if(m.type==='cleavagePatternLoaded'){if(m.index>=0)cleavageModel.cleavage_pattern_set.patterns[m.index]=m.pattern;else cleavageModel.cleavage_pattern_set.patterns.push(m.pattern);renderCleavage()}if(m.type==='elementSelectionResult'){const atom=elementRequests.get(m.requestId);if(atom!==undefined&&m.elements.length){atomConstraintState[atom].elements=m.elements;atomConstraintState[atom].mode='elements';elementRequests.delete(m.requestId);queryPanels()}}if(m.type==='chemistryResult'){const waiter=chemistryWaiters.get(m.requestId);if(waiter){waiter.resolve(m.result);chemistryWaiters.delete(m.requestId)}}if(m.type==='chemistryError'){const waiter=chemistryWaiters.get(m.requestId);if(waiter){waiter.reject(new Error(m.message));chemistryWaiters.delete(m.requestId)}}if(m.type==='predictSpectrumResult'){const waiter=predictWaiters.get(m.requestId);if(waiter){waiter.resolve(m.result);predictWaiters.delete(m.requestId)}}if(m.type==='predictSpectrumError'){const waiter=predictWaiters.get(m.requestId);if(waiter){waiter.reject(new Error(m.message));predictWaiters.delete(m.requestId)}}if(m.type==='listPredictAdductsResult'){const waiter=predictListWaiters.get(m.requestId);if(waiter){waiter.resolve(m.result);predictListWaiters.delete(m.requestId)}}if(m.type==='listPredictAdductsError'){const waiter=predictListWaiters.get(m.requestId);if(waiter){waiter.reject(new Error(m.message));predictListWaiters.delete(m.requestId)}}if(m.type==='status'){statusEl.textContent=m.text;statusEl.className='status '+m.status;stop.disabled=m.status!=='running';if(m.command)document.getElementById('command').textContent=m.command;}if(m.type==='trainingStatus'){trainingStatusEl.textContent=m.text;trainingStatusEl.className='status '+m.status;trainingStop.disabled=m.status!=='running';if(m.command)document.getElementById('trainingCommand').textContent=m.command;}});`;
+    window.addEventListener('message',e=>{const m=e.data;if(m.type==='picked'){const target=m.form==='training'?trainingForm:m.form==='predict'?predictForm:form;if(target.elements[m.field])target.elements[m.field].value=m.value;if(m.form==='predict'&&m.field==='modelPath')resetPredictModelState()}if(m.type==='config')setConfig(m.config);if(m.type==='trainingConfig')setFormConfig(trainingForm,m.config);if(m.type==='cleavagePatternSet'){cleavageModel=m.value;cleavagePath=m.path;document.getElementById('cleavagePath').textContent=m.path;renderCleavage()}if(m.type==='cleavagePatternSetSaved'){cleavagePath=m.path;document.getElementById('cleavagePath').textContent=m.path}if(m.type==='cleavagePatternLoaded'){if(m.index>=0)cleavageModel.cleavage_pattern_set.patterns[m.index]=m.pattern;else cleavageModel.cleavage_pattern_set.patterns.push(m.pattern);renderCleavage()}if(m.type==='elementSelectionResult'){const atom=elementRequests.get(m.requestId);if(atom!==undefined&&m.elements.length){atomConstraintState[atom].elements=m.elements;atomConstraintState[atom].mode='elements';elementRequests.delete(m.requestId);queryPanels()}}if(m.type==='chemistryResult'){const waiter=chemistryWaiters.get(m.requestId);if(waiter){waiter.resolve(m.result);chemistryWaiters.delete(m.requestId)}}if(m.type==='chemistryError'){const waiter=chemistryWaiters.get(m.requestId);if(waiter){waiter.reject(new Error(m.message));chemistryWaiters.delete(m.requestId)}}if(m.type==='predictSpectrumResult'){const waiter=predictWaiters.get(m.requestId);if(waiter){waiter.resolve(m.result);predictWaiters.delete(m.requestId)}}if(m.type==='predictSpectrumError'){const waiter=predictWaiters.get(m.requestId);if(waiter){waiter.reject(new Error(m.message));predictWaiters.delete(m.requestId)}}if(m.type==='listPredictAdductsResult'){const waiter=predictListWaiters.get(m.requestId);if(waiter){waiter.resolve(m.result);predictListWaiters.delete(m.requestId)}}if(m.type==='listPredictAdductsError'){const waiter=predictListWaiters.get(m.requestId);if(waiter){waiter.reject(new Error(m.message));predictListWaiters.delete(m.requestId)}}if(m.type==='status'){statusEl.textContent=m.text;statusEl.className='status '+m.status;stop.disabled=m.status!=='running';if(m.command)document.getElementById('command').textContent=m.command;}if(m.type==='trainingStatus'){trainingStatusEl.textContent=m.text;trainingStatusEl.className='status '+m.status;trainingStop.disabled=m.status!=='running';if(m.command)document.getElementById('trainingCommand').textContent=m.command;}});`;
 }
 function commonCss() { return `:root{color-scheme:light dark;--accent:#36c5a2;--panel:color-mix(in srgb,var(--vscode-editor-background) 88%,var(--vscode-editor-foreground));--border:color-mix(in srgb,var(--vscode-editor-foreground) 18%,transparent)}*{box-sizing:border-box}body{font-family:var(--vscode-font-family);color:var(--vscode-editor-foreground);background:var(--vscode-editor-background);margin:0}main{max-width:1100px;margin:auto;padding:32px}header{display:flex;align-items:flex-start;justify-content:space-between;gap:20px;margin-bottom:28px}h1{font-size:32px;margin:4px 0}h2{font-size:17px;margin:0 0 18px}.eyebrow{color:var(--accent);font-weight:700;letter-spacing:.14em;font-size:11px}.muted,small{opacity:.65}button{font:inherit;color:inherit;background:var(--vscode-button-secondaryBackground);border:1px solid var(--border);border-radius:6px;padding:8px 13px;cursor:pointer}button:hover{background:var(--vscode-button-secondaryHoverBackground)}section{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:22px;margin:14px 0}.cards{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;background:none;border:0;padding:0}.cards article{background:var(--panel);border:1px solid var(--border);padding:18px;border-radius:9px}.cards b{display:block;font-size:23px;color:var(--accent)}.cards span{opacity:.65}.files{display:grid;gap:4px}.file{display:flex;justify-content:space-between;text-align:left;background:transparent;border:0;border-bottom:1px solid var(--border);border-radius:0}.file em{opacity:.55;font-style:normal}dl{display:grid;grid-template-columns:110px 1fr;gap:10px}dt{opacity:.6}dd{margin:0;overflow-wrap:anywhere}code{font-family:var(--vscode-editor-font-family);font-size:12px}details{border-top:1px solid var(--border);padding:10px 0}summary{cursor:pointer;font-weight:600}table{width:100%;border-collapse:collapse;margin-top:10px;font-size:12px}th,td{text-align:left;vertical-align:top;border-bottom:1px solid var(--border);padding:7px}.formula{margin-bottom:7px}.formula small{display:block;margin-top:3px;font-family:var(--vscode-editor-font-family)}.warning{color:var(--vscode-editorWarning-foreground)}@media(max-width:700px){.cards{grid-template-columns:1fr 1fr}main{padding:18px}table{display:block;overflow:auto}}`; }
 function trainingCss() { return `.model-map{background:color-mix(in srgb,var(--vscode-editor-background) 94%,var(--accent))}.architecture{display:grid;gap:13px;margin-top:15px}.architecture-input,.architecture-merge,.architecture-branches{display:grid;gap:9px}.architecture-branches{grid-template-columns:1fr 1fr 1.35fr}.architecture-modes{display:grid;grid-template-columns:1fr 1fr;gap:12px}.mode{display:grid;grid-template-columns:1fr 1fr;gap:8px;border:1px solid var(--border);border-radius:8px;padding:10px}.mode strong{grid-column:1/-1;font-size:10px;letter-spacing:.14em}.training-mode strong{color:#e9b949}.prediction-mode strong{color:#63a8ff}.architecture button{position:relative;text-align:left;min-height:78px;background:var(--vscode-editor-background)}.architecture button b,.architecture button code,.architecture button span{display:block}.architecture button b{color:var(--accent);margin-bottom:5px}.architecture button code{font-size:11px;margin-bottom:5px;white-space:normal}.architecture button span{font-size:11px;opacity:.68}.architecture button.selected{outline:2px solid var(--accent);background:color-mix(in srgb,var(--accent) 14%,var(--vscode-editor-background))}.architecture-input button::after,.architecture-branches button::after,.architecture-merge button::after{content:'↓';position:absolute;left:50%;bottom:-22px;color:var(--accent);z-index:2;font-size:17px}.model-hint{margin:13px 0 0;font-size:12px;opacity:.75}[data-model-block]{scroll-margin-top:12px;transition:border-color .15s,box-shadow .15s}[data-model-block].selected{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent)}.model-losses{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:12px}.model-losses span:nth-child(odd){padding:8px 11px;border:1px solid var(--border);border-radius:18px;background:var(--vscode-editor-background)}.model-notes{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin:10px 0 16px}.model-notes p{margin:0;padding:10px;border-left:3px solid var(--accent);background:var(--vscode-editor-background);font-size:12px;line-height:1.45}.field-help{display:block;margin-top:5px;line-height:1.35;opacity:.7}.check .field-help{margin-top:2px}.check{align-items:flex-start}@media(max-width:850px){.architecture-branches,.architecture-modes,.mode,.model-notes{grid-template-columns:1fr}.mode strong{grid-column:1}.architecture button::after{display:none}}`; }

@@ -14,29 +14,24 @@ from rdkit import Chem
 from rdkit.Chem import rdDepictor
 from rdkit.Chem.Draw import rdMolDraw2D
 
-from clefts.libs.mmkit.mmkit import Adduct, Formula
-from clefts.ml.specgen.predict_spectrum import (
-    build_structure_from_dataset,
-    direct_input_dataset,
-    load_generator,
-)
+from clefts.libs.mmkit.mmkit import Adduct, Compound, Formula
+from clefts.domain.mass.parse_ce import parse_ce_to_ev
+from clefts.ml.specgen.predict_spectrum import load_generator
 
 
-def _node_formula(structure, node_id: int, elements: tuple[str, ...]) -> Formula:
-    row = structure.node_formula[node_id].detach().cpu().tolist()
-    charge = int(row[-1]) if row else 0
-    return Formula({name: int(value) for name, value in zip(elements, row[:-1]) if value}, charge=charge)
-
-
-def _build_tree(structure, spectrum) -> dict[str, Any]:
+def _build_tree(result, sample: int) -> dict[str, Any]:
     """Fragment-tree nodes/edges explored for this prediction, annotated with
     per-node neutral formula/exact mass plus any predicted-peak ion states."""
-    elements = tuple(getattr(structure, "formula_element_order", ()))
-    num_nodes = int(structure.num_nodes)
-    edge_pairs = structure.edge_index.detach().cpu().tolist()
+    fragments = result.fragments
+    node_offsets = [i for i, s in enumerate(fragments.node_sample_index.tolist()) if s == sample]
+    local_index = {global_index: local for local, global_index in enumerate(node_offsets)}
+    num_nodes = len(node_offsets)
+
+    edge_pairs = fragments.edge_index.detach().cpu().tolist()
     edges = [
-        {"id": i, "source": int(edge_pairs[0][i]), "target": int(edge_pairs[1][i])}
-        for i in range(len(edge_pairs[0]))
+        {"id": i, "source": local_index[src], "target": local_index[dst]}
+        for i, (src, dst) in enumerate(zip(*edge_pairs))
+        if src in local_index and dst in local_index
     ]
 
     indegree = [0] * num_nodes
@@ -55,30 +50,44 @@ def _build_tree(structure, spectrum) -> dict[str, Any]:
         if not changed:
             break
 
+    downstream = result.downstream
+    spectra = result.spectra
+    ion_node_index = downstream.ion_node_index.detach().cpu().tolist()
+    ion_formula_index = downstream.ion_formula_index.detach().cpu().tolist()
+    formula_sample_index = downstream.formula_sample_index.detach().cpu().tolist()
+    formula_mz = downstream.formula_mz.detach().cpu().tolist()
+    intensity = spectra.intensity.detach().cpu().tolist()
+
     annotations_by_node: dict[int, list[dict[str, Any]]] = {}
-    for peak in spectrum.peaks:
-        for annotation in peak.fragment_ion_annotations or []:
-            annotations_by_node.setdefault(annotation.global_node_id, []).append(
+    for formula_index, formula_sample in enumerate(formula_sample_index):
+        if formula_sample != sample:
+            continue
+        for entry, node_ion_formula in enumerate(ion_formula_index):
+            if node_ion_formula != formula_index:
+                continue
+            node = ion_node_index[entry]
+            if node not in local_index:
+                continue
+            annotations_by_node.setdefault(local_index[node], []).append(
                 {
-                    "peakMz": float(peak.mz),
-                    "peakIntensity": float(peak.intensity),
-                    "ionFormula": annotation.formula,
-                    "adduct": str(annotation.adduct),
-                    "probability": float(annotation.probability),
+                    "peakMz": float(formula_mz[formula_index]),
+                    "peakIntensity": float(intensity[formula_index]),
                 }
             )
 
     nodes = []
-    for node_id in range(num_nodes):
-        neutral_formula = _node_formula(structure, node_id, elements)
+    for global_index in node_offsets:
+        compound = fragments.compounds[global_index]
+        neutral_formula = compound.formula
+        local = local_index[global_index]
         nodes.append(
             {
-                "id": node_id,
-                "smiles": str(structure.node_smiles[node_id]),
-                "depth": depth[node_id],
+                "id": local,
+                "smiles": compound.smiles,
+                "depth": depth[local],
                 "formula": str(neutral_formula),
                 "exactMass": neutral_formula.exact_mass,
-                "annotations": annotations_by_node.get(node_id, []),
+                "annotations": annotations_by_node.get(local, []),
             }
         )
 
@@ -86,8 +95,8 @@ def _build_tree(structure, spectrum) -> dict[str, Any]:
 
 
 def list_adducts(request: dict[str, Any]) -> dict[str, Any]:
-    """Main adduct types (the measurement-condition adducts, not per-fragment
-    ion-shift states) that this checkpoint was trained to condition on."""
+    """Main adduct types (the measurement-condition adducts) that this
+    checkpoint was trained to condition on."""
     model_path = str(request.get("modelPath", "")).strip()
     if not model_path:
         raise ValueError("Model checkpoint path is required.")
@@ -98,11 +107,7 @@ def list_adducts(request: dict[str, Any]) -> dict[str, Any]:
     generator = load_generator(
         model_path=model_path, params_path=None, device=device, strict=False
     )
-    adducts = [
-        str(adduct)
-        for _, adduct in sorted(generator.probability_model.main_adduct_types.items())
-    ]
-    return {"adducts": adducts}
+    return {"adducts": list(generator.adduct_type_strs)}
 
 
 def predict(request: dict[str, Any]) -> dict[str, Any]:
@@ -133,48 +138,35 @@ def predict(request: dict[str, Any]) -> dict[str, Any]:
     generator = load_generator(
         model_path=model_path, params_path=None, device=device, strict=False
     )
-    dataset = direct_input_dataset(
-        smiles_values=[smiles], collision_energy=ce, adduct_type=adduct_type
-    )
-    structure, _metadata = build_structure_from_dataset(
-        dataset=dataset,
-        generator=generator,
-        smiles_values=[smiles],
-        smiles_column="SMILES",
-        precursor_mz_column="PrecursorMZ",
-        adduct_type_column="AdductType",
-        collision_energy_column="CollisionEnergy",
-        instrument_column=None,
-        device=device,
-    )
+    source = Compound.from_smiles(smiles)
+    neutral_formula = Formula.from_mol(mol).plain
+    precursor_mz = adduct.apply_to_mz(neutral_formula.exact_mass)
+    ce_ev = parse_ce_to_ev(ce, precursor_mz)
+    if ce_ev is None:
+        raise ValueError(f"Could not interpret collision energy: {ce!r}")
 
     with torch.no_grad():
-        output = generator(
-            structure,
-            include_formula_annotation=True,
-            include_fragment_ion_annotation=True,
-        )
-    if not output.spectra:
+        result = generator.predict([source], [adduct], [ce_ev])
+
+    if not result.spectra.mz.numel():
         raise ValueError("The model did not produce any peaks for this input.")
-    spectrum = output.spectra[0]
     peaks = sorted(
         (
-            {"mz": float(peak.mz), "intensity": float(peak.intensity), "formula": peak.formula}
-            for peak in spectrum.peaks
+            {"mz": float(mz), "intensity": float(intensity)}
+            for mz, intensity in zip(
+                result.spectra.mz.detach().cpu().tolist(),
+                result.spectra.intensity.detach().cpu().tolist(),
+            )
         ),
         key=lambda peak: peak["mz"],
     )
-    tree_structure = output.candidate_output.features.structure
-    tree = _build_tree(tree_structure, spectrum)
+    tree = _build_tree(result, sample=0)
 
     rdDepictor.Compute2DCoords(mol)
     drawer = rdMolDraw2D.MolDraw2DSVG(420, 300)
     drawer.DrawMolecule(mol)
     drawer.FinishDrawing()
     svg = drawer.GetDrawingText().replace("svg:", "")
-
-    neutral_formula = Formula.from_mol(mol).plain
-    precursor_mz = adduct.apply_to_mz(neutral_formula.exact_mass)
 
     return {
         "canonicalSmiles": Chem.MolToSmiles(mol),
@@ -197,8 +189,8 @@ if __name__ == "__main__":
         command = str(request.get("command", "predict"))
         if command not in COMMANDS:
             raise ValueError(f"Unknown command: {command}")
-        # load_generator/build_structure_from_dataset print progress lines;
-        # redirect them to stderr so stdout stays a single JSON line.
+        # load_generator prints progress lines; redirect them to stderr so
+        # stdout stays a single JSON line.
         with contextlib.redirect_stdout(sys.stderr):
             result = COMMANDS[command](request.get("payload", {}))
         print(json.dumps({"ok": True, "result": result}, ensure_ascii=False))

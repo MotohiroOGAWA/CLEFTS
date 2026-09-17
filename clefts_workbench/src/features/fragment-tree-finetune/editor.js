@@ -4,31 +4,26 @@ const path = require('path');
 const { saveConfiguration, loadConfiguration } = require('../../configuration');
 
 const fields = [
-  ['checkpoint', 'Base fragment-tree checkpoint', 'file'],
-  ['cleavagePatternSet', 'New complete Cleavage Pattern Set', 'file'],
+  ['params', 'New (expanded) model config JSON', 'file'],
+  ['fineTuneCheckpoint', 'Base fragment-tree checkpoint', 'file'],
+  ['fineTunePatternSet', 'New complete Cleavage Pattern Set', 'file'],
   ['trainDir', 'Regenerated training structures', 'folder'],
   ['valDir', 'Regenerated validation structures', 'folder'],
   ['outputDir', 'Fine-tuning output directory', 'folder'],
   ['adapterWidth', 'Added nodes per projection', 'number', '8'],
   ['lr', 'Learning rate', 'number', '0.0001'],
-  ['weightDecay', 'Weight decay', 'number', '0'],
   ['epochs', 'Epochs', 'number', '10'],
-  ['batchSize', 'Batch size', 'number', '1'],
-  ['maxSamples', 'Max samples', 'number', '100'],
-  ['numWorkers', 'Workers', 'number', '0'],
-  ['assignmentScoreThreshold', 'Assignment score threshold', 'number', '0.8'],
+  ['batchSize', 'Batch size', 'number', '4'],
   ['device', 'Device', 'text', 'cpu'],
-  ['experimentName', 'Experiment', 'text', 'exp_finetune'],
-  ['ckptId', 'Resume checkpoint ID (optional)', 'text', '']
+  ['resume', 'Resume checkpoint path (optional)', 'file', '']
 ];
-function buildArgs(config, dryRun = false) {
-  const args = ['-m', 'clefts.cli', 'train', 'fragment-tree-finetune'];
+function buildArgs(config) {
+  const args = ['-m', 'clefts.cli', 'train', 'fragment-tree'];
   for (const [key] of fields) {
     const value = String(config[key] ?? '').trim();
-    if (key === 'ckptId' && !value) continue;
+    if (key === 'resume' && !value) continue;
     args.push('--' + key.replace(/[A-Z]/g, c => '-' + c.toLowerCase()), value);
   }
-  if (dryRun) args.push('--dry-run');
   return args;
 }
 function shellDisplay(program, args) {
@@ -58,13 +53,13 @@ function attach(panel, context, projectRoot, output) {
         if (!field || !['file', 'folder'].includes(field[2])) return;
         const folder = field[2] === 'folder';
         const selected = await vscode.window.showOpenDialog({ canSelectMany: false, canSelectFiles: !folder,
-          canSelectFolders: folder, ...(folder ? {} : { filters: message.field === 'checkpoint' ? { 'PyTorch checkpoint': ['pt'] } : { 'Cleavage Pattern Set': ['clevageset.json', 'json'] } }) });
+          canSelectFolders: folder, ...(folder ? {} : { filters: message.field === 'fineTuneCheckpoint' || message.field === 'resume' ? { 'PyTorch checkpoint': ['pt'] } : message.field === 'fineTunePatternSet' ? { 'Cleavage Pattern Set': ['clevageset.json', 'json'] } : { 'JSON': ['json'] } }) });
         if (selected?.[0]) panel.webview.postMessage({ type: 'fineTunePicked', field: message.field, value: selected[0].fsPath });
         return;
       }
       const root = projectRoot(context);
       const python = vscode.workspace.getConfiguration('clefts').get('pythonPath', 'python');
-      const args = buildArgs(message.config, !!message.dryRun);
+      const args = buildArgs(message.config);
       const command = shellDisplay(python, args);
       if (message.type === 'fineTuneCopy') {
         await vscode.env.clipboard.writeText(command);
@@ -72,7 +67,7 @@ function attach(panel, context, projectRoot, output) {
       }
       if (child) return;
       output.show(true); output.appendLine('$ ' + command);
-      post({ running: true, clear: true, text: message.dryRun ? 'Validating…' : 'Fine-tuning…', command });
+      post({ running: true, clear: true, text: 'Fine-tuning…', command });
       child = spawn(python, args, { cwd: root, env: { ...process.env, PYTHONUNBUFFERED: '1',
         PYTHONPATH: [root, process.env.PYTHONPATH].filter(Boolean).join(path.delimiter) } });
       child.stdin.on('error', () => {}); child.stdin.end();
@@ -86,7 +81,7 @@ function attach(panel, context, projectRoot, output) {
           else resolve();
         });
       });
-      post({ running: false, text: message.dryRun ? 'Validation completed.' : 'Fine-tuning completed.' });
+      post({ running: false, text: 'Fine-tuning completed.' });
     } catch (error) {
       post({ running: false, text: error.message });
     } finally {
@@ -97,10 +92,10 @@ function attach(panel, context, projectRoot, output) {
 function html() {
   return `<div id="fineTuneApp" hidden><section><div class="section-title"><div><h2>Fragment Tree Fine-tuning</h2></div><div class="actions"><button type="button" id="fineTuneLoadConfig">Load Configuration</button><button type="button" id="fineTuneSaveConfig">Save Configuration</button></div></div>
   <p>MolEncoder and all existing parameters stay frozen. Train only added low-rank nodes and new cleavage-category embeddings.</p>
-  <p>Choose a complete set containing the old patterns plus new patterns. First regenerate both data splits with this set in Data Preparation. Keep other Fragmenter settings unchanged.</p>
+  <p>Choose a complete pattern set containing the old patterns plus new patterns, and a "new" model config JSON that already carries the expanded fragmenter_params. First regenerate both data splits with that config in Data Preparation. Keep other Fragmenter settings unchanged.</p>
   <form id="fineTuneForm"><div class="grid">${fields.map(([key, label, kind, value = '']) =>
-    `<label>${label}<input name="${key}" type="${kind === 'number' ? 'number' : 'text'}" value="${value}" ${['file','folder'].includes(kind) ? `data-path-kind="${kind}"` : ''} ${kind === 'number' ? 'step="any"' : ''} ${key === 'ckptId' ? '' : 'required'}>${['file','folder'].includes(kind) ? `<button type="button" data-finetune-pick="${key}">Browse…</button>` : ''}</label>`).join('')}</div>
-  <div class="actions"><button type="button" id="fineTuneCopy">Copy Command</button><button type="button" id="fineTuneValidate">Validate only</button><button type="button" id="fineTuneStop" disabled>Stop</button><button type="submit" class="primary">Run Fine-tuning CLI</button></div></form>
+    `<label>${label}<input name="${key}" type="${kind === 'number' ? 'number' : 'text'}" value="${value}" ${['file','folder'].includes(kind) ? `data-path-kind="${kind}"` : ''} ${kind === 'number' ? 'step="any"' : ''} ${key === 'resume' ? '' : 'required'}>${['file','folder'].includes(kind) ? `<button type="button" data-finetune-pick="${key}">Browse…</button>` : ''}</label>`).join('')}</div>
+  <div class="actions"><button type="button" id="fineTuneCopy">Copy Command</button><button type="button" id="fineTuneStop" disabled>Stop</button><button type="submit" class="primary">Run Fine-tuning CLI</button></div></form>
   <p id="fineTuneStatus" role="status">Ready</p><pre id="fineTuneCommand" style="white-space:pre-wrap;overflow-wrap:anywhere"></pre>
   <pre id="fineTuneLog" style="max-height:400px;overflow:auto;white-space:pre-wrap"></pre></section></div>`;
 }
@@ -108,10 +103,9 @@ function script() { return `(${client.toString()})();`; }
 function client() {
   const el = id => document.getElementById(id), form = el('fineTuneForm');
   const config = () => Object.fromEntries([...form.elements].filter(e => e.name).map(e => [e.name, e.value]));
-  function send(type, dryRun = false) { if (form.reportValidity()) vscode.postMessage({ type, config: config(), dryRun }); }
+  function send(type) { if (form.reportValidity()) vscode.postMessage({ type, config: config() }); }
   form.onsubmit = event => { event.preventDefault(); send('fineTuneRun'); };
   el('fineTuneCopy').onclick = () => send('fineTuneCopy');
-  el('fineTuneValidate').onclick = () => send('fineTuneRun', true);
   el('fineTuneStop').onclick = () => vscode.postMessage({ type: 'fineTuneStop' });
   el('fineTuneSaveConfig').onclick = () => vscode.postMessage({ type: 'fineTuneSaveConfig', config: config() });
   el('fineTuneLoadConfig').onclick = () => vscode.postMessage({ type: 'fineTuneLoadConfig' });
