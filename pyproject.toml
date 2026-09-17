@@ -36,6 +36,7 @@ docs = [
     "sphinx-autodoc-typehints",
     "myst-parser",
     "myst-nb",
+    "jupyter-sphinx>=0.5",
 ]
 
 [tool.mypy]

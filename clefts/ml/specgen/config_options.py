@@ -1,0 +1,85 @@
+"""Shared CLI configuration loading with explicit option precedence."""
+from __future__ import annotations
+import argparse
+import copy
+import json
+from pathlib import Path
+
+PRESET = Path(__file__).resolve().parents[2] / 'presets/spectrum_generator_params/source_anchored_pos_model_config.json'
+OPTIONS = {
+    'max_action_count': ('fragmenter_params', 'fragment_ion_tree_builder', 'max_action_count'),
+    'precursor_max_action_count': ('fragmenter_params', 'precursor_candidate_max_action_count'),
+    'mass_tolerance': ('fragmenter_params', 'mass_tolerance'),
+    'action_top_k': ('action_model_params', 'action_prefilter_top_k'),
+    'action_max_k': ('action_model_params', 'action_prefilter_max_k'),
+    'action_threshold': ('action_model_params', 'action_prefilter_threshold_logit'),
+    'beam_size': ('action_model_params', 'beam_size'),
+    'max_decode_steps': ('action_model_params', 'max_decode_steps'),
+}
+
+def configure_model_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument('--params', help='Model or fragmenter JSON file. Explicit options override file values.')
+    parser.add_argument('--params-json', help='Inline model or fragmenter JSON; overrides --params.')
+    for group in ('fragmenter', 'mol-encoder', 'action-model', 'post-model'):
+        parser.add_argument('--'+group+'-params-json', help='Inline parameter object overriding the corresponding configuration section.')
+    parser.add_argument('--adduct-types-json', help='JSON array of supported adduct strings.')
+    for key in OPTIONS:
+        kind = str if key == 'mass_tolerance' else float if key == 'action_threshold' else int
+        parser.add_argument('--'+key.replace('_','-'), type=kind, help='Override '+'.'.join(OPTIONS[key])+'.')
+    parser.add_argument('--set', dest='parameter_overrides', action='append', default=[], metavar='PATH=JSON',
+                        help='Override any individual parameter, including nested array entries. Repeat as needed; applied last.')
+
+def merge(base: dict, update: dict) -> dict:
+    result=copy.deepcopy(base)
+    for key,value in update.items():
+        result[key]=merge(result[key],value) if isinstance(value,dict) and isinstance(result.get(key),dict) else copy.deepcopy(value)
+    return result
+
+def unpack(config: dict) -> dict:
+    config=config.get('params',config.get('probability_model_params',config))
+    if not isinstance(config,dict): raise ValueError('Configuration must be a JSON object')
+    if 'fragment_ion_tree_builder' in config: return {'fragmenter_params':config}
+    return config
+
+def set_parameter(config: dict, path: list[str], value: object) -> None:
+    if not path or any(key in ('__proto__','prototype','constructor') or not key for key in path):
+        raise ValueError('Invalid parameter path')
+    parent=config
+    for key in path[:-1]:
+        if isinstance(parent,list): parent=parent[int(key)]
+        else:
+            if key not in parent: parent[key]={}
+            parent=parent[key]
+    if isinstance(parent,list): parent[int(path[-1])]=value
+    else: parent[path[-1]]=value
+
+def resolve_model_options(args: argparse.Namespace) -> dict:
+    config=json.loads(PRESET.read_text())
+    if args.params: config=merge(config,unpack(json.loads(Path(args.params).read_text())))
+    if args.params_json: config=merge(config,unpack(json.loads(args.params_json)))
+    for group in ('fragmenter','mol_encoder','action_model','post_model'):
+        raw=getattr(args,group+'_params_json',None)
+        if raw:
+            value=json.loads(raw)
+            if not isinstance(value,dict): raise ValueError(group+' parameters must be a JSON object')
+            config[group+'_params']=merge(config.get(group+'_params',{}),value)
+    if args.adduct_types_json: config['adduct_type_strs']=json.loads(args.adduct_types_json)
+    for key,path in OPTIONS.items():
+        value=getattr(args,key,None)
+        if value is not None: set_parameter(config,list(path),value)
+    for override in args.parameter_overrides:
+        key,separator,raw=override.partition('=')
+        if not separator: raise ValueError('--set requires PATH=JSON')
+        set_parameter(config,key.split('.'),json.loads(raw))
+    return config
+
+def namespace_argv(parser: argparse.ArgumentParser, args: argparse.Namespace) -> list[str]:
+    argv=[]
+    for action in parser._actions:
+        if isinstance(action,argparse._HelpAction) or not action.option_strings: continue
+        value=getattr(args,action.dest,None)
+        if value is None: continue
+        if isinstance(action,argparse._AppendAction):
+            for item in value: argv.extend([action.option_strings[0],str(item)])
+        else: argv.extend([action.option_strings[0],str(value)])
+    return argv

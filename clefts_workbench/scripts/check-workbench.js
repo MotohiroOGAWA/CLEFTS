@@ -1,0 +1,16 @@
+const assert = require('assert/strict');
+const Module = require('module');
+const load=Module._load;
+Module._load=function(name,parent,main){if(name==='vscode')return {};return load.call(this,name,parent,main);};
+const panel=require('../src/workbench/panel');
+const extension=require('../src/extension');
+const html=extension.workbenchHtml({},{});
+for(const id of ['homePage','navigationRail','jobPage','environmentPage','dataParameterEditor','trainingParameterEditor','predictForm','trainingForm'])assert(html.includes('id="'+id+'"'));
+for(const match of html.matchAll(/<script>([\s\S]*?)<\/script>/g))new Function(match[1]);
+const secured=panel.secure(html,{cspSource:'vscode-webview://test'});
+assert(secured.includes("default-src 'none'"));assert(!secured.includes('<script>'));assert(secured.includes('script nonce='));
+const args=extension.buildTrainingArgs({params:'a b.json',trainDir:'train',valDir:'val',outputDir:'out',epochs:2,batchSize:4,weightDecay:0,gradientClip:1,absoluteWeight:0});
+assert.deepEqual(args.slice(0,4),['-m','clefts.cli','train','fragment-tree']);assert.equal(args[args.indexOf('--params')+1],'a b.json');assert.equal(args[args.indexOf('--weight-decay')+1],'0');assert.equal(args[args.indexOf('--absolute-weight')+1],'0');
+assert(html.indexOf('<strong>Prepare Data</strong>') < html.indexOf('<strong>Train a Model</strong>'));
+const dataArgs=extension.buildArgs({input:'x.msds',outputDir:'out',params:'unused.json',modelConfig:{fragmenter_params:{mass_tolerance:'0.02Da'}}});assert(!dataArgs.includes('--params'));assert.deepEqual(JSON.parse(dataArgs[dataArgs.indexOf('--params-json')+1]),{fragmenter_params:{mass_tolerance:'0.02Da'}});
+console.log('Workbench HTML, script, CSP and CLI parameter checks passed.');

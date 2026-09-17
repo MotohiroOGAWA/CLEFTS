@@ -25,15 +25,5 @@ class CreateFragmentTreeDataCommand(CLICommand):
             parser._add_action(action)
 
     def run(self, args: argparse.Namespace) -> None:
-        argv = []
-        for action in build_create_training_data_arg_parser()._actions:
-            if isinstance(action, argparse._HelpAction):
-                continue
-            value = getattr(args, action.dest, None)
-            if value is None:
-                continue
-            option = action.option_strings[0] if action.option_strings else None
-            if option is None:
-                continue
-            argv.extend([option, str(value)])
-        run_create_training_data(argv)
+        from clefts.ml.specgen.config_options import namespace_argv
+        run_create_training_data(namespace_argv(build_create_training_data_arg_parser(), args))

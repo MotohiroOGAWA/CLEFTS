@@ -1,3 +1,11 @@
+const layout = require('./workbench/layout');
+const preparation = require('./workbench/preparation');
+const datasetUpload = require('./workbench/dataset-upload');
+const workbenchServices = require('./workbench/services');
+const parameterEditor = require('./workbench/parameter-editor');
+const workbenchDefaults = require('./workbench/defaults');
+const parameterService = require('./workbench/parameter-service');
+const workbench = require('./workbench/panel');
 const trainingMetrics = require('./features/training-metrics/editor');
 const fineTune = require('./features/fragment-tree-finetune/editor');
 const smartsSearch = require('./features/smarts-search/editor');
@@ -28,6 +36,7 @@ function activate(context) {
   );
   evaluation.register(context, output, projectRoot);
   cleavagePatternSetEditor.register(context);
+  workbench.register(context, output, projectRoot, openWorkbench);
   enableDevelopmentReload(context, output);
 }
 
@@ -85,35 +94,40 @@ function isCleftsRoot(candidate) {
 function defaultConfig(context) {
   const root = projectRoot(context);
   const defaultParams = path.join(root, 'clefts', 'presets', 'spectrum_generator_params', 'source_anchored_pos_model_config.json');
-  return {
-    application: 'fragment-tree-data-preparation',
-    input: '', params: defaultParams,
-    outputDir: path.join(root, 'data', 'training', 'fragment_tree_projects', 'gui-run')
-  };
+  return workbenchDefaults.workflowDefaults('data',{
+    application: 'fragment-tree-data-preparation', modelConfig: parameterService.defaults(root),
+    input: '', params: defaultParams, smilesColumn:'SMILES', adductTypeColumn:'AdductType', collisionEnergyColumn:'CollisionEnergy', precursorMzColumn:'PrecursorMZ', validationInput:'', validationRatio:0.1, validationSeed:0, minimumRelativeIntensity:0, normalizeIntensities:true, overwrite:false, numWorkers:1, chunkSize:1,
+    outputDir: ''
+  },root);
 }
 
 function defaultTrainingConfig(context) {
   const root = projectRoot(context);
   const defaultParams = path.join(root, 'clefts', 'presets', 'spectrum_generator_params', 'source_anchored_pos_model_config.json');
-  return {
-    application: 'fragment-tree-training', params: defaultParams, trainDir: '', valDir: '',
-    outputDir: path.join(root, 'data', 'training', 'fragment_tree_models', 'gui-run'),
+  return workbenchDefaults.workflowDefaults('training',{
+    application: 'fragment-tree-training', modelConfig: parameterService.defaults(root), params: defaultParams, trainDir: '', valDir: '',
+    outputDir: '',
     epochs: 1, batchSize: 4, device: 'cpu', lr: 0.0001, resume: '',
-    fineTuneCheckpoint: '', fineTunePatternSet: '', adapterWidth: 8
-  };
+    fineTuneCheckpoint: '', fineTunePatternSet: '', adapterWidth: 8, initializeFrom:''
+  },root);
 }
 
-function openWorkbench(context, output) {
+function openWorkbench(context, output, initialPage = "home") {
   const panel = vscode.window.createWebviewPanel('clefts.workbench', 'CLEFTS Workbench', vscode.ViewColumn.One, {
-    enableScripts: true, retainContextWhenHidden: true
+    enableScripts: true, retainContextWhenHidden: true, localResourceRoots: []
   });
   smartsSearch.attach(panel, context, projectRoot);
   fineTune.attach(panel, context, projectRoot, output);
   spectrumPrediction.attach(panel, context, projectRoot, output);
   trainingMetrics.attach(panel);
+  workbench.attach(panel, context, projectRoot, output, initialPage);
+  parameterService.attach(panel, context, projectRoot);
+  workbenchServices.attach(panel, context, projectRoot);
+  workbenchDefaults.attach(panel);
+  datasetUpload.attach(panel,context);
   const initialConfig = defaultConfig(context);
   const initialTrainingConfig = defaultTrainingConfig(context);
-  panel.webview.html = workbenchHtml(initialConfig, initialTrainingConfig);
+  panel.webview.html = workbench.secure(workbenchHtml(initialConfig, initialTrainingConfig,workbenchDefaults.workflowDefaults('prediction',{},projectRoot(context))), panel.webview);
   panel.webview.onDidReceiveMessage(async message => {
     try {
       if (message.type === 'pick') {
@@ -129,7 +143,8 @@ function openWorkbench(context, output) {
         const picked = await vscode.window.showOpenDialog({ filters: { 'CLEFTS run configuration': ['pft.json', 'json'] }, canSelectMany: false });
         if (picked && picked[0]) {
           const config = JSON.parse(await fs.promises.readFile(picked[0].fsPath, 'utf8'));
-          if (!config.fragmenterParams && config.params) config.fragmenterParams = JSON.parse(await fs.promises.readFile(path.resolve(path.dirname(picked[0].fsPath), config.params), 'utf8'));
+          if (!config.modelConfig && config.params) config.modelConfig = parameterService.merge(parameterService.defaults(projectRoot(context)), parameterService.unpack(JSON.parse(await fs.promises.readFile(path.resolve(path.dirname(picked[0].fsPath), config.params), 'utf8'))));
+          if(!config.modelConfig && config.fragmenterParams && !config.symbols) config.modelConfig=parameterService.merge(parameterService.defaults(projectRoot(context)),{fragmenter_params:config.fragmenterParams});
           panel.webview.postMessage({ type: 'config', config: { ...defaultConfig(context), ...config } });
         }
       } else if (message.type === 'saveTrainingConfig') {
@@ -139,6 +154,7 @@ function openWorkbench(context, output) {
         const picked = await vscode.window.showOpenDialog({ filters: { 'CLEFTS training configuration': ['pfttrain.json'] }, canSelectMany: false });
         if (picked && picked[0]) {
           const config = JSON.parse(await fs.promises.readFile(picked[0].fsPath, 'utf8'));
+          if(!config.modelConfig && config.params)config.modelConfig=parameterService.merge(parameterService.defaults(projectRoot(context)),parameterService.unpack(JSON.parse(await fs.promises.readFile(path.resolve(path.dirname(picked[0].fsPath),config.params),'utf8'))));
           panel.webview.postMessage({ type: 'trainingConfig', config: { ...defaultTrainingConfig(context), ...config } });
         }
       } else if (message.type === 'openResult') {
@@ -151,6 +167,8 @@ function openWorkbench(context, output) {
         await vscode.env.clipboard.writeText(command);
         panel.webview.postMessage({ type: 'status', status: 'idle', text: 'Command copied.', command });
       } else if (message.type === 'run') {
+        panel.webview.postMessage({type:'status',status:'running',text:'Validating datasets and configuration…'});
+        await workbenchServices.validateRun(context,projectRoot(context),normalizeConfig(message.config));
         await runFragmentTree(context, output, normalizeConfig(message.config), panel);
       } else if (message.type === 'copyTrainingCommand') {
         const python = vscode.workspace.getConfiguration('clefts').get('pythonPath', 'python');
@@ -160,7 +178,7 @@ function openWorkbench(context, output) {
       } else if (message.type === 'runTraining') {
         await runTraining(context, output, normalizeTrainingConfig(message.config), panel);
       } else if (message.type === 'stop') {
-        if (runningProcess) runningProcess.kill('SIGTERM');
+        if (runningProcess) workbench.stopChild(runningProcess,process.platform!=='win32');
       } else if (message.type === 'loadCleavagePatternSet') {
         const picked = await vscode.window.showOpenDialog({ filters: { 'CLEFTS Cleavage Pattern Set': ['clevageset.json'] }, canSelectMany: false });
         if (picked && picked[0]) {
@@ -301,20 +319,24 @@ function runSpectrumPredictionBackend(context, payload) {
     if (!isCleftsRoot(root)) { reject(new Error('The detected working directory is not a CLEFTS application.')); return; }
     const pythonPath = ['.', process.env.PYTHONPATH].filter(Boolean).join(path.delimiter);
     const child = spawn(python, [script], { cwd: root, env: { ...process.env, PYTHONPATH: pythonPath } });
+    const observed=payload.command==='predict'?workbench.observeJob(context,{type:'prediction',name:String(payload.payload?.smiles||'Spectrum prediction').slice(0,72),child,command:[python,script]}):null;
     let stdout = '', stderr = '';
     child.stdout.on('data', chunk => { stdout += chunk.toString(); });
-    child.stderr.on('data', chunk => { stderr += chunk.toString(); });
-    child.on('error', reject);
-    child.on('close', () => {
-      try { const response = JSON.parse(stdout); response.ok ? resolve(response.result) : reject(new Error(response.error)); }
-      catch (_) { reject(new Error(stderr || stdout || 'The spectrum prediction backend did not return a response.')); }
+    child.stderr.on('data', chunk => { const text=chunk.toString();stderr += text;if(observed)observed.log(text); });
+    child.on('error', error=>{if(observed)observed.finish({error:error.message});reject(error);});
+    child.on('close', (code,signal) => {
+      try { const response = JSON.parse(stdout.trim().split('\n').reverse().find(line=>line.startsWith('{'))||stdout);if(!response.ok)throw new Error(response.error);if(code!==0)throw new Error(stderr||'Prediction backend failed.');if(observed){observed.log('Predicted '+response.result.peaks.length+' peaks.\n');observed.finish({code:0,result:response.result});}resolve(response.result); }
+      catch (error) {if(observed){observed.log(stderr||stdout||error.message);observed.finish({code,signal,error:signal?undefined:error.message});}reject(new Error(error.message||stderr||stdout||'The spectrum prediction backend did not return a response.'));}
     });
     child.stdin.end(JSON.stringify(payload));
   });
 }
 
 function normalizeConfig(config) {
-  return { ...config };
+  const result={...config};
+  if (result.modelConfig || result.fragmenterParams) delete result.params;
+  result.input ||= result.trainInput;
+  return result;
 }
 
 function normalizeTrainingConfig(config) {
@@ -323,35 +345,22 @@ function normalizeTrainingConfig(config) {
 
 async function runTraining(context, output, config, panel) {
   if (runningProcess) throw new Error('Another CLEFTS process is already running.');
-  for (const key of ['params', 'trainDir', 'valDir', 'outputDir']) {
+  for (const key of ['trainDir', 'valDir', 'outputDir']) {
     if (!config[key]) throw new Error(`${key} is required.`);
   }
+  if (config.initializeFrom && (config.resume || config.fineTuneCheckpoint)) throw new Error('Use pretrained weight initialization, resume, or frozen-base expansion separately.');
   if (Boolean(config.fineTuneCheckpoint) !== Boolean(config.fineTunePatternSet)) {
     throw new Error('fineTuneCheckpoint and fineTunePatternSet must be given together.');
   }
   const root = projectRoot(context);
   const python = vscode.workspace.getConfiguration('clefts').get('pythonPath', 'python');
-  const args = buildTrainingArgs(config);
-  const command = shellDisplay(python, args);
-  output.clear(); output.show(true); output.appendLine(`$ ${command}`);
-  panel.webview.postMessage({ type: 'trainingStatus', status: 'running', text: 'Running training CLI…', command });
-  runningProcess = spawn(python, args, { cwd: root, env: process.env });
-  runningProcess.stdout.on('data', chunk => output.append(chunk.toString()));
-  runningProcess.stderr.on('data', chunk => output.append(chunk.toString()));
-  runningProcess.on('error', error => {
-    runningProcess = undefined;
-    panel.webview.postMessage({ type: 'trainingStatus', status: 'error', text: error.message });
-  });
-  runningProcess.on('close', code => {
-    runningProcess = undefined;
-    panel.webview.postMessage({ type: 'trainingStatus', status: code === 0 ? 'completed' : 'failed', text: code === 0 ? 'Training completed.' : `Training failed with exit code ${code}.` });
-    if (code === 0) vscode.window.showInformationMessage('CLEFTS fragment tree training completed.');
-  });
+  await workbench.startTraining(context, panel, output, root, python, config, buildTrainingArgs);
+
 }
 
 async function runFragmentTree(context, output, config, panel) {
   if (runningProcess) throw new Error('Another CLEFTS process is already running.');
-  for (const key of ['input', 'params', 'outputDir']) if (!config[key]) throw new Error(`${key} is required.`);
+  for (const key of ['input', 'outputDir']) if (!config[key]) throw new Error(`${key} is required.`);
   const root = projectRoot(context);
   const python = vscode.workspace.getConfiguration('clefts').get('pythonPath', 'python');
   await fs.promises.mkdir(config.outputDir, { recursive: true });
@@ -361,37 +370,55 @@ async function runFragmentTree(context, output, config, panel) {
   output.clear(); output.show(true); output.appendLine(`$ ${command}`);
   panel.webview.postMessage({ type: 'status', status: 'running', text: 'Running CLI…', command });
   const startedAt = new Date().toISOString();
-  runningProcess = spawn(python, args, { cwd: root, env: process.env });
-  runningProcess.stdout.on('data', chunk => output.append(chunk.toString()));
-  runningProcess.stderr.on('data', chunk => output.append(chunk.toString()));
+  runningProcess = spawn(python, args, { cwd: root, detached:process.platform!=='win32', env: { ...process.env, PYTHONUNBUFFERED:'1', PYTHONPATH:[root,process.env.PYTHONPATH].filter(Boolean).join(path.delimiter) } });
+  const observed=workbench.observeJob(context,{type:'preparation',name:path.basename(config.outputDir),outputDir:config.outputDir,child:runningProcess,detached:process.platform!=='win32',command:[python,...args]});
+  const stream=chunk=>{const text=chunk.toString();observed.log(text);output.append(text);panel.webview.postMessage({type:'data/log',text});};
+  runningProcess.stdout.on('data', stream);
+  runningProcess.stderr.on('data', stream);
   runningProcess.on('error', async error => {
+    observed.finish({error:error.message});
     runningProcess = undefined;
     panel.webview.postMessage({ type: 'status', status: 'error', text: error.message });
   });
-  runningProcess.on('close', async code => {
+  runningProcess.on('close', async (code,signal) => {
     runningProcess = undefined;
-    const status = code === 0 ? 'completed' : 'failed';
+    observed.finish({code,signal});
+    const status = observed.job.status;
     if (code === 0) {
       await fs.promises.writeFile(resultPath, JSON.stringify({
         status: 'completed', application: 'fragment-tree-data-preparation',
-        finishedAt: startedAt, exitCode: code, command: args
+        startedAt, finishedAt: new Date().toISOString(), exitCode: code, command: args
       }, null, 2) + '\n');
     }
-    panel.webview.postMessage({ type: 'status', status, text: code === 0 ? 'Completed.' : `Failed with exit code ${code}.`, resultPath });
+    panel.webview.postMessage({ type: 'status', status, text: signal ? 'Cancelled.' : code === 0 ? 'Completed.' : `Failed with exit code ${code}.`, resultPath });
     if (code === 0) vscode.window.showInformationMessage('CLEFTS fragment tree data preparation completed.', 'Open Train Result').then(choice => { if (choice) openResult(vscode.Uri.file(resultPath)); });
   });
 }
 
 function buildArgs(c) {
-  return ['-m', 'clefts.ml.data_preparation.fragment_tree.create_training_data',
-    '--input', c.input, '--params', c.params, '--output-dir', c.outputDir];
+  const args=['-m', 'clefts.cli', 'train', 'create-fragment-tree-data',
+    '--input', c.input || c.trainInput, '--output-dir', c.outputDir];
+  if(c.modelConfig || c.fragmenterParams) args.push('--params-json',JSON.stringify(c.modelConfig || c.fragmenterParams));
+  else if(c.params) args.push('--params',c.params);
+  if(c.symbols)args.push('--symbols-json',JSON.stringify(c.symbols));
+  for(const [key,flag]of Object.entries({maxNode:'--max-node',maxEdge:'--max-edge'}))if(c[key]!==undefined)args.push(flag,String(c[key]));
+  for(const [key,flag] of Object.entries({smilesColumn:'--smiles-column',adductTypeColumn:'--adduct-type-column',collisionEnergyColumn:'--collision-energy-column',precursorMzColumn:'--precursor-mz-column'}))if(c[key])args.push(flag,c[key]);
+  if(c.validationInput) args.push('--validation-input',c.validationInput);
+  else if(c.validationRatio !== undefined && c.validationRatio !== '') args.push('--validation-ratio',String(c.validationRatio));
+  for(const [key,flag] of Object.entries({validationSeed:'--validation-seed',minimumRelativeIntensity:'--minimum-relative-intensity',numWorkers:'--num-workers',chunkSize:'--chunk-size'}))if(c[key] !== undefined && c[key] !== '')args.push(flag,String(c[key]));
+  for(const [key,flag] of Object.entries({normalizeIntensities:'--normalize-intensities',overwrite:'--overwrite'}))if(c[key]!==undefined)args.push(flag,c[key]?'1':'0');
+  return args;
 }
 
 function buildTrainingArgs(c) {
-  const a = ['-m', 'clefts.ml.training.fragment_tree_training.training',
-    '--params', c.params, '--train-dir', c.trainDir, '--val-dir', c.valDir, '--output-dir', c.outputDir,
+  const a = ['-m', 'clefts.cli', 'train', 'fragment-tree',
+    '--train-dir', c.trainDir, '--val-dir', c.valDir, '--output-dir', c.outputDir,
     '--epochs', String(c.epochs || 1), '--batch-size', String(c.batchSize || 4),
     '--device', c.device || 'cpu', '--lr', String(c.lr ?? 0.0001)];
+  if(c.modelConfig) a.push('--params-json',JSON.stringify(c.modelConfig));
+  else if(c.params) a.push('--params',c.params);
+  for (const [key, flag] of Object.entries(workbench.trainingFlags)) if (c[key] !== undefined && c[key] !== '') a.push(flag, String(c[key]));
+  if (c.initializeFrom) a.push('--initialize-from', c.initializeFrom);
   if (c.resume) a.push('--resume', c.resume);
   if (c.fineTuneCheckpoint) a.push('--fine-tune-checkpoint', c.fineTuneCheckpoint, '--fine-tune-pattern-set', c.fineTunePatternSet, '--adapter-width', String(c.adapterWidth || 8));
   return a;
@@ -613,6 +640,7 @@ const HELP = {
   keepParallelTemp: 'Keep temporary parallel-processing files after merging.'
   ,trainDir: 'Directory containing generated training structures and preprocessing_config.pftprep.json.',
   valDir: 'Directory containing generated validation structures with compatible preprocessing settings.',
+  initializeFrom: 'Initialize compatible Source-anchored model weights for fine-tuning with a fresh optimizer.',
   molEncoderCheckpoint: 'Pretrained molecular encoder checkpoint used by FragmentTreeFeatureModel.',
   conditionAdductEmbeddingDim: 'Width of the learned main-adduct embedding.',
   conditionCeFeatureDim: 'Fixed feature width produced from collision energy.',
@@ -656,30 +684,27 @@ const HELP = {
   ,modelPath: 'Trained fragment-tree model checkpoint (model.pt or a raw state_dict) used for spectrum prediction.'
 };
 
-function workbenchHtml(config, trainingConfig) {
-  return `<!doctype html><html><head><meta charset="UTF-8"><style>${commonCss()}${formCss()}${trainingCss()}${pathDrop.css()}.selection-lasso{stroke:#fff}</style></head><body><main>
-  <header><div><span class="eyebrow">CLEFTS PLATFORM</span><h1>Workbench</h1><p id="appSubtitle" class="muted">Fragment Tree Data Preparation</p></div><div class="actions"><button id="openEvaluation" class="primary">Evaluation</button><div id="dataActions" class="actions"><button id="openResult">Open Result</button><button id="load">Load Configuration</button><button id="save">Save Configuration</button></div></div></header>
-  <nav><button class="tab" data-app="smarts">SMARTS Search</button><button class="tab" data-app="cleavage">Cleavage Pattern Set</button><button class="tab active" data-app="data">Data Preparation</button><button class="tab" data-app="training">Training</button><button class="tab" data-app="metrics">Metrics</button><button class="tab" data-app="finetune">Fine-tuning</button><button class="tab" data-app="predict">Predict Spectrum</button></nav>
+function workbenchHtml(config, trainingConfig, predictionConfig = {}) {
+  return `<!doctype html><html><head><meta charset="UTF-8"><style>${commonCss()}${formCss()}${trainingCss()}${pathDrop.css()}${workbench.css()}${parameterEditor.css()}.selection-lasso{stroke:#fff}</style></head><body><main>
+  ${layout.header()}
+  ${workbench.html()}<nav id="legacyNavigation"><button class="tab" data-app="smarts">SMARTS Search</button><button class="tab" data-app="cleavage">Cleavage Pattern Set</button><button class="tab active" data-app="data">Data Preparation</button><button class="tab" data-app="training">Training</button><button class="tab" data-app="metrics">Metrics</button><button class="tab" data-app="finetune">Fine-tuning</button><button class="tab" data-app="predict">Predict Spectrum</button></nav>
   ${trainingMetrics.html()}
   ${fineTune.html()}
   ${smartsSearch.html()}
-  <div id="cleavageApp" hidden><section><div class="section-title"><div><h2>Cleavage Pattern Set Configuration</h2><p id="cleavagePath" class="muted">Not saved</p></div><div class="actions"><button type="button" id="loadCleavage">Load Configuration</button><button type="button" id="saveCleavage">Save Configuration</button></div></div><label>Pattern set name<input id="cleavageSetName" placeholder="single_bond_cleavage_pattern_set"></label></section><section id="visualBuilder" hidden><div class="section-title"><div><h2>Visual Pattern Builder</h2><p class="muted">Click or right-click items individually, or hold either mouse button and draw a loop around atoms and bonds.</p></div><div class="actions"><button type="button" id="clearSelection">Clear all</button><button type="button" id="closeBuilder">Close</button></div></div><div class="row"><label class="grow">Source SMILES<input id="builderSmiles" placeholder="O=c1cc(-c2ccc(O)cc2)oc2cc(O)cc(O)c12"></label><button type="button" id="drawMolecule" class="primary">Draw Structure</button></div><div id="moleculeCanvas" class="molecule-canvas"></div><div class="builder-columns"><div><h3>Atom queries</h3><div id="atomConstraints" class="query-list"></div></div><div><h3>Bond queries</h3><div id="bondConstraints" class="query-list"></div></div></div><label>Pattern name<input id="builderPatternName" placeholder="flavonoid_substructure"></label><div class="actions"><button type="button" id="applyReactant" class="primary">Apply Reactant</button></div><div id="productBuilder" hidden><h3>Product Structure</h3><p class="muted">Draw an independent product skeleton from SMILES or SMARTS. Atoms are shown as mapping numbers; select an atom to change its number, or select a bond to change its type.</p><div class="row"><label class="grow">Product<select id="builderProductSelect"><option value="-1">New product</option></select></label><button type="button" id="newVisualProduct">New Product</button></div><div class="row"><label>Input type<select id="builderProductSourceType"><option value="smiles">SMILES</option><option value="smarts">SMARTS</option></select></label><label class="grow">Product SMILES / SMARTS<input id="builderProductSource" placeholder="O=c1ccccc1"></label><button type="button" id="drawProduct" class="primary">Draw Product</button></div><label class="check"><input type="checkbox" id="allowProductAtomTypes">Allow atom type changes</label><div id="productCanvas" class="molecule-canvas product-canvas"></div><div id="productAtomTools" class="bond-tools"><span>Click an atom to edit its mapping number.</span></div><div id="productBondTools" class="bond-tools"><span>Click a bond to edit its type.</span></div><label>Product name<input id="builderProductName" placeholder="fragment_product"></label><button type="button" id="applyProduct" class="primary">Add Product</button></div></section><div id="cleavagePatterns"></div><div class="actions"><button type="button" id="addCleavagePattern" class="primary">Add Pattern</button><button type="button" id="addVisualPattern">Add Pattern Visually</button><button type="button" id="loadSinglePattern">Load Pattern</button></div></div>
-  <form id="form" data-app-panel="data">
-    <section><h2>Input and Output</h2><p class="muted">Regenerates schema-v5 action training structures directly from an original MSDataset (clefts.ml.data_preparation.fragment_tree.create_training_data).</p>${pathField('input','Input MSDataset *','file')}${pathField('params','Model config JSON *','file')}${pathField('outputDir','Output directory *','folder')}</section>
-    <footer><div><div id="status" class="status idle">Ready</div><code id="command"></code></div><div class="actions"><button type="button" id="copyCommand">Copy Command</button><button type="button" id="stop" disabled>Stop</button><button type="submit" class="primary">Run</button></div></footer>
-  </form>
+  <div id="cleavageApp" hidden><section><div class="section-title"><div><h2>Cleavage Pattern Set Configuration</h2><p id="cleavagePath" class="muted">Not saved</p></div><div class="actions"><button type="button" id="applyParameterPatterns" hidden>Apply Patterns to Parameters</button><button type="button" id="loadCleavage">Load Configuration</button><button type="button" id="saveCleavage">Save Configuration</button></div></div><label>Pattern set name<input id="cleavageSetName" placeholder="single_bond_cleavage_pattern_set"></label></section><section id="visualBuilder" hidden><div class="section-title"><div><h2>Visual Pattern Builder</h2><p class="muted">Click or right-click items individually, or hold either mouse button and draw a loop around atoms and bonds.</p></div><div class="actions"><button type="button" id="clearSelection">Clear all</button><button type="button" id="closeBuilder">Close</button></div></div><div class="row"><label class="grow">Source SMILES<input id="builderSmiles" placeholder="O=c1cc(-c2ccc(O)cc2)oc2cc(O)cc(O)c12"></label><button type="button" id="drawMolecule" class="primary">Draw Structure</button></div><div id="moleculeCanvas" class="molecule-canvas"></div><div class="builder-columns"><div><h3>Atom queries</h3><div id="atomConstraints" class="query-list"></div></div><div><h3>Bond queries</h3><div id="bondConstraints" class="query-list"></div></div></div><label>Pattern name<input id="builderPatternName" placeholder="flavonoid_substructure"></label><div class="actions"><button type="button" id="applyReactant" class="primary">Apply Reactant</button></div><div id="productBuilder" hidden><h3>Product Structure</h3><p class="muted">Draw an independent product skeleton from SMILES or SMARTS. Atoms are shown as mapping numbers; select an atom to change its number, or select a bond to change its type.</p><div class="row"><label class="grow">Product<select id="builderProductSelect"><option value="-1">New product</option></select></label><button type="button" id="newVisualProduct">New Product</button></div><div class="row"><label>Input type<select id="builderProductSourceType"><option value="smiles">SMILES</option><option value="smarts">SMARTS</option></select></label><label class="grow">Product SMILES / SMARTS<input id="builderProductSource" placeholder="O=c1ccccc1"></label><button type="button" id="drawProduct" class="primary">Draw Product</button></div><label class="check"><input type="checkbox" id="allowProductAtomTypes">Allow atom type changes</label><div id="productCanvas" class="molecule-canvas product-canvas"></div><div id="productAtomTools" class="bond-tools"><span>Click an atom to edit its mapping number.</span></div><div id="productBondTools" class="bond-tools"><span>Click a bond to edit its type.</span></div><label>Product name<input id="builderProductName" placeholder="fragment_product"></label><button type="button" id="applyProduct" class="primary">Add Product</button></div></section><div id="cleavagePatterns"></div><div class="actions"><button type="button" id="addCleavagePattern" class="primary">Add Pattern</button><button type="button" id="addVisualPattern">Add Pattern Visually</button><button type="button" id="loadSinglePattern">Load Pattern</button></div></div>
+  ${preparation.html()}
   <form id="trainingForm" data-app-panel="training" hidden>
-    <section><div class="section-title"><div><h2>Source-anchored action training</h2><p class="muted">Trains ActionFragmentTreeTrainingModel from schema-v5 .preft.pt structures produced by Data Preparation.</p></div><div class="actions"><button type="button" id="loadTraining">Load Configuration</button><button type="button" id="saveTraining">Save Configuration</button></div></div>${pathField('params','Model config JSON *','file','training')}${pathField('trainDir','Training structures directory *','folder','training')}${pathField('valDir','Validation structures directory *','folder','training')}${pathField('outputDir','Model output directory *','folder','training')}<div class="grid">${field('epochs','Epochs','number')}${field('batchSize','Batch size','number')}<label>Device<select name="device"><option value="cpu">cpu</option><option value="cuda">cuda</option></select></label>${field('lr','Learning rate','number','any')}</div>${pathField('resume','Resume checkpoint (optional)','file','training')}</section>
-    <section><h2>Fine-tuning (optional)</h2><p class="muted">Fill in both fields to expand a frozen base checkpoint with a new cleavage pattern set instead of training from scratch. The model config above must already carry the expanded fragmenter_params, and the training/validation structures above must be regenerated with that same config.</p>${pathField('fineTuneCheckpoint','Base checkpoint','file','training')}${pathField('fineTunePatternSet','New complete Cleavage Pattern Set','file','training')}${field('adapterWidth','Adapter width','number')}</section>
+    <section><div class="section-title"><div><h2>Source-anchored action training</h2><p class="muted">Trains ActionFragmentTreeTrainingModel from schema-v5 .preft.pt structures produced by Data Preparation.</p></div><div class="actions"><button type="button" id="loadTraining">Load Configuration</button><button type="button" id="saveTraining">Save Configuration</button></div></div>${pathField('trainDir','Training structures directory *','folder','training')}${pathField('valDir','Validation structures directory *','folder','training')}${pathField('outputDir','Model output directory *','folder','training')}<div class="grid">${field('epochs','Epochs','number')}${field('batchSize','Batch size','number')}<label>Device<select name="device"><option value="cpu">cpu</option><option value="cuda">cuda</option></select></label>${field('lr','Learning rate','number','any')}</div>${pathField('initializeFrom','Pretrained checkpoint for fine-tuning (optional)','file','training')}${pathField('resume','Resume checkpoint (optional)','file','training')}</section>${workbench.trainingHtml()}${workbenchDefaults.html('training')}${parameterEditor.importHtml('training')}
+    <section><button type="button" id="trainingFineTuneToggle" aria-expanded="false">Advanced Fine-tuning Settings</button><div id="trainingFineTuneFields" hidden><h2>Fine-tuning (optional)</h2><p class="muted">Fill in both fields to expand a frozen base checkpoint with a new cleavage pattern set instead of training from scratch. The model config above must already carry the expanded fragmenter_params, and the training/validation structures above must be regenerated with that same config.</p>${pathField('fineTuneCheckpoint','Base checkpoint','file','training')}${pathField('fineTunePatternSet','New complete Cleavage Pattern Set','file','training')}${field('adapterWidth','Adapter width','number')}</div></section>
     <footer><div><div id="trainingStatus" class="status idle">Ready</div><code id="trainingCommand"></code></div><div class="actions"><button type="button" id="trainingCopyCommand">Copy Command</button><button type="button" id="trainingStop" disabled>Stop</button><button type="submit" class="primary">Run Training</button></div></footer>
   </form>
   <form id="predictForm" data-app-panel="predict" hidden>
     <section><h2>Model</h2><p class="muted">Points at a checkpoint produced by fragment-tree training (a full <code>model.pt</code>, or a raw generator state_dict). Apply it to load its trained main adduct types before specifying a molecule.</p>${pathField('modelPath','Model checkpoint *','file','predict')}<label>Device<select name="device"><option value="cpu">cpu</option><option value="cuda">cuda</option><option value="mps">mps</option></select></label><div class="actions"><button type="button" id="predictApplyModel" class="primary">Apply Model</button></div><div id="predictModelStatus" class="status idle">No model applied yet.</div></section>
-    ${spectrumPrediction.html()}
+    ${spectrumPrediction.html()}${workbenchDefaults.html('prediction')}
     <section><h2>Molecule and conditions</h2><label>SMILES *<input name="smiles" placeholder="CC(=O)Oc1ccccc1C(=O)O"></label><div class="grid">${field('ce','Collision energy (eV) *','text')}<label>Adduct type *<select name="adductType"><option value="">Apply a model first…</option></select></label></div><div class="actions"><button type="button" id="predictPreview">Preview Molecule</button></div><div id="predictMoleculePreview" class="molecule-preview" hidden></div></section>
     <section id="predictResultSection" hidden><h2>Predicted Spectrum</h2><div id="predictResult"></div></section>
     <footer><div><div id="predictStatus" class="status idle">Ready</div></div><div class="actions"><button type="submit" class="primary" id="predictSubmit">Predict Spectrum</button></div></footer>
-  </form><div id="helpTooltip" role="tooltip"></div><script>const vscode=acquireVsCodeApi(); const initial=${safeJson(config)}; const initialTraining=${safeJson(trainingConfig)}; ${webviewScript()}${spectrumPrediction.script()}${pathDrop.script()}</script></main></body></html>`;
+  </form><div id="helpTooltip" role="tooltip"></div><script>const vscode=acquireVsCodeApi(); const initial=${safeJson(config)}; const initialTraining=${safeJson(trainingConfig)};const initialPrediction=${safeJson(predictionConfig)}; ${webviewScript()}${spectrumPrediction.script()}${pathDrop.script()}${workbench.script()}${parameterEditor.script()}${layout.script()}${datasetUpload.script()}${preparation.script()}${workbenchDefaults.script()}</script></main></body></html>`;
 }
 function pathField(name,label,kind,form='data') { return `<label data-help="${HELP[name] || ''}">${label}<div class="path"><input name="${name}" data-path-kind="${kind}"><button type="button" data-pick="${name}" data-kind="${kind}" data-form="${form}">Browse</button></div>${HELP[name]?`<small class="field-help">${HELP[name]}</small>`:''}</label>`; }
 function field(name,label,type,step='1') { return `<label data-help="${HELP[name] || ''}">${label}<input name="${name}" type="${type}"${type==='number'?` step="${step}"`:''}>${HELP[name]?`<small class="field-help">${HELP[name]}</small>`:''}</label>`; }
@@ -700,8 +725,8 @@ function webviewScript() { return `
     function getTrainingConfig(){return readForm(trainingForm,'fragment-tree-training')}
     const tooltip=document.getElementById('helpTooltip'); let tooltipTimer;
     document.querySelectorAll('[data-help]').forEach(el=>{el.addEventListener('mouseenter',()=>{tooltipTimer=setTimeout(()=>{const r=el.getBoundingClientRect();tooltip.textContent=el.dataset.help;tooltip.style.left=Math.min(r.left,window.innerWidth-390)+'px';tooltip.style.top=(r.bottom+7)+'px';tooltip.classList.add('visible');},500);});el.addEventListener('mouseleave',()=>{clearTimeout(tooltipTimer);tooltip.classList.remove('visible');});});
-    setConfig(initial);setFormConfig(trainingForm,initialTraining);setPredictEnabled(false); document.querySelectorAll('[data-pick]').forEach(b=>b.onclick=()=>vscode.postMessage({type:'pick',form:b.dataset.form||'data',field:b.dataset.pick,kind:b.dataset.kind}));
-    document.querySelectorAll('[data-app]').forEach(button=>button.onclick=()=>{document.querySelectorAll('[data-app]').forEach(x=>x.classList.toggle('active',x===button));const app=button.dataset.app;document.getElementById('metricsApp').hidden=app!=='metrics';document.getElementById('fineTuneApp').hidden=app!=='finetune';document.getElementById('smartsApp').hidden=app!=='smarts';document.getElementById('cleavageApp').hidden=app!=='cleavage';form.hidden=app!=='data';trainingForm.hidden=app!=='training';predictForm.hidden=app!=='predict';document.getElementById('dataActions').hidden=app!=='data';document.getElementById('appSubtitle').textContent=app==='metrics'?'Training Metrics':app==='finetune'?'Fragment Tree Fine-tuning':app==='smarts'?'SMARTS Search':app==='cleavage'?'Cleavage Pattern Set Editor':app==='training'?'Fragment Tree Training':app==='predict'?'Predict Spectrum':'Fragment Tree Data Preparation';});
+    setConfig(initial);setFormConfig(trainingForm,initialTraining);setFormConfig(predictForm,initialPrediction);if(initialPrediction.adductType)predictForm.elements.adductType.dataset.restoreValue=initialPrediction.adductType;setPredictEnabled(false); document.querySelectorAll('[data-pick]').forEach(b=>b.onclick=()=>vscode.postMessage({type:'pick',form:b.dataset.form||'data',field:b.dataset.pick,kind:b.dataset.kind}));
+    document.querySelectorAll('[data-app]').forEach(button=>button.onclick=()=>{document.querySelectorAll('[data-app]').forEach(x=>x.classList.toggle('active',x===button));const app=button.dataset.app;document.getElementById('homePage').hidden=true;document.getElementById('jobPage').hidden=true;document.getElementById('environmentPage').hidden=true;document.getElementById('metricsApp').hidden=app!=='metrics';document.getElementById('fineTuneApp').hidden=app!=='finetune';document.getElementById('smartsApp').hidden=app!=='smarts';document.getElementById('cleavageApp').hidden=app!=='cleavage';form.hidden=app!=='data';trainingForm.hidden=app!=='training';predictForm.hidden=app!=='predict';document.getElementById('dataActions').hidden=app!=='data';document.getElementById('appSubtitle').textContent=app==='metrics'?'Training Metrics':app==='finetune'?'Fragment Tree Fine-tuning':app==='smarts'?'SMARTS Search':app==='cleavage'?'Cleavage Pattern Set Editor':app==='training'?'Fragment Tree Training':app==='predict'?'Predict Spectrum':'Fragment Tree Data Preparation';});
     document.getElementById('save').onclick=()=>vscode.postMessage({type:'saveConfig',config:getConfig()}); document.getElementById('load').onclick=()=>vscode.postMessage({type:'loadConfig'}); document.getElementById('openResult').onclick=()=>vscode.postMessage({type:'openResult'}); document.getElementById('openEvaluation').onclick=()=>vscode.postMessage({type:'openEvaluation'});
     function renderCleavage(){document.getElementById('cleavageSetName').value=cleavageModel.cleavage_pattern_set.name;document.getElementById('cleavagePatterns').innerHTML=cleavageModel.cleavage_pattern_set.patterns.map((p,pi)=>\`<section class="pattern-card"><div class="section-title"><h2>Pattern \${pi+1}</h2><div class="actions"><button type="button" data-edit-visual="\${pi}">Edit Visually</button><button type="button" data-load-pattern="\${pi}">Load</button><button type="button" data-save-pattern="\${pi}">Save</button><button type="button" class="danger" data-remove-pattern="\${pi}">Remove Pattern</button></div></div><div class="grid"><label>Pattern name<input data-pattern="\${pi}" data-key="name" value="\${htmlEscape(p.name)}" placeholder="single_bond_cleavage"></label><label>Reactant SMARTS<input data-pattern="\${pi}" data-key="reactant_smarts" value="\${htmlEscape(p.reactant_smarts)}" placeholder="[!#1:1]-[!#1:2]"></label></div><div class="section-title product-title"><h3>Products</h3><button type="button" data-add-product="\${pi}">Add Product</button></div><div class="product-list">\${p.products.map((product,xi)=>\`<div class="product-row"><label>Product name<input data-pattern="\${pi}" data-product="\${xi}" data-key="name" value="\${htmlEscape(product.name)}"></label><label>Product SMARTS<input data-pattern="\${pi}" data-product="\${xi}" data-key="smarts" value="\${htmlEscape(product.smarts)}" placeholder="[!#1:1]"></label><button type="button" class="danger" data-remove-product="\${pi}:\${xi}">Remove</button></div>\`).join('')}</div></section>\`).join('');}
     document.getElementById('cleavageSetName').oninput=e=>cleavageModel.cleavage_pattern_set.name=e.target.value;document.getElementById('addCleavagePattern').onclick=()=>{cleavageModel.cleavage_pattern_set.patterns.push({name:'',reactant_smarts:'',products:[]});renderCleavage()};
@@ -781,12 +806,14 @@ function webviewScript() { return `
     function resetPredictModelState(){document.getElementById('predictModelStatus').textContent='Model checkpoint changed — apply it again to refresh adduct types.';document.getElementById('predictModelStatus').className='status idle';renderAdductOptions([]);predictForm.elements.adductType.innerHTML='<option value="">Apply a model first…</option>';setPredictEnabled(false);}
     document.getElementById('predictApplyModel').onclick=async()=>{const modelPath=predictForm.elements.modelPath.value.trim(),device=predictForm.elements.device.value,modelStatusEl=document.getElementById('predictModelStatus');if(!modelPath){modelStatusEl.textContent='Model checkpoint path is required.';modelStatusEl.className='status error';return}modelStatusEl.textContent='Loading model…';modelStatusEl.className='status running';setPredictEnabled(false);try{const result=await listPredictAdductsRequest({modelPath,device});renderAdductOptions(result.adducts);modelStatusEl.textContent='Model applied. '+result.adducts.length+' main adduct type(s) available.';modelStatusEl.className='status completed';setPredictEnabled(true);}catch(error){modelStatusEl.textContent=String(error.message||error);modelStatusEl.className='status error';setPredictEnabled(false);}};
     predictForm.elements.modelPath.addEventListener('input',resetPredictModelState);
-    function spectrumSvg(peaks){if(!peaks.length)return '<p class="muted">No peaks were predicted.</p>';const maxMz=Math.max(...peaks.map(p=>p.mz))*1.05,maxIntensity=Math.max(...peaks.map(p=>p.intensity))||1,width=900,height=260,padL=55,padB=30,padT=12,padR=20,x=mz=>padL+(mz/maxMz)*(width-padL-padR),y=intensity=>height-padB-(intensity/maxIntensity)*(height-padT-padB);const bars=peaks.map(p=>'<line class="spectrum-bar" x1="'+x(p.mz)+'" x2="'+x(p.mz)+'" y1="'+y(0)+'" y2="'+y(p.intensity)+'"><title>m/z '+p.mz.toFixed(4)+' · intensity '+p.intensity.toPrecision(4)+(p.formula?(' · '+p.formula):'')+'</title></line>').join('');const ticks=[0,.25,.5,.75,1].map(f=>'<text x="'+x(maxMz*f)+'" y="'+(height-8)+'" text-anchor="middle" class="spectrum-tick">'+(maxMz*f).toFixed(0)+'</text>').join('');return '<svg class="spectrum-chart" viewBox="0 0 '+width+' '+height+'"><line x1="'+padL+'" y1="'+padT+'" x2="'+padL+'" y2="'+y(0)+'" class="spectrum-axis"/><line x1="'+padL+'" y1="'+y(0)+'" x2="'+(width-padR)+'" y2="'+y(0)+'" class="spectrum-axis"/>'+bars+ticks+'</svg>'}
+    function spectrumSvg(peaks,width=900,height=260){if(!peaks.length)return '<p class="muted">No peaks were predicted.</p>';const maxMz=Math.max(...peaks.map(p=>p.mz))*1.05,maxIntensity=Math.max(...peaks.map(p=>p.intensity))||1,padL=55,padB=30,padT=12,padR=20,x=mz=>padL+(mz/maxMz)*(width-padL-padR),y=intensity=>height-padB-(intensity/maxIntensity)*(height-padT-padB);const bars=peaks.map(p=>'<line class="spectrum-bar" x1="'+x(p.mz)+'" x2="'+x(p.mz)+'" y1="'+y(0)+'" y2="'+y(p.intensity)+'"><title>m/z '+p.mz.toFixed(4)+' · intensity '+p.intensity.toPrecision(4)+(p.formula?(' · '+p.formula):'')+'</title></line>').join('');const ticks=[0,.25,.5,.75,1].map(f=>'<text x="'+x(maxMz*f)+'" y="'+(height-8)+'" text-anchor="middle" class="spectrum-tick">'+(maxMz*f).toFixed(0)+'</text>').join('');return '<svg class="spectrum-chart" viewBox="0 0 '+width+' '+height+'"><line x1="'+padL+'" y1="'+padT+'" x2="'+padL+'" y2="'+y(0)+'" class="spectrum-axis"/><line x1="'+padL+'" y1="'+y(0)+'" x2="'+(width-padR)+'" y2="'+y(0)+'" class="spectrum-axis"/>'+bars+ticks+'</svg>'}
     function peakTable(peaks){return '<table><thead><tr><th>#</th><th>m/z</th><th>intensity</th><th>formula</th></tr></thead><tbody>'+peaks.map((p,i)=>'<tr><td>'+(i+1)+'</td><td>'+p.mz.toFixed(6)+'</td><td>'+p.intensity.toPrecision(5)+'</td><td>'+htmlEscape(p.formula||'')+'</td></tr>').join('')+'</tbody></table>'}
     let lastPredictTree=null;
     function predictTreeSvg(tree){if(!tree||!tree.nodes.length)return '<p class="muted">No fragment tree was produced.</p>';const detectedNodes=new Set(tree.nodes.filter(n=>n.annotations&&n.annotations.length).map(n=>n.id)),depth=new Map(tree.nodes.map(n=>[n.id,Math.max(0,n.depth)]));const levels={};for(const n of tree.nodes)(levels[depth.get(n.id)]||(levels[depth.get(n.id)]=[])).push(n);for(const nodes of Object.values(levels))nodes.sort((a,b)=>a.id-b.id);const maxDepth=Math.max(...depth.values(),1),width=Math.max(900,(maxDepth+1)*220),maxRows=Math.max(...Object.values(levels).map(x=>x.length)),height=Math.max(240,maxRows*58+50),pos=new Map();for(const [d,nodes] of Object.entries(levels))nodes.forEach((n,i)=>pos.set(n.id,{x:45+Number(d)/maxDepth*(width-90),y:30+(i+1)*(height-40)/(nodes.length+1)}));const lines=tree.edges.map(e=>{const a=pos.get(e.source),b=pos.get(e.target);return '<line class="tree-edge" x1="'+a.x+'" y1="'+a.y+'" x2="'+b.x+'" y2="'+b.y+'"><title>edge '+e.id+'</title></line>'}).join('');const nodes=tree.nodes.map(n=>{const p=pos.get(n.id);return '<g class="tree-node '+(detectedNodes.has(n.id)?'detected':'')+'" data-node="'+n.id+'" transform="translate('+p.x+' '+p.y+')"><circle r="13"><title>'+htmlEscape(n.smiles)+'</title></circle><text text-anchor="middle" dominant-baseline="central">'+n.id+'</text></g>'}).join('');return '<div class="tree-scroll"><svg class="fragment-tree" viewBox="0 0 '+width+' '+height+'">'+lines+nodes+'</svg></div>'}
     document.getElementById('predictPreview').onclick=async()=>{const smiles=predictForm.elements.smiles.value.trim(),adductType=predictForm.elements.adductType.value.trim(),box=document.getElementById('predictMoleculePreview');if(!smiles){box.hidden=true;return}try{const result=await chemistry('depict',{smiles,adducts:adductType?[adductType]:[],usedAdduct:adductType});box.hidden=false;const row=result.adducts[0];box.innerHTML='<div>'+result.svg+'</div><dl><dt>Formula</dt><dd>'+htmlEscape(result.formula)+'</dd><dt>Exact mass</dt><dd>'+result.exactMass.toFixed(6)+'</dd>'+(row?'<dt>Precursor m/z ('+htmlEscape(row.adduct)+')</dt><dd>'+(row.error?('<span class="warning">'+htmlEscape(row.error)+'</span>'):row.mz.toFixed(6))+'</dd>':'')+'</dl>'}catch(e){box.hidden=false;box.innerHTML='<p class="warning">'+htmlEscape(e.message||String(e))+'</p>'}};
-    predictForm.onsubmit=async e=>{e.preventDefault();const modelPath=predictForm.elements.modelPath.value.trim(),smiles=predictForm.elements.smiles.value.trim(),ce=predictForm.elements.ce.value.trim(),adductType=predictForm.elements.adductType.value.trim(),device=predictForm.elements.device.value,predictStatusEl=document.getElementById('predictStatus'),resultSection=document.getElementById('predictResultSection'),resultBox=document.getElementById('predictResult');if(!modelPath||!smiles||!ce||!adductType){predictStatusEl.textContent='Model checkpoint, SMILES, collision energy, and adduct type are required.';predictStatusEl.className='status error';return}predictStatusEl.textContent='Predicting… this can take a while for large models.';predictStatusEl.className='status running';lastPredictTree=null;try{const result=await predictSpectrumRequest({modelPath,smiles,ce,adductType,device});predictStatusEl.textContent='Predicted '+result.peaks.length+' peaks.';predictStatusEl.className='status completed';resultSection.hidden=false;lastPredictTree=result.tree;resultBox.innerHTML='<div class="predict-layout"><div>'+spectrumSvg(result.peaks)+peakTable(result.peaks)+'<h3>Fragment Tree</h3><p class="muted">Circles are candidate fragments explored while predicting. Accent-colored fragments back at least one predicted peak. Click a fragment to inspect its structure.</p>'+predictTreeSvg(result.tree)+'<div id="predictFragmentDetail" hidden></div></div><aside class="predict-side"><div class="molecule-preview">'+result.svg+'</div><dl><dt>Formula</dt><dd>'+htmlEscape(result.formula)+'</dd><dt>Exact mass</dt><dd>'+result.exactMass.toFixed(6)+'</dd><dt>Adduct</dt><dd>'+htmlEscape(result.adduct)+'</dd><dt>Precursor m/z</dt><dd>'+result.precursorMz.toFixed(6)+'</dd></dl></aside></div>'}catch(error){predictStatusEl.textContent=String(error.message||error);predictStatusEl.className='status error';resultSection.hidden=true}};
+    function renderPredictionResult(result){const resultSection=document.getElementById('predictResultSection'),resultBox=document.getElementById('predictResult');document.getElementById('predictStatus').textContent='Predicted '+result.peaks.length+' peaks.';resultSection.hidden=false;lastPredictTree=result.tree;resultBox.innerHTML='<div class="predict-layout"><div>'+spectrumSvg(result.peaks)+peakTable(result.peaks)+'<h3>Fragment Tree</h3><p class="muted">Circles are candidate fragments explored while predicting. Accent-colored fragments back at least one predicted peak. Click a fragment to inspect its structure.</p>'+predictTreeSvg(result.tree)+'<div id="predictFragmentDetail" hidden></div></div><aside class="predict-side"><div class="molecule-preview">'+result.svg+'</div><dl><dt>Formula</dt><dd>'+htmlEscape(result.formula)+'</dd><dt>Exact mass</dt><dd>'+result.exactMass.toFixed(6)+'</dd><dt>Adduct</dt><dd>'+htmlEscape(result.adduct)+'</dd><dt>Precursor m/z</dt><dd>'+result.precursorMz.toFixed(6)+'</dd></dl></aside></div>'}
+    window.addEventListener('message',event=>{if(event.data.type==='workbench/predictionResult')renderPredictionResult(event.data.result);});
+    predictForm.onsubmit=async e=>{e.preventDefault();const modelPath=predictForm.elements.modelPath.value.trim(),smiles=predictForm.elements.smiles.value.trim(),ce=predictForm.elements.ce.value.trim(),adductType=predictForm.elements.adductType.value.trim(),device=predictForm.elements.device.value,predictStatusEl=document.getElementById('predictStatus'),resultSection=document.getElementById('predictResultSection'),resultBox=document.getElementById('predictResult');if(!modelPath||!smiles||!ce||!adductType){predictStatusEl.textContent='Model checkpoint, SMILES, collision energy, and adduct type are required.';predictStatusEl.className='status error';return}predictStatusEl.textContent='Predicting… this can take a while for large models.';predictStatusEl.className='status running';lastPredictTree=null;try{const result=await predictSpectrumRequest({modelPath,smiles,ce,adductType,device});predictStatusEl.textContent='Predicted '+result.peaks.length+' peaks.';predictStatusEl.className='status completed';renderPredictionResult(result)}catch(error){predictStatusEl.textContent=String(error.message||error);predictStatusEl.className='status error';resultSection.hidden=true}};
     document.getElementById('predictResult').addEventListener('click',async e=>{const nodeEl=e.target.closest('[data-node]');if(!nodeEl||!lastPredictTree)return;const nodeId=Number(nodeEl.dataset.node),node=lastPredictTree.nodes.find(n=>n.id===nodeId);if(!node)return;const detail=document.getElementById('predictFragmentDetail');detail.hidden=false;detail.innerHTML='<p class="muted">Loading…</p>';detail.scrollIntoView({behavior:'smooth',block:'nearest'});try{const adducts=(node.annotations||[]).map(a=>a.adduct);const depicted=await chemistry('depict',{smiles:node.smiles,adducts,usedAdduct:adducts[0]||''});const rows=(node.annotations||[]).map(a=>'<tr><td>'+htmlEscape(a.adduct)+'</td><td>'+htmlEscape(a.ionFormula||'')+'</td><td>'+a.peakMz.toFixed(6)+'</td><td>'+a.peakIntensity.toPrecision(4)+'</td><td>'+(a.probability*100).toFixed(1)+'%</td></tr>').join('');detail.innerHTML='<h4>Fragment node '+nodeId+'</h4><div class="predict-layout"><div class="molecule-preview">'+depicted.svg+'</div><div><dl><dt>SMILES</dt><dd>'+htmlEscape(node.smiles)+'</dd><dt>Formula</dt><dd>'+htmlEscape(node.formula)+'</dd><dt>Exact mass</dt><dd>'+node.exactMass.toFixed(6)+'</dd></dl>'+(rows?('<table><thead><tr><th>Adduct</th><th>Ion formula</th><th>m/z</th><th>intensity</th><th>probability</th></tr></thead><tbody>'+rows+'</tbody></table>'):'<p class="muted">This fragment did not directly back a predicted peak.</p>')+'</div></div>'}catch(error){detail.innerHTML='<p class="warning">'+htmlEscape(error.message||String(error))+'</p>'}});
     window.addEventListener('message',e=>{const m=e.data;if(m.type==='picked'){const target=m.form==='training'?trainingForm:m.form==='predict'?predictForm:form;if(target.elements[m.field])target.elements[m.field].value=m.value;if(m.form==='predict'&&m.field==='modelPath')resetPredictModelState()}if(m.type==='config')setConfig(m.config);if(m.type==='trainingConfig')setFormConfig(trainingForm,m.config);if(m.type==='cleavagePatternSet'){cleavageModel=m.value;cleavagePath=m.path;document.getElementById('cleavagePath').textContent=m.path;renderCleavage()}if(m.type==='cleavagePatternSetSaved'){cleavagePath=m.path;document.getElementById('cleavagePath').textContent=m.path}if(m.type==='cleavagePatternLoaded'){if(m.index>=0)cleavageModel.cleavage_pattern_set.patterns[m.index]=m.pattern;else cleavageModel.cleavage_pattern_set.patterns.push(m.pattern);renderCleavage()}if(m.type==='elementSelectionResult'){const atom=elementRequests.get(m.requestId);if(atom!==undefined&&m.elements.length){atomConstraintState[atom].elements=m.elements;atomConstraintState[atom].mode='elements';elementRequests.delete(m.requestId);queryPanels()}}if(m.type==='chemistryResult'){const waiter=chemistryWaiters.get(m.requestId);if(waiter){waiter.resolve(m.result);chemistryWaiters.delete(m.requestId)}}if(m.type==='chemistryError'){const waiter=chemistryWaiters.get(m.requestId);if(waiter){waiter.reject(new Error(m.message));chemistryWaiters.delete(m.requestId)}}if(m.type==='predictSpectrumResult'){const waiter=predictWaiters.get(m.requestId);if(waiter){waiter.resolve(m.result);predictWaiters.delete(m.requestId)}}if(m.type==='predictSpectrumError'){const waiter=predictWaiters.get(m.requestId);if(waiter){waiter.reject(new Error(m.message));predictWaiters.delete(m.requestId)}}if(m.type==='listPredictAdductsResult'){const waiter=predictListWaiters.get(m.requestId);if(waiter){waiter.resolve(m.result);predictListWaiters.delete(m.requestId)}}if(m.type==='listPredictAdductsError'){const waiter=predictListWaiters.get(m.requestId);if(waiter){waiter.reject(new Error(m.message));predictListWaiters.delete(m.requestId)}}if(m.type==='status'){statusEl.textContent=m.text;statusEl.className='status '+m.status;stop.disabled=m.status!=='running';if(m.command)document.getElementById('command').textContent=m.command;}if(m.type==='trainingStatus'){trainingStatusEl.textContent=m.text;trainingStatusEl.className='status '+m.status;trainingStop.disabled=m.status!=='running';if(m.command)document.getElementById('trainingCommand').textContent=m.command;}});`;
 }
@@ -794,5 +821,5 @@ function commonCss() { return `:root{color-scheme:light dark;--accent:#36c5a2;--
 function trainingCss() { return `.model-map{background:color-mix(in srgb,var(--vscode-editor-background) 94%,var(--accent))}.architecture{display:grid;gap:13px;margin-top:15px}.architecture-input,.architecture-merge,.architecture-branches{display:grid;gap:9px}.architecture-branches{grid-template-columns:1fr 1fr 1.35fr}.architecture-modes{display:grid;grid-template-columns:1fr 1fr;gap:12px}.mode{display:grid;grid-template-columns:1fr 1fr;gap:8px;border:1px solid var(--border);border-radius:8px;padding:10px}.mode strong{grid-column:1/-1;font-size:10px;letter-spacing:.14em}.training-mode strong{color:#e9b949}.prediction-mode strong{color:#63a8ff}.architecture button{position:relative;text-align:left;min-height:78px;background:var(--vscode-editor-background)}.architecture button b,.architecture button code,.architecture button span{display:block}.architecture button b{color:var(--accent);margin-bottom:5px}.architecture button code{font-size:11px;margin-bottom:5px;white-space:normal}.architecture button span{font-size:11px;opacity:.68}.architecture button.selected{outline:2px solid var(--accent);background:color-mix(in srgb,var(--accent) 14%,var(--vscode-editor-background))}.architecture-input button::after,.architecture-branches button::after,.architecture-merge button::after{content:'↓';position:absolute;left:50%;bottom:-22px;color:var(--accent);z-index:2;font-size:17px}.model-hint{margin:13px 0 0;font-size:12px;opacity:.75}[data-model-block]{scroll-margin-top:12px;transition:border-color .15s,box-shadow .15s}[data-model-block].selected{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent)}.model-losses{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:12px}.model-losses span:nth-child(odd){padding:8px 11px;border:1px solid var(--border);border-radius:18px;background:var(--vscode-editor-background)}.model-notes{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin:10px 0 16px}.model-notes p{margin:0;padding:10px;border-left:3px solid var(--accent);background:var(--vscode-editor-background);font-size:12px;line-height:1.45}.field-help{display:block;margin-top:5px;line-height:1.35;opacity:.7}.check .field-help{margin-top:2px}.check{align-items:flex-start}@media(max-width:850px){.architecture-branches,.architecture-modes,.mode,.model-notes{grid-template-columns:1fr}.mode strong{grid-column:1}.architecture button::after{display:none}}`; }
 function formCss() { return `nav{display:flex;gap:8px;margin-bottom:18px}.molecule-preview{width:100%;max-height:340px;overflow:hidden;background:#fff;border-radius:6px;margin:14px 0}.molecule-preview svg{display:block;width:100%;height:auto}.predict-layout{display:grid;grid-template-columns:minmax(0,1fr) 300px;gap:18px;align-items:start}.predict-side{border:1px solid var(--border);border-radius:8px;padding:14px}.spectrum-chart{width:100%;height:260px;margin:14px 0}.spectrum-bar{stroke:var(--accent);stroke-width:2}.spectrum-axis{stroke:var(--vscode-editor-foreground);stroke-opacity:.4}.spectrum-tick{font-size:10px;fill:var(--vscode-editor-foreground);opacity:.7}.tree-scroll{overflow:auto;max-height:60vh;border:1px solid var(--border);border-radius:8px;background:var(--vscode-editor-background);margin:10px 0}.fragment-tree{display:block;width:100%;min-width:700px}.tree-edge{stroke:color-mix(in srgb,var(--vscode-editor-foreground) 35%,transparent);stroke-width:1.5}.tree-node{cursor:pointer}.tree-node circle{fill:var(--vscode-editor-background);stroke:var(--vscode-editor-foreground);stroke-width:1.5}.tree-node.detected circle{fill:color-mix(in srgb,#ff8a3d 28%,var(--vscode-editor-background));stroke:#ff8a3d;stroke-width:3}.tree-node text{fill:var(--vscode-editor-foreground);font-size:9px;pointer-events:none}#predictFragmentDetail{border-top:1px solid var(--border);margin-top:14px;padding-top:14px}@media(max-width:850px){.predict-layout{grid-template-columns:1fr}}.tab{border-radius:20px}.tab.active{border-color:var(--accent)}[hidden]{display:none!important}label{display:block;font-size:12px;opacity:.8;margin:12px 0}input,select,textarea{width:100%;display:block;margin-top:6px;padding:9px;color:var(--vscode-input-foreground);background:var(--vscode-input-background);border:1px solid var(--vscode-input-border,var(--border));border-radius:5px;font:inherit}.path{display:flex;gap:7px}.path input{flex:1}.row{display:flex;align-items:end;gap:12px}.grow{flex:1}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:0 16px}.checks{display:flex;flex-wrap:wrap;gap:8px 22px}.check{display:flex;align-items:center;gap:7px}.check input{width:auto;margin:0}.section-title{display:flex;align-items:flex-start;justify-content:space-between;gap:16px}.section-title h2{margin-bottom:4px}.section-title p{margin:0}.actions{display:flex;gap:8px}textarea{min-height:280px;resize:vertical;font-family:var(--vscode-editor-font-family);font-size:12px;line-height:1.5}.pattern-card{border-left:3px solid var(--accent)}.product-title{align-items:center;margin-top:18px}.product-title h3{margin:0}.product-list{margin-left:18px}.product-row{display:grid;grid-template-columns:1fr 1fr auto;gap:12px;align-items:end;border-top:1px solid var(--border);padding:6px 0}.danger{color:var(--vscode-errorForeground)}.molecule-canvas{min-height:260px;margin:16px 0;border:1px solid var(--border);border-radius:8px;background:var(--vscode-editor-background);color:var(--vscode-editor-foreground);touch-action:none;user-select:none}.molecule-canvas svg{display:block;width:100%;height:440px}.bond-group{stroke:currentColor;stroke-width:3;stroke-linecap:round;cursor:pointer}.bond-aromatic .aromatic-mark{stroke-dasharray:8 6}.bond-group.selected{stroke:var(--accent);stroke-width:5}.bond-group.deleted{opacity:.2;stroke-dasharray:5 4}.bond-hit{stroke:transparent!important;stroke-width:24}.mol-atom{cursor:pointer}.atom-hit{fill:transparent;stroke:transparent}.atom-label-bg{fill:var(--vscode-editor-background);stroke:color-mix(in srgb,var(--vscode-editor-foreground) 45%,transparent);stroke-width:1.5}.mol-atom text{fill:var(--vscode-editor-foreground);font-size:16px;font-family:var(--vscode-font-family);font-weight:700;pointer-events:none}.mol-atom .atom-index{font-size:11px;font-weight:600;fill:var(--vscode-descriptionForeground)}.mol-atom.selected .atom-label-bg{stroke:var(--accent);stroke-width:3;fill:color-mix(in srgb,var(--accent) 20%,var(--vscode-editor-background))}.mol-atom.selected .atom-hit{fill:#36c5a214}.mol-atom.deleted{opacity:.25}.selection-lasso{fill:none;stroke:var(--vscode-editor-foreground);stroke-width:2.5;stroke-dasharray:7 5;stroke-linecap:round;stroke-linejoin:round;pointer-events:none}.builder-columns{display:grid;grid-template-columns:1fr 1fr;gap:18px}.query-list{display:grid;gap:8px}.query-card{border:1px solid var(--border);border-radius:7px;padding:10px}.query-head{display:flex;justify-content:space-between}.query-modes,.bond-type-choices,.bond-tools{display:flex;flex-wrap:wrap;gap:5px;margin-top:8px}.query-card button,.bond-tools button{padding:5px 8px}.query-card button.active,.bond-tools button.active{background:var(--accent);color:#10251f;border-color:var(--accent)}.element-picker{width:100%;margin-top:8px}.element-summary{margin-top:7px;padding:6px 8px;border-radius:4px;background:var(--vscode-textBlockQuote-background);font-size:12px}.product-canvas{max-height:350px}.product-canvas svg{height:350px}.bond-tools{align-items:center;margin-bottom:12px}#productBuilder{margin-top:22px;padding-top:16px;border-top:1px solid var(--border)}#helpTooltip{position:fixed;z-index:50;display:none;max-width:380px;padding:9px 11px;border:1px solid var(--vscode-editorHoverWidget-border,var(--border));border-radius:5px;background:var(--vscode-editorHoverWidget-background);color:var(--vscode-editorHoverWidget-foreground);box-shadow:0 4px 14px #0005;font-size:12px;line-height:1.4}#helpTooltip.visible{display:block}.primary{background:var(--vscode-button-background);color:var(--vscode-button-foreground);font-weight:600}.primary:hover{background:var(--vscode-button-hoverBackground)}footer{position:sticky;bottom:0;background:var(--vscode-editor-background);border-top:1px solid var(--border);padding:17px 0;display:flex;justify-content:space-between;align-items:center;gap:20px}.status{font-weight:600}.status.running{color:#e9b949}.status.completed{color:var(--accent)}.status.error,.status.failed{color:#ef6b73}footer code{display:block;opacity:.65;max-width:700px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:5px}@media(max-width:700px){.grid,.product-row,.builder-columns{grid-template-columns:1fr}.row{display:block}footer{position:static}}`; }
 
-function deactivate() { if (runningProcess) runningProcess.kill('SIGTERM'); }
+function deactivate() {}
 module.exports = { activate, deactivate, buildArgs, normalizeConfig, buildTrainingArgs, normalizeTrainingConfig, resultHtml, workbenchHtml, ensureFileSuffix, summarizeStructureManifests };

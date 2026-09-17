@@ -45,10 +45,11 @@ class ActionTrainingOutput:
 class ActionFragmentTreeTrainingModel(nn.Module):
     def __init__(self, feature_model: nn.Module, absolute_weight: float = 1.0,
                  next_weight: float = 1.0, negative_weight: float = 1.0,
-                 downstream_model: nn.Module | None = None) -> None:
+                 downstream_model: nn.Module | None = None, intensity_weight: float = 1.0) -> None:
         super().__init__()
         self.feature_model = feature_model
         self.absolute_weight, self.next_weight, self.negative_weight = absolute_weight, next_weight, negative_weight
+        self.intensity_weight = intensity_weight
         self.downstream_model = downstream_model
 
     def set_checkpoint_model_config(self, config: dict) -> None:
@@ -116,5 +117,5 @@ class ActionFragmentTreeTrainingModel(nn.Module):
             downstream_output = (self.downstream_model(data.downstream, action_h=encoded.action_h, condition_h=conditions)
                                  if getattr(self.downstream_model,"requires_action_features",False) else self.downstream_model(data.downstream))
             downstream_loss = downstream_output["loss"] if isinstance(downstream_output, dict) else downstream_output.loss
-            loss = loss + downstream_loss
+            loss = loss + self.intensity_weight * downstream_loss
         return ActionTrainingOutput(loss, absolute_loss, next_loss, absolute, logits, next_positive, pool, metrics, downstream_output)

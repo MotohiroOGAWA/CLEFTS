@@ -247,3 +247,80 @@ train, train_window, and validation, with colors and line styles plus toggles in
 legend. These are recorded summary statistics, rather than raw sample histograms. Non-finite and missing values are omitted.
 Hover over a chart to inspect its nearest recorded step and value. The run path and
 selected charts are retained in the webview state.
+
+### Workbench dashboard
+
+Open `CLEFTS: Open Workbench` or use the CLEFTS Activity Bar. The dashboard
+provides quick actions, environment diagnostics and recent training jobs.
+The navigation retains the existing preprocessing, prediction, fragment viewer,
+SMARTS, fine-tuning and evaluation tools.
+
+Training supports AdamW weight decay, gradient clipping and separate absolute
+ action, next action, negative action and fragment intensity loss weights.
+Data Preparation and Training expose individual parameter fields. Import Parameters
+accepts model or fragmenter JSON through Browse or drag-and-drop and expands it into
+the form. The file is optional; execution uses a snapshot of the edited fields.
+Advanced buttons reveal less frequently changed settings. Hover over a parameter
+label for 500ms to see its description.
+The CLI is `python -m clefts.cli train fragment-tree`; new options are
+`--weight-decay`, `--gradient-clip`, `--absolute-weight`, `--next-weight`,
+`--negative-weight` and `--intensity-weight`.
+
+Training Jobs shows live stdout/stderr, epoch progress, searchable logs and a
+link to the metrics charts. Training writes `metrics.tsv` and emits JSON Lines
+`epoch_end` events. Metadata and bounded log previews live in VS Code workspace
+storage. Training continues when its panel closes and uses detached processes
+so it can survive extension host restarts. Restored running PIDs are checked;
+if the process disappeared, its exit status is reported as unknown. Stopping a
+restored process requires verifying it in the terminal to avoid killing a reused
+PID. Existing batch prediction and fine-tuning retain their original lifecycle.
+
+Run `npm run check:workbench` for dashboard, CSP and CLI argument checks.
+
+CLI configuration precedence is: preset defaults → `--params` file → inline
+`--params-json` → section JSON options → named options → repeated `--set PATH=JSON`.
+For example, `--params model.json --max-action-count 2 --mass-tolerance 0.02Da`
+overrides those two values from the file. Any nested value, including pattern or
+adduct-rule array entries, can be overridden with `--set`, e.g.
+`--set 'fragmenter_params.fragment_ion_tree_builder.cleavage_pattern_set.patterns.0.name="custom"'`.
+The same configuration options are supported by both `train create-fragment-tree-data`
+and `train fragment-tree`. Dataset column mapping is configurable in preparation.
+
+
+### Home and dataset preparation
+
+Home shares the CLEFTS introduction with the [documentation](https://github.com/MotohiroOGAWA/CLEFTS/tree/main/docs).
+Quick Start and the jobs, samples and models tabs open workflows, copy paths and
+reveal results. Compact forms launch training and single-spectrum prediction.
+A compatible pretrained checkpoint loads its configuration and initializes new
+training with a fresh optimizer. Resume in the full Training form continues a run.
+
+Training Data has Input Dataset, Fragmentation, Assignment, Output and Run steps.
+Browse or drop training and optional validation inputs to inspect real records,
+summary statistics, molecular structures and spectra. Column mapping checks
+column presence immediately. Click **Validate Dataset Values** for RDKit SMILES,
+registered main adducts, parsed collision energy and numeric precursor m/z.
+Fragmentation settings use a clickable JSON drop area, periodic-table Symbols
+and unique-node / total-transition limits; model dimensions are training-only.
+Without validation input, CLEFTS splits by unique SMILES.
+Run stays visible; missing requirements appear in red and disable execution.
+
+Document, GitHub, theme and Help stay available in the toolbar. From the project
+root, install the docs extra and build with `python -m sphinx -W -b html docs
+docs/_build/html`. Document opens the Sphinx/Furo pages when built and otherwise
+opens the shared introduction.
+
+
+### Default values and output root
+
+Open **Settings → Preferences** and configure `clefts.workbench.defaultOutputDirectory`.
+It defaults to empty; output fields remain blank until a root is configured or a
+path is entered. New workflows use named timestamp subdirectories of that root.
+**Save as Workbench Defaults** stores Data, Training or Prediction values in VS Code
+settings. New Workbench forms apply those defaults, including nested parameter
+objects. Output paths are generated separately. See the
+[defaults guide](https://github.com/MotohiroOGAWA/CLEFTS/blob/main/docs/guides/workbench.md).
+
+Normalize Intensities defaults to enabled. Data **Output → Parallel Processing**
+provides Worker Processes and Chunk Size (`1` each by default). The CLI supports
+`--num-workers` and `--chunk-size`. Stop terminates the preparation process and its workers.

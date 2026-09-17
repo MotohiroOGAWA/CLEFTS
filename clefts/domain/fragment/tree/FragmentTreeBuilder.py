@@ -280,6 +280,7 @@ class _FragmentTreeBuildState:
         self.only_add_min_action_count = only_add_min_action_count
         self.nodes: dict[int, FragmentNode] = {}
         self.edges: dict[tuple[int, int], FragmentEdge] = {}
+        self.transition_count = 0
         self.smiles_to_node_index: dict[str, int] = {}
         self.node_action_counts: dict[int, int] = {}
         self.get_or_create_node_index(root_smiles, 0)
@@ -309,11 +310,14 @@ class _FragmentTreeBuildState:
         if (self.only_add_min_action_count and not transition.is_seed
                 and len(transition.action_sequence.actions) > self.node_action_counts[target_index]):
             return
+        if key in self.edges and transition in self.edges[key].transitions:
+            return
+        if self.max_edge >= 0 and self.transition_count >= self.max_edge:
+            raise ValueError(f"Fragment tree edge limit exceeded: max_edge={self.max_edge}")
+        self.transition_count += 1
         if key in self.edges:
             self.edges[key] = self.edges[key].with_transition(transition)
             return
-        if self.max_edge >= 0 and len(self.edges) >= self.max_edge:
-            raise ValueError(f"Fragment tree edge limit exceeded: max_edge={self.max_edge}")
         self.edges[key] = FragmentEdge(len(self.edges), -1, source_index, target_index,
                                        self.nodes[source_index].id, self.nodes[target_index].id,
                                        transitions=(transition,))

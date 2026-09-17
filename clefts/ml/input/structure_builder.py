@@ -34,8 +34,10 @@ def _walk_pathway(tree, fragmenter, pathway) -> set:
 
 
 class ActionStructureBuilder:
-    def __init__(self, generator: SourceAnchoredFragmentSpectrumGenerator) -> None:
+    def __init__(self, generator: SourceAnchoredFragmentSpectrumGenerator, *, max_node: int = -1, max_edge: int = -1) -> None:
         self.generator = generator
+        self.max_node = max_node
+        self.max_edge = max_edge
 
     def build(self, source: Compound, precursor_types: Sequence[Adduct], collision_energy: Sequence[float],
               peaks_mz: Sequence[Sequence[float]], peaks_intensity: Sequence[Sequence[float]]) -> SourceActionStructure:
@@ -48,7 +50,7 @@ class ActionStructureBuilder:
         fragmenter=generator.fragmenter
         actions=fragmenter.fragment_ion_tree_builder.create_cleavage_actions(source)
         # Full chemistry is permitted here, never inside neural forward.
-        tree=fragmenter.build_fragment_ion_tree(source,_include_fragment_compound_cache=True)
+        tree=fragmenter.build_fragment_ion_tree(source,max_node=self.max_node,max_edge=self.max_edge,_include_fragment_compound_cache=True)
         assignments=fragmenter.assign_fragment_pathways_to_peak_sets(tree,zip(precursor_types,peaks_mz))
         targets=[]
         for _,groups in assignments:

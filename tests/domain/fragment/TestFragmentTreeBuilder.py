@@ -393,6 +393,19 @@ class TestFragmentTreeBuilder(unittest.TestCase):
         self.assertTrue(any(edge.source_index == parent.index for edge in tree.get_in_edges(child.index)))
         self.assertEqual(result['search_stats']['num_rdkit_run_reactants'], 4)
 
+    def test_edge_limit_counts_distinct_routes_between_merged_nodes(self) -> None:
+        source = Compound.from_smiles('[CH3:1][CH:2]([OH:3])[OH:4]')
+        build = builder(pattern('[C:1]-[O:2]', '[C:1]'), limit=1)
+        tree = build.build(source)
+        self.assertEqual(tree.num_nodes, 2)
+        self.assertEqual(tree.num_edges, 1)
+        self.assertEqual(tree.num_transitions, 2)
+        with self.assertRaisesRegex(ValueError, 'edge limit'):
+            build.build(source, max_edge=1)
+        self.assertEqual(build.build(source, max_node=2, max_edge=2).num_transitions, 2)
+        with self.assertRaisesRegex(ValueError, 'node limit'):
+            build.build(source, max_node=1)
+
     def test_limits_seed_validation_and_removed_apis(self) -> None:
         for limit in (0, -1, True):
             with self.assertRaises(ValueError):

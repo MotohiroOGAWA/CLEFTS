@@ -141,6 +141,11 @@ class TestActionPipeline(unittest.TestCase):
             self.assertTrue((root/'run'/'last.pt').is_file())
             resumed = train_actions(model_config=config(), train_dir=root/'train', val_dir=root/'val', output_dir=root/'run', epochs=1, resume=root/'run'/'last.pt')
             self.assertEqual(resumed['history'][0]['epoch'], 2)
+            initialized = train_actions(model_config=config(), train_dir=root/'train', val_dir=root/'val', output_dir=root/'initialized', epochs=1, initialize_from=root/'run'/'last.pt')
+            self.assertEqual(initialized['history'][0]['epoch'], 1)
+            self.assertTrue((root/'initialized'/'last.pt').is_file())
+            with self.assertRaisesRegex(ValueError, 'not both'):
+                train_actions(model_config=config(), train_dir=root/'train', val_dir=root/'val', output_dir=root/'invalid', resume=root/'run'/'last.pt', initialize_from=root/'run'/'last.pt')
             from clefts.ml.specgen.predict_spectrum import load_generator
             loaded = load_generator(model_path=str(root/'run'/'last.pt'), params_path=None,
                                     device=torch.device('cpu'), strict=True)
@@ -229,7 +234,6 @@ class TestActionPipeline(unittest.TestCase):
             resumed = train_actions(model_config=fine_tuned_config, train_dir=root/'ft_train', val_dir=root/'ft_val',
                 output_dir=root/'ft_run', epochs=1, resume=tuned_checkpoint)
             self.assertEqual(resumed['history'][0]['epoch'], 2)
-
             # Prediction also works from the fine-tuned checkpoint.
             checkpoint = torch.load(tuned_checkpoint, map_location='cpu', weights_only=False)
             self.assertEqual(checkpoint['model_config'], fine_tuned_config)
