@@ -107,15 +107,16 @@ def model(payload: dict) -> dict:
 
 def structure_manifest(payload):
     import torch
+    from clefts.ml.data_preparation.fragment_tree.manifest_summary import structure_manifest_fields
     directory=Path(payload['directory'])
     rows=[]
     files=sorted(set(directory.glob('*.preft.pt'))|set((directory/'data').glob('*.preft.pt')))
     for file in files:
-        saved=torch.load(file,map_location='cpu')
+        saved=torch.load(file,map_location='cpu',weights_only=False)
         metadata=saved.get('metadata',{})
         indexes=metadata.get('record_indexes',[])
         rows.append(dict(file=str(file.relative_to(directory)),smiles=metadata.get('smiles',''),
-            record_indexes=json.dumps(indexes),num_input_records=len(indexes),num_valid_samples=len(indexes),status='completed'))
+            record_indexes=json.dumps(indexes),num_input_records=len(indexes),num_valid_samples=int(saved['structure'].num_samples),rejected_sample_count=max(0,len(indexes)-int(saved['structure'].num_samples)),rejection_log='',**structure_manifest_fields(saved['structure']),status='completed'))
     return rows
 
 def main():

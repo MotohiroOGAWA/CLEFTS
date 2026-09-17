@@ -106,3 +106,12 @@ Choose **All peaks** or **Without precursor peaks** and change **Bins** from 1
 to 100. Scores of 100% belong to the final bin; unavailable scores are counted
 separately. Hover over a bar to see its interval and sample count. Light mode
 uses a white page background.
+
+
+The Output Files table includes rejected sample counts, a rejection-log link
+when records were skipped, and total stored node/edge counts across the samples
+in each structure. Both assignment-score columns show the mean of available
+per-sample scores; select the structure and a spectrum to see individual scores.
+A zero count or score is displayed explicitly. Missing values in older
+manifests are recovered from saved structures and assignment-score TSV files.
+Workbench light mode uses white page, panel, toolbar and navigation surfaces.

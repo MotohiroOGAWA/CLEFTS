@@ -108,6 +108,12 @@ class TestPreparationWorkflow(unittest.TestCase):
                         self.assertEqual(len(files),1)
                         skipped=json.loads((output/'skipped_sources.json').read_text())
                         self.assertEqual(skipped[0]['smiles'],'CCO')
+                        manifest=pd.read_csv(output/'manifest.tsv',sep='\t')
+                        rejected=manifest[manifest.status=='skipped'].iloc[0]
+                        self.assertEqual(rejected.rejected_sample_count,2)
+                        self.assertEqual(rejected.num_nodes,0)
+                        self.assertEqual(rejected.num_edges,0)
+                        self.assertTrue((output/rejected.rejection_log).is_file())
                         self.assertEqual(skipped[0]['record_indexes'],[0,1])
                         self.assertIn('limit exceeded',skipped[0]['reason'])
                         stats=json.loads((output/'action_statistics.json').read_text())
@@ -208,6 +214,16 @@ class TestPreparationWorkflow(unittest.TestCase):
             result=result_backend.inspect_structure(files[0])
             scores=pd.read_csv(Path(directory)/'assignment_scores.tsv',sep='\t')
             self.assertEqual(len(scores),1)
+            manifest=pd.read_csv(Path(directory)/'manifest.tsv',sep='\t').iloc[0]
+            self.assertEqual(manifest.num_nodes,4)
+            self.assertEqual(manifest.num_edges,3)
+            self.assertEqual(manifest.rejected_sample_count,0)
+            self.assertAlmostEqual(manifest.assignment_score,13/15)
+            self.assertAlmostEqual(manifest.assignment_score_without_precursor,3/5)
+            recovered=backend.structure_manifest({'directory':directory})[0]
+            self.assertEqual(recovered['num_nodes'],4)
+            self.assertEqual(recovered['num_edges'],3)
+            self.assertAlmostEqual(recovered['assignment_score'],13/15)
             self.assertAlmostEqual(scores.assignment_score.iloc[0],13/15)
             self.assertAlmostEqual(scores.assignment_score_without_precursor.iloc[0],3/5)
         sample=result['samples'][0]

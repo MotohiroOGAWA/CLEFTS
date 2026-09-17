@@ -11,6 +11,7 @@ from clefts.libs.msentity.msentity import MSDataset
 from clefts.domain.mass.parse_ce import parse_ce_to_ev
 from clefts.ml.input.structure_builder import ActionStructureBuilder
 from clefts.ml.input.source_action_structure import save_fragment_tree_structure,make_structure_file_stem
+from .manifest_summary import structure_manifest_fields
 from .context import create_preparation_context, validate_limits
 from clefts.ml.specgen.config_options import configure_model_options, resolve_model_options
 from .datasets import load_spectrum_dataset, split_by_smiles
@@ -52,16 +53,16 @@ def _prepare_group(task, builder, options):
     structure=builder.build(Compound.from_smiles(smiles),adducts,energies,mzs,intensities)
     path=output/'data'/(make_structure_file_stem(smiles,index=tree)+'.preft.pt')
     save_fragment_tree_structure(structure=structure,output_file=path,metadata=dict(smiles=smiles,record_indexes=rows,sample_annotations=structure.sample_annotations))
-    return path,structure.sample_annotations
+    return path,structure.sample_annotations,structure_manifest_fields(structure)
 
 
 def _prepare_group_safely(task, builder, options):
     try:
-        path,annotations=_prepare_group(task,builder,options)
+        path,annotations,summary=_prepare_group(task,builder,options)
         scores=[dict(structure_file=path.name,sample_index=index,record_index=record_index,
                      assignment_score=sample['assignmentScore'],assignment_score_without_precursor=sample['assignmentScoreWithoutPrecursor'])
                 for index,(record_index,sample) in enumerate(zip(task[2],annotations))]
-        return dict(path=path,record_count=len(task[2]),smiles=task[1],record_indexes=task[2],assignment_scores=scores)
+        return dict(path=path,record_count=len(task[2]),smiles=task[1],record_indexes=task[2],assignment_scores=scores,summary=summary)
     except FragmentTreeLimitExceeded as error:
         return dict(skipped=dict(source_index=task[0],smiles=task[1],record_indexes=task[2],reason=str(error)))
 
@@ -106,13 +107,13 @@ def create_action_training_data(*, dataset: MSDataset, model_config: dict, outpu
         completed_sources+=1
         if 'skipped' in result:
             source=result['skipped']
-            manifest_rows.append(dict(file='',smiles=source['smiles'],record_indexes=json.dumps(source['record_indexes']),num_input_records=len(source['record_indexes']),num_valid_samples=0,status='skipped',reason=source['reason']))
+            manifest_rows.append(dict(file='',smiles=source['smiles'],record_indexes=json.dumps(source['record_indexes']),num_input_records=len(source['record_indexes']),num_valid_samples=0,rejected_sample_count=len(source['record_indexes']),rejection_log='skipped_sources.json',num_nodes=0,num_edges=0,assignment_score=None,assignment_score_without_precursor=None,status='skipped',reason=source['reason']))
             skipped.append(result['skipped'])
             print(json.dumps(dict(event='source_skipped',split=split,**result['skipped'])),flush=True)
         else:
             files.append(Path(result['path']));prepared_records+=result['record_count']
             score_rows.extend(result['assignment_scores'])
-            manifest_rows.append(dict(file=Path(result['path']).name,smiles=result['smiles'],record_indexes=json.dumps(result['record_indexes']),num_input_records=result['record_count'],num_valid_samples=result['record_count'],status='completed',reason=''))
+            manifest_rows.append(dict(file=Path(result['path']).name,smiles=result['smiles'],record_indexes=json.dumps(result['record_indexes']),num_input_records=result['record_count'],num_valid_samples=result['record_count'],rejected_sample_count=0,rejection_log='',**result['summary'],status='completed',reason=''))
         print(json.dumps(dict(event='progress',split=split,current=completed_sources,total=len(grouped),
                               prepared=len(files),skipped=len(skipped))),flush=True)
 
@@ -146,7 +147,7 @@ def create_action_training_data(*, dataset: MSDataset, model_config: dict, outpu
             run_parallel_subprocesses(commands,max_workers=min(num_workers,len(commands)),print_output=False,
                                       env=env,desc=f'Fragment trees ({split})',unit='chunk',on_complete=on_complete)
     with (output/'manifest.tsv').open('w',newline='') as stream:
-        writer=csv.DictWriter(stream,fieldnames=['file','smiles','record_indexes','num_input_records','num_valid_samples','status','reason'],delimiter='\t')
+        writer=csv.DictWriter(stream,fieldnames=['file','smiles','record_indexes','num_input_records','num_valid_samples','rejected_sample_count','rejection_log','num_nodes','num_edges','assignment_score','assignment_score_without_precursor','status','reason'],delimiter='\t')
         writer.writeheader();writer.writerows(sorted(manifest_rows,key=lambda row:row['smiles']))
     with (output/'assignment_scores.tsv').open('w',newline='') as stream:
         writer=csv.DictWriter(stream,fieldnames=['structure_file','sample_index','record_index','assignment_score','assignment_score_without_precursor'],delimiter='\t')
