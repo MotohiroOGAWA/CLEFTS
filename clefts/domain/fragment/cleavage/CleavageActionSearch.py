@@ -69,7 +69,11 @@ class CleavageActionSearch:
         self.visited_sequence_keys: set[tuple[tuple[object, ...], ...]] = set()
 
     def enumerate(self) -> tuple[_ActionSequenceCandidate, ...]:
-        candidates: list[_ActionSequenceCandidate] = []
+        return tuple(self.iter_candidates())
+
+    def iter_candidates(self):
+        """Yield each connection lazily so tree limits can stop combination search."""
+        connections: set[_ActionSequenceCandidate] = set()
         # Heap prioritizes the normalized action count, with a stable serial tie-break.
         frontier: list[tuple[int, int, CleavageActionSequence | None, int]] = []
         minimum_cursor: dict[CleavageActionSequence | None, int] = {}
@@ -79,7 +83,9 @@ class CleavageActionSearch:
             if rejection:
                 raise ValueError(f"Invalid seed action sequence: {rejection}")
             self.visited_sequence_keys.add(seed.key)
-            candidates.append(_ActionSequenceCandidate(None, seed, None, True))
+            candidate = _ActionSequenceCandidate(None, seed, None, True)
+            connections.add(candidate)
+            yield candidate
             heapq.heappush(frontier, (len(seed.actions), serial, seed, -1))
             minimum_cursor[seed] = -1
             serial += 1
@@ -87,7 +93,6 @@ class CleavageActionSearch:
             frontier.append((0, serial, None, -1))
             minimum_cursor[None] = -1
             serial += 1
-        connections: set[_ActionSequenceCandidate] = set(candidates)
         while frontier:
             _, _, parent, cursor = heapq.heappop(frontier)
             if minimum_cursor[parent] != cursor:
@@ -129,9 +134,8 @@ class CleavageActionSearch:
                     self.visited_sequence_keys.add(sequence.key)
                 if candidate not in connections:
                     connections.add(candidate)
-                    candidates.append(candidate)
+                    yield candidate
                 if sequence not in minimum_cursor or i < minimum_cursor[sequence]:
                     minimum_cursor[sequence] = i
                     heapq.heappush(frontier, (len(sequence.actions), serial, sequence, i))
                     serial += 1
-        return tuple(candidates)

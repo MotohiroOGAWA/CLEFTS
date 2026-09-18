@@ -21,13 +21,13 @@ def predict_source_msdataset(dataset: object, generator: SourceAnchoredFragmentS
         ev=parse_ce_to_ev(value,mz,instrument)
         if ev is None: raise ValueError(f"Cannot convert collision energy at record {i}")
         energies.append(float(ev))
-    output=generator.predict(sources,adducts,energies)
     spectra=[GeneratedMassSpectrum(i,[]) for i in range(len(sources))]
-    prediction=output.spectra
-    for sample,formula,mz,intensity in zip(prediction.sample_index.detach().cpu().tolist(),prediction.formula_tensor.detach().cpu(),prediction.mz.detach().cpu().tolist(),prediction.intensity.detach().cpu().tolist()):
-        original=output.sample_input_index[sample]
-        spectra[original].peaks.append(GeneratedSpectrumPeak(mz=mz,intensity=max(float(intensity),0.),sample_id=original,
-            formula=str(generator.tensorizer.tensor_to_formula(formula)) if include_formula_annotation else None))
+    for output in generator.predict_batches(sources,adducts,energies):
+        prediction=output.spectra
+        for sample,formula,mz,intensity in zip(prediction.sample_index.detach().cpu().tolist(),prediction.formula_tensor.detach().cpu(),prediction.mz.detach().cpu().tolist(),prediction.intensity.detach().cpu().tolist()):
+            original=output.sample_input_index[sample]
+            spectra[original].peaks.append(GeneratedSpectrumPeak(mz=mz,intensity=max(float(intensity),0.),sample_id=original,
+                formula=str(generator.tensorizer.tensor_to_formula(formula)) if include_formula_annotation else None))
     for spectrum in spectra:
         if spectrum.peaks:
             maximum=max(peak.intensity for peak in spectrum.peaks)

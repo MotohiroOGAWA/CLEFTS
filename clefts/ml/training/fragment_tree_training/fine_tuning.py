@@ -114,7 +114,7 @@ def prepare_model_config(*, checkpoint_path, pattern_set_path, new_params_path, 
     mapping = _action_category_mapping(old_fragmenter.cleavage_pattern_set, new_fragmenter.cleavage_pattern_set)
     config = deepcopy(new_config)
     config['fragmenter_params'] = new_fragmenter.to_dict()
-    config['fine_tuning'] = dict(version=1, width=int(width), source_checkpoint=str(checkpoint_path), category_mapping=mapping)
+    config['fine_tuning'] = dict(version=1, width=int(width), source_checkpoint=str(checkpoint_path), pattern_set_path=str(pattern_set_path), category_mapping=mapping)
     return config
 
 

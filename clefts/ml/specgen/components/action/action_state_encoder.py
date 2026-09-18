@@ -9,6 +9,7 @@ class ActionStateEncoder(nn.Module):
     def __init__(self, hidden_dim: int, num_heads: int = 4, num_layers: int = 2,
                  dropout: float = 0.0) -> None:
         super().__init__()
+        if num_layers<1 or not 0<=dropout<1:raise ValueError("State encoder requires positive layers and dropout in [0,1)")
         self.bos = nn.Parameter(torch.randn(1, 1, hidden_dim) * 0.02)
         self.blocks = nn.ModuleList(SAB(hidden_dim, num_heads=num_heads, dropout=dropout)
                                     for _ in range(num_layers))
@@ -17,6 +18,8 @@ class ActionStateEncoder(nn.Module):
                 state_sample_index: Tensor) -> Tensor:
         if state_action_index.shape[0] == 0:
             return action_h_pool.new_empty((0, self.bos.shape[-1]))
+        if action_h_pool.shape[1]==0:
+            action_h_pool=action_h_pool.new_zeros((action_h_pool.shape[0],1,self.bos.shape[-1]))
         tokens = action_h_pool[state_sample_index[:, None], state_action_index.clamp_min(0)]
         padding = state_action_index < 0
         tokens = tokens.masked_fill(padding[:, :, None], 0)

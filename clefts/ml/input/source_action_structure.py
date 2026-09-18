@@ -54,14 +54,17 @@ class SourceActionStructure:
     # precursor type, recorded as its own row (never merged/unioned together:
     # alternatives are mutually exclusive ways of reaching the precursor, not
     # actions that can all be applied at once). A sample whose precursor is
-    # Source itself has zero rows here.
+    # Source itself has an explicit empty row here.
     sample_precursor_row_ptr: Tensor
     precursor_row_action_ptr: Tensor
     precursor_row_action_index: Tensor
     # Downstream precomputed graphs are optional for scorer-only training.
+    source_smiles: tuple[str,...] = field(default=(),kw_only=True)
+    precursor_next_index: Tensor = field(default_factory=lambda: torch.empty((2,0),dtype=torch.long),kw_only=True)
     max_action_role_count: int = field(default=0,kw_only=True)
     source_atom_capacity: int = field(default=0,kw_only=True)
     action_source_atom_features: Tensor | None = field(default=None,kw_only=True)
+    sample_annotations: tuple[dict, ...] = field(default=(),kw_only=True)
     downstream: object | None = None
     transition_parent_state_index: Tensor = field(default_factory=lambda: torch.empty(0,dtype=torch.long),kw_only=True)
     transition_child_state_index: Tensor = field(default_factory=lambda: torch.empty(0,dtype=torch.long),kw_only=True)
@@ -85,14 +88,25 @@ class SourceActionStructure:
                         fragmentation_schema=FRAGMENTATION_SCHEMA, structure=self.to("cpu")), path)
 
     @classmethod
-    def load(cls, path: str | Path, device: str | torch.device = "cpu") -> SourceActionStructure:
-        payload = torch.load(path, map_location=device)
+    def load(cls, path: str | Path, device: str | torch.device = "cpu", *, max_action_count: int = 3) -> SourceActionStructure:
+        payload = torch.load(path, map_location="cpu",weights_only=False)
         if not isinstance(payload, dict) or (payload.get("schema"), payload.get("schema_version"), payload.get("fragmentation_schema")) != (SCHEMA, SCHEMA_VERSION, FRAGMENTATION_SCHEMA):
-            raise ValueError("Action training requires schema v4; regenerate from original MSDataset")
+            raise ValueError("Action training requires schema v5; regenerate from original MSDataset")
         result = payload["structure"]
         if not isinstance(result, cls):
-            raise TypeError("schema v4 structure must be SourceActionStructure")
-        return result
+            raise TypeError("schema v5 structure must be SourceActionStructure")
+        if result.downstream is not None and not hasattr(result.downstream.decoded,"edge_seed_action_index"):
+            object.__setattr__(result.downstream.decoded,"edge_seed_action_index",torch.empty((2,0),dtype=torch.long))
+        if result.downstream is not None and not result.downstream.node_smiles:
+            result=replace(result,downstream=replace(result.downstream,node_smiles=tuple(compound.smiles for compound in result.downstream.decoded.compounds)))
+        if not result.source_smiles and result.downstream is not None:
+            keys={}
+            for sample,tree in enumerate(result.sample_tree_index.tolist()):
+                node=int((result.downstream.decoded.node_sample_index==sample).nonzero()[0])
+                keys[tree]=result.downstream.node_smiles[node]
+            result=replace(result,source_smiles=tuple(keys[i] for i in range(result.source_graph.num_graphs)))
+        from .action_batching import upgrade_precursor_metadata
+        return upgrade_precursor_metadata(result,max_action_count=max_action_count).to(device)
 
     @classmethod
     def from_structures(cls, structures: Sequence[SourceActionStructure]) -> SourceActionStructure:
@@ -102,14 +116,20 @@ class SourceActionStructure:
         relations = {name: [] for name in ("action_conflict_index", "action_precedence_index", "action_dominance_index")}
         state_samples, state_rows, next_rows, eos, positives, static, tree_indices = [], [], [], [], [], [], []
         precursor_rows, sample_precursor_row_counts = [], []
+        precursor_next, precursor_offset = [], 0
         atom_offset = action_offset = tree_offset = sample_offset = state_offset = node_offset = 0
         downstream_items, action_offsets, parents, children, added_actions, state_nodes = [], [], [], [], [], []
+        annotations=[]
         for item in structures:
             action_offsets.append(action_offset)
             parents.append(item.transition_parent_state_index+state_offset)
             children.append(item.transition_child_state_index+state_offset)
             added_actions.append(item.transition_added_action_index+action_offset)
             state_nodes.append(torch.where(item.state_fragment_node_index>=0,item.state_fragment_node_index+node_offset,item.state_fragment_node_index))
+            for sample in getattr(item,'sample_annotations',()):
+                annotations.append({**sample,'peaks':[{**peak,'matches':[
+                    {**match,'nodeIndices':[index+node_offset for index in match['nodeIndices']]}
+                    for match in peak['matches']]} for peak in sample['peaks']]})
             state_offset+=item.teacher_state_sample_index.numel()
             if item.downstream is not None:
                 downstream_items.append(item.downstream)
@@ -133,6 +153,8 @@ class SourceActionStructure:
                     dest.append((data[start:stop] + action_offset).tolist())
             for start, stop in zip(item.precursor_row_action_ptr[:-1], item.precursor_row_action_ptr[1:]):
                 precursor_rows.append((item.precursor_row_action_index[start:stop] + action_offset).tolist())
+            precursor_next.append(item.precursor_next_index + torch.tensor([[precursor_offset],[action_offset]]))
+            precursor_offset += item.precursor_row_action_ptr.numel()-1
             sample_precursor_row_counts.extend((item.sample_precursor_row_ptr[1:] - item.sample_precursor_row_ptr[:-1]).tolist())
             eos.append(item.teacher_positive_eos)
             atom_offset += item.source_graph.num_nodes
@@ -158,9 +180,10 @@ class SourceActionStructure:
                    torch.cat(retained, dim=1), torch.cat(sample_trees), torch.cat(conditions),
                    torch.cat(state_samples), state_ptr, state_index, next_ptr, next_index, torch.cat(eos),
                    positive_ptr, positive_index, sample_precursor_row_ptr, precursor_row_action_ptr, precursor_row_action_index,
-                   downstream,transition_parent_state_index=torch.cat(parents),
+                   downstream,source_smiles=tuple(key for item in structures for key in item.source_smiles),precursor_next_index=torch.cat(precursor_next,dim=1),transition_parent_state_index=torch.cat(parents),
                    transition_child_state_index=torch.cat(children),transition_added_action_index=torch.cat(added_actions),
                    state_fragment_node_index=torch.cat(state_nodes),
+                   sample_annotations=tuple(annotations) if len(annotations)==sum(item.num_samples for item in structures) else (),
                    max_action_role_count=max(item.max_action_role_count for item in structures),
                    source_atom_capacity=max(item.source_atom_capacity for item in structures),
                    action_source_atom_features=torch.cat([item.action_source_atom_features for item in structures]))
@@ -180,14 +203,13 @@ def prepare_source_actions(*, source: Compound, actions: tuple[CleavageAction, .
     itself be a subset or superset of one of these alternatives.
     """
     relations = CleavageActionRelations.from_actions(actions)
-    mol = source.mapped_mol
-    maps = {atom.GetAtomMapNum(): atom.GetIdx() for atom in mol.GetAtoms()}
-    atom_ptr, atom_index = csr([tuple(maps[v] for v in a.source_atom_maps) for a in actions])
+    maps = {atom.GetAtomMapNum(): index for index, atom in enumerate(graph_builder.graph_atoms(source))}
+    atom_ptr, atom_index = csr([tuple(maps[v] for v in a.source_atom_maps if v in maps) for a in actions])
     role_features=torch.tensor([[float(v in a.retained_atom_maps),float(v in a.discarded_atom_maps),
         sum(v in edge for edge in a.matched_bond_maps),sum(v in edge for edge in a.cut_bond_maps),
         sum(v in edge for edge in a.changed_bond_maps),sum(v in (u,w) for u,w,_ in a.bond_updates)]
-        for a in actions for v in a.source_atom_maps],dtype=torch.float32).reshape(-1,6)
-    retained = coo([(i, maps[v]) for i, a in enumerate(actions) for v in sorted(a.retained_atom_maps)])
+        for a in actions for v in a.source_atom_maps if v in maps],dtype=torch.float32).reshape(-1,6)
+    retained = coo([(i, maps[v]) for i, a in enumerate(actions) for v in sorted(a.retained_atom_maps) if v in maps])
     samples, states, positive_next, eos, sample_positive = [], [], [], [], []
     transition_parents,transition_children,transition_actions=[],[],[]
     index = {a: i for i, a in enumerate(actions)}
@@ -195,11 +217,27 @@ def prepare_source_actions(*, source: Compound, actions: tuple[CleavageAction, .
         raise ValueError("precursor_sequences must have one row per condition")
     # Recorded independently of target_sequences: inference needs this to seed
     # beam decoding from the precursor state even when there is no teacher DAG.
-    precursor_rows = [tuple(sorted(index[a] for a in seq.actions)) for sample_alternatives in
-                      (precursor_sequences or ()) for seq in sample_alternatives if seq is not None]
-    sample_precursor_row_counts = [sum(1 for seq in sample_alternatives if seq is not None)
-                                   for sample_alternatives in precursor_sequences] if precursor_sequences is not None \
-                                   else [0] * condition_features.shape[0]
+    alternatives = [tuple(rows) for rows in precursor_sequences] if precursor_sequences is not None else [(None,)] * condition_features.shape[0]
+    if any(not rows for rows in alternatives):
+        raise ValueError("No valid precursor action sequence for a sample; cannot decode from Source")
+    precursor_rows = [tuple(sorted(index[a] for a in seq.actions)) if seq is not None else () for rows in alternatives for seq in rows]
+    if any(len(row)>max_action_count for row in precursor_rows):raise ValueError("Precursor exceeds Fragmenter max_action_count")
+    sample_precursor_row_counts = [len(rows) for rows in alternatives]
+    # Chemistry relations are prepared once. Neural filtering applies this sparse
+    # table on the device; there is no RDKit or Python chemistry in forward.
+    precursor_next = []
+    next_cache={}
+    for row, previous in enumerate(precursor_rows):
+        if previous not in next_cache:
+            candidates=[]
+            if len(previous)<max_action_count:
+                for candidate, action in enumerate(actions):
+                    if candidate in previous or relations.rejection((*previous,candidate)) or any(relations.must_precede_mask[candidate] & (1<<i) for i in previous):continue
+                    child=CleavageActionSequence((*(actions[i] for i in previous),action))
+                    ids=frozenset(index[a] for a in child.actions)
+                    if child.retained_atom_maps and len(ids)<=max_action_count and frozenset(previous)<ids:candidates.append(candidate)
+            next_cache[previous]=candidates
+        precursor_next.extend((row,candidate) for candidate in next_cache[previous])
     if target_sequences is not None:
         if len(target_sequences) != condition_features.shape[0]:
             raise ValueError("target_sequences must have one row per condition")
@@ -216,6 +254,7 @@ def prepare_source_actions(*, source: Compound, actions: tuple[CleavageAction, .
                 if parent is not None and action in parent.actions:
                     continue
                 raw = (*(parent.actions if parent else ()), action)
+                if any(relations.must_precede_mask[index[action]] & (1<<index[a]) for a in (parent.actions if parent else ())):continue
                 if relations.rejection(tuple(index[a] for a in raw)):
                     continue
                 child = CleavageActionSequence(raw)
@@ -225,7 +264,7 @@ def prepare_source_actions(*, source: Compound, actions: tuple[CleavageAction, .
             terminal = set(targets)
             if not terminal <= known:
                 raise ValueError("Teacher target is not a valid searchable Source action state")
-            required = frozenset(precursor_sequences[sample]) if precursor_sequences is not None else frozenset((None,))
+            required = frozenset(alternatives[sample]) if precursor_sequences is not None else frozenset((None,))
             if not required <= known:
                 raise ValueError("Precursor action sequence is not a valid searchable Source action state")
             root_is_precursor = None in required
@@ -294,11 +333,11 @@ def prepare_source_actions(*, source: Compound, actions: tuple[CleavageAction, .
         torch.tensor(samples, dtype=torch.long), state_ptr, state_index, next_ptr, next_index,
         torch.tensor(eos, dtype=torch.bool), positive_ptr, positive_index,
         sample_precursor_row_ptr, precursor_row_action_ptr, precursor_row_action_index,
-        transition_parent_state_index=torch.tensor(transition_parents,dtype=torch.long),
+        source_smiles=(source.smiles,),precursor_next_index=coo(precursor_next),transition_parent_state_index=torch.tensor(transition_parents,dtype=torch.long),
         transition_child_state_index=torch.tensor(transition_children,dtype=torch.long),
         transition_added_action_index=torch.tensor(transition_actions,dtype=torch.long),
         state_fragment_node_index=torch.full((len(states),),-1,dtype=torch.long),
-        source_atom_capacity=mol.GetNumAtoms(),action_source_atom_features=role_features,
+        source_atom_capacity=len(maps),action_source_atom_features=role_features,
         max_action_role_count=max((len(a.source_atom_maps) for a in actions),default=0))
 
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import json
 import math
+import itertools
 import random
 import re
 import time
@@ -314,10 +315,15 @@ def evaluate(
     device: torch.device,
     node_mask_ratio: float,
     edge_mask_ratio: float,
+    max_batches: Optional[int] = None,
+    description: str = "Validation",
 ) -> Dict[str, float]:
     model.eval()
     metrics = []
-    for batch in loader:
+    total = len(loader) if max_batches is None else min(len(loader), max_batches)
+    batches = loader if max_batches is None else itertools.islice(loader, max_batches)
+    print(f"{description}: {total} batches on {device}.", flush=True)
+    for batch in tqdm(batches, total=total, desc=description, leave=False, mininterval=1.0):
         batch = move_batch(batch, device)
         output = model(
             batch,
@@ -335,6 +341,8 @@ def evaluate_timed(
     device: torch.device,
     node_mask_ratio: float,
     edge_mask_ratio: float,
+    max_batches: Optional[int] = None,
+    description: str = "Validation",
 ) -> Tuple[Dict[str, float], float]:
     start = time.perf_counter()
     metrics = evaluate(
@@ -343,6 +351,8 @@ def evaluate_timed(
         device=device,
         node_mask_ratio=node_mask_ratio,
         edge_mask_ratio=edge_mask_ratio,
+        max_batches=max_batches,
+        description=description,
     )
     return metrics, time.perf_counter() - start
 
@@ -364,7 +374,10 @@ def train_epochs(
     early_stopping_min_delta: float = DEFAULT_MIN_DELTA,
     early_stopping_reset_step: float = 1.0,
     early_stopping_verbose: bool = False,
+    initial_evaluation_batches: int = 0,
 ) -> Dict[str, object]:
+    if epochs < 1 or initial_evaluation_batches < 0:
+        raise ValueError("epochs must be positive and initial_evaluation_batches must be non-negative")
     output_dir.mkdir(parents=True, exist_ok=True)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=DEFAULT_WEIGHT_DECAY)
     best = {
@@ -372,6 +385,7 @@ def train_epochs(
         "epoch": -1,
         "stopped_epoch": int(epochs),
         "early_stopping_enabled": bool(early_stopping_patience is not None and early_stopping_patience > 0),
+        "initial_evaluation_batches": initial_evaluation_batches,
     }
     early_stopping = EarlyStopping(
         patience=early_stopping_patience,
@@ -430,41 +444,38 @@ def train_epochs(
 
     with open(metrics_path, "w+", newline="", encoding="utf-8") as f:
 
-        epoch0_train_metrics = evaluate(
-            model,
-            train_loader,
-            device=device,
-            node_mask_ratio=node_mask_ratio,
-            edge_mask_ratio=edge_mask_ratio,
-        )
-        epoch0_val_metrics, epoch0_val_seconds = evaluate_timed(
-            model,
-            val_loader,
-            device=device,
-            node_mask_ratio=node_mask_ratio,
-            edge_mask_ratio=edge_mask_ratio,
-        )
-        write_epoch_record(
-            f,
-            epoch=0,
-            train_metrics=epoch0_train_metrics,
-            val_metrics=epoch0_val_metrics,
-        )
-        val_loss = float(epoch0_val_metrics.get("loss", float("inf")))
-        early_stopping(val_loss)
-        final_epoch = 0
-        final_train_metrics = epoch0_train_metrics
-        final_val_metrics = epoch0_val_metrics
-        final_val_seconds = epoch0_val_seconds
-        if val_loss < best["val_loss"] - DEFAULT_MIN_DELTA:
-            best.update({"val_loss": val_loss, "epoch": 0})
-            save_checkpoint(model, output_dir / f"{stage_name}_best.pt", extra={"stage": stage_name, **best})
+        print(json.dumps({"event": "training_started", "stage": stage_name,
+            "device": str(device), "train_batches": len(train_loader),
+            "validation_batches": len(val_loader),
+            "initial_evaluation_batches": initial_evaluation_batches}), flush=True)
+        if initial_evaluation_batches:
+            # Monitoring must not advance the balanced training sampler.
+            initial_train_loader = make_loader(train_loader.dataset,
+                batch_size=train_loader.batch_size or train_loader.batch_sampler.batch_size,
+                shuffle=False, num_workers=train_loader.num_workers)
+            initial_train_metrics = evaluate(model, initial_train_loader, device=device,
+                node_mask_ratio=node_mask_ratio, edge_mask_ratio=edge_mask_ratio,
+                max_batches=initial_evaluation_batches, description="Initial training subset")
+            initial_val_metrics = evaluate(model, val_loader, device=device,
+                node_mask_ratio=node_mask_ratio, edge_mask_ratio=edge_mask_ratio,
+                max_batches=initial_evaluation_batches, description="Initial validation subset")
+            write_epoch_record(f, epoch=0, train_metrics=initial_train_metrics,
+                val_metrics=initial_val_metrics)
+            # Subset losses are not used for best-checkpoint selection or early stopping.
 
+        global_step = 0
         for epoch in range(1, epochs + 1):
             model.train()
             rows = []
-            progress = tqdm(train_loader, desc=f"{stage_name} epoch {epoch}", leave=False)
-            for batch in progress:
+            print(json.dumps({"event": "epoch_start", "stage": stage_name,
+                "epoch": epoch, "total": epochs, "train_batches": len(train_loader)}), flush=True)
+            progress = tqdm(train_loader, desc=f"{stage_name} epoch {epoch}", leave=False, mininterval=1.0)
+            last_progress_log = 0.0
+            epoch_start = time.perf_counter()
+            for batch_index, batch in enumerate(progress, 1):
+                if batch_index == 1:
+                    print(json.dumps({"event": "batch_start", "epoch": epoch,
+                        "batch": batch_index, "total": len(train_loader), "device": str(device)}), flush=True)
                 batch = move_batch(batch, device)
                 optimizer.zero_grad(set_to_none=True)
                 output = model(
@@ -476,6 +487,16 @@ def train_epochs(
                 torch.nn.utils.clip_grad_norm_(model.parameters(), DEFAULT_GRAD_CLIP_NORM)
                 optimizer.step()
                 rows.append(output.metrics)
+                global_step += 1
+                batch_loss = output.metrics.get("loss", float(output.loss.detach()))
+                tb_writer.add_scalar("batch/train_loss", batch_loss, global_step)
+                now = time.perf_counter()
+                if batch_index == 1 or batch_index == len(train_loader) or now - last_progress_log >= 30:
+                    print(json.dumps({"event": "batch_end", "epoch": epoch, "batch": batch_index,
+                        "total": len(train_loader), "global_step": global_step,
+                        "train_loss": batch_loss, "elapsed_seconds": now - epoch_start}), flush=True)
+                    tb_writer.flush()
+                    last_progress_log = now
                 progress.set_postfix(loss=f"{output.metrics.get('loss', 0.0):.4f}")
 
             train_metrics = mean_metrics(rows)
@@ -493,6 +514,10 @@ def train_epochs(
                 val_metrics=val_metrics,
             )
 
+            print(json.dumps({"event": "epoch_end", "stage": stage_name, "epoch": epoch,
+                "current": epoch, "total": epochs, "global_step": global_step,
+                "train_loss": train_metrics.get("loss"), "validation_loss": val_metrics.get("loss"),
+                "validation_seconds": val_seconds}), flush=True)
             final_epoch = epoch
             final_train_metrics = train_metrics
             final_val_metrics = val_metrics

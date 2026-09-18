@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import sys
+from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 
 import torch
@@ -60,6 +61,88 @@ def _precursor_rows(structure) -> list[list[list[int]]]:
     return rows
 
 
+def _node_view(structure, samples, source_smiles, file_path):
+    from rdkit import Chem
+    from rdkit.Chem.Draw import rdMolDraw2D
+    from clefts.libs.mmkit.mmkit import Compound
+    source=Compound.from_smiles(source_smiles)
+    mol=source.mapped_mol
+    drawer=rdMolDraw2D.MolDraw2DSVG(620,360)
+    drawer.DrawMolecule(mol);drawer.FinishDrawing()
+    registry=[];original_actions=[];params={}
+    for parent in file_path.parents:
+        config=parent/'preparation_config.json'
+        if config.exists():
+            params=json.loads(config.read_text());break
+    model=params.get('model_config',{})
+    fragmenter_params=model.get('fragmenter_params',params.get('fragmenterParams'))
+    if fragmenter_params:
+        from clefts.domain.fragment.fragmenter import Fragmenter
+        original_actions=list(Fragmenter.from_dict(fragmenter_params).fragment_ion_tree_builder.create_cleavage_actions(source))
+        if len(original_actions)!=len(structure.action_type): original_actions=[]
+    atoms=list(mol.GetAtoms())
+    if len(atoms)!=structure.source_graph.num_nodes:
+        atoms=[atom for atom in atoms if atom.GetAtomicNum()!=1]
+    ptr=structure.action_source_atom_ptr.tolist();index=structure.action_source_atom_index.tolist()
+    for number,category in enumerate(structure.action_type.tolist()):
+        original=original_actions[number] if original_actions else None
+        definitions=(fragmenter_params or {}).get('fragment_ion_tree_builder',{}).get('cleavage_pattern_set',{}).get('patterns',[])
+        definition=definitions[category[0]] if category[0]<len(definitions) else {}
+        registry.append(dict(id=number,cleavagePatternId=category[0],reactionId=category[1],reactantId=category[1],productMoleculeId=category[2],
+            cleavagePatternName=definition.get('name',''),reactantSmarts=definition.get('reactant_smarts',''),
+            sourceAtomMaps=list(original.source_atom_maps) if original else [atoms[i].GetAtomMapNum() for i in index[ptr[number]:ptr[number+1]]],
+            retainedAtomMaps=sorted(original.retained_atom_maps) if original else [],
+            discardedAtomMaps=sorted(original.discarded_atom_maps) if original else [],
+            cutBondMaps=sorted(original.cut_bond_maps) if original else [],
+            changedBondMaps=sorted(original.changed_bond_maps) if original else []))
+    def action_id(action):
+        if action is None:return None
+        if original_actions:
+            try:return original_actions.index(action)
+            except ValueError:pass
+        for entry in registry:
+            if (entry['cleavagePatternId'],entry['reactantId'],entry['productMoleculeId'])==(action.cleavage_pattern_id,action.reaction_id,action.product_molecule_id) and entry['sourceAtomMaps']==list(action.source_atom_maps):return entry['id']
+        raise ValueError('Saved transition cannot be matched to an action registry entry.')
+    decoded=structure.downstream.decoded if structure.downstream is not None else None
+    offset=0
+    totals=dict(nodes=0,edges=0,edgeTransitions=0)
+    if decoded:
+        for sample,tree in zip(samples,decoded.trees):
+            tree_nodes=[tree.get_node(index) for index in range(tree.num_nodes)]
+            ids=[node.id for node in tree_nodes]
+            use_ids=len(set(ids))==len(ids) and all(number>=0 for number in ids)
+            ids=ids if use_ids else [node.index for node in tree_nodes]
+            states_for_node={}
+            for state in sample['states']:
+                global_node=int(structure.state_fragment_node_index[state['id']].item())
+                states_for_node.setdefault(global_node,[]).append(state)
+            nodes=[]
+            for node in tree_nodes:
+                histories=[];eos=False;next_actions=set()
+                for state in states_for_node.get(offset+node.index,[]):
+                    if state['actions'] not in histories:histories.append(state['actions'])
+                    eos=eos or state['eos'];next_actions.update(state['positiveNextActions'])
+                precursor=any(set(history)==set(alternative) for history in histories for alternative in sample['precursorAlternatives'])
+                if node.index==0 and (not sample['precursorAlternatives'] or [] in sample['precursorAlternatives']):precursor=True
+                nodes.append(dict(id=ids[node.index],smiles=node.smiles,actionSets=histories,precursor=precursor,eos=eos,positiveNextActions=sorted(next_actions)))
+            edges=[]
+            for edge in (tree.get_edge(index) for index in range(tree.num_edges)):
+                transitions=[]
+                for transition in edge.transitions:
+                    transitions.append(dict(addedAction=action_id(transition.added_action),
+                        parentActions=[action_id(action) for action in transition.parent_action_sequence.actions] if transition.parent_action_sequence else [],
+                        targetActions=[action_id(action) for action in transition.action_sequence.actions]))
+                edges.append(dict(id=edge.index,source=ids[edge.source_index],target=ids[edge.target_index],transitions=transitions))
+            for peak in sample.get('peaks',[]):
+                for match in peak['matches']:
+                    match['nodeIds']=[ids[index-offset] for index in match.get('nodeIndices',[]) if offset<=index<offset+len(nodes)]
+            sample.update(nodes=nodes,edges=edges,nodeIdSource='stored ID' if use_ids else 'local fragment node index',
+                          nodeCount=len(nodes),edgeCount=len(edges),edgeTransitionCount=sum(len(edge['transitions']) for edge in edges))
+            totals['nodes']+=len(nodes);totals['edges']+=len(edges);totals['edgeTransitions']+=sample['edgeTransitionCount']
+            offset+=len(nodes)
+    return registry,drawer.GetDrawingText(),totals,fragmenter_params
+
+
 def inspect_structure(file_path: Path) -> dict:
     payload = torch.load(file_path, map_location="cpu", weights_only=False)
     if not isinstance(payload, dict) or "structure" not in payload:
@@ -87,23 +170,47 @@ def inspect_structure(file_path: Path) -> dict:
             transitions_by_sample.setdefault(sample, []).append(transition)
 
     num_samples = int(structure.num_samples)
+    annotations=getattr(structure,'sample_annotations',()) or metadata.get('sample_annotations',[])
     samples = []
     for sample_id in range(num_samples):
         adduct_index, collision_energy = (conditions[sample_id] if sample_id < len(conditions) else (None, None))
+        if sample_id<len(annotations): collision_energy=annotations[sample_id]["collisionEnergy"]
+        display_ce=str(Decimal(str(collision_energy if sample_id<len(annotations) else round(collision_energy,5))).quantize(Decimal("0.1"),rounding=ROUND_HALF_UP)) if collision_energy is not None else "Unavailable"
         samples.append({
+            **(annotations[sample_id] if sample_id<len(annotations) else {}),
             "id": sample_id,
             "adductIndex": adduct_index,
             "collisionEnergy": collision_energy,
+            "collisionEnergyDisplay":display_ce,
             "precursorAlternatives": precursor_rows[sample_id] if sample_id < len(precursor_rows) else [],
             "states": states_by_sample.get(sample_id, []),
             "transitions": transitions_by_sample.get(sample_id, []),
         })
 
+    actions,source_svg,totals,fragmenter_params=_node_view(structure,samples,source_smiles,file_path)
+    if fragmenter_params:
+        from clefts.domain.fragment.fragmenter import Fragmenter
+        from clefts.libs.mmkit.mmkit import Adduct
+        fragmenter=Fragmenter.from_dict(fragmenter_params)
+        for sample in samples:
+            if not sample.get('adduct'):
+                for parent in file_path.parents:
+                    config=parent/'preparation_config.json'
+                    if not config.exists():continue
+                    model=json.loads(config.read_text()).get('model_config',{})
+                    types=model.get('adduct_type_strs',[str(adduct) for adduct in fragmenter.adduct_types])
+                    index=int(sample['adductIndex'])
+                    if 0<=index<len(types):
+                        sample['adduct']=types[index]
+                        sample['mainAdduct']=str(fragmenter._resolve_main_adduct_type(Adduct.parse(types[index])))
+                    break
     return {
+        "actions":actions,"sourceSvg":source_svg,"fragmenterParams":fragmenter_params,
         "file": str(file_path),
         "metadata": metadata,
         "sourceSmiles": source_smiles,
         "summary": {
+            **totals,
             "samples": num_samples,
             "primitiveActions": int(structure.action_type.shape[0]),
             "teacherStates": len(states),

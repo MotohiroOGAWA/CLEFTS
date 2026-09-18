@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Sequence, Iterable
 from dataclasses import dataclass
 import time
 from typing import Any
@@ -18,6 +18,10 @@ from .CleavageActionTransition import CleavageActionTransition
 from .FragmentEdge import FragmentEdge
 from .FragmentNode import FragmentNode
 from .FragmentTree import FragmentTree
+
+
+class FragmentTreeLimitExceeded(ValueError):
+    """A single source tree exceeds configured size limits."""
 
 
 @dataclass(frozen=True)
@@ -72,7 +76,7 @@ class FragmentTreeBuilder:
         *,
         seed_action_sequences: Sequence[CleavageActionSequence] | None,
         max_action_count: int | None,
-    ) -> tuple[CleavageActionSearch, tuple[_ActionSequenceCandidate, ...]]:
+    ) -> tuple[CleavageActionSearch, Iterable[_ActionSequenceCandidate]]:
         if not isinstance(source_compound, Compound):
             raise TypeError("source_compound must be a Compound.")
         limit = self._action_limit(max_action_count)
@@ -88,14 +92,18 @@ class FragmentTreeBuilder:
         actions = self.create_cleavage_actions(source_compound)
         search = CleavageActionSearch(actions, max_action_count=limit,
                                       seed_action_sequences=seeds)
-        return search, search.enumerate()
+        return search, search.iter_candidates()
 
-    def _materialize(
+    def _materialize(self, source_compound, search, candidates):
+        return {candidate.action_sequence: result for candidate, result in
+                self._materialize_iter(source_compound, search, candidates)}
+
+    def _materialize_iter(
         self,
         source_compound: Compound,
         search: CleavageActionSearch,
-        candidates: tuple[_ActionSequenceCandidate, ...],
-    ) -> dict[CleavageActionSequence, CleavageActionResult]:
+        candidates: Iterable[_ActionSequenceCandidate],
+    ):
         """Compile/run each unique effect once, retaining every action history."""
         results: dict[CleavageActionSequence, CleavageActionResult] = {}
         effect_cache: dict[tuple[object, ...], tuple[Compound, str] | None] = {}
@@ -103,6 +111,7 @@ class FragmentTreeBuilder:
         for candidate in candidates:
             sequence = candidate.action_sequence
             if sequence in results:
+                yield candidate, results[sequence]
                 continue
             effect = sequence.effect_key
             if effect in visited_effect_keys:
@@ -128,7 +137,7 @@ class FragmentTreeBuilder:
             if cached is not None:
                 target, smirks = cached
                 results[sequence] = CleavageActionResult(sequence, target, smirks)
-        return results
+                yield candidate, results[sequence]
 
     def cleave_all(
         self,
@@ -137,7 +146,7 @@ class FragmentTreeBuilder:
         seed_action_sequences: Sequence[CleavageActionSequence] | None = None,
         max_action_count: int | None = None,
     ) -> tuple[CleavageActionResult, ...]:
-        """Enumerate unordered histories, then react once per unique Source effect."""
+        """Iterate normalized unordered histories and react once per unique Source effect."""
         search, candidates = self._search(source_compound,
             seed_action_sequences=seed_action_sequences, max_action_count=max_action_count)
         results = self._materialize(source_compound, search, candidates)
@@ -176,17 +185,15 @@ class FragmentTreeBuilder:
         source_compound = compound
         search, candidates = self._search(source_compound,
             seed_action_sequences=seed_action_sequences, max_action_count=max_action_count)
-        results = self._materialize(source_compound, search, candidates)
         state = _FragmentTreeBuildState(source_compound.smiles, max_node=max_node, max_edge=max_edge,
                                         only_add_min_action_count=self.only_add_min_action_count)
         compounds = {0: source_compound.copy()}
         expansion_by_sequence: dict[CleavageActionSequence | None, _FragmentExpansionState] = {
             None: _FragmentExpansionState(0, None)}
         processed_states: set[tuple[int, tuple[tuple[object, ...], ...] | None]] = set()
-        for candidate in candidates:
+        pending_predecessors = {}
+        for candidate, result in self._materialize_iter(source_compound, search, candidates):
             sequence = candidate.action_sequence
-            if sequence not in results:
-                continue
             parent_sequence = candidate.parent_action_sequence
             added_action = candidate.added_action
             parent = expansion_by_sequence.get(parent_sequence)
@@ -208,7 +215,6 @@ class FragmentTreeBuilder:
                             break
                 if parent is None:
                     continue
-            result = results[sequence]
             target_index = state.get_or_create_node_index(result.compound.smiles, len(sequence.actions))
             child = _FragmentExpansionState(target_index, sequence)
             expansion_by_sequence[sequence] = child
@@ -217,24 +223,25 @@ class FragmentTreeBuilder:
             transition = CleavageActionTransition(added_action, sequence,
                                                    parent_sequence, candidate.is_seed)
             state.add_fragment_edge(parent.node_index, target_index, transition)
-        # Combination enumeration visits each unordered collection once. Tree
-        # presentation may retain several valid one-action predecessors for the
-        # same already computed history, without executing its effect again.
-        for sequence, child in expansion_by_sequence.items():
-            if sequence is None:
-                continue
+            # Add alternative routes immediately, including routes whose predecessor
+            # arrives later. Count distinct transitions rather than node pairs.
+            for target_sequence, added in pending_predecessors.pop(sequence, []):
+                destination = expansion_by_sequence[target_sequence]
+                state.add_fragment_edge(child.node_index, destination.node_index,
+                    CleavageActionTransition(added, target_sequence, sequence))
             for added in sequence.actions:
                 remaining = tuple(a for a in sequence.actions if a != added)
                 predecessor = CleavageActionSequence(remaining) if remaining else None
                 if predecessor is None and seed_action_sequences:
                     continue
-                parent = expansion_by_sequence.get(predecessor)
-                if parent is None:
-                    continue
                 if CleavageActionSequence((*(predecessor.actions if predecessor else ()), added)) != sequence:
                     continue
-                state.add_fragment_edge(parent.node_index, child.node_index,
-                    CleavageActionTransition(added, sequence, predecessor))
+                alternate = expansion_by_sequence.get(predecessor)
+                if alternate is None:
+                    pending_predecessors.setdefault(predecessor, []).append((sequence, added))
+                else:
+                    state.add_fragment_edge(alternate.node_index, child.node_index,
+                        CleavageActionTransition(added, sequence, predecessor))
         if not seed_action_sequences:
             processed_states.add((0, None))
         stats = search.stats.to_dict()
@@ -280,6 +287,7 @@ class _FragmentTreeBuildState:
         self.only_add_min_action_count = only_add_min_action_count
         self.nodes: dict[int, FragmentNode] = {}
         self.edges: dict[tuple[int, int], FragmentEdge] = {}
+        self.transition_count = 0
         self.smiles_to_node_index: dict[str, int] = {}
         self.node_action_counts: dict[int, int] = {}
         self.get_or_create_node_index(root_smiles, 0)
@@ -290,7 +298,7 @@ class _FragmentTreeBuildState:
             self.node_action_counts[index] = min(self.node_action_counts[index], action_count)
             return index
         if self.max_node >= 0 and len(self.nodes) >= self.max_node:
-            raise ValueError(f"Fragment tree node limit exceeded: max_node={self.max_node}")
+            raise FragmentTreeLimitExceeded(f"Fragment tree node limit exceeded: max_node={self.max_node}")
         index = len(self.nodes)
         self.nodes[index] = FragmentNode(index, -1, smiles)
         self.smiles_to_node_index[smiles] = index
@@ -309,11 +317,14 @@ class _FragmentTreeBuildState:
         if (self.only_add_min_action_count and not transition.is_seed
                 and len(transition.action_sequence.actions) > self.node_action_counts[target_index]):
             return
+        if key in self.edges and transition in self.edges[key].transitions:
+            return
+        if self.max_edge >= 0 and self.transition_count >= self.max_edge:
+            raise FragmentTreeLimitExceeded(f"Fragment tree edge limit exceeded: max_edge={self.max_edge}")
+        self.transition_count += 1
         if key in self.edges:
             self.edges[key] = self.edges[key].with_transition(transition)
             return
-        if self.max_edge >= 0 and len(self.edges) >= self.max_edge:
-            raise ValueError(f"Fragment tree edge limit exceeded: max_edge={self.max_edge}")
         self.edges[key] = FragmentEdge(len(self.edges), -1, source_index, target_index,
                                        self.nodes[source_index].id, self.nodes[target_index].id,
                                        transitions=(transition,))

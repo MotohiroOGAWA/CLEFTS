@@ -19,11 +19,12 @@ class ActionExpansion:
 
 
 class ActionCompatibilityEngine(nn.Module):
-    def __init__(self, max_action_count: int) -> None:
+    def __init__(self, max_action_count: int, *, enforce_reactant_order: bool = False) -> None:
         super().__init__()
         if type(max_action_count) is not int or max_action_count < 1:
             raise ValueError("max_action_count must be a positive integer")
         self.max_action_count = max_action_count
+        self.enforce_reactant_order=enforce_reactant_order
 
     def expand(self, *, state_action_index: Tensor, state_sample_index: Tensor,
                pool_valid: Tensor, pool_conflict: Tensor, pool_precedence: Tensor,
@@ -62,6 +63,11 @@ class ActionCompatibilityEngine(nn.Module):
                 words=pool_retained[sample,safe[:,position]]
                 retained=retained & torch.where(normalized[:,position,None],words,torch.full_like(words,-1))
         repeated = (previous == candidate[:, None]).any(dim=1)
+        # An action whose original SMARTS match was invalidated by an already
+        # selected action cannot be appended after it. This is stronger than
+        # acyclic unordered combination validity and matters after a precursor.
+        invalidated=(pool_precedence[sample[:,None],candidate[:,None],previous.clamp_min(0)] & (previous>=0)).any(dim=1)
         valid = (pool_valid[sample, candidate] & ~repeated & ~conflict & ~cycle & ~no_op
                  & retained.any(dim=1) & (count <= self.max_action_count))
+        if self.enforce_reactant_order:valid &= ~invalidated
         return ActionExpansion(parent, candidate, valid, child, count, retained, conflict, cycle, no_op)

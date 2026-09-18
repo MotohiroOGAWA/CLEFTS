@@ -1,6 +1,6 @@
 """Source -> actions -> Torch decode -> selected molecules -> tree/intensity."""
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from collections.abc import Sequence
 import torch
 from torch import Tensor, nn
@@ -40,8 +40,11 @@ class SourceAnchoredFragmentSpectrumGenerator(nn.Module):
 
     def __init__(self, fragmenter_params: dict, mol_encoder_params: dict,
                  action_model_params: dict | None = None, post_model_params: dict | None = None,
+                 max_samples: int = 128,
                  adduct_type_strs: Sequence[str] | None = None, fine_tuning: dict | None = None) -> None:
         super().__init__()
+        if type(max_samples) is not int or max_samples<1:raise ValueError("max_samples must be positive")
+        self.max_samples=max_samples
         self.fragmenter = Fragmenter.from_dict(fragmenter_params)
         self.adduct_type_strs = tuple(dict.fromkeys(str(Adduct.parse(value)) for value in
             (adduct_type_strs or (str(adduct) for adduct in self.fragmenter.adduct_types))))
@@ -88,8 +91,13 @@ class SourceAnchoredFragmentSpectrumGenerator(nn.Module):
             # small, fixed-cost preparation step, never an exhaustive search.
             precursor_tree=self.fragmenter.build_fragment_ion_tree(source,
                 max_action_count=self.fragmenter.precursor_candidate_max_action_count,_include_fragment_compound_cache=True)
-            precursor_sequences=[tuple(pa.action_sequence for pa in
-                self.fragmenter.resolve_precursor_actions(precursor_tree,precursor_types[i])) for i in rows]
+            precursor_cache={}
+            for i in rows:
+                key=str(precursor_types[i])
+                if key not in precursor_cache:
+                    sequences={pa.action_sequence for pa in self.fragmenter.resolve_precursor_actions(precursor_tree,precursor_types[i])}
+                    precursor_cache[key]=tuple(sorted(sequences,key=lambda seq:(seq is not None,seq.key if seq else ())))
+            precursor_sequences=[precursor_cache[str(precursor_types[i])] for i in rows]
             structures.append(prepare_source_actions(source=source,actions=actions,graph_builder=self.mol_encoder.graph_builder,
                 condition_features=conditions,max_action_count=self.feature_model.max_action_count,
                 precursor_sequences=precursor_sequences))
@@ -101,14 +109,63 @@ class SourceAnchoredFragmentSpectrumGenerator(nn.Module):
         return data,tuple(unique_sources),tuple(universes),tuple(ordered_adducts),tuple(input_indices)
 
     @torch.no_grad()
-    def predict(self, sources: Sequence[Compound], precursor_types: Sequence[Adduct], collision_energy: Sequence[float]) -> SourceAnchoredSpectrumOutput:
-        if self.training:
-            raise ValueError("Call eval() before predict(); training uses precomputed schema v4 data")
-        data,sources,actions,adducts,indices=self.prepare(sources,precursor_types,collision_energy)
+    def predict_batches(self,sources,precursor_types,collision_energy,*,max_samples=None):
+        limit=self.max_samples if max_samples is None else max_samples
+        if self.training:raise ValueError('Call eval() before predict_batches()')
+        if type(limit) is not int or limit<1:raise ValueError('max_samples must be positive')
+        if not sources or not len(sources)==len(precursor_types)==len(collision_energy):raise ValueError('Input lengths must match and be nonzero')
+        # Keep every condition of a shared source in one group. Packs bound the
+        # source/action tensors too, rather than merely slicing final scores.
+        groups={}
+        for i,source in enumerate(sources):groups.setdefault(source.smiles,[]).append(i)
+        packs=[];current=[]
+        for rows in groups.values():
+            if current and len(current)+len(rows)>limit:packs.append(current);current=[]
+            current.extend(rows)
+            if len(current)>=limit:packs.append(current);current=[]
+        if current:packs.append(current)
+        for rows in packs:
+            for output in self._predict_group_batches([sources[i] for i in rows],[precursor_types[i] for i in rows],[collision_energy[i] for i in rows],max_samples=limit):
+                yield replace(output,sample_input_index=tuple(rows[i] for i in output.sample_input_index))
+
+    @torch.no_grad()
+    def _predict_group_batches(self, sources, precursor_types, collision_energy, *, max_samples=None):
+        """Yield bounded outputs, with global input indices and shared static tokens."""
+        if self.training:raise ValueError("Call eval() before predict_batches()")
+        limit=self.max_samples if max_samples is None else max_samples
+        if type(limit) is not int or limit<1:raise ValueError("max_samples must be positive")
+        data,unique_sources,actions,adducts,indices=self.prepare(sources,precursor_types,collision_energy)
+        from ..input.action_batching import select_samples
+        from .post_materialization_model import deduplicate_molecular_graphs
         device=next(self.parameters()).device
-        data=data.to(device)
-        selection=self(data)
-        decoded=materialize_action_states(selection.decoded,sources,actions,data.sample_tree_index,self.mol_encoder.graph_builder)
-        downstream=prepare_post_materialization(decoded,self.fragmenter,adducts,self.tensorizer).to(device)
-        spectra=self.post_model(downstream,action_h=selection.features.action_h,condition_h=selection.features.condition_h)
-        return SourceAnchoredSpectrumOutput(selection,decoded,spectra,downstream,indices)
+        static=self.feature_model.encode_static(data,max_graphs=limit)
+        effect_cache={}
+        molecular_cache={source.smiles:static[1][i] for i,source in enumerate(unique_sources)}
+        for start in range(0,data.num_samples,limit):
+            stop=min(start+limit,data.num_samples)
+            chunk=select_samples(data,range(start,stop)).to(device)
+            features=self.feature_model(chunk,static_features=static)
+            selection=SourceAnchoredSelectionOutput(features,self.feature_model.decoder(features.pool,features.condition_h))
+            decoded=materialize_action_states(selection.decoded,unique_sources,actions,chunk.sample_tree_index,self.mol_encoder.graph_builder,effect_cache=effect_cache)
+            downstream=prepare_post_materialization(decoded,self.fragmenter,adducts[start:stop],self.tensorizer)
+            downstream=deduplicate_molecular_graphs(downstream,tuple(source.smiles for source in unique_sources))
+            graph_keys=[key for key,index in zip(downstream.unique_smiles,downstream.unique_source_index.tolist()) if index<0]
+            graphs=downstream.unique_node_graph.to_data_list()
+            missing=[i for i,key in enumerate(graph_keys) if key not in molecular_cache]
+            if missing:
+                from torch_geometric.data import Batch
+                # Also bound molecular graph encoding for large selected trees.
+                for offset in range(0,len(missing),limit):
+                    ids=missing[offset:offset+limit]
+                    embeddings=self.mol_encoder(Batch.from_data_list([graphs[i] for i in ids]).to(device)).embeddings
+                    molecular_cache.update((graph_keys[i],embeddings[j]) for j,i in enumerate(ids))
+            molecular=torch.stack([molecular_cache[key] for key in downstream.unique_smiles])[downstream.node_graph_inverse.to(device)]
+            downstream=downstream.to(device)
+            spectra=self.post_model(downstream,action_h=features.action_h,condition_h=features.condition_h,source_embeddings=features.source_embeddings,molecular_embeddings=molecular)
+            yield SourceAnchoredSpectrumOutput(selection,decoded,spectra,downstream,indices[start:stop])
+
+    @torch.no_grad()
+    def predict(self, sources, precursor_types, collision_energy):
+        if len(sources)>self.max_samples:
+            raise ValueError("Use predict_batches() for inputs exceeding max_samples")
+        return next(self.predict_batches(sources,precursor_types,collision_energy))

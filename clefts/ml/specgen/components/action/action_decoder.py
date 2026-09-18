@@ -1,6 +1,6 @@
 """Fixed-pool, tensor-only normalized action-set decoder."""
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
@@ -23,10 +23,11 @@ class ActionPool:
     # Pool-local seeds for beam initialization: real MS2 fragmentation always
     # happens on the selected precursor ion, never on the bare Source, so
     # decoding starts from these states instead of always the empty <BOS>.
-    # One row per (sample, precursor alternative); a sample with none of its
-    # own (Source itself is the precursor) contributes no row here.
+    # One row per (sample, precursor alternative), including an empty row
+    # when Source itself is a valid precursor.
     precursor_row_sample_index: Tensor
     precursor_row_action_index: Tensor
+    precursor_eos_logits: Tensor | None = field(default=None,kw_only=True)
 
 
 def positive_mask(ptr: Tensor, index: Tensor, rows: int, columns: int) -> Tensor:
@@ -41,7 +42,7 @@ def build_action_pool(action_h: Tensor, absolute: Tensor, data: object, *, top_k
     s, a = absolute.shape
     device = absolute.device
     eligible = data.action_tree_index[None, :] == data.sample_tree_index[:, None]
-    filtered = absolute.masked_fill(~eligible | (absolute < threshold), -torch.inf)
+    filtered = absolute.masked_fill(~eligible | (absolute <= threshold), -torch.inf)
     ids = torch.argsort(filtered,dim=1,descending=True,stable=True)[:,:min(top_k,a)]
     values = filtered.gather(1,ids)
     inference = torch.zeros_like(eligible)
@@ -57,15 +58,21 @@ def build_action_pool(action_h: Tensor, absolute: Tensor, data: object, *, top_k
     precursor_action_sample = torch.repeat_interleave(row_sample, row_action_counts)
     precursor = torch.zeros((s, a), dtype=torch.bool, device=device)
     precursor[precursor_action_sample, data.precursor_row_action_index] = True
+    if torch.any(precursor.sum(dim=1)>top_k):
+        raise ValueError("Mandatory precursor actions exceed action-top-k; increase the candidate limit")
     selection = inference | precursor | (positive if training else torch.zeros_like(inference))
     if training and torch.any(selection.sum(dim=1) > max_k):
-        raise ValueError("Training pool union exceeds 128; split samples or reduce first-stage top-k")
+        raise ValueError("Training positive/precursor union exceeds action-max-k; increase the limit or reduce action-top-k")
     width = max_k if training else top_k
     # A recorded precursor action must never be dropped by top-k truncation.
-    priority = absolute.masked_fill(~selection, -torch.inf) + precursor.float() * 1e6
-    chosen_ids = torch.argsort(priority,dim=1,descending=True,stable=True)[:,:min(width,a)]
-    chosen_values = priority.gather(1,chosen_ids)
-    valid = torch.isfinite(chosen_values)
+    priority = absolute.masked_fill(~selection, -torch.inf)
+    order = torch.argsort(priority,dim=1,descending=True,stable=True)
+    chosen=selection.gather(1,order)
+    order=order.gather(1,torch.argsort(chosen.to(torch.int8),dim=1,descending=True,stable=True))
+    mandatory = precursor.gather(1,order)
+    order = order.gather(1,torch.argsort(mandatory.to(torch.int8),dim=1,descending=True,stable=True))
+    chosen_ids=order[:,:min(width,a)]
+    valid=selection.gather(1,chosen_ids)
     missing = width - chosen_ids.shape[1]
     chosen_ids = F.pad(chosen_ids, (0, missing), value=a)
     valid = F.pad(valid, (0, missing), value=False)
@@ -153,12 +160,13 @@ class ActionDecoderOutput:
 
 class ActionSequenceDecoder(nn.Module):
     def __init__(self, hidden_dim: int, condition_dim: int, max_action_count: int,
-                 beam_size: int = 32, num_heads: int = 4, max_decode_steps: int = 16) -> None:
+                 beam_size: int = 32, num_heads: int = 4, max_decode_steps: int = 16,
+                 state_num_layers: int = 2, state_dropout: float = 0.0) -> None:
         super().__init__()
         if beam_size < 1 or max_decode_steps < 1:
             raise ValueError("beam_size and max_decode_steps must be positive")
-        self.state_encoder = ActionStateEncoder(hidden_dim, num_heads=num_heads)
-        self.compatibility = ActionCompatibilityEngine(max_action_count)
+        self.state_encoder = ActionStateEncoder(hidden_dim, num_heads=num_heads,num_layers=state_num_layers,dropout=state_dropout)
+        self.compatibility = ActionCompatibilityEngine(max_action_count,enforce_reactant_order=True)
         self.query = nn.Linear(hidden_dim + condition_dim, hidden_dim)
         self.key = nn.Linear(hidden_dim, hidden_dim, bias=False)
         self.eos_head = nn.Linear(hidden_dim + condition_dim, 1)
@@ -171,12 +179,32 @@ class ActionSequenceDecoder(nn.Module):
                      sample: Tensor) -> tuple[Tensor, ActionExpansion]:
         h = self.state_encoder(pool.embeddings, state, sample)
         context = torch.cat((h, conditions[sample]), dim=1)
-        action = pool.absolute_logits[sample] + torch.einsum("ph,pkh->pk", self.query(context), self.key(pool.embeddings[sample])) * self.scale
+        action = pool.absolute_logits[sample].nan_to_num(neginf=0.0) + torch.einsum("ph,pkh->pk", self.query(context), self.key(pool.embeddings[sample])) * self.scale
         expansion = self.compatibility.expand(state_action_index=state, state_sample_index=sample,
             pool_valid=pool.valid, pool_conflict=pool.conflict, pool_precedence=pool.precedence,
             pool_dominance=pool.dominance, pool_retained=pool.retained, source_atom_valid=pool.source_atom_valid)
-        valid = expansion.valid.reshape(state.shape[0], -1) & ((state >= 0).sum(dim=1) < self.max_action_count)[:, None]
-        logits = torch.cat((action.masked_fill(~valid, -torch.inf), self.eos_head(context)), dim=1)
+        valid = expansion.valid.reshape(state.shape[0], pool.valid.shape[1]) & ((state >= 0).sum(dim=1) < self.max_action_count)[:, None]
+        # Children must still contain at least one complete precursor anchor.
+        child=expansion.child_action_index.reshape(state.shape[0],pool.valid.shape[1],self.max_action_count)
+        seeds=pool.precursor_row_action_index
+        rows=pool.precursor_row_sample_index
+        preserved=torch.zeros_like(valid)
+        for start in range(0,seeds.shape[0],32):
+            anchor=seeds[start:start+32]
+            matches=((child[:,:,None,:,None]==anchor[None,None,:,None,:]) | (anchor[None,None,:,None,:]<0)).any(dim=3).all(dim=-1)
+            preserved |= (matches & (sample[:,None,None]==rows[None,None,start:start+32])).any(dim=-1)
+        if seeds.shape[0]:
+            valid &= preserved
+        eos=self.eos_head(context).squeeze(-1)
+        if pool.precursor_eos_logits is not None:
+            # Initial no-cleavage score participates in precursor termination.
+            prior=eos.new_full(eos.shape,-torch.inf)
+            for start in range(0,seeds.shape[0],32):
+                match=(state[:,None,:]==seeds[None,start:start+32,:]).all(-1) & (sample[:,None]==rows[None,start:start+32])
+                values=pool.precursor_eos_logits[None,start:start+32].expand_as(match).masked_fill(~match,-torch.inf)
+                prior=torch.maximum(prior,values.max(-1).values)
+            eos=eos+torch.where(torch.isfinite(prior),prior,torch.zeros_like(prior))
+        logits = torch.cat((action.masked_fill(~valid, -torch.inf), eos[:,None]), dim=1)
         return logits, expansion
 
     def forward(self, pool: ActionPool, conditions: Tensor) -> ActionDecoderOutput:

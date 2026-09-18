@@ -1,5 +1,6 @@
 """Condition-specific scores without recomputing static action embeddings."""
 from __future__ import annotations
+import torch
 from torch import Tensor, nn
 
 
@@ -11,5 +12,8 @@ class ActionConditionScorer(nn.Module):
         self.condition_q = nn.Linear(condition_dim, interaction_dim, bias=False)
         self.scale = interaction_dim ** -0.5
 
-    def forward(self, action_h: Tensor, condition_h: Tensor) -> Tensor:
-        return self.base(action_h).squeeze(-1)[None, :] + self.condition_q(condition_h) @ self.action_q(action_h).T * self.scale
+    def forward(self, action_h: Tensor, condition_h: Tensor, precursor_h: Tensor | None = None) -> Tensor:
+        context = self.condition_q(condition_h)
+        if precursor_h is not None:
+            context = torch.tanh(context + self.action_q(precursor_h))
+        return self.base(action_h).squeeze(-1)[None, :] + context @ self.action_q(action_h).T * self.scale

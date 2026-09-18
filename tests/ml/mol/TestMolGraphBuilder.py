@@ -32,6 +32,24 @@ class TestMolGraphBuilder(unittest.TestCase):
         self.assertTrue(torch.isfinite(data.x).all())
         self.assertTrue(torch.isfinite(data.edge_attr).all())
 
+    def test_hydrogen_nodes_are_optional_and_attached_counts_are_preserved(self):
+        builder=MolGraphBuilder(symbols=('C','O'))
+        plain=builder.build(Compound.from_smiles('C'))
+        explicit=builder.build(Compound.from_smiles('C[H]'))
+        torch.testing.assert_close(plain.x,explicit.x)
+        isotope=Compound.from_smiles('C([2H])O')
+        data=builder.build(isotope)
+        self.assertEqual(data.num_nodes,2)
+        self.assertEqual(data.edge_index.tolist(),[[0,1],[1,0]])
+        carbon=next(atom for atom in isotope.mol.GetAtoms() if atom.GetSymbol()=='C')
+        counts=builder.atom_layer.encode_num_hydrogens(carbon)
+        self.assertEqual(counts.argmax().item(),carbon.GetTotalNumHs(includeNeighbors=True))
+        self.assertEqual(carbon.GetTotalNumHs(includeNeighbors=True),3)
+        hydrogen=builder.build(Compound.from_smiles('[H]'))
+        self.assertEqual(hydrogen.x.shape,(0,builder.atom_dim))
+        registered=MolGraphBuilder(symbols=('C','H','O')).build(isotope)
+        self.assertEqual(registered.num_nodes,3)
+
     def test_build_single_atom_graph(self) -> None:
         compound = Compound.from_smiles("C")
 

@@ -45,3 +45,7 @@ MSDataset prediction**. `clefts-predict-spectrum` is an equivalent command name.
 
 
 ---
+
+## Documentation
+
+See the [CLEFTS documentation](docs/index.md) and the [shared product overview](clefts_workbench/content/overview.md). Build the Sphinx + Furo guide with `pip install -e ".[docs]"` and `python -m sphinx -W --keep-going -b html docs docs/_build/html`.

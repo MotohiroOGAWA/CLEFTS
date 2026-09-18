@@ -26,6 +26,9 @@ def _walk_pathway(tree, fragmenter, pathway) -> set:
                 for transition in edge.transitions:
                     if transition.parent_action_sequence != state:
                         continue
+                    if state is not None and transition.added_action is not None:
+                        action=transition.added_action
+                        if not set(action.source_atom_maps)<=state.retained_atom_maps or any(previous.changed_bond_maps & action.matched_bond_maps for previous in state.actions):continue
                     if node.is_precursor and len(transition.action_sequence.actions) > fragmenter.precursor_candidate_max_action_count:
                         continue
                     next_states.add((edge.target_index, transition.action_sequence))
@@ -34,8 +37,10 @@ def _walk_pathway(tree, fragmenter, pathway) -> set:
 
 
 class ActionStructureBuilder:
-    def __init__(self, generator: SourceAnchoredFragmentSpectrumGenerator) -> None:
+    def __init__(self, generator: SourceAnchoredFragmentSpectrumGenerator, *, max_node: int = -1, max_edge: int = -1) -> None:
         self.generator = generator
+        self.max_node = max_node
+        self.max_edge = max_edge
 
     def build(self, source: Compound, precursor_types: Sequence[Adduct], collision_energy: Sequence[float],
               peaks_mz: Sequence[Sequence[float]], peaks_intensity: Sequence[Sequence[float]]) -> SourceActionStructure:
@@ -48,7 +53,7 @@ class ActionStructureBuilder:
         fragmenter=generator.fragmenter
         actions=fragmenter.fragment_ion_tree_builder.create_cleavage_actions(source)
         # Full chemistry is permitted here, never inside neural forward.
-        tree=fragmenter.build_fragment_ion_tree(source,_include_fragment_compound_cache=True)
+        tree=fragmenter.build_fragment_ion_tree(source,max_node=self.max_node,max_edge=self.max_edge,_include_fragment_compound_cache=True)
         assignments=fragmenter.assign_fragment_pathways_to_peak_sets(tree,zip(precursor_types,peaks_mz))
         targets=[]
         for _,groups in assignments:
@@ -94,6 +99,13 @@ class ActionStructureBuilder:
                 added.append(action)
                 terminal.append(bool(data.teacher_positive_eos[known[state]]))
                 original=known[state]
+                if state is None and None not in precursor_sequences[sample]:
+                    # Match inference: deterministic precursor combinations are
+                    # whole seed edges, not learned fragmentation prefixes.
+                    for seed in sorted((seq for seq in precursor_sequences[sample] if seq in known),key=lambda seq:seq.key):
+                        if seed not in visited:
+                            visited.add(seed);queue.append((seed,row_index,-1))
+                    continue
                 start,stop=data.teacher_positive_action_ptr[original:original+2].tolist()
                 # prepare_source_actions already guarantees every teacher state
                 # here is precursor-consistent, so any traversal order yields a
@@ -123,5 +135,31 @@ class ActionStructureBuilder:
         node_by_state={(dense_sample[row],tuple(i for i in dense_rows[row] if i>=0)):node
                        for row,node in zip(decoded.materialized_state_index.tolist(),decoded.materialized_node_index.tolist())}
         state_nodes=torch.tensor([node_by_state.get((sample,tuple(row)),-1) for sample,row in zip(samples,rows)],dtype=torch.long)
-        return replace(data,state_fragment_node_index=state_nodes,
+        annotations=[]
+        for sample,((_,groups),adduct,energy,mzs,intensities) in enumerate(zip(assignments,precursor_types,collision_energy,peaks_mz,peaks_intensity)):
+            main=fragmenter._resolve_main_adduct_type(adduct)
+            precursor_mz=adduct.apply_to_formula(source.formula).normalized.exact_mass
+            peaks=[]
+            for peak_index,(mz,intensity,group) in enumerate(zip(mzs,intensities,groups)):
+                matches=[]
+                for pathway in group:
+                    sequences=_walk_pathway(tree,fragmenter,pathway)
+                    local_nodes=sorted({node_by_state[(sample,tuple(sorted(actions.index(action) for action in seq.actions)) if seq else ())]
+                                        for seq in sequences if (sample,tuple(sorted(actions.index(action) for action in seq.actions)) if seq else ()) in node_by_state})
+                    if not local_nodes:continue
+                    match=dict(nodeIndices=local_nodes,smiles=pathway.terminal_node.smiles,
+                               formula=str(pathway.formula),theoreticalMz=float(pathway.formula.exact_mass),
+                               massErrorPpm=(float(mz)-pathway.formula.exact_mass)/pathway.formula.exact_mass*1e6,
+                               adduct=str(pathway.adduct),hydrogenShift=pathway.adduct.element_diff.get('H',0)-main.element_diff.get('H',0))
+                    if match not in matches:matches.append(match)
+                peaks.append(dict(index=peak_index,mz=float(mz),intensity=float(intensity),
+                                  precursor=bool(fragmenter.mass_tolerance.within(float(mz),precursor_mz)),matches=matches))
+            def score(selected):
+                total=sum(peak['intensity'] for peak in selected)
+                return sum(peak['intensity'] for peak in selected if peak['matches'])/total if total>0 else None
+            annotations.append(dict(adduct=str(adduct),mainAdduct=str(main),collisionEnergy=float(energy),
+                                    precursorMz=float(precursor_mz),peaks=peaks,
+                                    assignmentScore=score(peaks),
+                                    assignmentScoreWithoutPrecursor=score([peak for peak in peaks if not peak['precursor']])))
+        return replace(data,state_fragment_node_index=state_nodes,sample_annotations=tuple(annotations),
                        downstream=replace(downstream,target_intensity=torch.tensor(target)))

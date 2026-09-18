@@ -4,7 +4,7 @@ import os
 import sys
 import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Dict, Generator, List, Optional
+from typing import Callable, Dict, Generator, List, Optional
 
 from tqdm import tqdm
 
@@ -107,6 +107,7 @@ def run_parallel_subprocesses(
     env: Optional[Dict[str, str]] = None,
     desc: str = "Parallel tasks",
     unit: str = "it",
+    on_complete: Optional[Callable[[List[str]], None]] = None,
 ) -> None:
     """Run multiple subprocesses in parallel.
 
@@ -121,18 +122,23 @@ def run_parallel_subprocesses(
     print_output:
         If True, show subprocess stdout/stderr.
         If False, suppress stdout/stderr.
+    on_complete:
+        Optional callback receiving the command after each successful subprocess,
+        invoked in the calling thread in completion order.
     """
 
+
+    # Optional parent-side notification preserves subprocess isolation.
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [
+        futures = {
             executor.submit(
                 run_in_subprocess,
                 commands,
                 print_output,
                 env,
-            )
+            ): commands
             for commands in commands_list
-        ]
+        }
 
         for future in tqdm(
             as_completed(futures),
@@ -141,3 +147,5 @@ def run_parallel_subprocesses(
             unit=unit,
         ):
             future.result()
+            if on_complete is not None:
+                on_complete(futures[future])
