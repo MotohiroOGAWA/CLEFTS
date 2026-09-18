@@ -316,11 +316,49 @@ opens the shared introduction.
 Open **Settings → Preferences** and configure `clefts.workbench.defaultOutputDirectory`.
 It defaults to empty; output fields remain blank until a root is configured or a
 path is entered. New workflows use named timestamp subdirectories of that root.
-**Save as Workbench Defaults** stores Data, Training or Prediction values in VS Code
-settings. New Workbench forms apply those defaults, including nested parameter
+Edit `clefts.workbench.dataDefaults`, `trainingDefaults` or `predictionDefaults`
+in VS Code settings to configure initial form values. New Workbench forms apply those defaults, including nested parameter
 objects. Output paths are generated separately. See the
 [defaults guide](https://github.com/MotohiroOGAWA/CLEFTS/blob/main/docs/guides/workbench.md).
 
 Normalize Intensities defaults to enabled. Data **Output → Parallel Processing**
 provides Worker Processes and Chunk Size (`1` each by default). The CLI supports
 `--num-workers` and `--chunk-size`. Stop terminates the preparation process and its workers.
+
+### Source-anchored training workbench
+
+Open **CLEFTS: Start Training** (or **Training → New Training**) to configure
+`clefts.cli train fragment-tree`, implemented by
+`clefts/ml/training/fragment_tree_training/training.py`.
+The training page provides four initialization modes:
+
+- **New model** starts from scratch.
+- **Initialize weights** supplies `--initialize-from` with a fresh optimizer.
+- **Resume training** supplies `--resume` to restore the optimizer and epoch.
+- **Fine-tune patterns** supplies `--fine-tune-checkpoint`,
+  `--fine-tune-pattern-set` and `--adapter-width`. Include every old pattern and
+  regenerate training and validation structures with the expanded configuration.
+
+The page groups dataset paths, model configuration, training settings and output
+beside a live run summary, environment/input checks and weighted loss summary.
+Dataset cards recursively count `.preft.pt` files and their bytes without loading
+tensors. Estimated optimizer steps are `ceil(training files / batch size) × epochs`.
+Dataset schema, saved molecular targets, checkpoint compatibility and actual
+memory requirements are verified by the training runtime. **Inspect Dataset**
+reveals the directory in Explorer. **Start Training** opens the existing job view
+with logs, progress and metrics. **Copy Command** uses the same CLI builder.
+
+
+Mol Training is available under **Training → Mol Training**. Drop or select multiple
+training and validation SMILES files, then configure Graphormer candidates, six
+pretraining tasks and their loss weights, early stopping and balanced sampling.
+Each graph dimension must be a multiple of every node dimension, and every node
+dimension must be divisible by every attention head count. The initial 64 / 128
+node / graph dimensions provide a valid single configuration.
+
+**Copy Command** and **Start Training** stay at the bottom right. Preflight checks
+file access, elements, descriptor names, candidate combinations and the selected
+device. Runs appear in **Training Jobs**, where logs, stop and output actions are
+available. **Inspect molecules** reports all non-empty SMILES rows and checks up
+to the first 5,000 molecules, with structure previews for the first five valid
+molecules. Configure initial values through `clefts.workbench.molTrainingDefaults`.

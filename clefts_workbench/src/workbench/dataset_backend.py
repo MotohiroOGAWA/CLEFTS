@@ -119,11 +119,115 @@ def structure_manifest(payload):
             record_indexes=json.dumps(indexes),num_input_records=len(indexes),num_valid_samples=int(saved['structure'].num_samples),rejected_sample_count=max(0,len(indexes)-int(saved['structure'].num_samples)),rejection_log='',**structure_manifest_fields(saved['structure']),status='completed'))
     return rows
 
+def training_checkpoint(payload):
+    import torch
+    checkpoint = torch.load(payload['path'], map_location='cpu', weights_only=False)
+    if checkpoint.get('fragmentation_schema') != 'source-anchored-action-autoregressive-v1':
+        raise ValueError('Checkpoint architecture is incompatible with training.')
+    config = checkpoint.get('model_config')
+    if not config:
+        raise ValueError('Checkpoint does not contain model configuration.')
+    group = checkpoint['optimizer_state_dict']['param_groups'][0]
+    return {'modelConfig': config.get('params', config), 'lr': group['lr'], 'weightDecay': group.get('weight_decay', 0)}
+
+def training_sources(payload):
+    import torch
+    from clefts.ml.training.fragment_tree_training.sources import inherit_model_config, dataset_sources
+    saved = None
+    path = payload.get('resume') or payload.get('fineTuneCheckpoint')
+    if path:
+        saved = torch.load(path, map_location='cpu', weights_only=False)['model_config']
+        if not payload.get('resume'):
+            inherited = dataset_sources(payload['trainDir'], payload['valDir'])
+            saved = {**saved.get('params', saved), 'fragmenter_params': inherited['fragmenter_params'],
+                     'adduct_type_strs': inherited['adduct_type_strs']}
+    config = inherit_model_config({}, payload['trainDir'], payload['valDir'],
+        encoder_checkpoint=payload.get('molEncoderCheckpoint'), saved_model=saved)
+    return {'modelConfig': config}
+
+def mol_smiles(payload):
+    from rdkit import Chem, rdBase
+    from rdkit.Chem.Draw import rdMolDraw2D
+    count = checked = valid = 0
+    symbols, unique, preview = set(), set(), []
+    with rdBase.BlockLogs():
+        for filename in payload['paths']:
+            with open(filename, encoding='utf-8-sig') as stream:
+                for line in stream:
+                    smiles = line.strip()
+                    if not smiles:
+                        continue
+                    count += 1
+                    if checked >= 5000:
+                        continue
+                    checked += 1
+                    mol = Chem.MolFromSmiles(smiles)
+                    if mol is None:
+                        continue
+                    valid += 1
+                    canonical = Chem.MolToSmiles(mol)
+                    unique.add(canonical)
+                    symbols.update(atom.GetSymbol() for atom in mol.GetAtoms())
+                    if len(preview) < 5:
+                        draw = rdMolDraw2D.MolDraw2DSVG(180, 120)
+                        rdMolDraw2D.PrepareAndDrawMolecule(draw, mol)
+                        draw.FinishDrawing()
+                        preview.append({'smiles': canonical, 'svg': draw.GetDrawingText()})
+    return {'count': count, 'checked': checked, 'valid': valid, 'unique': len(unique),
+            'symbols': sorted(symbols), 'preview': preview}
+
+
+def mol_preflight(payload):
+    import argparse
+    from rdkit import Chem
+    from clefts.ml.training.mol_training.training_model import build_arg_parser, mol_encoder_configs
+    from clefts.domain.molecule.descriptors import compute_descriptor_values
+    config = payload['config']
+    argv = []
+    for action in build_arg_parser()._actions:
+        if isinstance(action, argparse._HelpAction):
+            continue
+        parts = action.dest.split('_')
+        key = parts[0] + ''.join(part.title() for part in parts[1:])
+        value = config.get(key)
+        if value is None or value == '':
+            continue
+        if isinstance(action, argparse._StoreTrueAction):
+            if value:
+                argv.append(action.option_strings[0])
+        elif isinstance(value, list):
+            argv.extend([action.option_strings[0], *map(str, value)])
+        else:
+            argv.extend([action.option_strings[0], str(value)])
+    args = build_arg_parser().parse_args(argv)
+    combinations = mol_encoder_configs(args)
+    table = Chem.GetPeriodicTable()
+    supported_symbols = {table.GetElementSymbol(number) for number in range(1, 119)}
+    for symbol in config['symbols'].split(','):
+        if symbol.strip() not in supported_symbols:
+            raise ValueError('Unknown element: ' + symbol)
+    if config.get('descriptorNames') and not config.get('disableGraphDescriptors'):
+        compute_descriptor_values(Chem.MolFromSmiles('CCO'), tuple(name.strip() for name in config['descriptorNames'].split(',')))
+    if config['device'].startswith('cuda'):
+        import torch
+        if not torch.cuda.is_available():
+            raise ValueError('CUDA is unavailable in the selected Python environment')
+        torch.empty(0, device=config['device'])
+    if config['device'] == 'mps':
+        import torch
+        if not torch.backends.mps.is_available():
+            raise ValueError('MPS is unavailable in the selected Python environment')
+    for filename in config['trainSmiles'] + config['valSmiles']:
+        with open(filename, encoding='utf-8-sig') as stream:
+            if not any(line.strip() for line in stream):
+                raise ValueError('Empty SMILES file: ' + filename)
+    return {'combinations': len(combinations)}
+
 def main():
     request=json.loads(sys.stdin.read())
     try:
         with contextlib.redirect_stdout(sys.stderr):
-            result={'structure-manifest':structure_manifest,'preview':preview,'validate':validate,'validate-config':lambda payload:validate(payload,check_datasets=False),'model':model}[request['command']](request['payload'])
+            result={'mol-smiles':mol_smiles,'mol-preflight':mol_preflight,'training-sources':training_sources,'training-checkpoint':training_checkpoint,'structure-manifest':structure_manifest,'preview':preview,'validate':validate,'validate-config':lambda payload:validate(payload,check_datasets=False),'model':model}[request['command']](request['payload'])
         print(json.dumps({'ok':True,'result':result},allow_nan=False))
     except Exception as error:
         import traceback

@@ -11,7 +11,7 @@ function attach(panel,context){
   try{
    if(message.type==='dataset/uploadStart'){
     const name=path.basename(String(message.name||'dataset'));
-    if(!/\.(msds|msp|mgf|tsv|csv|parquet)$/i.test(name))throw new Error('Unsupported dataset format.');
+    if(!name || name==='.' || name==='..')throw new Error('Invalid file name.');
     if(!Number.isSafeInteger(message.size)||message.size<0)throw new Error('Invalid dataset file size.');
     const storage=context.storageUri||context.globalStorageUri;if(!storage)throw new Error('Workbench storage is unavailable. Use Browse.');
     const directory=path.join(storage.fsPath,'datasets');await fs.promises.mkdir(directory,{recursive:true});
@@ -40,7 +40,7 @@ function client(){
  window.uploadDataset=async(file,progress)=>{
   const {id}=await request({type:'dataset/uploadStart',name:file.name,size:file.size});
   try{
-   for(let offset=0;offset<file.size;offset+=524288){const bytes=new Uint8Array(await file.slice(offset,offset+524288).arrayBuffer());let binary='';for(const byte of bytes)binary+=String.fromCharCode(byte);const reply=await request({type:'dataset/uploadChunk',id,data:btoa(binary)});progress(Math.round(reply.offset/file.size*100));}
+   for(let offset=0;offset<file.size;offset+=524288){const bytes=new Uint8Array(await file.slice(offset,offset+524288).arrayBuffer());let binary='';for(const byte of bytes)binary+=String.fromCharCode(byte);const reply=await request({type:'dataset/uploadChunk',id,data:btoa(binary)});progress?.(Math.round(reply.offset/file.size*100));}
    return (await request({type:'dataset/uploadFinish',id})).path;
   }catch(error){vscode.postMessage({type:'dataset/uploadCancel',id});throw error;}
  };

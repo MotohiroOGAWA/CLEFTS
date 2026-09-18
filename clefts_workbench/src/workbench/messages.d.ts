@@ -1,5 +1,5 @@
 export interface JobInfo {
-  id: string; type: 'training' | 'preparation' | 'prediction'; name: string;
+  id: string; type: 'training' | 'mol-training' | 'preparation' | 'prediction'; name: string;
   status: 'running' | 'completed' | 'failed' | 'cancelled';
   pid?: number; startedAt: string; finishedAt?: string;
   outputDir: string; logPath: string; command: string[]; epochs?: number; detached?: boolean; resultsPath?: string;
@@ -9,17 +9,22 @@ export type WorkbenchRequest =
   | { type: 'workbench/ready' | 'workbench/environment' | 'workbench/settings' | 'workbench/terminal' }
   | { type: 'workbench/stop' | 'workbench/logs' | 'workbench/openOutput' | 'workbench/predictionResult'; jobId: string }
   | { type: 'workbench/modelConfig'; path: string; open: boolean }
+  | { type: 'workbench/trainingInspect'; field: 'trainDir' | 'valDir'; path: string }
+  | { type: 'workbench/trainingDataset'; field: 'trainDir' | 'valDir'; path: string }
   | { type: 'workbench/saveModelConfig'; json: string };
 export type WorkbenchEvent =
   | { type: 'workbench/jobs'; jobs: JobInfo[] }
   | { type: 'workbench/jobSelected'; jobId: string }
   | { type: 'workbench/navigate'; page: string }
   | { type: 'workbench/logs'; job: JobInfo; text: string }
+  | { type: 'workbench/trainingDataset'; field: 'trainDir' | 'valDir'; path: string; count?: number; bytes?: number; files?: string[]; summary?: Record<string, unknown>; error?: string }
   | { type: 'workbench/error'; error: string }
   | { type: 'workbench/modelConfig'; config: Record<string, unknown> }
   | { type: 'workbench/environment'; error?: string; data?: { torch: string; cuda: boolean; gpu: string | null; root: string; python: string } };
 
 export type ParameterRequest =
+  | { type: 'training/checkpoint'; path: string }
+  | { type: 'training/sources'; requestId: string; config: { trainDir: string; valDir: string; molEncoderCheckpoint?: string; resume?: string; fineTuneCheckpoint?: string } }
   | { type: 'parameters/pick'; target: 'data' | 'training' }
   | { type: 'parameters/import'; target: 'data' | 'training'; name: string; json: string }
   | { type: 'parameters/load'; target: 'data' | 'training'; path: string };

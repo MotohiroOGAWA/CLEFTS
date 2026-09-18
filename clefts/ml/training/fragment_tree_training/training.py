@@ -26,22 +26,38 @@ def train_actions(*, model_config: dict, train_dir: str | Path, val_dir: str | P
         raise ValueError("Optimizer settings and loss weights must be finite and non-negative")
     if initialize_from is not None and resume is not None:
         raise ValueError('Use initialize_from or resume, not both.')
-    params=model_config.get("params",model_config)
+    resume_checkpoint = None
+    if resume is not None:
+        resume_checkpoint = torch.load(resume, map_location=device, weights_only=False)
+        if not resume_checkpoint.get("model_config"):
+            raise ValueError("Resume checkpoint must contain model configuration")
+        model_config = resume_checkpoint["model_config"]
+    from .sources import inherit_model_config
+    current_params = model_config.get("params", model_config)
+    model_config = inherit_model_config(model_config, train_dir, val_dir,
+        encoder_checkpoint=current_params.get("mol_encoder_checkpoint"),
+        saved_model=model_config if resume is not None or current_params.get("fine_tuning") else None)
+    params = dict(model_config)
+    mol_encoder_checkpoint = params.pop("mol_encoder_checkpoint", None)
     # install_expansion (frozen base + low-rank adapters) already ran inside
     # the generator constructor when params['fine_tuning'] is set.
     generator=create_spectrum_generator(params).to(device)
     if getattr(generator,"architecture",None)!="source-anchored-action-autoregressive-v1":
         raise ValueError("Action training requires the Source/action architecture")
+    if resume is None and initialize_from is None and not params.get("fine_tuning") and mol_encoder_checkpoint:
+        encoder_checkpoint = torch.load(mol_encoder_checkpoint, map_location=device, weights_only=False)
+        encoder_state = encoder_checkpoint.get("mol_encoder_state_dict")
+        if encoder_state is None:
+            raise ValueError("Mol encoder checkpoint must contain mol_encoder_state_dict")
+        generator.mol_encoder.load_state_dict(encoder_state)
     model=ActionFragmentTreeTrainingModel(generator.feature_model,downstream_model=generator.post_model, absolute_weight=absolute_weight, next_weight=next_weight, negative_weight=negative_weight, intensity_weight=intensity_weight).to(device)
     model.set_checkpoint_model_config(model_config)
     optimizer=torch.optim.AdamW(model.parameters(),lr=lr,weight_decay=weight_decay)
     start=0
     if resume is not None:
-        checkpoint=torch.load(resume,map_location=device)
+        checkpoint=resume_checkpoint
         if checkpoint.get("fragmentation_schema")!=generator.architecture:
             raise ValueError("Cannot resume a checkpoint from a different architecture as an action model")
-        if params.get("fine_tuning") and checkpoint.get("model_config")!=model_config:
-            raise ValueError("Fine-tuning resume configuration differs from the saved checkpoint. Use the same base, pattern set and adapter width.")
         model.load_state_dict(checkpoint['model_state_dict']);optimizer.load_state_dict(checkpoint['optimizer_state_dict']);start=int(checkpoint['epoch'])
     elif initialize_from is not None:
         if params.get('fine_tuning'): raise ValueError('Weight initialization cannot be combined with frozen-base expansion.')
@@ -127,16 +143,34 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> None:
     args=build_arg_parser().parse_args(argv)
-    if bool(args.fine_tune_checkpoint) != bool(args.fine_tune_pattern_set):
-        raise SystemExit('--fine-tune-checkpoint and --fine-tune-pattern-set must be given together.')
+    if args.fine_tune_pattern_set and not args.fine_tune_checkpoint:
+        raise SystemExit('--fine-tune-pattern-set requires --fine-tune-checkpoint.')
     model_config=resolve_model_options(args)
-    if args.fine_tune_checkpoint:
+    from .sources import inherit_model_config
+    saved_model = None
+    source_checkpoint = args.resume or args.fine_tune_checkpoint
+    if source_checkpoint:
+        saved_model = torch.load(source_checkpoint, map_location='cpu', weights_only=False)['model_config']
+    # A new expansion inherits the encoder from its base, and Fragmenter from the expanded datasets.
+    if args.fine_tune_checkpoint and not args.resume:
+        saved_params = saved_model.get('params', saved_model)
+        from .sources import dataset_sources
+        inherited = dataset_sources(args.train_dir, args.val_dir)
+        saved_model = {**saved_params, 'fragmenter_params': inherited['fragmenter_params'],
+                       'adduct_type_strs': inherited['adduct_type_strs']}
+    model_config = inherit_model_config(model_config, args.train_dir, args.val_dir,
+        encoder_checkpoint=model_config.get('mol_encoder_checkpoint'), saved_model=saved_model)
+    if args.fine_tune_checkpoint and not args.resume:
         from .fine_tuning import prepare_model_config
         with tempfile.TemporaryDirectory(prefix='clefts-training-config-') as directory:
             config_path=Path(directory)/'model.json'
             config_path.write_text(json.dumps(model_config))
+            patterns_path=Path(directory)/'patterns.json'
+            patterns_path.write_text(json.dumps(model_config['fragmenter_params']['fragment_ion_tree_builder']['cleavage_pattern_set']))
             model_config=prepare_model_config(checkpoint_path=args.fine_tune_checkpoint,
-                pattern_set_path=args.fine_tune_pattern_set,new_params_path=config_path,width=args.adapter_width)
+                pattern_set_path=args.fine_tune_pattern_set or patterns_path,new_params_path=config_path,width=args.adapter_width)
+            if not args.fine_tune_pattern_set:
+                model_config['fine_tuning'].pop('pattern_set_path', None)
     report=train_actions(model_config=model_config,train_dir=args.train_dir,val_dir=args.val_dir,
         output_dir=args.output_dir,epochs=args.epochs,batch_size=args.batch_size,lr=args.lr,device=args.device,resume=args.resume,
         weight_decay=args.weight_decay,gradient_clip=args.gradient_clip,

@@ -1,0 +1,49 @@
+const assert=require('assert/strict'),fs=require('fs'),path=require('path'),os=require('os'),Module=require('module');
+const {JSDOM,VirtualConsole}=require('jsdom');
+const clipboard=[],mock={workspace:{getConfiguration:()=>({get:()=> 'python'})},env:{clipboard:{writeText:async text=>clipboard.push(text)}}};
+const load=Module._load;Module._load=function(name,parent,main){return name==='vscode'?mock:load.call(this,name,parent,main);};
+const mol=require('../src/workbench/mol-training'),extension=require('../src/extension'),services=require('../src/workbench/services'),jobs=require('../src/workbench/panel');
+const preset=require('../../clefts/presets/spectrum_generator_params/source_anchored_pos_model_config.json');
+(async()=>{
+ const c={...mol.defaults(),trainSmiles:['/data/train one.smi','/data/train two.smi'],valSmiles:['/data/val.smi'],outputDir:'/output/mol'};
+ assert.deepEqual(mol.validate(c).errors,[]);
+ assert(mol.validate({...c,nodeDim:'64,256'}).errors.some(text=>text.includes('graph dimension')));
+ assert(mol.validate({...c,numHeads:'7'}).errors.some(text=>text.includes('attention head')));
+ assert(mol.validate({...c,...Object.fromEntries(mol.tasks.map(([key])=>[key,true]))}).errors.some(text=>text.includes('at least one')));
+ const args=mol.buildArgs({...c,disableNodeAttribute:true,disableBalancedRecordSampling:true,earlyStoppingPatience:10});
+ assert.deepEqual(args.slice(0,4),['-m','clefts.cli','train','mol-encoder']);assert.deepEqual(args.slice(5,7),c.trainSmiles);assert(args.includes('--disable-node-attribute'));assert(args.includes('--disable-balanced-record-sampling'));assert(args.includes('--early-stopping-patience'));assert(!args.includes('--disable-graph-ecfp'));
+ const messages=[],errors=[],console=new VirtualConsole();console.on('jsdomError',error=>errors.push(error.detail?.stack||error.message));
+ const dom=new JSDOM(extension.workbenchHtml({modelConfig:preset},{modelConfig:preset,epochs:1,batchSize:4,lr:0.0001,adapterWidth:8}),{runScripts:'dangerously',pretendToBeVisual:true,virtualConsole:console,beforeParse(w){w.acquireVsCodeApi=()=>({postMessage:m=>messages.push(m),getState:()=>({}),setState(){}});w.HTMLElement.prototype.scrollIntoView=function(){};w.ResizeObserver=class{observe(){}disconnect(){}};w.matchMedia=()=>({matches:false,addEventListener(){}});w.CSS={escape:s=>s};}});
+ try{
+ const w=dom.window,d=w.document,form=d.getElementById('molTrainingForm'),post=data=>w.dispatchEvent(new w.MessageEvent('message',{data}));
+ d.querySelector('#navigationRail [data-page=molTraining]').click();assert(!form.hidden);assert(d.getElementById('trainingForm').hidden);
+ assert(d.getElementById('molStartTraining').closest('.mol-bottom'));assert(d.getElementById('molCopyCommand').closest('.mol-bottom'));assert(d.getElementById('molStartTraining').disabled);
+ form.querySelector('[data-mol-files=trainSmiles]').click();assert.equal(messages.at(-1).type,'mol/pick');
+ post({type:'mol/picked',field:'trainSmiles',paths:c.trainSmiles});post({type:'mol/picked',field:'valSmiles',paths:c.valSmiles});post({type:'mol/picked',field:'outputDir',paths:[c.outputDir]});
+ assert.equal(d.querySelectorAll('#trainSmilesMolFiles .mol-file-row').length,2);
+ const inspection=messages.filter(m=>m.type==='mol/inspect'&&m.field==='trainSmiles').at(-1);post({type:'mol/inspected',field:'trainSmiles',requestId:inspection.requestId,count:4,checked:4,valid:3,symbols:['C','O'],preview:[{smiles:'CCO',svg:'<svg></svg>'}]});assert(d.getElementById('trainSmilesMolPreview').textContent.includes('4 SMILES rows'));
+ form.elements.disableNodeAttribute.checked=false;form.elements.disableNodeAttribute.dispatchEvent(new w.Event('change',{bubbles:true}));assert(form.elements.nodeLossWeight.disabled);
+ form.elements.earlyStoppingPatience.value='10';form.elements.earlyStoppingPatience.dispatchEvent(new w.Event('input',{bubbles:true}));
+ await new Promise(resolve=>setTimeout(resolve,450));const preflight=messages.filter(m=>m.type==='mol/preflight').at(-1);assert(preflight);assert(preflight.config.disableNodeAttribute);assert.equal(preflight.config.earlyStoppingPatience,10);
+ post({type:'mol/preflight',requestId:preflight.requestId,ok:true});assert(!d.getElementById('molStartTraining').disabled);
+ d.getElementById('molCopyCommand').click();assert.equal(messages.at(-1).type,'mol/copy');assert(messages.at(-1).config.disableNodeAttribute);
+ form.dispatchEvent(new w.Event('submit',{cancelable:true,bubbles:true}));assert.equal(messages.at(-1).type,'mol/start');assert(d.getElementById('molStartTraining').disabled);
+ post({type:'mol/status',error:'Test launch rejected'});assert(d.getElementById('molTrainingStatus').textContent.includes('Test launch rejected'));
+ d.getElementById('trainSmilesMolFiles').querySelector('button').click();assert.equal(d.querySelectorAll('#trainSmilesMolFiles .mol-file-row').length,1);
+ await form.querySelector('[data-mol-files=trainSmiles]').ondrop({preventDefault(){},stopPropagation(){},dataTransfer:{getData:type=>type==='text/uri-list'?'file:///data/a%20file.smi\nfile:///data/another.smi':'',files:[]}});assert.equal(d.querySelectorAll('#trainSmilesMolFiles .mol-file-row').length,3);
+ d.querySelector('#navigationRail [data-page=training]').click();assert(form.hidden);assert(!d.getElementById('trainingForm').hidden);
+ assert.deepEqual(errors,[]);
+ }finally{dom.window.close();}
+ const root=fs.mkdtempSync(path.join(os.tmpdir(),'clefts-mol-training-'));const backend=services.backend,start=jobs.startTraining;let handler,launched;const posted=[];
+ try{
+ fs.writeFileSync(path.join(root,'train.smi'),'CCO\n');fs.writeFileSync(path.join(root,'val.smi'),'CC\n');services.backend=async()=>({combinations:1});jobs.startTraining=async(...args)=>{launched=args;};
+ mol.attach({webview:{onDidReceiveMessage:fn=>handler=fn,postMessage:m=>posted.push(m)}},{},()=>root,{});
+ const config={...mol.defaults(),trainSmiles:['train.smi'],valSmiles:['val.smi'],outputDir:'output'};
+ await handler({type:'mol/preflight',requestId:'test',config});assert(posted.at(-1).ok);
+ await handler({type:'mol/copy',config});assert(clipboard[0].includes('train mol-encoder'));
+ await handler({type:'mol/start',config});assert(launched);assert.equal(launched[5].workflow,'mol');assert.equal(launched[5].trainSmiles[0],path.join(root,'train.smi'));assert(fs.existsSync(path.join(root,'output','mol_training_config.json')));
+ const saved=JSON.parse(fs.readFileSync(path.join(root,'output','mol_training_config.json')));assert.equal(saved.kind,'mol-training');
+ launched=null;await handler({type:'mol/start',config:{...config,trainSmiles:['missing.smi']}});assert(!launched);assert(posted.at(-1).error);
+ }finally{services.backend=backend;jobs.startTraining=start;fs.rmSync(root,{recursive:true,force:true});}
+ process.stdout.write('Mol Training CLI, navigation, files, task controls, preflight, command copy and launch checks passed.\n');
+})().catch(error=>{console.error(error);process.exitCode=1;});

@@ -61,6 +61,8 @@ def fragment_spectrum_output_to_msdataset(output: FragmentSpectrumGeneratorOutpu
 def create_spectrum_generator(params: Dict):
     from .source_anchored_spectrum_predictor import SourceAnchoredFragmentSpectrumGenerator
     config = dict(params)
+    # Training initialization metadata is not a generator constructor argument.
+    config.pop("mol_encoder_checkpoint", None)
     architecture = config.pop("architecture", None)
     if architecture not in (None, SourceAnchoredFragmentSpectrumGenerator.architecture):
         raise ValueError(f"Unknown spectrum generator architecture: {architecture}")

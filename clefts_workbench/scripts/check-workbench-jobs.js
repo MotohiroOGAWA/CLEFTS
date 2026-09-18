@@ -17,8 +17,17 @@ const panel=require('../src/workbench/panel');
  try{
  await handler({type:'workbench/ready'});const jobs=posted.find(m=>m.type==='workbench/jobs').jobs;assert.equal(jobs[0].status,'running');assert(fs.existsSync(path.join(root,'jobs',jobs[0].id+'.json')));
  fs.appendFileSync(jobs[0].logPath,'stdout\nstderr\n');await handler({type:'workbench/logs',jobId:jobs[0].id});assert.equal(posted.at(-1).text,'stdout\nstderr\n');
+ const dataset=path.join(root,'structures');fs.mkdirSync(path.join(dataset,'data'),{recursive:true});
+ fs.writeFileSync(path.join(dataset,'data','sample.preft.pt'),'abc');
+ fs.writeFileSync(path.join(dataset,'action_statistics.json'),JSON.stringify({num_sources:1,num_samples:7}));
+ await handler({type:'workbench/trainingInspect',field:'trainDir',path:dataset});
+ assert.equal(posted.at(-1).type,'workbench/trainingDataset');assert.equal(posted.at(-1).count,1);assert.equal(posted.at(-1).summary.num_samples,7);assert.equal(posted.at(-1).files[0],path.join('data','sample.preft.pt'));
+ await handler({type:'workbench/trainingInspect',field:'trainDir',path:dataset+'-missing'});
+ assert(posted.at(-1).error);
  record.child.emit('close',0,null);const saved=JSON.parse(fs.readFileSync(path.join(root,'jobs',jobs[0].id+'.json')));assert.equal(saved.status,'completed');assert(saved.finishedAt);
  }finally{dispose();}
+ await panel.startTraining(context,{webview},{appendLine(){}},root,'python',{workflow:'mol',outputDir:root,epochs:2,batchSize:32,lr:0.001},()=>['-m','clefts.cli','train','mol-encoder']);
+ const molRecord=JSON.parse(fs.readFileSync(path.join(root,'jobs',posted.at(-1).jobId+'.json')));assert.equal(molRecord.type,'mol-training');assert(molRecord.command.includes('mol-encoder'));children[1].child.emit('close',0,null);
  await assert.rejects(()=>panel.startTraining(context,{webview},{appendLine(){}},root,'python',{outputDir:root,epochs:0,batchSize:4,lr:0.001},()=>[]),/positive integer/);
  console.log('Training job persistence, process options, logs and completion checks passed.');
  }finally{fs.rmSync(root,{recursive:true,force:true});}
