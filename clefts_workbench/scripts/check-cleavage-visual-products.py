@@ -167,7 +167,7 @@ assert "Delete Selected" in extension
 assert "productSelectedAtoms" in extension
 assert "productCanvas.onpointerdown" in extension
 assert "data-delete-selected-product-atoms" in extension
-assert ".selection-lasso{stroke:#fff}" in extension
+assert "stroke:var(--accent,#168bdf)" in extension
 assert "Start New Bond" in extension
 assert "Update Product" in extension
 assert "Custom SMARTS" in extension

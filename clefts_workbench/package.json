@@ -13,6 +13,7 @@
   ],
   "activationEvents": [
     "onCommand:clefts.openWorkbench",
+    "onCommand:clefts.editCleavagePatterns",
     "onCommand:clefts.openResult",
     "onCommand:clefts.openEvaluation",
     "onCustomEditor:clefts.resultViewer",
@@ -22,6 +23,10 @@
   "main": "./src/extension.js",
   "contributes": {
     "commands": [
+      {
+        "command": "clefts.editCleavagePatterns",
+        "title": "CLEFTS: Edit Cleavage Patterns"
+      },
       {
         "command": "clefts.openWorkbench",
         "title": "CLEFTS: Open Workbench"
@@ -180,6 +185,7 @@
     "package": "mkdir -p artifacts && npx @vscode/vsce package --allow-missing-repository --out artifacts/clefts_workbench-${npm_package_version}.vsix",
     "check:training-sources": "python scripts/check-training-sources.py",
     "check:training-ui": "node scripts/check-training-ui.js",
+    "check:cleavage-pattern-ui": "node scripts/check-cleavage-pattern-ui.js",
     "check:workbench": "node scripts/check-workbench.js && node scripts/check-workbench-jobs.js && node scripts/check-parameter-editor.js && node scripts/check-defaults.js",
     "check:mol-training": "node scripts/check-mol-training.js && python scripts/check-mol-backend.py && python scripts/check-mol-startup.py"
   },
