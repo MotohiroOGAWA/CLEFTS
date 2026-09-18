@@ -4,7 +4,6 @@ import argparse
 import json
 import math
 import tempfile
-from clefts.ml.specgen.config_options import configure_model_options, resolve_model_options
 from pathlib import Path
 import torch
 from clefts.ml.input.source_action_structure import SourceActionStructure
@@ -124,15 +123,45 @@ def train_actions(*, model_config: dict, train_dir: str | Path, val_dir: str | P
     return report
 
 
+# Only trainable model sections are exposed by the training CLI.
+MODEL_OPTIONS = {
+    'action-hidden-dim': ('action_model_params', 'hidden_dim', int, 128),
+    'action-condition-dim': ('action_model_params', 'condition_dim', int, 128),
+    'action-num-heads': ('action_model_params', 'num_heads', int, 4),
+    'action-max-roles': ('action_model_params', 'max_roles', int, None),
+    'action-top-k': ('action_model_params', 'action_prefilter_top_k', int, 64),
+    'action-max-k': ('action_model_params', 'action_prefilter_max_k', int, 128),
+    'action-threshold': ('action_model_params', 'action_prefilter_threshold_logit', float, 0.0),
+    'beam-size': ('action_model_params', 'beam_size', int, 32),
+    'max-decode-steps': ('action_model_params', 'max_decode_steps', int, 16),
+    'post-hidden-dim': ('post_model_params', 'hidden_dim', int, 128),
+    'post-num-layers': ('post_model_params', 'num_layers', int, 2),
+    'post-num-heads': ('post_model_params', 'num_heads', int, 4),
+}
+
+
+def training_model_config(args):
+    config = {'architecture': 'source-anchored-action-autoregressive-v1',
+              'action_model_params': {}, 'post_model_params': {}}
+    for flag, (section, key, _, default) in MODEL_OPTIONS.items():
+        value = getattr(args, flag.replace('-', '_'))
+        if value is not None or default is not None:
+            config[section][key] = value if value is not None else default
+    if args.mol_encoder_checkpoint:
+        config['mol_encoder_checkpoint'] = args.mol_encoder_checkpoint
+    return config
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser=argparse.ArgumentParser(description=__doc__)
-    configure_model_options(parser)
+    parser.add_argument('--mol-encoder-checkpoint', help='Pretrained Mol Encoder checkpoint; required for new training.')
+    for flag, (_, _, kind, default) in MODEL_OPTIONS.items():
+        parser.add_argument('--'+flag, type=kind, default=default)
     for name in ('train-dir','val-dir','output-dir'):parser.add_argument('--'+name,required=True)
     parser.add_argument('--epochs',type=int,default=1);parser.add_argument('--batch-size',type=int,default=4)
     parser.add_argument('--device',default='cpu');parser.add_argument('--lr',type=float,default=1e-4);parser.add_argument('--resume')
     parser.add_argument('--initialize-from',help='Initialize compatible pretrained weights with a fresh optimizer for fine-tuning.')
     parser.add_argument('--fine-tune-checkpoint',help='Base action training model.pt to expand with a new cleavage pattern set.')
-    parser.add_argument('--fine-tune-pattern-set',help='Complete new .clevageset.json including all old patterns.')
     parser.add_argument('--adapter-width',type=int,default=8,help='Extra low-rank nodes per linear/attention projection (default: 8).')
     for name, default in (("weight-decay",0.01),("gradient-clip",0.0),
                           ("absolute-weight",1.0),("next-weight",1.0),
@@ -143,9 +172,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> None:
     args=build_arg_parser().parse_args(argv)
-    if args.fine_tune_pattern_set and not args.fine_tune_checkpoint:
-        raise SystemExit('--fine-tune-pattern-set requires --fine-tune-checkpoint.')
-    model_config=resolve_model_options(args)
+    if not (args.resume or args.fine_tune_checkpoint or args.mol_encoder_checkpoint):
+        raise SystemExit('--mol-encoder-checkpoint is required for new training.')
+    model_config=training_model_config(args)
     from .sources import inherit_model_config
     saved_model = None
     source_checkpoint = args.resume or args.fine_tune_checkpoint
@@ -168,9 +197,8 @@ def main(argv: list[str] | None = None) -> None:
             patterns_path=Path(directory)/'patterns.json'
             patterns_path.write_text(json.dumps(model_config['fragmenter_params']['fragment_ion_tree_builder']['cleavage_pattern_set']))
             model_config=prepare_model_config(checkpoint_path=args.fine_tune_checkpoint,
-                pattern_set_path=args.fine_tune_pattern_set or patterns_path,new_params_path=config_path,width=args.adapter_width)
-            if not args.fine_tune_pattern_set:
-                model_config['fine_tuning'].pop('pattern_set_path', None)
+                pattern_set_path=patterns_path,new_params_path=config_path,width=args.adapter_width)
+            model_config['fine_tuning'].pop('pattern_set_path', None)
     report=train_actions(model_config=model_config,train_dir=args.train_dir,val_dir=args.val_dir,
         output_dir=args.output_dir,epochs=args.epochs,batch_size=args.batch_size,lr=args.lr,device=args.device,resume=args.resume,
         weight_decay=args.weight_decay,gradient_clip=args.gradient_clip,

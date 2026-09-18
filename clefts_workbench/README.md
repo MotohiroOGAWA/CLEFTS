@@ -283,8 +283,12 @@ For example, `--params model.json --max-action-count 2 --mass-tolerance 0.02Da`
 overrides those two values from the file. Any nested value, including pattern or
 adduct-rule array entries, can be overridden with `--set`, e.g.
 `--set 'fragmenter_params.fragment_ion_tree_builder.cleavage_pattern_set.patterns.0.name="custom"'`.
-The same configuration options are supported by both `train create-fragment-tree-data`
-and `train fragment-tree`. Dataset column mapping is configurable in preparation.
+These JSON configuration options apply to dataset preparation, not `train fragment-tree`.
+Fragment-tree training uses explicit Action/Post Model options and
+`--mol-encoder-checkpoint` (required for new training). Fragmenter, adducts and
+cleavage patterns are inherited from the train/validation datasets; encoder
+parameters come from the pretrained checkpoint. JSON configuration arguments
+and `--set` are rejected by the training CLI. Dataset column mapping is configurable in preparation.
 
 
 ### Home and dataset preparation
@@ -330,13 +334,12 @@ provides Worker Processes and Chunk Size (`1` each by default). The CLI supports
 Open **CLEFTS: Start Training** (or **Training → New Training**) to configure
 `clefts.cli train fragment-tree`, implemented by
 `clefts/ml/training/fragment_tree_training/training.py`.
-The training page provides four initialization modes:
+The training page provides three initialization modes:
 
-- **New model** starts from scratch.
-- **Initialize weights** supplies `--initialize-from` with a fresh optimizer.
+- **New model** requires a pretrained Mol Encoder checkpoint.
 - **Resume training** supplies `--resume` to restore the optimizer and epoch.
 - **Fine-tune patterns** supplies `--fine-tune-checkpoint`,
-  `--fine-tune-pattern-set` and `--adapter-width`. Include every old pattern and
+  and `--adapter-width`; patterns are inherited from the datasets. Include every old pattern and
   regenerate training and validation structures with the expanded configuration.
 
 The page groups dataset paths, model configuration, training settings and output

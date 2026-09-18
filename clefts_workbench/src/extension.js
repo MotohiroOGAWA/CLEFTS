@@ -429,8 +429,12 @@ function buildTrainingArgs(c) {
     '--train-dir', c.trainDir, '--val-dir', c.valDir, '--output-dir', c.outputDir,
     '--epochs', String(c.epochs || 1), '--batch-size', String(c.batchSize || 4),
     '--device', c.device || 'cpu', '--lr', String(c.lr ?? 0.0001)];
-  if(c.modelConfig) a.push('--params-json',JSON.stringify({...Object.fromEntries(Object.entries(c.modelConfig).filter(([key])=>!['fragmenter_params','mol_encoder_params','adduct_type_strs','symbols','max_node','max_edge'].includes(key))),mol_encoder_checkpoint:c.molEncoderCheckpoint||c.modelConfig.mol_encoder_checkpoint}));
-  else if(c.params) a.push('--params',c.params);
+  const encoder=c.molEncoderCheckpoint||c.modelConfig?.mol_encoder_checkpoint;
+  if(encoder&&!c.resume&&!c.fineTuneCheckpoint)a.push('--mol-encoder-checkpoint',encoder);
+  if(!c.resume&&!c.fineTuneCheckpoint){
+    const sections={action_model_params:{hidden_dim:'action-hidden-dim',condition_dim:'action-condition-dim',num_heads:'action-num-heads',max_roles:'action-max-roles',action_prefilter_top_k:'action-top-k',action_prefilter_max_k:'action-max-k',action_prefilter_threshold_logit:'action-threshold',beam_size:'beam-size',max_decode_steps:'max-decode-steps'},post_model_params:{hidden_dim:'post-hidden-dim',num_layers:'post-num-layers',num_heads:'post-num-heads'}};
+    for(const [section,flags]of Object.entries(sections))for(const [key,flag]of Object.entries(flags)){const value=c.modelConfig?.[section]?.[key];if(value!==undefined&&value!==null)a.push('--'+flag,String(value));}
+  }
   for (const [key, flag] of Object.entries(workbench.trainingFlags)) if (c[key] !== undefined && c[key] !== '') a.push(flag, String(c[key]));
   if (c.initializeFrom) a.push('--initialize-from', c.initializeFrom);
   if (c.resume) a.push('--resume', c.resume);

@@ -15,8 +15,8 @@ class FragmentTreeTrainCommand(CLICommand):
     help = "Train (or fine-tune) the Source-anchored action fragment-tree model."
     description = (
         "Train ActionFragmentTreeTrainingModel from schema-v5 .preft.pt structures. "
-        "Pass --fine-tune-checkpoint and --fine-tune-pattern-set together to expand "
-        "a frozen base checkpoint with a new cleavage pattern set instead."
+        "Pass --fine-tune-checkpoint to expand "
+        "a frozen base checkpoint with patterns inherited from the datasets."
     )
     order = 30
 
