@@ -1,5 +1,6 @@
 """Exercise SMILES inspection and Mol Training preflight without starting training."""
 import importlib.util
+import json
 from pathlib import Path
 import sys
 import tempfile
@@ -7,6 +8,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 spec = importlib.util.spec_from_file_location('workbench_backend', Path(__file__).resolve().parents[1] / 'src/workbench/dataset_backend.py')
 backend = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(backend)
+from clefts.domain.molecule.descriptors import DEFAULT_DESCRIPTOR_NAMES
+catalog = json.loads((Path(__file__).resolve().parents[1] / 'content/mol-descriptors.json').read_text())
+assert tuple(item['name'] for item in catalog) == DEFAULT_DESCRIPTOR_NAMES
 with tempfile.TemporaryDirectory() as directory:
     smiles = Path(directory) / 'molecules.smi'
     smiles.write_text('CCO\nnot-a-molecule\nC\n\nCCO\n')

@@ -16,6 +16,12 @@ The tabs are **Input Dataset**, **Fragmentation**, **Assignment**, **Output** an
 
 The fixed bottom-right **Run** button is always clickable. Clicking it checks dataset validation and required settings; red text explains any unmet requirements and processing does not start. Clicking during an active job also displays a message and prevents duplicate runs. The backend validates settings again before launching processing.
 
+## Mol Training descriptor targets
+
+In **Mol Training → Training Tasks & Loss Weights → Descriptor Regression**, select individual descriptor targets using the checkboxes. The standard 14 training descriptors are all checked by default. Each target includes a short description. **Select All** and **Clear All** update the selection together.
+
+Keep at least one descriptor selected while Descriptor Regression is enabled. Disabling the task also disables its target controls without discarding the selection. Copy Command passes the selected names through `--descriptor-names`; Start Training uses the same selection. Save Configuration records the selected names, and Load Configuration restores the selection and its order, including configurations exported by the training CLI.
+
 ## Themes and help
 
 Theme preference is saved in the webview's workspace state. The default follows the VS Code theme; the toolbar toggles light/dark overrides. Help explains the current page and links to the product guide.

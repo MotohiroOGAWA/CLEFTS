@@ -17,6 +17,9 @@ const preset=require('../../clefts/presets/spectrum_generator_params/source_anch
  const relative=mol.parseMolConfiguration({args:{...cliArgs,train_smiles:['train.smi']},working_directory:'/data'});assert.deepEqual(relative.trainSmiles,['/data/train.smi']);
  const c={...mol.defaults(),trainSmiles:['/data/train one.smi','/data/train two.smi'],valSmiles:['/data/val.smi'],outputDir:'/output/mol'};
  assert.deepEqual(mol.validate(c).errors,[]);
+ assert.equal(mol.defaults().descriptorNames,mol.descriptors.map(item=>item.name).join(','));
+ assert(mol.validate({...c,descriptorNames:''}).errors.some(text=>text.includes('at least one descriptor')));
+ assert.deepEqual(mol.validate({...c,descriptorNames:'',disableGraphDescriptors:true}).errors,[]);
  assert(mol.validate({...c,nodeDim:'64,256'}).errors.some(text=>text.includes('graph dimension')));
  assert(mol.validate({...c,numHeads:'7'}).errors.some(text=>text.includes('attention head')));
  assert(mol.validate({...c,...Object.fromEntries(mol.tasks.map(([key])=>[key,true]))}).errors.some(text=>text.includes('at least one')));
@@ -28,6 +31,13 @@ const preset=require('../../clefts/presets/spectrum_generator_params/source_anch
  const w=dom.window,d=w.document,form=d.getElementById('molTrainingForm'),post=data=>w.dispatchEvent(new w.MessageEvent('message',{data}));
  d.querySelector('#navigationRail [data-page=molTraining]').click();assert(!form.hidden);assert(d.getElementById('trainingForm').hidden);
  assert(d.getElementById('molStartTraining').closest('.mol-bottom'));assert(d.getElementById('molCopyCommand').closest('.mol-bottom'));assert(d.getElementById('molStartTraining').disabled);
+ assert.equal(form.querySelectorAll('[data-mol-descriptor]').length,14);
+ assert.equal(form.querySelectorAll('[data-mol-descriptor]:checked').length,14);
+ form.querySelector('[data-descriptor-select=none]').click();assert.equal(form.elements.descriptorNames.value,'');assert(d.getElementById('molCopyCommand').disabled);
+ for(const name of ['ExactMolWt','TPSA']){const input=form.querySelector('[data-mol-descriptor="'+name+'"]');input.checked=true;input.dispatchEvent(new w.Event('change',{bubbles:true}));}
+ assert.equal(form.elements.descriptorNames.value,'ExactMolWt,TPSA');
+ assert(d.getElementById('molCommand').textContent.includes('--descriptor-names ExactMolWt,TPSA'));
+ d.getElementById('molSaveConfiguration').click();assert.equal(messages.at(-1).config.descriptorNames,'ExactMolWt,TPSA');
  form.querySelector('[data-mol-files=trainSmiles]').click();assert.equal(messages.at(-1).type,'mol/pick');
  post({type:'mol/picked',field:'trainSmiles',paths:c.trainSmiles});post({type:'mol/picked',field:'valSmiles',paths:c.valSmiles});post({type:'mol/picked',field:'outputDir',paths:[c.outputDir]});
  assert.equal(d.querySelectorAll('#trainSmilesMolFiles .mol-file-row').length,2);
@@ -41,9 +51,18 @@ const preset=require('../../clefts/presets/spectrum_generator_params/source_anch
  post({type:'mol/status',error:'Test launch rejected'});assert(d.getElementById('molTrainingStatus').textContent.includes('Test launch rejected'));
  d.getElementById('trainSmilesMolFiles').querySelector('button').click();assert.equal(d.querySelectorAll('#trainSmilesMolFiles .mol-file-row').length,1);
  await form.querySelector('[data-mol-files=trainSmiles]').ondrop({preventDefault(){},stopPropagation(){},dataTransfer:{getData:type=>type==='text/uri-list'?'file:///data/a%20file.smi\nfile:///data/another.smi':'',files:[]}});assert.equal(d.querySelectorAll('#trainSmilesMolFiles .mol-file-row').length,3);
- post({type:'mol/config',config:{...c,nodeDim:'16',graphDim:'64',dropout:0.5,batchSize:128,epochs:50,device:'cuda:1'},path:'/test/pretraining_config.json'});
+ post({type:'mol/config',config:{...c,descriptorNames:'MolLogP,TPSA',nodeDim:'16',graphDim:'64',dropout:0.5,batchSize:128,epochs:50,device:'cuda:1'},path:'/test/pretraining_config.json'});
+ assert.equal(form.querySelectorAll('[data-mol-descriptor]:checked').length,2);
+ assert(form.querySelector('[data-mol-descriptor=MolLogP]').checked);assert(form.querySelector('[data-mol-descriptor=TPSA]').checked);
+ assert(!form.querySelector('[data-mol-descriptor=ExactMolWt]').checked);
+ assert.equal(form.elements.descriptorNames.value,'MolLogP,TPSA');
  assert.equal(form.elements.nodeDim.value,'16');assert.equal(form.elements.device.value,'cuda:1');assert.equal(form.elements.dropout.value,'0.5');assert.equal(form.elements.earlyStoppingPatience.value,'');assert(form.elements.disableNodeAttribute.checked);assert.equal(d.querySelectorAll('#trainSmilesMolFiles .mol-file-row').length,2);assert.equal(d.getElementById('trainSmilesMolPreview').textContent,'');assert(d.getElementById('molTrainingStatus').textContent.includes('Configurations loaded'));
  d.getElementById('molCopyCommand').click();assert.equal(messages.at(-1).config.dropout,0.5);assert.equal(messages.at(-1).config.disableNodeAttribute,false);
+ assert.equal(messages.at(-1).config.descriptorNames,'MolLogP,TPSA');
+ form.elements.disableGraphDescriptors.checked=false;form.elements.disableGraphDescriptors.dispatchEvent(new w.Event('change',{bubbles:true}));
+ assert(form.querySelector('[data-mol-descriptor=TPSA]').disabled);assert(form.querySelector('[data-descriptor-select=all]').disabled);
+ form.elements.disableGraphDescriptors.checked=true;form.elements.disableGraphDescriptors.dispatchEvent(new w.Event('change',{bubbles:true}));
+ form.querySelector('[data-descriptor-select=all]').click();assert.equal(form.querySelectorAll('[data-mol-descriptor]:checked').length,14);
  d.querySelector('#navigationRail [data-page=training]').click();assert(form.hidden);assert(!d.getElementById('trainingForm').hidden);
  assert.deepEqual(errors,[]);
  }finally{dom.window.close();}

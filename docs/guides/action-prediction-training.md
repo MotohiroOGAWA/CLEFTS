@@ -115,7 +115,7 @@ The script saves a detailed report, learning curves in PNG/SVG format, TensorBoa
 
 Regression tests cover prediction agreement across sample chunking, restoration of input order, multi-action precursor retention and seed edges, capacity violations, GPU masking of changed reactant bonds, CUDA forward/backward without RDKit, finite gradients, TensorBoard output, Resume, and reconstruction of masks from legacy tensor metadata.
 
-All 46 action tests and 42 chemical-rule/Fragment Tree Builder tests passed. Workbench settings, the training UI, Resume, Batch Prediction, and explicit CLI arguments also passed their checks. Boundary checks confirm that scores equal to the threshold are excluded while required precursor actions remain retained.
+All 48 action tests and 42 chemical-rule/Fragment Tree Builder tests passed. Workbench settings, the training UI, Resume, Batch Prediction, and explicit CLI arguments also passed their checks. Boundary checks confirm that scores equal to the threshold are excluded while required precursor actions remain retained.
 
 ## Design references
 
