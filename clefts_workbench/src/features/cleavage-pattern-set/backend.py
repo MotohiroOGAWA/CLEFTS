@@ -104,6 +104,16 @@ def _atom_query_body(value: str) -> str:
     return canonical[1:-1] if canonical.startswith("[") and canonical.endswith("]") else canonical
 
 
+def _selected_fragment_smarts(editable: Chem.RWMol, atom_ids: list[int], bond_ids: list[int]) -> str:
+    """Remove excluded edges because RDKit interprets an empty bond list as all."""
+    kept_bonds = set(bond_ids)
+    excluded_pairs = [(bond.GetBeginAtomIdx(), bond.GetEndAtomIdx())
+                      for bond in editable.GetBonds() if bond.GetIdx() not in kept_bonds]
+    for begin, end in excluded_pairs:
+        editable.RemoveBond(begin, end)
+    return Chem.MolFragmentToSmarts(editable.GetMol(), atomsToUse=atom_ids, isomericSmarts=False)
+
+
 def reactant(payload: dict[str, Any]) -> dict[str, Any]:
     mol = _source(payload)
     atom_ids = sorted({int(value) for value in payload.get("atoms", [])})
@@ -187,9 +197,7 @@ def reactant(payload: dict[str, Any]) -> dict[str, Any]:
         query_atom.SetAtomMapNum(map_number)
         atom_editable.ReplaceAtom(atom_id, query_atom)
     mol = atom_editable.GetMol()
-    smarts = Chem.MolFragmentToSmarts(
-        mol, atomsToUse=atom_ids, bondsToUse=bond_ids, isomericSmarts=False
-    )
+    smarts = _selected_fragment_smarts(Chem.RWMol(mol), atom_ids, bond_ids)
     _CleavagePattern.from_rules(name=str(payload.get("name", "")), reactant_smarts=smarts, products=())
     return {"smarts": smarts, "atomMapBySource": {str(atom_id): map_by_atom[atom_id] for atom_id in atom_ids}}
 
@@ -346,6 +354,70 @@ def product_from_structure(payload: dict[str, Any]) -> dict[str, Any]:
     return {"smarts": Chem.MolToSmarts(editable.GetMol(), isomericSmiles=False)}
 
 
+def product_from_selection(payload: dict[str, Any]) -> dict[str, Any]:
+    """Select a mapped reactant subgraph, preserving its queries unless edited."""
+    mol = Chem.MolFromSmarts(str(payload.get("reactantSmarts", "")))
+    if mol is None:
+        raise ValueError("Invalid reactant SMARTS.")
+    atom_ids = sorted({int(value) for value in payload.get("atoms", [])})
+    if not atom_ids:
+        raise ValueError("Select at least one product atom.")
+    if not set(atom_ids) <= set(range(mol.GetNumAtoms())):
+        raise ValueError("Unknown product atom.")
+    selected = set(atom_ids)
+    editable = Chem.RWMol(mol)
+    for key, value in payload.get("atomOverrides", {}).items():
+        index = int(key)
+        if index not in selected:
+            continue
+        body = _atom_query_body(str(value))
+        atom = Chem.AtomFromSmarts(f"[{body}]")
+        atom.SetAtomMapNum(mol.GetAtomWithIdx(index).GetAtomMapNum())
+        editable.ReplaceAtom(index, atom)
+    symbols = {"1": "-", "2": "=", "3": "#", "1.5": ":"}
+    bond_ids = []
+    for value in payload.get("bonds", []):
+        index = int(value)
+        if index < 0 or index >= mol.GetNumBonds():
+            raise ValueError("Unknown product bond.")
+        bond = mol.GetBondWithIdx(index)
+        if bond.GetBeginAtomIdx() not in selected or bond.GetEndAtomIdx() not in selected:
+            continue
+        override = str(payload.get("bondOverrides", {}).get(str(index), "preserve"))
+        if override == "remove":
+            continue
+        query = payload.get("bondQueries", {}).get(str(index))
+        if override in symbols and not query:
+            query = symbols[override]
+        if query:
+            replacement = Chem.BondFromSmarts(str(query))
+            if replacement is None:
+                raise ValueError("Invalid product bond query.")
+            editable.ReplaceBond(index, replacement)
+        bond_ids.append(index)
+    pairs = {tuple(sorted((b.GetBeginAtomIdx(), b.GetEndAtomIdx()))) for b in mol.GetBonds()}
+    for item in payload.get("addedBonds", []):
+        if not item.get("selected", True):
+            continue
+        begin, end = int(item["begin"]), int(item["end"])
+        if begin not in selected or end not in selected:
+            continue
+        pair = tuple(sorted((begin, end)))
+        if begin == end or pair in pairs:
+            raise ValueError("New product bonds must connect different atoms without an existing bond.")
+        query = str(item.get("query") or symbols.get(str(item.get("order", "1")), ""))
+        replacement = Chem.BondFromSmarts(query)
+        if replacement is None:
+            raise ValueError("Invalid new product bond type.")
+        editable.AddBond(begin, end, Chem.BondType.SINGLE)
+        index = editable.GetNumBonds() - 1
+        editable.ReplaceBond(index, replacement)
+        bond_ids.append(index)
+        pairs.add(pair)
+    smarts = _selected_fragment_smarts(editable, atom_ids, bond_ids)
+    return {"smarts": smarts}
+
+
 def product_state(payload: dict[str, Any]) -> dict[str, Any]:
     """Recover visual-editor state from an existing reactant/product SMARTS pair."""
     reactant = Chem.MolFromSmarts(str(payload.get("reactantSmarts", "")))
@@ -374,12 +446,14 @@ def product_state(payload: dict[str, Any]) -> dict[str, Any]:
     kept_atoms = sorted(reactant_by_map[number] for number in product_by_map)
     atom_map_by_source = {str(source): number for number, source in reactant_by_map.items()}
     product_bonds: dict[tuple[int, int], float] = {}
+    product_queries = {}
     for bond in product_mol.GetBonds():
         begin = product_mol.GetAtomWithIdx(bond.GetBeginAtomIdx()).GetAtomMapNum()
         end = product_mol.GetAtomWithIdx(bond.GetEndAtomIdx()).GetAtomMapNum()
         if begin > 0 and end > 0:
             order = 1.5 if bond.GetIsAromatic() else float(bond.GetBondTypeAsDouble())
             product_bonds[tuple(sorted((begin, end)))] = order
+            product_queries[tuple(sorted((begin, end)))] = bond.GetSmarts()
 
     overrides: dict[str, str] = {}
     kept = set(kept_atoms)
@@ -397,8 +471,34 @@ def product_state(payload: dict[str, Any]) -> dict[str, Any]:
         if product_order != reactant_order:
             overrides[str(bond.GetIdx())] = f"{product_order:g}"
 
+    kept_bonds = [bond.GetIdx() for bond in reactant.GetBonds()
+                  if tuple(sorted((reactant.GetAtomWithIdx(bond.GetBeginAtomIdx()).GetAtomMapNum(),
+                                   reactant.GetAtomWithIdx(bond.GetEndAtomIdx()).GetAtomMapNum()))) in product_bonds]
+    reactant_pairs = {tuple(sorted((reactant.GetAtomWithIdx(b.GetBeginAtomIdx()).GetAtomMapNum(),
+                                    reactant.GetAtomWithIdx(b.GetEndAtomIdx()).GetAtomMapNum())))
+                      for b in reactant.GetBonds()}
+    added_bonds = [{"id": index + 1, "begin": reactant_by_map[pair[0]],
+                    "end": reactant_by_map[pair[1]], "order": order, "query": product_queries[pair]}
+                   for index, (pair, order) in enumerate(product_bonds.items()) if pair not in reactant_pairs]
+    atom_overrides = {}
+    for number, index in product_by_map.items():
+        product_query = _atom_query_body(product_mol.GetAtomWithIdx(index).GetSmarts())
+        reactant_query = _atom_query_body(reactant.GetAtomWithIdx(reactant_by_map[number]).GetSmarts())
+        if product_query != reactant_query:
+            atom_overrides[str(reactant_by_map[number])] = f"[{product_query}]"
+    bond_queries = {}
+    for bond in reactant.GetBonds():
+        pair = tuple(sorted((reactant.GetAtomWithIdx(bond.GetBeginAtomIdx()).GetAtomMapNum(),
+                             reactant.GetAtomWithIdx(bond.GetEndAtomIdx()).GetAtomMapNum())))
+        if pair in product_queries and product_queries[pair] != bond.GetSmarts():
+            bond_queries[str(bond.GetIdx())] = product_queries[pair]
+
     return {
         "keptAtoms": kept_atoms,
+        "keptBonds": kept_bonds,
+        "addedBonds": added_bonds,
+        "atomOverrides": atom_overrides,
+        "bondQueries": bond_queries,
         "atomMapBySource": atom_map_by_source,
         "bondOverrides": overrides,
     }
@@ -413,7 +513,7 @@ def validate(payload: dict[str, Any]) -> dict[str, Any]:
 COMMANDS = {
     "molecule": molecule, "depict": depict, "reactant": reactant,
     "product": product, "productFromStructure": product_from_structure,
-    "productState": product_state, "validate": validate,
+    "productState": product_state, "productFromSelection": product_from_selection, "validate": validate,
 }
 
 

@@ -230,3 +230,54 @@ mapped = {atom.GetAtomMapNum(): atom.GetIdx() for atom in new_mol.GetAtoms()}
 assert new_mol.GetBondBetweenAtoms(mapped[1], mapped[3]).GetBondTypeAsDouble() == 2
 assert new_mol.GetBondBetweenAtoms(mapped[1], mapped[2]) is None
 print("Any + Non-H, product type edits and added-bond query serialization checks passed.")
+
+# Selection-based products inherit the entire mapped reactant query by default.
+base = '[#6,#7;!#1:1]-[#6:2]=[#8:3]'
+def selected_product(atoms=(0, 1, 2), bonds=(0, 1), **edits):
+    return backend.product_from_selection({
+        'reactantSmarts': base, 'atoms': list(atoms), 'bonds': list(bonds), **edits,
+    })['smarts']
+
+unchanged = selected_product()
+source_query = backend.Chem.MolFromSmarts(base)
+unchanged_query = backend.Chem.MolFromSmarts(unchanged)
+assert [a.GetSmarts() for a in unchanged_query.GetAtoms()] == [a.GetSmarts() for a in source_query.GetAtoms()]
+assert [b.GetSmarts() for b in unchanged_query.GetBonds()] == [b.GetSmarts() for b in source_query.GetBonds()]
+split = selected_product(bonds=(1,))
+assert split.count('.') == 1
+assert selected_product(bonds=()).count('.') == 2
+split_state = backend.product_state({'reactantSmarts': base, 'productSmarts': split})
+assert split_state['keptAtoms'] == [0, 1, 2]
+assert split_state['keptBonds'] == [1]
+assert backend.validate({'name': 'selected_fragments', 'reactant_smarts': base,
+                         'products': [{'name': 'fragments', 'smarts': split}]})['valid']
+# Excluding an atom also excludes any selected bonds that end at that atom.
+subset = backend.Chem.MolFromSmarts(selected_product(atoms=(0, 1)))
+assert subset.GetNumAtoms() == 2 and subset.GetNumBonds() == 1
+assert {a.GetAtomMapNum() for a in subset.GetAtoms()} == {1, 2}
+changed_selection = selected_product(atomOverrides={'2': '[#7]'}, bondOverrides={'1': '1'})
+changed_query = backend.Chem.MolFromSmarts(changed_selection)
+assert changed_query.GetAtomWithIdx(2).GetAtomicNum() == 7
+assert changed_query.GetBondWithIdx(1).GetBondTypeAsDouble() == 1
+recovered = backend.product_state({'reactantSmarts': base, 'productSmarts': changed_selection})
+assert recovered['atomOverrides'] == {'2': '[#7]'}
+assert selected_product(atomOverrides=recovered['atomOverrides'], bondOverrides=recovered['bondOverrides'],
+                        bondQueries=recovered['bondQueries']) == changed_selection
+for included in (True, False):
+    formed = selected_product(addedBonds=[{'id': 1, 'begin': 0, 'end': 2, 'order': '1', 'selected': included}])
+    formed_query = backend.Chem.MolFromSmarts(formed)
+    assert formed_query.GetNumBonds() == (3 if included else 2)
+    if included:
+        saved = backend.product_state({'reactantSmarts': base, 'productSmarts': formed})
+        assert len(saved['addedBonds']) == 1
+        rebuilt = selected_product(addedBonds=saved['addedBonds'])
+        assert backend.Chem.MolFromSmarts(rebuilt).GetNumBonds() == 3
+try:
+    selected_product(atoms=())
+except ValueError as error:
+    assert 'Select at least one product atom' in str(error)
+else:
+    raise AssertionError('Empty products must not be generated')
+print('Selection-based products: unchanged queries, dot-separated fragments, subset maps, explicit edits, new-bond selection and recovery passed.')
+
+assert backend.reactant({'sourceType': 'smiles', 'smiles': 'CC', 'atoms': [0, 1], 'bonds': []})['smarts'].count('.') == 1

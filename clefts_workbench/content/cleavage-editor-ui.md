@@ -1,61 +1,53 @@
-# Cleavage Pattern Editor UI update
+# Cleavage Pattern Editor
 
-## Changed files
+The Workbench editor reuses the SVG atom/bond renderer and hit targets, RDKit parsing and SMARTS serialization, Webview chemistry messaging, atom maps, pattern storage, and shared selection, pan/zoom and periodic-table controls.
 
-- `src/features/cleavage-pattern-set/visual-editor.js`: new shared Workbench UI and interaction layer.
-- `src/features/cleavage-pattern-set/periodic-table.js`: shared 18-group periodic-table data.
-- `src/extension.js`: installs the UI after the existing editor script; copies generated strings through the VS Code clipboard.
-- `src/features/cleavage-pattern-set/backend.py`: serializes Non-H and three ring states; supports product bond query constraints.
-- `scripts/check-cleavage-pattern-ui.js`: extends the existing jsdom interaction tests.
-- `scripts/check-cleavage-visual-products.py`: adds RDKit query matching and mapped reaction serialization tests.
-- `package.json`: includes the new UI syntax and interaction checks in `npm run check`.
-- `package-lock.json`: synchronizes the previously missing declared jsdom dependency.
+## Step 1
 
-## Components and state
+New input defaults to SMILES. Existing mapped patterns open as SMARTS. Draw Structure displays RDKit coordinates with a single scale on both axes, preserving angles and relative bond lengths. The molecule canvas uses VS Code's editor background.
 
-The new layer shares the selection toolbar, selected-item chips, atom/bond inspector, periodic-table dialog, output/copy field and canvas interactions between both steps. It reuses the existing SVG atom/bond renderer, hit targets, polygon geometry, RDKit parsers/generators, atom mapping, product graph operations, pattern storage and Webview request protocol.
+Click toggles atom/bond selection; Shift-click or Shift-drag removes items. Lasso is the default; the box icon switches the drag region. Right-drag pans and the wheel zooms in either mode. Edit mode only inspects already selected items, without changing selection. Constraint changes in Edit apply to that item; selection mode permits batch constraints.
 
-Each editor keeps its mode (`selection` or `edit`), selection shape (`lasso` or `box`), selected atom/bond sets and viewport. Existing structured constraint objects remain separate from generated strings:
+Atom matching supports Any/Custom, independent Non-H and multiple allowed elements (OR). Bond matching supports Any/Custom, multiple bond types (OR) and ring predicates. Unspecified source bond ring status follows RDKit's topology. Periodic-table buttons retain selection highlights, including mixed selections. Both pickers share 18-group data; narrow inline dialogs scroll horizontally.
 
-- Atom: `mode`, `elements`, `nonHydrogen`; existing raw queries retain `mode: custom` and `smarts`.
-- Bond: `mode`, `types`, `ringStatus: any | inRing | notInRing`.
-- Product operations retain the existing added-bond records, bond overrides and deleted-atom set.
+Generate SMARTS generates and validates without registering a pattern or leaving Step 1. Apply validates the reactant into the local pattern draft, then collapses Step 1 and opens Step 2; it does not register anything in the Pattern Set. Opening either accordion header closes the other large editor.
 
-Custom atom queries use element OR with `;!#1`; Any emits `*`, or `!#1` when its independent Non-H option is enabled. Bond types use OR and append `;@` or `;!@` for ring matching; Any emits `~` without ring restrictions. Non-H defaults to enabled for new element constraints. Ring status follows explicit SMARTS ring predicates, or the RDKit ring flag for an unconstrained source bond. Raw atom SMARTS from imported patterns is preserved.
+## Step 2: products from a selected reactant graph
 
-## Usage
+The product canvas always starts from the confirmed mapped Reactant SMARTS. All atoms and bonds are initially selected, and both default to Unchanged. There is no Product source input, input type picker, Draw Product or generic atom/bond deletion control. Canvas atom labels show map numbers; the serializer retains original atom types and queries by default.
 
-1. Open Cleavage Patterns and choose Add Pattern Visually (or edit an existing pattern visually).
-2. Select input type, enter SMILES/SMARTS and choose Draw Structure.
-3. Use the pointer icon to toggle atoms/bonds; Shift removes items. Drag a lasso (default), or choose the rectangle icon. Both selected bond endpoints must be selected.
-4. Use the pencil icon, then click an already selected atom/bond to edit only that item without changing the selection. Clicking an unselected item in Edit mode has no effect. In selection mode, Inspector changes can apply to all selected atoms or bonds. The element + button opens the periodic table with persistent blue highlights and pressed states; chips remove individual elements/items.
-5. Right-drag pans and the wheel zooms in either mode. View buttons zoom or fit the structure.
-6. Enter the pattern name and Apply. RDKit generates and validates the reactant before Step 1 collapses and Step 2 opens. The summary includes SMARTS, counts and Copy. Opening either header collapses the other editor.
-7. Edit Product with the same selection and inspector tools. The scissors cuts/restores a bond, + connects two clicked atoms with a single bond, and the atom icon deletes/restores an atom. Undo restores the previous edit, including bonds removed by an atom deletion. Use Product bond type in the right inspector to change the actual bond type; Allowed types are SMARTS alternatives (OR). Cut/Delete Bond share one tool because their existing domain operation is identical. Red previews mark deletion and green marks additions.
-8. Review operation counts and Reaction SMARTS / Reaction SMIRKS / Product SMARTS tabs; Copy uses the VS Code clipboard. Add/Update Product validates before saving to the pattern.
+The selected atoms and bonds define the output. Deselecting either endpoint immediately clears the selection of every incident bond, including newly added bonds. This applies to click toggling, Shift-click, Shift-lasso/box and the Selected Items controls in both steps. The other endpoint stays selected; added bonds remain in the graph. Deselecting a bond excludes the bond while keeping selected endpoints. Disconnected components are serialized in one Product SMARTS separated by `.`. An empty atom selection reports an error.
 
-Reactant generation and product serialization use the existing asynchronous RDKit backend. Live output is debounced and older responses are discarded. Reaction fields compose the mapped reactant/product queries with `>>`.
+The bond + tool connects two clicked atoms with a selected single bond; reconnecting an existing deselected bond includes it again. Newly added bonds support the same click/drag selection and deselection as original bonds. In Edit mode, clicking a selected added bond exposes its type and a control to remove that new bond from the graph. Original bonds are excluded by deselection. Undo restores graph edits and inclusion selections.
 
-## Validation and remaining limitations
+Edit mode keeps selections unchanged. Product atom defaults to Unchanged; Custom permits an explicit atom SMARTS or periodic-table edit. Product bond defaults to Unchanged; Single/Double/Triple/Aromatic explicitly replaces its type. Choosing Unchanged clears the override and restores the Reactant query (new bonds have only explicit types, with Single selected initially). Atom maps remain fixed to the source.
 
-Passed: expanded cleavage UI tests, RDKit visual-product and query semantics tests, and `npm run check:workbench` (HTML/CSP, settings, jobs, parameters, defaults). Individual SMARTS compound-view and training-metrics checks also passed.
+Generate SMARTS validates and displays the selection while staying in Step 2. The + immediately adds a new unsaved Product to the Editor-local list and opens it for editing. Save validates and overwrites the selected Product; it never appends another entry. New Products and Products changed since their last Save have a * beside their names. Undoing back to the saved state clears the marker. Switching Products preserves unsaved edits without saving them. Restore Saved discards edits to the active Product and restores its saved name, atom/bond changes, inclusion and SMARTS; it is unavailable for a Product that has never been saved. Async Product loading keeps the current entry active until chemistry is ready, and stale loads or output updates cannot overwrite another Product. The compact list only shows names, unsaved markers and Remove controls; clicking an entry displays its structure, constraints, counts and outputs in the Editor. Deleting the active Product selects a remaining entry, or hides the Product editor when none remain. Generate SMARTS and Save have equal-sized buttons in one row.
 
-The full existing `npm run check` stops at a missing `src/features/fragment-tree-result/score-distribution` module. Individually running the remaining checks also exposes existing fine-tune command and step-validation assertion failures. These are outside the cleavage editor changes.
+The canvas count shows atoms, included bonds and the number of connected molecules immediately, including isolated selected atoms and newly added selected bonds. Product SMARTS and Reaction SMIRKS appear as two stacked read-only output fields, each with its own Copy button. There are no output tabs or Reaction SMARTS controls.
 
-No VS Code/browser screenshot verification was performed. Reaction SMARTS and Reaction SMIRKS currently show the same mapped query reaction; strict SMIRKS conversion of arbitrary SMARTS queries is not implemented. Advanced atom creation and charge editing remain future work. Newly added bonds also support selection and editing through the shared inspector.
+Step 3 reviews the local Pattern and provides Add Cleavage Pattern to Set, which validates and commits the entire local pattern (reactant and added products) to the current Pattern Set. Editing an existing pattern clones it first; registration updates that entry, while later draft edits/deletions leave the registered entry intact until registration is pressed again. Save all new or modified Products before registering; registration never implicitly saves Product edits. Closing an unregistered draft does not change the Pattern Set. Add and Save at least one Product before registering. Continue to Step 3 moves from Product editing to registration; the three steps open one at a time. Successful registration automatically closes the Editor and leaves a confirmation beside the Pattern list; validation failures keep it open.
 
-## Follow-up interaction changes
+Copy uses the VS Code clipboard. Reaction SMIRKS currently composes the reactant and current product with `>>`; strict conversion of arbitrary SMARTS to SMIRKS remains unsupported.
 
-The molecule area uses `--vscode-editor-background` and `--vscode-editor-foreground`; other panels retain the dark navy theme. RDKit coordinates use one fixed scale on both axes, preserving angles and relative distances; initial/Fit view adds padding without stretching the molecule.
+## State and serialization
 
-Step 2 shows only Product. A + icon appends products to the list, which highlights the active product. The first + registers the current initial draft; subsequent + adds another product skeleton. Switching products or adding another product validates and saves the current registered product first, so edits are retained.
+Source constraints remain structured objects: atom mode/elements/nonHydrogen/raw query; bond mode/types/ringStatus. A local pattern draft separates Editor changes from the registered Pattern Set. Product state uses selected atom and bond sets, explicit atom overrides, bond overrides/raw queries, added-bond records and an undo history. Inspector focus is separate from selection.
 
-Added tests verify persistent periodic-table colors and pressed state, Any + Non-H matching, unchanged selection in Edit mode, isotropic coordinates, removed Reactant/change-tool UI, multiple-product registration/switching, deletion undo, actual product bond type updates and new-bond serialization. Cleavage UI/chemistry checks and Workbench checks pass.
+`productFromSelection` preserves source queries, applies explicit edits, removes excluded edges and serializes selected mapped atoms with RDKit. The shared fragment helper explicitly removes excluded bonds because RDKit interprets an empty `bondsToUse` list as all bonds. `productState` recovers selected atoms/bonds, changed atom/bond queries and added bonds when a saved product is reopened.
 
-## Periodic-table and generation regressions
+## Changed files and validation
 
-The second and third periods previously had 19 cells, shifting the following rows. Both element pickers now use the same 18-column data; the inline picker places cells by row/group and scrolls horizontally on narrow screens. SMILES is the default for new input; opening an existing SMARTS pattern still explicitly selects SMARTS.
+- `src/features/cleavage-pattern-set/visual-editor.js`: Workbench components, state, interaction and product-selection UI.
+- `src/features/cleavage-pattern-set/backend.py`: structured constraints, selection-based product serialization and recovery.
+- `src/features/cleavage-pattern-set/periodic-table.js`: shared 18-group element layout.
+- `src/extension.js`: UI installation, shared standalone periodic table, source defaults and clipboard messaging.
+- `scripts/check-cleavage-pattern-ui.js`: jsdom interaction and real-RDKit integration checks.
+- `scripts/check-cleavage-visual-products.py`: query semantics, product serialization and state recovery checks.
+- `package.json` / `package-lock.json`: UI check integration and synchronization of the declared jsdom dependency.
 
-Generate SMARTS validates and displays the current reactant query without registering a pattern or opening Step 2. Apply continues to register/validate the pattern and advance. Unconstrained source bonds initialize their ring status from RDKit, so clicking a ring bond shows In ring and clicking a chain bond shows Not in ring; explicit radio changes remain editable.
+Passed: cleavage UI tests, RDKit chemistry tests and `npm run check:workbench`. Tests cover unchanged atom/bond queries, dot-separated fragments (including no selected bonds), selected subsets and maps, explicit atom/bond edits, selecting/deselecting/removing added bonds, Undo, saved-product recovery, periodic-table highlights/positions, Edit selection isolation, SMILES reset defaults, and both generation buttons staying in their respective steps, local product add/remove/preview, stacked output copying, molecule counts and explicit Pattern Set registration/update isolation. Integration also uses the exact `CC=CC1CCCCC1` source with real RDKit.
 
-Regression tests cover the period/group positions, SMILES default on reset, Generate staying in Step 1 without registering a pattern, and the exact `CC=CC1CCCCC1` source with real RDKit parsing, ring selection, radio changes and generated `@` constraints.
+The earlier full `npm run check` stopped at a missing `score-distribution` module; individually run fine-tune and step-validation checks also exposed unrelated assertion failures. No browser/VS Code screenshot verification was performed. Atom creation and charge-specific tools remain future work.
+
+All Workbench buttons provide hover, pressed/click and keyboard-focus feedback. Async Editor actions show a busy spinner; mutation buttons prevent duplicate submissions while processing. Motion effects respect reduced-motion preferences.
