@@ -184,8 +184,10 @@ def reactant(payload: dict[str, Any]) -> dict[str, Any]:
                 for symbol in elements:
                     number = Chem.GetPeriodicTable().GetAtomicNumber(str(symbol))
                     if number and number not in numbers: numbers.append(number)
-                if not numbers: raise ValueError(f"Choose at least one element for atom {atom_id}.")
-                replacement = ",".join(f"#{number}" for number in numbers)
+                excluded = bool(constraint.get("excludeElements", False))
+                if not numbers and not excluded:
+                    raise ValueError(f"Choose at least one element for atom {atom_id}.")
+                replacement = (";".join(f"!#{number}" for number in numbers) or "*") if excluded else ",".join(f"#{number}" for number in numbers)
                 if constraint.get("nonHydrogen", False):
                     replacement += ";!#1"
         else:

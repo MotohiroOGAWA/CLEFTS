@@ -195,6 +195,25 @@ hydrogen = backend.Chem.MolFromSmiles("[H][H]")
 assert hydrogen.HasSubstructMatch(query({"mode": "any", "nonHydrogen": False}))
 assert not hydrogen.HasSubstructMatch(query({"mode": "any", "nonHydrogen": True}))
 assert not hydrogen.HasSubstructMatch(query({"mode": "elements", "elements": ["H", "C"], "nonHydrogen": True}))
+# NOT (C OR N OR O) is NOT C AND NOT N AND NOT O, not an OR of negations.
+def exclusion_query(elements, non_h=False):
+    return backend.Chem.MolFromSmarts(backend.reactant({
+        "smiles":"C", "atoms":[0], "bonds":[],
+        "constraints":{"0":{"mode":"elements", "elements":elements,
+                             "excludeElements":True, "nonHydrogen":non_h}},
+    })["smarts"])
+excluded = exclusion_query(["C", "N", "O"])
+for smiles in ["C", "N", "O", "c1ccccc1", "[13CH4]"]:
+    assert not matches(excluded, smiles), smiles
+for smiles in ["F", "Cl", "S", "P", "B"]:
+    assert matches(excluded, smiles), smiles
+assert hydrogen.HasSubstructMatch(excluded)
+assert not hydrogen.HasSubstructMatch(exclusion_query(["C", "N", "O"], True))
+assert not hydrogen.HasSubstructMatch(exclusion_query(["H"], False))
+assert matches(exclusion_query([], False), "C") and hydrogen.HasSubstructMatch(exclusion_query([], False))
+assert not hydrogen.HasSubstructMatch(exclusion_query([], True))
+print("Element exclusion: NOT (C OR N OR O), aromatic/isotope atoms, hydrogen independence and empty exclusion set passed.")
+
 q = query(bond={"mode": "any", "types": ["single"], "ringStatus": "notInRing"})
 assert matches(q, "C=C") and matches(q, "C1CC1")
 q = query(bond={"mode": "custom", "types": ["single", "double"], "ringStatus": "any"})
