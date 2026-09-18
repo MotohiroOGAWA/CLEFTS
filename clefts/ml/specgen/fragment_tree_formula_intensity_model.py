@@ -33,4 +33,7 @@ class FragmentTreeFormulaIntensityPredictor(nn.Module):
         # Keep formula_tensor in the public signature for compatibility, but
         # never expose formula identity/composition to the intensity network.
         x = torch.cat([group_score.float(), group_count.float()], dim=-1)
-        return F.softplus(self.net(x).squeeze(-1))
+        # A bounded multiplicative correction retains the direct gradient from
+        # ion scores. An unconstrained MLP can otherwise invert/flatten them.
+        correction=torch.exp(0.5*torch.tanh(self.net(torch.log1p(x.clamp_min(0))).squeeze(-1)))
+        return group_score.squeeze(-1).clamp_min(0)*correction

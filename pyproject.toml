@@ -18,6 +18,7 @@ dependencies = [
     "pandas",
     "h5py",
     "pyarrow",
+    "tensorboard>=2.14",
 ]
 
 [project.scripts]

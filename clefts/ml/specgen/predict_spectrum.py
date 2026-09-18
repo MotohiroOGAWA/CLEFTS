@@ -109,7 +109,9 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Use strict state_dict loading.",
     )
+    parser.add_argument('--max-samples',type=int,default=128,help='Maximum simultaneous prediction samples; larger inputs are split.')
     args = parser.parse_args()
+    if args.max_samples<1:parser.error('--max-samples must be positive')
     if Path(args.output_name).name != args.output_name:
         parser.error("--output-name must be a filename, not a path")
     if not args.output_name.endswith(".msds"):
@@ -482,6 +484,7 @@ def main() -> None:
         strict=args.strict,
     )
 
+    generator.max_samples=args.max_samples
     print("[4/4] Predicting spectra")
     predicted, failures = predict_msdataset(
         dataset=dataset,

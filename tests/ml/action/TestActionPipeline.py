@@ -21,7 +21,7 @@ from clefts.ml.specgen.spectrum_generator import create_spectrum_generator
 from clefts.ml.specgen.components.action.action_decoder import build_action_pool, deduplicate
 from clefts.ml.specgen.source_anchored_spectrum_predictor import SourceAnchoredFragmentSpectrumGenerator
 from clefts.ml.training.fragment_tree_training.model import ActionFragmentTreeTrainingModel
-from clefts.ml.training.fragment_tree_training.training import train_actions
+from clefts.ml.training.fragment_tree_training.training import train_actions as _train_actions
 from clefts.ml.training.fragment_tree_training.fine_tuning import prepare_model_config, parameter_report
 from .TestSourceAction import model_and_data
 
@@ -33,6 +33,19 @@ def config() -> dict:
         action_prefilter_max_k=16, beam_size=16, max_decode_steps=4)
     value['post_model_params'].update(hidden_dim=16, num_layers=1)
     return value
+
+
+def train_actions(**kwargs):
+    value=deepcopy(kwargs['model_config']);root=Path(kwargs['output_dir']).parent
+    encoder=root/'test_encoder.pt'
+    if not encoder.exists():
+        generator=create_spectrum_generator(value)
+        torch.save({'mol_encoder_params':value['mol_encoder_params'],'mol_encoder_state_dict':generator.mol_encoder.state_dict()},encoder)
+    value['mol_encoder_checkpoint']=str(encoder)
+    for key in ('train_dir','val_dir'):
+        (Path(kwargs[key])/'action_statistics.json').write_text(json.dumps({'model_config':value}))
+    kwargs['model_config']=value
+    return _train_actions(**kwargs,device='cuda',warmup_steps=0)
 
 
 class TestActionPipeline(unittest.TestCase):
@@ -111,6 +124,7 @@ class TestActionPipeline(unittest.TestCase):
         self.assertEqual(decoded.rdkit_run_count, len(effects))
         self.assertEqual(decoded.failed_effect_count, 0)
 
+    @unittest.skipUnless(torch.cuda.is_available(), 'CUDA unavailable')
     def test_dehydrated_precursor_stored_graph_training_and_checkpoint(self) -> None:
         generator = create_spectrum_generator(config()).eval()
         source = Compound.from_smiles('CCCO')
@@ -137,10 +151,10 @@ class TestActionPipeline(unittest.TestCase):
                 (root/name).mkdir()
                 data.save(root/name/'source.preft.pt')
             report = train_actions(model_config=config(), train_dir=root/'train', val_dir=root/'val', output_dir=root/'run', epochs=1)
-            self.assertEqual(report['schema_version'], 4)
+            self.assertEqual(report['schema_version'], 5)
             self.assertTrue((root/'run'/'last.pt').is_file())
             resumed = train_actions(model_config=config(), train_dir=root/'train', val_dir=root/'val', output_dir=root/'run', epochs=1, resume=root/'run'/'last.pt')
-            self.assertEqual(resumed['history'][0]['epoch'], 2)
+            self.assertEqual(resumed['history'][-1]['epoch'], 2)
             initialized = train_actions(model_config=config(), train_dir=root/'train', val_dir=root/'val', output_dir=root/'initialized', epochs=1, initialize_from=root/'run'/'last.pt')
             self.assertEqual(initialized['history'][0]['epoch'], 1)
             self.assertTrue((root/'initialized'/'last.pt').is_file())
@@ -161,7 +175,7 @@ class TestActionPipeline(unittest.TestCase):
         result = generator.predict([source, source],
             [Adduct.parse('[M+H]+'), Adduct.parse('[M+H-H2O]+')], [20., 40.])
         pool = result.selection.features.pool
-        self.assertEqual(pool.precursor_row_sample_index.tolist(), [1])
+        self.assertEqual(pool.precursor_row_sample_index.tolist(), [0,1])
         decoded = result.fragments
         sample_index = decoded.node_sample_index.tolist()
         compounds = [compound.smiles for compound in decoded.compounds]
@@ -171,6 +185,7 @@ class TestActionPipeline(unittest.TestCase):
         self.assertFalse(any(src == source_node and compounds[dst] != 'CCC'
                              for src, dst in edges if src in dehydrated_sample))
 
+    @unittest.skipUnless(torch.cuda.is_available(), 'CUDA unavailable')
     def test_action_fine_tuning_freezes_base_and_trains_new_pattern(self) -> None:
         base_config = config()
         base_generator = create_spectrum_generator(deepcopy(base_config)).eval()
@@ -233,10 +248,11 @@ class TestActionPipeline(unittest.TestCase):
             # Resuming with the exact original fine-tuning config succeeds.
             resumed = train_actions(model_config=fine_tuned_config, train_dir=root/'ft_train', val_dir=root/'ft_val',
                 output_dir=root/'ft_run', epochs=1, resume=tuned_checkpoint)
-            self.assertEqual(resumed['history'][0]['epoch'], 2)
+            self.assertEqual(resumed['history'][-1]['epoch'], 2)
             # Prediction also works from the fine-tuned checkpoint.
             checkpoint = torch.load(tuned_checkpoint, map_location='cpu', weights_only=False)
-            self.assertEqual(checkpoint['model_config'], fine_tuned_config)
+            saved=checkpoint['model_config'];saved.pop('mol_encoder_checkpoint',None);saved.pop('max_samples',None)
+            self.assertEqual(saved,fine_tuned_config)
             from clefts.ml.specgen.predict_spectrum import load_generator
             predicting_generator = load_generator(model_path=str(tuned_checkpoint), params_path=None,
                                                   device=torch.device('cpu'), strict=True)

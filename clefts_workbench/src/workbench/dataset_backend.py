@@ -128,7 +128,9 @@ def training_checkpoint(payload):
     if not config:
         raise ValueError('Checkpoint does not contain model configuration.')
     group = checkpoint['optimizer_state_dict']['param_groups'][0]
-    return {'modelConfig': config.get('params', config), 'lr': group['lr'], 'weightDecay': group.get('weight_decay', 0)}
+    fields={'absolute_weight':'absoluteWeight','next_weight':'nextWeight','negative_weight':'negativeWeight','intensity_weight':'intensityWeight','absolute_intensity_weight':'absoluteIntensityWeight','train_mol_encoder':'trainMolEncoder','validation_interval_steps':'validationIntervalSteps','validation_fraction':'validationFraction'}
+    restored={field:checkpoint.get('training_settings',{})[key] for key,field in fields.items() if key in checkpoint.get('training_settings',{})}
+    return {'modelConfig': config.get('params', config), 'lr': group['lr'], 'weightDecay': group.get('weight_decay', 0), 'trainingSettings':restored}
 
 def training_sources(payload):
     import torch

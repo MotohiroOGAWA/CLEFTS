@@ -79,7 +79,11 @@ def namespace_argv(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
         if isinstance(action,argparse._HelpAction) or not action.option_strings: continue
         value=getattr(args,action.dest,None)
         if value is None: continue
-        if isinstance(action,argparse._AppendAction):
+        if isinstance(action,argparse._StoreTrueAction):
+            if value:argv.append(action.option_strings[0])
+        elif isinstance(action,argparse._StoreFalseAction):
+            if not value:argv.append(action.option_strings[0])
+        elif isinstance(action,argparse._AppendAction):
             for item in value: argv.extend([action.option_strings[0],str(item)])
         else: argv.extend([action.option_strings[0],str(value)])
     return argv

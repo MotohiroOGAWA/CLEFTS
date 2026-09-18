@@ -8,6 +8,7 @@
 guides/installation
 guides/data-preparation
 guides/training
+guides/action-prediction-training
 guides/prediction
 guides/workbench
 ```

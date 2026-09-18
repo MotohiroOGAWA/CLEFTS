@@ -108,9 +108,9 @@ function defaultTrainingConfig(context) {
   const root = projectRoot(context);
   const defaultParams = path.join(root, 'clefts', 'presets', 'spectrum_generator_params', 'source_anchored_pos_model_config.json');
   return workbenchDefaults.workflowDefaults('training',{
-    application: 'fragment-tree-training', modelConfig: parameterService.defaults(root), params: defaultParams, trainDir: '', valDir: '',
+    application: 'fragment-tree-training', modelConfig: {...parameterService.defaults(root),action_model_params:{...parameterService.defaults(root).action_model_params,action_prefilter_threshold_logit:1}}, params: defaultParams, trainDir: '', valDir: '',
     outputDir: '',
-    experimentName: 'exp_main', molEncoderCheckpoint: '', epochs: 1, batchSize: 4, device: 'cpu', lr: 0.0001, resume: '',
+    experimentName: 'exp_main', molEncoderCheckpoint: '', epochs: 1, batchSize: 4, device: 'cuda', maxSamples:128, seed:42, warmupSteps:100, validationIntervalSteps:0, validationFraction:0.1, lrPatience:3, earlyStoppingPatience:10, minLr:0.000001, absoluteIntensityWeight:1, gradientClip:1, lr: 0.0001, resume: '',
     fineTuneCheckpoint: '', fineTunePatternSet: '', adapterWidth: 8
   },root);
 }
@@ -428,14 +428,15 @@ function buildTrainingArgs(c) {
   const a = ['-m', 'clefts.cli', 'train', 'fragment-tree',
     '--train-dir', c.trainDir, '--val-dir', c.valDir, '--output-dir', c.outputDir,
     '--epochs', String(c.epochs || 1), '--batch-size', String(c.batchSize || 4),
-    '--device', c.device || 'cpu', '--lr', String(c.lr ?? 0.0001)];
+    '--device', c.device || 'cuda', '--lr', String(c.lr ?? 0.0001)];
   const encoder=c.molEncoderCheckpoint||c.modelConfig?.mol_encoder_checkpoint;
   if(encoder&&!c.resume&&!c.fineTuneCheckpoint)a.push('--mol-encoder-checkpoint',encoder);
   if(!c.resume&&!c.fineTuneCheckpoint){
-    const sections={action_model_params:{hidden_dim:'action-hidden-dim',condition_dim:'action-condition-dim',num_heads:'action-num-heads',max_roles:'action-max-roles',action_prefilter_top_k:'action-top-k',action_prefilter_max_k:'action-max-k',action_prefilter_threshold_logit:'action-threshold',beam_size:'beam-size',max_decode_steps:'max-decode-steps'},post_model_params:{hidden_dim:'post-hidden-dim',num_layers:'post-num-layers',num_heads:'post-num-heads'}};
+    const sections={action_model_params:{hidden_dim:'action-hidden-dim',condition_dim:'action-condition-dim',num_heads:'action-num-heads',max_roles:'action-max-roles',action_prefilter_top_k:'action-top-k',action_prefilter_max_k:'action-max-k',action_prefilter_threshold_logit:'action-threshold',beam_size:'beam-size',max_decode_steps:'max-decode-steps',state_num_layers:'action-state-layers',state_dropout:'action-state-dropout'},post_model_params:{hidden_dim:'post-hidden-dim',num_layers:'post-num-layers',num_heads:'post-num-heads',cosine_loss_weight:'post-cosine-loss-weight'}};
     for(const [section,flags]of Object.entries(sections))for(const [key,flag]of Object.entries(flags)){const value=c.modelConfig?.[section]?.[key];if(value!==undefined&&value!==null)a.push('--'+flag,String(value));}
   }
   for (const [key, flag] of Object.entries(workbench.trainingFlags)) if (c[key] !== undefined && c[key] !== '') a.push(flag, String(c[key]));
+  if(c.trainMolEncoder)a.push('--train-mol-encoder');
   if (c.initializeFrom) a.push('--initialize-from', c.initializeFrom);
   if (c.resume) a.push('--resume', c.resume);
   if (c.fineTuneCheckpoint && !c.resume) a.push('--fine-tune-checkpoint', c.fineTuneCheckpoint, '--adapter-width', String(c.adapterWidth || 8));

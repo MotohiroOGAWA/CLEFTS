@@ -29,6 +29,9 @@ const panel=require('../src/workbench/panel');
  await panel.startTraining(context,{webview},{appendLine(){}},root,'python',{workflow:'mol',outputDir:root,epochs:2,batchSize:32,lr:0.001},()=>['-m','clefts.cli','train','mol-encoder']);
  const molRecord=JSON.parse(fs.readFileSync(path.join(root,'jobs',posted.at(-1).jobId+'.json')));assert.equal(molRecord.type,'mol-training');assert(molRecord.command.includes('mol-encoder'));children[1].child.emit('close',0,null);
  await assert.rejects(()=>panel.startTraining(context,{webview},{appendLine(){}},root,'python',{outputDir:root,epochs:0,batchSize:4,lr:0.001},()=>[]),/positive integer/);
+ await assert.rejects(()=>panel.startTraining(context,{webview},{appendLine(){}},root,'python',{outputDir:root,epochs:1,batchSize:4,lr:0.001,validationIntervalSteps:1.5},()=>[]),/Validation interval/);
+ await assert.rejects(()=>panel.startTraining(context,{webview},{appendLine(){}},root,'python',{outputDir:root,epochs:1,batchSize:4,lr:0.001,validationFraction:0},()=>[]),/Validation fraction/);
+ await assert.rejects(()=>panel.startTraining(context,{webview},{appendLine(){}},root,'python',{outputDir:root,epochs:1,batchSize:4,lr:0.001,validationFraction:1.1},()=>[]),/Validation fraction/);
  console.log('Training job persistence, process options, logs and completion checks passed.');
  }finally{fs.rmSync(root,{recursive:true,force:true});}
 })().catch(error=>{console.error(error);process.exitCode=1;});

@@ -26,6 +26,9 @@ def _walk_pathway(tree, fragmenter, pathway) -> set:
                 for transition in edge.transitions:
                     if transition.parent_action_sequence != state:
                         continue
+                    if state is not None and transition.added_action is not None:
+                        action=transition.added_action
+                        if not set(action.source_atom_maps)<=state.retained_atom_maps or any(previous.changed_bond_maps & action.matched_bond_maps for previous in state.actions):continue
                     if node.is_precursor and len(transition.action_sequence.actions) > fragmenter.precursor_candidate_max_action_count:
                         continue
                     next_states.add((edge.target_index, transition.action_sequence))
@@ -96,6 +99,13 @@ class ActionStructureBuilder:
                 added.append(action)
                 terminal.append(bool(data.teacher_positive_eos[known[state]]))
                 original=known[state]
+                if state is None and None not in precursor_sequences[sample]:
+                    # Match inference: deterministic precursor combinations are
+                    # whole seed edges, not learned fragmentation prefixes.
+                    for seed in sorted((seq for seq in precursor_sequences[sample] if seq in known),key=lambda seq:seq.key):
+                        if seed not in visited:
+                            visited.add(seed);queue.append((seed,row_index,-1))
+                    continue
                 start,stop=data.teacher_positive_action_ptr[original:original+2].tolist()
                 # prepare_source_actions already guarantees every teacher state
                 # here is precursor-consistent, so any traversal order yields a
@@ -136,6 +146,7 @@ class ActionStructureBuilder:
                     sequences=_walk_pathway(tree,fragmenter,pathway)
                     local_nodes=sorted({node_by_state[(sample,tuple(sorted(actions.index(action) for action in seq.actions)) if seq else ())]
                                         for seq in sequences if (sample,tuple(sorted(actions.index(action) for action in seq.actions)) if seq else ()) in node_by_state})
+                    if not local_nodes:continue
                     match=dict(nodeIndices=local_nodes,smiles=pathway.terminal_node.smiles,
                                formula=str(pathway.formula),theoreticalMz=float(pathway.formula.exact_mass),
                                massErrorPpm=(float(mz)-pathway.formula.exact_mass)/pathway.formula.exact_mass*1e6,

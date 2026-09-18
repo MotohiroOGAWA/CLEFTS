@@ -2,6 +2,7 @@
 import contextlib
 import io
 import sys
+import tempfile
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from clefts.ml.training.fragment_tree_training.training import build_arg_parser, training_model_config, main, MODEL_OPTIONS
@@ -24,7 +25,8 @@ assert 'fragmenter_params' not in config and 'mol_encoder_params' not in config
 for _, (section, key, kind, _) in MODEL_OPTIONS.items():
     assert config[section][key] == (0.25 if kind is float else 64)
 try:
-    main(base)
+    with tempfile.TemporaryDirectory() as output_dir:
+        main(['--train-dir', 'train', '--val-dir', 'val', '--output-dir', output_dir])
 except SystemExit as error:
     assert '--mol-encoder-checkpoint' in str(error)
 else:

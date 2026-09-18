@@ -10,26 +10,25 @@ const feature = require('../src/features/spectrum-prediction/editor');
 
 const args = feature.buildBatchArgs({
   input: '/data/source database.msds', outputDir: '/data/prediction output', outputName: 'result.msds',
-  modelPath: '/models/model.pt', device: 'cuda', db: 'MoNA', batchSize: 16,
-  precomputeWorkers: 6, keepTemp: true,
+  modelPath: '/models/model.pt', device: 'cuda', db: 'MoNA', maxSamples: 16,
   specIdColumn: 'SpecID', smilesColumn: 'SMILES', precursorMzColumn: 'PrecursorMZ',
   adductTypeColumn: 'AdductType', collisionEnergyColumn: 'CollisionEnergy',
   instrumentColumn: 'InstrumentType', overwrite: true
 });
 assert.deepEqual(args.slice(0, 2), ['-m', 'clefts.ml.specgen.predict_spectrum']);
 assert.deepEqual(args.slice(args.indexOf('--db'), args.indexOf('--db') + 2), ['--db', 'MoNA']);
-assert.deepEqual(args.slice(args.indexOf('--batch-size'), args.indexOf('--batch-size') + 2), ['--batch-size', '16']);
+assert.deepEqual(args.slice(args.indexOf('--max-samples'), args.indexOf('--max-samples') + 2), ['--max-samples', '16']);
 assert.deepEqual(args.slice(args.indexOf('--output-dir'), args.indexOf('--output-dir') + 2), ['--output-dir', '/data/prediction output']);
 assert.deepEqual(args.slice(args.indexOf('--output-name'), args.indexOf('--output-name') + 2), ['--output-name', 'result.msds']);
-assert.deepEqual(args.slice(args.indexOf('--precompute-workers'), args.indexOf('--precompute-workers') + 2), ['--precompute-workers', '6']);
+assert(!args.includes('--precompute-workers'));
 assert(args.includes('--overwrite'));
-assert(args.includes('--keep-temp'));
+assert(!args.includes('--keep-temp'));
 assert(args.includes('--instrument-column'));
 assert(feature.shellDisplay('python', args).includes("'/data/source database.msds'"));
 assert(feature.html().includes('Predict MSDataset'));
 assert(feature.html().includes('predictLoadConfig'));
 assert(feature.html().includes('predictSaveConfig'));
-assert(feature.html().includes('batchPrecomputeWorkers'));
+assert(feature.html().includes('batchMaxSamples'));
 new Function(feature.script());
 
 const { workbenchHtml } = require('../src/extension');

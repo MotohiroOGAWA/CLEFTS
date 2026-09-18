@@ -72,17 +72,22 @@ class TestConfigOptions(unittest.TestCase):
         self.assertEqual(kwargs['model_config']['fragmenter_params']['fragment_ion_tree_builder']['max_action_count'],2)
         self.assertEqual(kwargs['model_config']['action_model_params']['beam_size'],7)
 
-    def test_official_training_command_accepts_inline_gui_configuration(self):
+    def test_official_training_command_forwards_explicit_options(self):
         from clefts.cli.train.commands.fragment_tree import FragmentTreeTrainCommand
         from clefts.ml.training.fragment_tree_training import training
         args=training.build_arg_parser().parse_args(['--train-dir','train','--val-dir','val','--output-dir','out',
-            '--params-json','{"action_model_params":{"beam_size":4}}','--beam-size','8',
-            '--weight-decay','0','--intensity-weight','0.5'])
-        with patch.object(training,'train_actions',return_value={}) as run, patch('builtins.print'):
+            '--mol-encoder-checkpoint','encoder.pt','--beam-size','8','--train-mol-encoder',
+            '--weight-decay','0','--intensity-weight','0.5',
+            '--validation-interval-steps','1000','--validation-fraction','0.1'])
+        with tempfile.TemporaryDirectory() as directory, patch('clefts.ml.training.fragment_tree_training.sources.inherit_model_config',side_effect=lambda config,*args,**kwargs:config), patch.object(training,'train_actions',return_value={}) as run, patch('builtins.print'):
+            args.output_dir=directory
             FragmentTreeTrainCommand().run(args)
         self.assertEqual(run.call_args.kwargs['model_config']['action_model_params']['beam_size'],8)
         self.assertEqual(run.call_args.kwargs['weight_decay'],0)
         self.assertEqual(run.call_args.kwargs['intensity_weight'],0.5)
+        self.assertTrue(run.call_args.kwargs['train_mol_encoder'])
+        self.assertEqual(run.call_args.kwargs['validation_interval_steps'],1000)
+        self.assertEqual(run.call_args.kwargs['validation_fraction'],0.1)
 
     def test_preparation_file_limits_and_symbols_are_overridden_only_explicitly(self):
         from clefts.ml.data_preparation.fragment_tree import create_training_data as preparation
