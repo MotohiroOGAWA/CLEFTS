@@ -92,8 +92,20 @@ function client(){
   const defaultModel=initial.modelConfig||{fragmenter_params:initial.fragmenterParams||initialTraining.modelConfig?.fragmenter_params,symbols:initial.symbols||initialTraining.modelConfig?.mol_encoder_params?.symbols};
   const dataInitial={...defaultModel,symbols:initial.symbols||defaultModel.symbols||defaultModel.mol_encoder_params?.symbols,max_node:initial.maxNode??defaultModel.max_node,max_edge:initial.maxEdge??defaultModel.max_edge};
   let applyPatterns,patternTarget;
-  function editPatterns(target){return (value,apply)=>{applyPatterns=apply;patternTarget=target;cleavageModel={cleavage_pattern_set:value};cleavagePath='';renderCleavage();el('cleavagePath').textContent='Editing '+(target==='data'?'Data Preparation':'Training')+' Cleavage Patterns';el('applyParameterPatterns').hidden=false;document.querySelector('[data-app=cleavage]').click();};}
+  function editPatterns(target){return (value,apply)=>{applyPatterns=apply;patternTarget=target;cleavageModel={cleavage_pattern_set:value};cleavagePath='';renderCleavage();el('cleavagePath').textContent='Editing '+(target==='data'?'Data Preparation':'Training')+' Cleavage Patterns';el('applyParameterPatterns').hidden=false;document.querySelector('#navigationRail [data-page=cleavage]').click();};}
   const editors={data:createParameterEditor(el('dataParameterEditor'),dataInitial,'data',editPatterns('data')),training:createParameterEditor(el('trainingParameterEditor'),initialTraining.modelConfig||defaultModel,'training',editPatterns('training'))};
+  function openDataPatterns(visually=false){
+    const model=editors.data.getValue();
+    const value=model.fragmenter_params?.fragment_ion_tree_builder?.cleavage_pattern_set||{name:'new_cleavage_pattern_set',patterns:[]};
+    editPatterns('data')(JSON.parse(JSON.stringify(value)),updated=>{
+      const current=editors.data.getValue();
+      current.fragmenter_params.fragment_ion_tree_builder.cleavage_pattern_set=JSON.parse(JSON.stringify(updated));
+      editors.data.setValue(current);form.dispatchEvent(new Event('input',{bubbles:true}));
+    });
+    if(visually)el('addVisualPattern').click();
+  }
+  el('dataEditCleavagePatterns').onclick=()=>openDataPatterns();
+  el('dataAddVisualPattern').onclick=()=>openDataPatterns(true);
   el('applyParameterPatterns').onclick=()=>{if(applyPatterns){applyPatterns(cleavageModel.cleavage_pattern_set);el('applyParameterPatterns').hidden=true;document.querySelector('[data-page='+patternTarget+']').click();}};
   function snapshot(target,application){const config={application};for(const input of target.elements){if(input.name)config[input.name]=input.type==='number'?Number(input.value):input.type==='checkbox'?input.checked:input.value;}return config;}
   getConfig=()=>{const value=editors.data.getValue();return {...snapshot(form,'fragment-tree-data-preparation'),fragmenterParams:value.fragmenter_params,symbols:value.symbols,maxNode:value.max_node,maxEdge:value.max_edge};};

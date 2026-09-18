@@ -6,7 +6,7 @@ const crypto = require('crypto');
 const { spawn } = require('child_process');
 const sessions = new Map();
 const trainingFlags = { weightDecay:'--weight-decay', gradientClip:'--gradient-clip', absoluteWeight:'--absolute-weight', nextWeight:'--next-weight', negativeWeight:'--negative-weight', intensityWeight:'--intensity-weight',absoluteIntensityWeight:'--absolute-intensity-weight',maxSamples:'--max-samples',seed:'--seed',warmupSteps:'--warmup-steps',validationIntervalSteps:'--validation-interval-steps',validationFraction:'--validation-fraction',lrPatience:'--lr-patience',earlyStoppingPatience:'--early-stopping-patience',minLr:'--min-lr' };
-const pages = [['HOME','home','Overview'],['DATA','data','Training Data'],['TRAINING','training','New Training'],['TRAINING','molTraining','Mol Training'],['TRAINING','jobs','Training Jobs'],['TRAINING','models','Models'],['TRAINING','metrics','Metrics'],['TRAINING','finetune','Fine-tuning'],['PREDICTION','predict','Single / Batch Prediction'],['VISUALIZATION','viewer','Spectrum / Fragment Viewer'],['VISUALIZATION','smarts','Structure / SMARTS Search'],['SETTINGS','cleavage','Cleavage Patterns'],['SETTINGS','environment','Environment']];
+const pages = [['HOME','home','Overview'],['DATA','data','Training Data'],['DATA','cleavage','Cleavage Patterns'],['TRAINING','training','New Training'],['TRAINING','molTraining','Mol Training'],['TRAINING','jobs','Training Jobs'],['TRAINING','models','Models'],['TRAINING','metrics','Metrics'],['TRAINING','finetune','Fine-tuning'],['PREDICTION','predict','Single / Batch Prediction'],['VISUALIZATION','viewer','Spectrum / Fragment Viewer'],['VISUALIZATION','smarts','Structure / SMARTS Search'],['SETTINGS','environment','Environment']];
 function session(context) {
   const dir=path.join((context.storageUri || context.globalStorageUri).fsPath,'jobs');
   if(sessions.has(dir)) return sessions.get(dir);
@@ -17,7 +17,7 @@ function session(context) {
 }
 function save(s,job){const file=path.join(s.dir,job.id+'.json');fs.writeFileSync(file+'.tmp',JSON.stringify(job,null,2));fs.renameSync(file+'.tmp',file);for(const listener of s.listeners)listener();}
 function register(context, output, projectRoot, open) {
-  const commands={importDataset:'data',prepareTrainingData:'data',startTraining:'training',startMolTraining:'molTraining',predictSpectrum:'predict',batchPrediction:'predict',openSpectrumViewer:'viewer',openFragmentExplorer:'viewer',checkEnvironment:'environment'};
+  const commands={editCleavagePatterns:'cleavage',importDataset:'data',prepareTrainingData:'data',startTraining:'training',startMolTraining:'molTraining',predictSpectrum:'predict',batchPrediction:'predict',openSpectrumViewer:'viewer',openFragmentExplorer:'viewer',checkEnvironment:'environment'};
   for(const [name,page] of Object.entries(commands))context.subscriptions.push(vscode.commands.registerCommand('clefts.'+name,()=>open(context,output,page)));
   context.subscriptions.push(vscode.commands.registerCommand('clefts.navigate',page=>open(context,output,page)),vscode.window.registerTreeDataProvider('clefts.navigation',{getTreeItem:item=>item,getChildren:item=>item?pages.filter(p=>p[0]===item.label).map(p=>({label:p[2],command:{command:'clefts.navigate',title:p[2],arguments:[p[1]]}})):[...new Set(pages.map(p=>p[0]))].map(label=>({label,collapsibleState:1}))}));
 }

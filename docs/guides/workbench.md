@@ -16,6 +16,14 @@ The tabs are **Input Dataset**, **Fragmentation**, **Assignment**, **Output** an
 
 The fixed bottom-right **Run** button is always clickable. Clicking it checks dataset validation and required settings; red text explains any unmet requirements and processing does not start. Clicking during an active job also displays a message and prevents duplicate runs. The backend validates settings again before launching processing.
 
+## Cleavage patterns
+
+Open **Data → Cleavage Patterns**, or run **CLEFTS: Edit Cleavage Patterns** from the command palette. Creation controls appear above the pattern list. **Add Pattern** creates an editable reactant/product SMARTS entry. **Add Pattern Visually** opens the existing structure builder: draw a source molecule, select atoms and bonds, configure their queries, then **Apply Reactant**. While dragging with the left mouse button held down, a colored dashed line follows the mouse in both the source and product views. When drawing a selection loop, a bond is selected only when both of its endpoint atoms are enclosed. Draw and map each product, edit bond types, and use **Add Product**. Existing entries also support visual editing.
+
+Import a pattern set or an individual pattern by dropping its JSON file onto the corresponding import control, or click that control to browse. **Save Configuration** exports the complete pattern set; individual entries can also be saved separately. Import errors appear in the editor.
+
+To update a preparation run, open **Training Data → Fragmentation → Cleavage Patterns** and choose **Edit Cleavage Patterns** or **Add Pattern Visually**. The editor starts with that run's current pattern set. After adding, editing or importing patterns, click **Apply Patterns to Parameters** to return to Data Preparation and include the edited set in the preparation configuration. Saving a standalone pattern set does not apply it to a preparation run.
+
 ## Mol Training descriptor targets
 
 In **Mol Training → Training Tasks & Loss Weights → Descriptor Regression**, select individual descriptor targets using the checkboxes. The standard 14 training descriptors are all checked by default. Each target includes a short description. **Select All** and **Clear All** update the selection together.
