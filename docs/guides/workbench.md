@@ -22,6 +22,14 @@ In **Mol Training → Training Tasks & Loss Weights → Descriptor Regression**,
 
 Keep at least one descriptor selected while Descriptor Regression is enabled. Disabling the task also disables its target controls without discarding the selection. Copy Command passes the selected names through `--descriptor-names`; Start Training uses the same selection. Save Configuration records the selected names, and Load Configuration restores the selection and its order, including configurations exported by the training CLI.
 
+## Mol Training startup and progress
+
+A `Validation target warning` reports node or edge classes with too few validation targets. It is informational and does not block training. Sampling-index construction follows this summary and displays its progress.
+
+Mol Training starts optimizer updates without an epoch-0 evaluation by default. Earlier versions silently evaluated the entire training split before the first update, which could take a long time on large CPU datasets. To record initial subset metrics, set **Initial evaluation batches (0 skips)** in Basic Training Settings, or pass `--initial-evaluation-batches N` to the CLI. A positive value limits initial evaluation to at most N batches from each split; 0 skips it. These subset metrics are excluded from best-checkpoint selection and early stopping. Full validation continues after each training epoch.
+
+Logs include training and epoch start, first-batch start, completed-batch progress, and epoch-end metrics. Validation also displays a progress bar. TensorBoard records batch training loss as well as epoch metrics. If an individual first forward pass is slow, its `batch_start` event distinguishes it from preprocessing or initial evaluation. The CLI's `--device cpu` selects CPU execution; `--device cuda` selects CUDA execution.
+
 ## Themes and help
 
 Theme preference is saved in the webview's workspace state. The default follows the VS Code theme; the toolbar toggles light/dark overrides. Help explains the current page and links to the product guide.

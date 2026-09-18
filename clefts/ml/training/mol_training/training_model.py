@@ -395,6 +395,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--batch-size", type=int, default=32, help="Number of molecules per training batch.")
     parser.add_argument("--num-workers", type=int, default=0, help="Number of DataLoader worker processes.")
+    parser.add_argument("--initial-evaluation-batches", type=int, default=0,
+        help="Optional epoch-0 evaluation: maximum batches per split. Default 0 starts training without an initial evaluation.")
     parser.add_argument("--lr", type=float, default=1e-4, help="AdamW learning rate.")
     parser.add_argument(
         "--preprocessing-cache",
@@ -462,6 +464,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def mol_encoder_configs(args: argparse.Namespace) -> List[MolEncoderConfig]:
+    if args.initial_evaluation_batches < 0:
+        raise ValueError("initial_evaluation_batches must be non-negative")
     configs = []
     for values in itertools.product(
         parse_csv_ints(args.node_dim),
@@ -753,6 +757,7 @@ def build_feature_record_index(
     *,
     symbols: Sequence[str],
 ) -> Dict[str, Dict[str, Dict[str, List[int]]]]:
+    print(f"Building attribute sampling index for {len(dataset):,} molecules.", flush=True)
     return {
         "node": dataset.feature_record_index("x", atom_feature_groups(symbols)),
         "edge": dataset.feature_record_index("edge_attr", bond_feature_groups()),
@@ -764,7 +769,9 @@ def build_descriptor_sampling_index(
     *,
     min_record_count: int,
 ) -> Tuple[Dict[str, Dict[str, Dict[str, List[int]]]], Dict[str, Dict[str, object]]]:
-    descriptor_rows = [data.descriptors.detach().cpu().tolist() for data in dataset.items]
+    descriptor_rows = [data.descriptors.detach().cpu().tolist() for data in tqdm(
+        dataset.items, desc="Collecting descriptor sampling targets", unit="mol", mininterval=1.0)]
+    print("Building descriptor coverage bins.", flush=True)
     descriptor_index, descriptor_summary = build_descriptor_record_index(
         descriptor_rows,
         dataset.descriptor_names,
@@ -841,6 +848,8 @@ def write_feature_target_summary(
             "Validation target warning: "
             f"{len(warnings)} node/edge classes have fewer than "
             f"{min_validation_target_count} targets. See feature_target_summary.json."
+            " This warning does not prevent training.",
+            flush=True,
         )
     return summary
 
@@ -866,6 +875,8 @@ def run_pretraining_stage(
     output_dir: Path,
     config_count: int,
 ) -> Dict[str, object]:
+    print(f"Preparing training loaders on {device}: {len(train_dataset):,} training molecules, "
+          f"{len(val_dataset):,} validation molecules.", flush=True)
     balanced_feature_record_index = None
     if not args.disable_balanced_record_sampling and train_feature_record_index:
         balanced_feature_record_index = train_feature_record_index
@@ -904,6 +915,7 @@ def run_pretraining_stage(
         early_stopping_min_delta=args.early_stopping_min_delta,
         early_stopping_reset_step=args.early_stopping_reset_step,
         early_stopping_verbose=args.early_stopping_verbose,
+        initial_evaluation_batches=args.initial_evaluation_batches,
     )
     return {
         **asdict(config),
@@ -1034,6 +1046,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     config_record["balanced_record_sampling"] = balanced_record_sampling_summary
     write_pretraining_config(output_dir, config_record)
+    print("Sampling indexes prepared; starting model training.", flush=True)
 
     all_rows = []
     for config in configs:
