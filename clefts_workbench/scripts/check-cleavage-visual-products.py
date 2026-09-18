@@ -175,3 +175,58 @@ assert "atomMapBySource" in extension
 assert 'id="builderSourceType"' in extension
 assert "Source SMILES / SMARTS" in extension
 print("Complex reactant and visual product round-trip checks passed.")
+
+# Query semantics are checked by matching real molecules, rather than string spelling.
+def query(atom=None, bond=None):
+    return backend.Chem.MolFromSmarts(backend.reactant({
+        "sourceType": "smiles", "smiles": "CC", "atoms": [0, 1], "bonds": [0],
+        "constraints": {"0": atom or {"mode": "any"}, "1": {"mode": "any"}},
+        "bondConstraints": {"0": bond or {"mode": "any"}},
+    })["smarts"])
+
+def matches(q, smiles):
+    return backend.Chem.MolFromSmiles(smiles).HasSubstructMatch(q)
+
+assert matches(query({"mode": "any", "elements": ["O"], "nonHydrogen": True}), "NN")
+q = query({"mode": "elements", "elements": ["N", "O"], "nonHydrogen": True})
+assert matches(q, "NC") and matches(q, "OC") and not matches(q, "CC")
+assert matches(query({"mode": "custom", "smarts": "[#7,#8]"}), "NC")
+hydrogen = backend.Chem.MolFromSmiles("[H][H]")
+assert hydrogen.HasSubstructMatch(query({"mode": "any", "nonHydrogen": False}))
+assert not hydrogen.HasSubstructMatch(query({"mode": "any", "nonHydrogen": True}))
+assert not hydrogen.HasSubstructMatch(query({"mode": "elements", "elements": ["H", "C"], "nonHydrogen": True}))
+q = query(bond={"mode": "any", "types": ["single"], "ringStatus": "notInRing"})
+assert matches(q, "C=C") and matches(q, "C1CC1")
+q = query(bond={"mode": "custom", "types": ["single", "double"], "ringStatus": "any"})
+assert matches(q, "CC") and matches(q, "C=C") and not matches(q, "C#C")
+q = query(bond={"mode": "custom", "types": ["single"], "ringStatus": "inRing"})
+assert matches(q, "C1CC1") and not matches(q, "CC")
+q = query(bond={"mode": "custom", "types": ["single"], "ringStatus": "notInRing"})
+assert matches(q, "CC") and not matches(q, "C1CC1")
+from rdkit.Chem import rdChemReactions
+reaction = rdChemReactions.ReactionFromSmarts(reactant + ">>" + round_trip["smarts"])
+assert reaction is not None and reaction.GetNumProductTemplates() == 1
+print("Any/custom, element OR, Non-H, bond OR, ring status and mapped reaction serialization checks passed.")
+
+# Product graph edits and query constraints use the same mapped serializer.
+changed = backend.product_from_structure({
+    "sourceType": "smiles", "smiles": "CCO", "reactantSmarts": "[#6:1]-[#6:2]-[#8:3]",
+    "atomMaps": {"0": 1, "1": 2, "2": 3}, "bondOverrides": {"0": "2"},
+    "atomOverrides": {"2": "[!#1]"},
+    "bondConstraints": {"0": {"mode": "custom", "types": ["double"], "ringStatus": "any"}},
+})
+changed_mol = backend.Chem.MolFromSmarts(changed["smarts"])
+assert changed_mol.GetBondBetweenAtoms(0, 1).GetBondTypeAsDouble() == 2
+assert backend.Chem.MolFromSmiles("C=CN").HasSubstructMatch(changed_mol)
+assert not backend.Chem.MolFromSmiles("CCN").HasSubstructMatch(changed_mol)
+new_bond = backend.product_from_structure({
+    "sourceType": "smiles", "smiles": "CCC", "reactantSmarts": "[#6:1]-[#6:2]-[#6:3]",
+    "atomMaps": {"0": 1, "1": 2, "2": 3}, "bondOverrides": {"0": "remove"},
+    "addedBonds": [{"begin": 0, "end": 2, "order": "2", "constraint": {
+        "mode": "custom", "types": ["double"], "ringStatus": "any"}}],
+})
+new_mol = backend.Chem.MolFromSmarts(new_bond["smarts"])
+mapped = {atom.GetAtomMapNum(): atom.GetIdx() for atom in new_mol.GetAtoms()}
+assert new_mol.GetBondBetweenAtoms(mapped[1], mapped[3]).GetBondTypeAsDouble() == 2
+assert new_mol.GetBondBetweenAtoms(mapped[1], mapped[2]) is None
+print("Any + Non-H, product type edits and added-bond query serialization checks passed.")

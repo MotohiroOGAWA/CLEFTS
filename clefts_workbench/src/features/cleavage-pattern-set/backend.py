@@ -35,7 +35,7 @@ def molecule(payload: dict[str, Any]) -> dict[str, Any]:
         bonds.append({
             "index": bond.GetIdx(), "begin": bond.GetBeginAtomIdx(), "end": bond.GetEndAtomIdx(),
             "order": 1.5 if bond.GetIsAromatic() else float(bond.GetBondTypeAsDouble()),
-            "aromatic": bond.GetIsAromatic(), "inRing": bond.IsInRing(),
+            "aromatic": bond.GetIsAromatic(), "inRing": bond.IsInRing(), "smarts": bond.GetSmarts(),
         })
     return {"canonicalSmiles": "" if is_smarts else Chem.MolToSmiles(mol), "sourceType": "smarts" if is_smarts else "smiles", "atoms": atoms, "bonds": bonds}
 
@@ -132,7 +132,7 @@ def reactant(payload: dict[str, Any]) -> dict[str, Any]:
     editable = Chem.RWMol(mol)
     for bond_id in bond_ids:
         constraint = bond_constraints.get(str(bond_id), {})
-        requested_types = constraint.get("types")
+        requested_types = ["any"] if constraint.get("mode") == "any" else constraint.get("types")
         bond_type = str(constraint.get("type", "preserve"))
         if requested_types is None and bond_type == "preserve" and not constraint.get("ring"):
             continue
@@ -145,7 +145,8 @@ def reactant(payload: dict[str, Any]) -> dict[str, Any]:
             token = ",".join(tokens)
         else:
             token = symbols.get(bond_type, preserved)
-        query = "@" if constraint.get("ring") and token == "~" else (f"{token};@" if constraint.get("ring") else token)
+        ring = "any" if constraint.get("mode") == "any" else constraint.get("ringStatus", "inRing" if constraint.get("ring") else "any")
+        query = token + (";@" if ring == "inRing" else ";!@" if ring == "notInRing" else "")
         editable.ReplaceBond(bond_id, Chem.BondFromSmarts(query))
     mol = editable.GetMol()
     constraints = payload.get("constraints", {})
@@ -159,8 +160,11 @@ def reactant(payload: dict[str, Any]) -> dict[str, Any]:
         if isinstance(constraint, dict):
             mode = constraint.get("mode", "elements")
             elements = constraint.get("elements", [atom.GetSymbol()])
-            if mode == "custom": replacement = _atom_query_body(str(constraint.get("smarts", "")))
-            elif mode == "any": replacement = "*"
+            if mode == "custom":
+                replacement = _atom_query_body(str(constraint.get("smarts", "")))
+                if constraint.get("nonHydrogen", False):
+                    replacement += ";!#1"
+            elif mode == "any": replacement = "!#1" if constraint.get("nonHydrogen", False) else "*"
             elif mode == "any-heavy": replacement = "!#1"
             else:
                 numbers = []
@@ -169,6 +173,8 @@ def reactant(payload: dict[str, Any]) -> dict[str, Any]:
                     if number and number not in numbers: numbers.append(number)
                 if not numbers: raise ValueError(f"Choose at least one element for atom {atom_id}.")
                 replacement = ",".join(f"#{number}" for number in numbers)
+                if constraint.get("nonHydrogen", False):
+                    replacement += ";!#1"
         else:
             mode = constraint
             if mode == "any": replacement = "*"
@@ -298,8 +304,41 @@ def product_from_structure(payload: dict[str, Any]) -> dict[str, Any]:
         if order not in bond_smarts:
             raise ValueError(f"Unsupported new product bond type: {order}")
         editable.AddBond(begin, end, Chem.BondType.SINGLE)
-        editable.ReplaceBond(editable.GetNumBonds() - 1, Chem.BondFromSmarts(bond_smarts[order]))
+        constraint = item.get("constraint") or {}
+        if constraint.get("mode") == "any":
+            token = "~"
+        elif constraint:
+            symbols = {"single": "-", "double": "=", "triple": "#", "aromatic": ":"}
+            tokens = [symbols[value] for value in constraint.get("types", []) if value in symbols]
+            if not tokens:
+                raise ValueError("Choose at least one new product bond type.")
+            token = ",".join(tokens)
+            ring = constraint.get("ringStatus", "any")
+            token += ";@" if ring == "inRing" else ";!@" if ring == "notInRing" else ""
+        else:
+            token = bond_smarts[order]
+        editable.ReplaceBond(editable.GetNumBonds() - 1, Chem.BondFromSmarts(token))
         active_pairs.add(pair)
+
+    for key, constraint in payload.get("bondConstraints", {}).items():
+        bond_id = int(key)
+        if overrides.get(bond_id) == "remove":
+            continue
+        original = mol.GetBondWithIdx(bond_id)
+        bond = editable.GetBondBetweenAtoms(original.GetBeginAtomIdx(), original.GetEndAtomIdx())
+        if bond is None:
+            continue
+        if constraint.get("mode") == "any":
+            query = "~"
+        else:
+            symbols = {"single": "-", "double": "=", "triple": "#", "aromatic": ":"}
+            tokens = [symbols[value] for value in constraint.get("types", []) if value in symbols]
+            if not tokens:
+                raise ValueError("Choose at least one product bond type.")
+            query = ",".join(tokens)
+            ring = constraint.get("ringStatus", "any")
+            query += ";@" if ring == "inRing" else ";!@" if ring == "notInRing" else ""
+        editable.ReplaceBond(bond.GetIdx(), Chem.BondFromSmarts(query))
 
     for atom_id in sorted(deleted_atoms, reverse=True):
         editable.RemoveAtom(atom_id)
