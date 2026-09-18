@@ -1,5 +1,7 @@
 const periodicTable = require('./features/cleavage-pattern-set/periodic-table');
 const cleavageVisualEditor = require('./features/cleavage-pattern-set/visual-editor');
+const cleavageReactionPreview = require('./features/cleavage-pattern-set/reaction-preview');
+const cleavageReactionService = require('./features/cleavage-pattern-set/reaction-service');
 const molTraining = require('./workbench/mol-training');
 const trainingWorkbench = require('./workbench/training');
 const resultView = require('./features/fragment-tree-result/view');
@@ -221,7 +223,7 @@ function openWorkbench(context, output, initialPage = "home") {
         const elements = await showElementPicker(message.elements);
         if (elements) panel.webview.postMessage({ type: 'elementSelectionResult', requestId: message.requestId, elements });
       } else if (message.type === 'chemistry') {
-        const result = await runChemistryBackend(context, message.command, message.payload);
+        const result = await runChemistryBackend(context, message.command, message.payload, panel);
         panel.webview.postMessage({ type: 'chemistryResult', requestId: message.requestId, result });
       } else if (message.type === 'predictSpectrum') {
         try {
@@ -298,7 +300,7 @@ function ensureFileSuffix(filePath, suffix, acceptedAliases = []) {
   return `${result}${suffix}`;
 }
 
-function runChemistryBackend(context, command, payload) {
+function runChemistryBackend(context, command, payload, owner = context) {
   return new Promise((resolve, reject) => {
     const python = vscode.workspace.getConfiguration('clefts').get('pythonPath', 'python');
     const script = path.join(context.extensionPath, 'src', 'features', 'cleavage-pattern-set', 'backend.py');
@@ -306,6 +308,10 @@ function runChemistryBackend(context, command, payload) {
     try { root = projectRoot(context); }
     catch (error) { reject(error); return; }
     if (!isCleftsRoot(root)) { reject(new Error('The detected working directory is not a CLEFTS application.')); return; }
+    if (command === 'reactionPreview' || command === 'reactionPreviewProducts') {
+      cleavageReactionService.forOwner(owner, { python, script, root }, context).request(command, payload).then(resolve, reject);
+      return;
+    }
     const pythonPath = ['.', process.env.PYTHONPATH].filter(Boolean).join(path.delimiter);
     const child = spawn(python, [script], { cwd: root, env: { ...process.env, PYTHONPATH: pythonPath } });
     let stdout = '', stderr = '';
@@ -774,7 +780,7 @@ function workbenchHtml(config, trainingConfig, predictionConfig = {}, molConfig 
     <section><h2>Molecule and conditions</h2><label>SMILES *<input name="smiles" placeholder="CC(=O)Oc1ccccc1C(=O)O"></label><div class="grid">${field('ce','Collision energy (eV) *','text')}<label>Adduct type *<select name="adductType"><option value="">Apply a model first…</option></select></label></div><div class="actions"><button type="button" id="predictPreview">Preview Molecule</button></div><div id="predictMoleculePreview" class="molecule-preview" hidden></div></section>
     <section id="predictResultSection" hidden><h2>Predicted Spectrum</h2><div id="predictResult"></div></section>
     <footer><div><div id="predictStatus" class="status idle">Ready</div></div><div class="actions"><button type="submit" class="primary" id="predictSubmit">Predict Spectrum</button></div></footer>
-  </form><div id="helpTooltip" role="tooltip"></div><script>const vscode=acquireVsCodeApi(); const initial=${safeJson(config)}; const initialTraining=${safeJson(trainingConfig)};const initialPrediction=${safeJson(predictionConfig)}; ${webviewScript()}${cleavageVisualEditor.script()}${spectrumPrediction.script()}${pathDrop.script()}${workbench.script()}${parameterEditor.script()}${layout.script()}${datasetUpload.script()}${preparation.script()}${workbenchDefaults.script()}${trainingWorkbench.script()}${molTraining.script(molConfig)}</script></main></body></html>`;
+  </form><div id="helpTooltip" role="tooltip"></div><script>const vscode=acquireVsCodeApi(); const initial=${safeJson(config)}; const initialTraining=${safeJson(trainingConfig)};const initialPrediction=${safeJson(predictionConfig)}; ${webviewScript()}${cleavageVisualEditor.script()}${cleavageReactionPreview.script()}${spectrumPrediction.script()}${pathDrop.script()}${workbench.script()}${parameterEditor.script()}${layout.script()}${datasetUpload.script()}${preparation.script()}${workbenchDefaults.script()}${trainingWorkbench.script()}${molTraining.script(molConfig)}</script></main></body></html>`;
 }
 function pathField(name,label,kind,form='data') { return `<label data-help="${HELP[name] || ''}">${label}<div class="path"><input name="${name}" data-path-kind="${kind}"><button type="button" data-pick="${name}" data-kind="${kind}" data-form="${form}">Browse</button></div>${HELP[name]?`<small class="field-help">${HELP[name]}</small>`:''}</label>`; }
 function field(name,label,type,step='1') { return `<label data-help="${HELP[name] || ''}">${label}<input name="${name}" type="${type}"${type==='number'?` step="${step}"`:''}>${HELP[name]?`<small class="field-help">${HELP[name]}</small>`:''}</label>`; }

@@ -3,9 +3,11 @@ from __future__ import annotations
 
 import json
 import sys
+from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, ".")
+sys.path.insert(0, str(Path(__file__).parent))
 
 from rdkit import Chem
 from rdkit.Chem import rdDepictor
@@ -13,6 +15,7 @@ from rdkit.Chem.Draw import rdMolDraw2D
 
 from clefts.domain.fragment.cleavage._CleavagePattern import _CleavagePattern, ProductRule
 from clefts.libs.mmkit.mmkit import Adduct, Formula
+from reaction_preview import reaction_preview, reaction_preview_products
 
 
 def molecule(payload: dict[str, Any]) -> dict[str, Any]:
@@ -511,23 +514,38 @@ def validate(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 COMMANDS = {
-    "molecule": molecule, "depict": depict, "reactant": reactant,
+    "reactionPreview": reaction_preview, "reactionPreviewProducts": reaction_preview_products, "molecule": molecule, "depict": depict, "reactant": reactant,
     "product": product, "productFromStructure": product_from_structure,
     "productState": product_state, "productFromSelection": product_from_selection, "validate": validate,
 }
 
 
-def main() -> int:
+def response(request):
     try:
-        request = json.load(sys.stdin)
         command = str(request.get("command", ""))
         if command not in COMMANDS:
             raise ValueError(f"Unknown command: {command}")
-        print(json.dumps({"ok": True, "result": COMMANDS[command](request.get("payload", {}))}))
-        return 0
+        return {"ok": True, "result": COMMANDS[command](request.get("payload", {}))}
     except Exception as error:
-        print(json.dumps({"ok": False, "error": str(error)}))
-        return 1
+        return {"ok": False, "error": str(error)}
+
+
+def main() -> int:
+    if "--server" in sys.argv:
+        for line in sys.stdin:
+            try:
+                request = json.loads(line)
+                reply = {**response(request), "requestId": request.get("requestId")}
+            except Exception as error:
+                reply = {"ok": False, "error": str(error)}
+            print(json.dumps(reply), flush=True)
+        return 0
+    try:
+        reply = response(json.load(sys.stdin))
+    except Exception as error:
+        reply = {"ok": False, "error": str(error)}
+    print(json.dumps(reply))
+    return 0 if reply["ok"] else 1
 
 
 if __name__ == "__main__":
