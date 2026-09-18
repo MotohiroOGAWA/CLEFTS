@@ -36,7 +36,7 @@ async function saveConfiguration(kind, config, defaultName) {
   return target.fsPath;
 }
 
-async function loadConfiguration(kind) {
+async function loadConfiguration(kind, parser = parseConfiguration) {
   const selected = await vscode.window.showOpenDialog({
     canSelectMany: false, filters: { 'CLEFTS Workbench configuration': ['json'] }
   });
@@ -44,7 +44,7 @@ async function loadConfiguration(kind) {
   const bytes = await vscode.workspace.fs.readFile(selected[0]);
   return {
     path: selected[0].fsPath,
-    config: parseConfiguration(JSON.parse(Buffer.from(bytes).toString('utf8')), kind)
+    config: parser(JSON.parse(Buffer.from(bytes).toString('utf8')), kind)
   };
 }
 

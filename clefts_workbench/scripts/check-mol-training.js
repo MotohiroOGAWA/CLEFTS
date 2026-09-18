@@ -5,6 +5,16 @@ const load=Module._load;Module._load=function(name,parent,main){return name==='v
 const mol=require('../src/workbench/mol-training'),extension=require('../src/extension'),services=require('../src/workbench/services'),jobs=require('../src/workbench/panel');
 const preset=require('../../clefts/presets/spectrum_generator_params/source_anchored_pos_model_config.json');
 (async()=>{
+ const cliArgs={train_smiles:['/data/train.smi'],val_smiles:['/data/val.smi'],output_dir:'/output/mol',...Object.fromEntries(mol.options.map(([,flag,,,kind])=>[flag.replace(/-/g,'_'),['boolean','enabled'].includes(kind)?true:kind==='csv'?'16':kind==='integer'?2:kind==='number'?0.5:'value'])),...Object.fromEntries(mol.tasks.map(([,flag])=>[flag.replace(/-/g,'_'),true]))};
+ cliArgs.output_dir='/output/mol';cliArgs.preprocessing_cache=null;cliArgs.early_stopping_patience=null;
+ const imported=mol.parseMolConfiguration({args:cliArgs});
+ for(const [key,flag,,,kind]of mol.options)assert.deepEqual(imported[key],cliArgs[flag.replace(/-/g,'_')]??'');
+ for(const [key]of mol.tasks)assert.equal(imported[key],true);
+ assert.deepEqual(mol.parseMolConfiguration(cliArgs),imported);
+ assert.deepEqual(mol.parseMolConfiguration({schema:'clefts.workbench.configuration',schemaVersion:1,kind:'mol-training',config:imported}),imported);
+ assert.throws(()=>mol.parseMolConfiguration({schema:'clefts.workbench.configuration',schemaVersion:1,kind:'training',config:imported}));
+ assert.throws(()=>mol.parseMolConfiguration({unrelated:true}));
+ const relative=mol.parseMolConfiguration({args:{...cliArgs,train_smiles:['train.smi']},working_directory:'/data'});assert.deepEqual(relative.trainSmiles,['/data/train.smi']);
  const c={...mol.defaults(),trainSmiles:['/data/train one.smi','/data/train two.smi'],valSmiles:['/data/val.smi'],outputDir:'/output/mol'};
  assert.deepEqual(mol.validate(c).errors,[]);
  assert(mol.validate({...c,nodeDim:'64,256'}).errors.some(text=>text.includes('graph dimension')));
@@ -31,6 +41,9 @@ const preset=require('../../clefts/presets/spectrum_generator_params/source_anch
  post({type:'mol/status',error:'Test launch rejected'});assert(d.getElementById('molTrainingStatus').textContent.includes('Test launch rejected'));
  d.getElementById('trainSmilesMolFiles').querySelector('button').click();assert.equal(d.querySelectorAll('#trainSmilesMolFiles .mol-file-row').length,1);
  await form.querySelector('[data-mol-files=trainSmiles]').ondrop({preventDefault(){},stopPropagation(){},dataTransfer:{getData:type=>type==='text/uri-list'?'file:///data/a%20file.smi\nfile:///data/another.smi':'',files:[]}});assert.equal(d.querySelectorAll('#trainSmilesMolFiles .mol-file-row').length,3);
+ post({type:'mol/config',config:{...c,nodeDim:'16',graphDim:'64',dropout:0.5,batchSize:128,epochs:50,device:'cuda:1'},path:'/test/pretraining_config.json'});
+ assert.equal(form.elements.nodeDim.value,'16');assert.equal(form.elements.device.value,'cuda:1');assert.equal(form.elements.dropout.value,'0.5');assert.equal(form.elements.earlyStoppingPatience.value,'');assert(form.elements.disableNodeAttribute.checked);assert.equal(d.querySelectorAll('#trainSmilesMolFiles .mol-file-row').length,2);assert.equal(d.getElementById('trainSmilesMolPreview').textContent,'');assert(d.getElementById('molTrainingStatus').textContent.includes('Configurations loaded'));
+ d.getElementById('molCopyCommand').click();assert.equal(messages.at(-1).config.dropout,0.5);assert.equal(messages.at(-1).config.disableNodeAttribute,false);
  d.querySelector('#navigationRail [data-page=training]').click();assert(form.hidden);assert(!d.getElementById('trainingForm').hidden);
  assert.deepEqual(errors,[]);
  }finally{dom.window.close();}
@@ -38,6 +51,9 @@ const preset=require('../../clefts/presets/spectrum_generator_params/source_anch
  try{
  fs.writeFileSync(path.join(root,'train.smi'),'CCO\n');fs.writeFileSync(path.join(root,'val.smi'),'CC\n');services.backend=async()=>({combinations:1});jobs.startTraining=async(...args)=>{launched=args;};
  mol.attach({webview:{onDidReceiveMessage:fn=>handler=fn,postMessage:m=>posted.push(m)}},{},()=>root,{});
+ const configPath=path.join(root,'pretraining_config.json');fs.writeFileSync(configPath,JSON.stringify({args:cliArgs}));
+ mock.window={showOpenDialog:async()=>[{fsPath:configPath}]};mock.workspace.fs={readFile:async uri=>fs.readFileSync(uri.fsPath)};
+ await handler({type:'mol/load'});assert.equal(posted.at(-1).type,'mol/config');assert.deepEqual(posted.at(-1).config,imported);assert.equal(posted.at(-1).path,configPath);
  const config={...mol.defaults(),trainSmiles:['train.smi'],valSmiles:['val.smi'],outputDir:'output'};
  await handler({type:'mol/preflight',requestId:'test',config});assert(posted.at(-1).ok);
  await handler({type:'mol/copy',config});assert(clipboard[0].includes('train mol-encoder'));

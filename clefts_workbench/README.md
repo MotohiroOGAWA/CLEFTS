@@ -362,3 +362,10 @@ device. Runs appear in **Training Jobs**, where logs, stop and output actions ar
 available. **Inspect molecules** reports all non-empty SMILES rows and checks up
 to the first 5,000 molecules, with structure previews for the first five valid
 molecules. Configure initial values through `clefts.workbench.molTrainingDefaults`.
+
+Mol Training creates its output directory and saves `training_args.json`,
+`pretraining_config.json`, `input_manifest.json` and each candidate's
+`mol_encoder_config.json` before canonicalizing SMILES. For multiple candidates,
+the candidate directories under `runs/` are also created in advance. The main
+config gains split, descriptor, feature and sampling statistics as each
+preprocessing stage completes, retaining the configuration if a later stage fails.

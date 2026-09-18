@@ -927,22 +927,57 @@ def save_selected_checkpoint(summary_row: Dict[str, object], output_dir: Path) -
     torch.save(checkpoint, output_dir / "mol_encoder_pretrained.pt")
 
 
+def write_pretraining_config(output_dir: Path, record: Dict[str, object]) -> None:
+    with open(output_dir / "pretraining_config.json", "w", encoding="utf-8") as f:
+        json.dump(record, f, indent=2)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    device = torch.device(args.device)
-
+    # Save arguments even if model validation or input inspection subsequently fails.
+    with open(output_dir / "training_args.json", "w", encoding="utf-8") as f:
+        json.dump(vars(args), f, indent=2)
     configs = mol_encoder_configs(args)
+    symbols = parse_csv_strings(args.symbols)
+    descriptor_names = tuple(parse_csv_strings(args.descriptor_names) or DEFAULT_DESCRIPTOR_NAMES)
+    config_record = {
+        "args": vars(args),
+        "mol_encoder_configs": [asdict(config) for config in configs],
+        "symbols": tuple(symbols),
+        "descriptor_names": descriptor_names,
+        "ecfp_radius": int(args.ecfp_radius),
+        "ecfp_n_bits": int(args.ecfp_n_bits),
+        "working_directory": str(Path.cwd()),
+        "preprocessing_cache_path": str(args.preprocessing_cache or output_dir / "pretraining_preprocessed_dataset.pt"),
+        "smiles_split_cache_path": str(output_dir / "pretraining_smiles_split_cache.json"),
+    }
+    # Persist the invocation before reading or canonicalizing the input datasets.
+    write_pretraining_config(output_dir, config_record)
+
+    for config in configs:
+        stage_dir = pretraining_stage_output_dir(output_dir, config, len(configs))
+        stage_dir.mkdir(parents=True, exist_ok=True)
+        with open(stage_dir / "mol_encoder_config.json", "w", encoding="utf-8") as f:
+            json.dump({"config_id": config.id, "mol_encoder_params": {**asdict(config), "symbols": tuple(symbols)}}, f, indent=2)
+    input_manifest = smiles_split_cache_manifest(
+        train_smiles_paths=args.train_smiles, val_smiles_paths=args.val_smiles)
+    with open(output_dir / "input_manifest.json", "w", encoding="utf-8") as f:
+        json.dump(input_manifest, f, indent=2)
+    config_record["input_manifest"] = input_manifest
+    write_pretraining_config(output_dir, config_record)
+    print(f"Mol training settings saved to {output_dir} before preprocessing.", flush=True)
+
+    device = torch.device(args.device)
     train_smiles, val_smiles, smiles_split_summary = load_or_prepare_smiles_split(
         train_smiles_paths=args.train_smiles,
         val_smiles_paths=args.val_smiles,
         output_dir=output_dir,
         rebuild_cache=args.rebuild_preprocessing_cache,
     )
-    symbols = parse_csv_strings(args.symbols)
-    descriptor_names = tuple(parse_csv_strings(args.descriptor_names) or DEFAULT_DESCRIPTOR_NAMES)
-
+    config_record["smiles_split_summary"] = smiles_split_summary
+    write_pretraining_config(output_dir, config_record)
     train_dataset, val_dataset, normalizer, preprocessing_cache_summary = build_or_load_preprocessed_datasets(
         args=args,
         output_dir=output_dir,
@@ -951,6 +986,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         symbols=symbols,
         descriptor_names=descriptor_names,
     )
+    config_record.update({
+        "descriptor_mean": normalizer.mean.tolist(),
+        "descriptor_std": normalizer.std.tolist(),
+        "num_train_molecules": len(train_dataset),
+        "num_val_molecules": len(val_dataset),
+        "preprocessing_cache": preprocessing_cache_summary,
+    })
+    write_pretraining_config(output_dir, config_record)
     feature_target_summary = write_feature_target_summary(
         train_dataset=train_dataset,
         val_dataset=val_dataset,
@@ -958,6 +1001,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         output_dir=output_dir,
         min_validation_target_count=args.min_validation_target_count,
     )
+    config_record["feature_target_summary"] = feature_target_summary
+    write_pretraining_config(output_dir, config_record)
     attribute_record_index = build_feature_record_index(train_dataset, symbols=symbols)
     descriptor_record_sampling_index, descriptor_sampling_summary = build_descriptor_sampling_index(
         train_dataset,
@@ -987,24 +1032,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         "train_record_counts": feature_record_index_counts(train_feature_record_index),
     }
 
-    config_record = {
-        "args": vars(args),
-        "mol_encoder_configs": [asdict(config) for config in configs],
-        "symbols": tuple(symbols),
-        "descriptor_names": descriptor_names,
-        "descriptor_mean": normalizer.mean.tolist(),
-        "descriptor_std": normalizer.std.tolist(),
-        "ecfp_radius": int(args.ecfp_radius),
-        "ecfp_n_bits": int(args.ecfp_n_bits),
-        "num_train_molecules": len(train_dataset),
-        "num_val_molecules": len(val_dataset),
-        "smiles_split_summary": smiles_split_summary,
-        "feature_target_summary": feature_target_summary,
-        "preprocessing_cache": preprocessing_cache_summary,
-        "balanced_record_sampling": balanced_record_sampling_summary,
-    }
-    with open(output_dir / "pretraining_config.json", "w", encoding="utf-8") as f:
-        json.dump(config_record, f, indent=2)
+    config_record["balanced_record_sampling"] = balanced_record_sampling_summary
+    write_pretraining_config(output_dir, config_record)
 
     all_rows = []
     for config in configs:
