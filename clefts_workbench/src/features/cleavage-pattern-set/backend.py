@@ -371,12 +371,21 @@ def product_from_selection(payload: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("Unknown product atom.")
     selected = set(atom_ids)
     editable = Chem.RWMol(mol)
+    overridden_atoms = {int(key) for key in payload.get("atomOverrides", {})}
     for key, value in payload.get("atomOverrides", {}).items():
         index = int(key)
         if index not in selected:
             continue
         body = _atom_query_body(str(value))
         atom = Chem.AtomFromSmarts(f"[{body}]")
+        atom.SetAtomMapNum(mol.GetAtomWithIdx(index).GetAtomMapNum())
+        editable.ReplaceAtom(index, atom)
+    for index in selected - overridden_atoms:
+        # "Unchanged" only needs to carry the atom map: when the reaction actually
+        # runs, RDKit copies the matched atom's element/charge/isotope onto the
+        # product unless the product template sets them explicitly, so repeating
+        # the reactant-side element/non-H query here would be redundant.
+        atom = Chem.AtomFromSmarts("[*]")
         atom.SetAtomMapNum(mol.GetAtomWithIdx(index).GetAtomMapNum())
         editable.ReplaceAtom(index, atom)
     symbols = {"1": "-", "2": "=", "3": "#", "1.5": ":"}
@@ -488,6 +497,10 @@ def product_state(payload: dict[str, Any]) -> dict[str, Any]:
     atom_overrides = {}
     for number, index in product_by_map.items():
         product_query = _atom_query_body(product_mol.GetAtomWithIdx(index).GetSmarts())
+        # A bare "*" is the sentinel product_from_selection now writes for "Unchanged"
+        # atoms, so it must not be recovered as an explicit override.
+        if product_query == "*":
+            continue
         reactant_query = _atom_query_body(reactant.GetAtomWithIdx(reactant_by_map[number]).GetSmarts())
         if product_query != reactant_query:
             atom_overrides[str(reactant_by_map[number])] = f"[{product_query}]"
