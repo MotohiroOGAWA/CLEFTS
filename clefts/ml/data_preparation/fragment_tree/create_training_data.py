@@ -10,7 +10,7 @@ from clefts.libs.mmkit.mmkit import Compound,Adduct
 from clefts.libs.msentity.msentity import MSDataset
 from clefts.domain.mass.parse_ce import parse_ce_to_ev
 from clefts.ml.input.structure_builder import ActionStructureBuilder
-from clefts.ml.input.source_action_structure import save_fragment_tree_structure,make_structure_file_stem
+from clefts.ml.input.source_action_structure import save_fragment_tree_structure,make_structure_file_stem,UnresolvedPrecursorError
 from .manifest_summary import structure_manifest_fields
 from .context import create_preparation_context, validate_limits
 from clefts.ml.specgen.config_options import configure_model_options, resolve_model_options
@@ -50,20 +50,24 @@ def _prepare_group(task, builder, options):
         retained=[(mz,value) for mz,value in values if value>=maximum*minimum_relative_intensity]
         mzs.append([mz for mz,_ in retained])
         intensities.append([value/maximum if normalize_intensities and maximum>0 else value for _,value in retained])
-    structure=builder.build(Compound.from_smiles(smiles),adducts,energies,mzs,intensities)
+    structure,kept=builder.build(Compound.from_smiles(smiles),adducts,energies,mzs,intensities)
+    kept_rows=[rows[index] for index in kept]
     path=output/'data'/(make_structure_file_stem(smiles,index=tree)+'.preft.pt')
-    save_fragment_tree_structure(structure=structure,output_file=path,metadata=dict(smiles=smiles,record_indexes=rows,sample_annotations=structure.sample_annotations))
-    return path,structure.sample_annotations,structure_manifest_fields(structure)
+    save_fragment_tree_structure(structure=structure,output_file=path,metadata=dict(smiles=smiles,record_indexes=kept_rows,sample_annotations=structure.sample_annotations))
+    return path,kept_rows,structure.sample_annotations,structure_manifest_fields(structure)
 
 
 def _prepare_group_safely(task, builder, options):
     try:
-        path,annotations,summary=_prepare_group(task,builder,options)
+        path,kept_rows,annotations,summary=_prepare_group(task,builder,options)
         scores=[dict(structure_file=path.name,sample_index=index,record_index=record_index,
                      assignment_score=sample['assignmentScore'],assignment_score_without_precursor=sample['assignmentScoreWithoutPrecursor'])
-                for index,(record_index,sample) in enumerate(zip(task[2],annotations))]
-        return dict(path=path,record_count=len(task[2]),smiles=task[1],record_indexes=task[2],assignment_scores=scores,summary=summary)
-    except FragmentTreeLimitExceeded as error:
+                for index,(record_index,sample) in enumerate(zip(kept_rows,annotations))]
+        rejected=len(task[2])-len(kept_rows)
+        reason=f'{rejected} of {len(task[2])} records dropped: unresolved precursor action sequence' if rejected else ''
+        return dict(path=path,record_count=len(kept_rows),input_record_count=len(task[2]),rejected_record_count=rejected,
+                    smiles=task[1],record_indexes=kept_rows,assignment_scores=scores,summary=summary,reason=reason)
+    except (FragmentTreeLimitExceeded,UnresolvedPrecursorError) as error:
         return dict(skipped=dict(source_index=task[0],smiles=task[1],record_indexes=task[2],reason=str(error)))
 
 
@@ -113,7 +117,7 @@ def create_action_training_data(*, dataset: MSDataset, model_config: dict, outpu
         else:
             files.append(Path(result['path']));prepared_records+=result['record_count']
             score_rows.extend(result['assignment_scores'])
-            manifest_rows.append(dict(file=Path(result['path']).name,smiles=result['smiles'],record_indexes=json.dumps(result['record_indexes']),num_input_records=result['record_count'],num_valid_samples=result['record_count'],rejected_sample_count=0,rejection_log='',**result['summary'],status='completed',reason=''))
+            manifest_rows.append(dict(file=Path(result['path']).name,smiles=result['smiles'],record_indexes=json.dumps(result['record_indexes']),num_input_records=result['input_record_count'],num_valid_samples=result['record_count'],rejected_sample_count=result['rejected_record_count'],rejection_log='',**result['summary'],status='completed',reason=result['reason']))
         print(json.dumps(dict(event='progress',split=split,current=completed_sources,total=len(grouped),
                               prepared=len(files),skipped=len(skipped))),flush=True)
 
@@ -155,7 +159,9 @@ def create_action_training_data(*, dataset: MSDataset, model_config: dict, outpu
     (output/'skipped_sources.json').write_text(json.dumps(skipped,indent=2))
     (output/'action_statistics.json').write_text(json.dumps(dict(schema_version=4,fragmentation_schema=generator.architecture,
         num_sources=len(files),num_samples=prepared_records,num_metadata_valid_records=len(dataset),num_skipped_sources=len(skipped),
-        num_skipped_records=sum(len(source['record_indexes']) for source in skipped),num_excluded_records=inspection['excludedRecords'],num_workers=num_workers,chunk_size=chunk_size,model_config=model_config,minimum_relative_intensity=minimum_relative_intensity,normalize_intensities=normalize_intensities),indent=2))
+        num_skipped_records=sum(len(source['record_indexes']) for source in skipped),
+        num_rejected_records=sum(row['rejected_sample_count'] for row in manifest_rows if row['status']=='completed'),
+        num_excluded_records=inspection['excludedRecords'],num_workers=num_workers,chunk_size=chunk_size,model_config=model_config,minimum_relative_intensity=minimum_relative_intensity,normalize_intensities=normalize_intensities),indent=2))
     return sorted(files)
 
 

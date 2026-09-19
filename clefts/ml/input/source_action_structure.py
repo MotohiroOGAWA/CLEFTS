@@ -18,6 +18,16 @@ SCHEMA_VERSION = 5
 FRAGMENTATION_SCHEMA = "source-anchored-action-autoregressive-v1"
 
 
+class UnresolvedPrecursorError(ValueError):
+    """A sample's precursor ion has no valid cleavage action sequence from Source.
+
+    Not every observed precursor is reachable under a given cleavage pattern
+    set (e.g. an ion shift the configured patterns cannot produce); such a
+    sample cannot be supervised and must be dropped, not treated as a fatal
+    error for the rest of its group.
+    """
+
+
 def coo(pairs: Sequence[tuple[int, int]]) -> Tensor:
     return torch.tensor(pairs, dtype=torch.long).reshape(-1, 2).T.contiguous()
 
@@ -219,7 +229,7 @@ def prepare_source_actions(*, source: Compound, actions: tuple[CleavageAction, .
     # beam decoding from the precursor state even when there is no teacher DAG.
     alternatives = [tuple(rows) for rows in precursor_sequences] if precursor_sequences is not None else [(None,)] * condition_features.shape[0]
     if any(not rows for rows in alternatives):
-        raise ValueError("No valid precursor action sequence for a sample; cannot decode from Source")
+        raise UnresolvedPrecursorError("No valid precursor action sequence for a sample; cannot decode from Source")
     precursor_rows = [tuple(sorted(index[a] for a in seq.actions)) if seq is not None else () for rows in alternatives for seq in rows]
     if any(len(row)>max_action_count for row in precursor_rows):raise ValueError("Precursor exceeds Fragmenter max_action_count")
     sample_precursor_row_counts = [len(rows) for rows in alternatives]
