@@ -16,7 +16,14 @@ def inspect_records(dataset, fragmenter, mapping=None):
                   for key, name in mapping.items()}
     invalid = []
     accepted = []
+    # Reference libraries (e.g. NIST) repeat a handful of distinct adduct/CE
+    # strings across hundreds of thousands of rows; caching by the raw string
+    # (like smiles_cache already does) turns this loop from O(records) calls
+    # into O(unique values) calls to Adduct.parse/parse_ce_to_ev, which is
+    # where nearly all the wall-clock time otherwise goes.
     smiles_cache = {}
+    adduct_cache = {}
+    ce_cache = {}
     reasons = {'smilesColumn': 'Invalid RDKit SMILES',
                'adductTypeColumn': 'Invalid adduct or main adduct not registered in the fragmenter',
                'collisionEnergyColumn': 'Cannot parse collision energy to finite non-negative eV',
@@ -35,8 +42,14 @@ def inspect_records(dataset, fragmenter, mapping=None):
                         smiles_cache[text] = bool(text.strip()) and Chem.MolFromSmiles(text) is not None
                     valid = smiles_cache[text]
                 elif key == 'adductTypeColumn':
-                    fragmenter.get_index_by_adduct_type(Adduct.parse(str(value)))
-                    valid = True
+                    text = str(value)
+                    if text not in adduct_cache:
+                        try:
+                            fragmenter.get_index_by_adduct_type(Adduct.parse(text))
+                            adduct_cache[text] = True
+                        except Exception:
+                            adduct_cache[text] = False
+                    valid = adduct_cache[text]
                 elif key == 'precursorMzColumn':
                     valid = math.isfinite(float(value)) and float(value) > 0
                 else:
@@ -44,7 +57,17 @@ def inspect_records(dataset, fragmenter, mapping=None):
                         mz = float(values['precursorMzColumn'][index])
                     except (ValueError, TypeError):
                         mz = 0.0
-                    energy = parse_ce_to_ev(value, mz)
+                    text = str(value)
+                    # parse_ce_to_ev only depends on precursor m/z for a "%"
+                    # (NCE) value; every other form can be cached by string
+                    # alone (this caller never passes an instrument, so the
+                    # other mz-dependent branch is unreachable here).
+                    if '%' in text:
+                        energy = parse_ce_to_ev(value, mz)
+                    else:
+                        if text not in ce_cache:
+                            ce_cache[text] = parse_ce_to_ev(value, mz)
+                        energy = ce_cache[text]
                     valid = energy is not None and math.isfinite(float(energy)) and float(energy) >= 0
             except Exception:
                 valid = False

@@ -45,7 +45,7 @@ async function openDocumentation(context,root){
 function attach(panel,context,projectRoot){
  const post=data=>panel.webview.postMessage(data),latest=new Map();
  panel.webview.onDidReceiveMessage(async message=>{
- if(!message||!['data/preview','data/check','data/preflight','data/model','library/load','library/pick','library/copy','library/open','shell/document','shell/github'].includes(message.type))return;
+ if(!message||!['data/columns','data/preview','data/check','data/preflight','data/model','library/load','library/pick','library/copy','library/open','shell/document','shell/github'].includes(message.type))return;
  try{
  const root=projectRoot(context);
  if(message.type==='shell/document')await openDocumentation(context,root);
@@ -61,10 +61,16 @@ function attach(panel,context,projectRoot){
  const folder=/Dir|Output/.test(message.target);const selected=await vscode.window.showOpenDialog({canSelectMany:false,canSelectFolders:folder,canSelectFiles:!folder,...(!folder?{filters:{Checkpoint:['pt']}}:{})});if(selected?.[0])post({type:'library/picked',target:message.target,path:selected[0].fsPath});
  }
  if(message.type==='data/model')post({type:'data/model',requestId:message.requestId,...await backend(context,root,'model',{path:message.path})});
- if(['data/preview','data/check'].includes(message.type)){
+ if(['data/columns','data/preview','data/check'].includes(message.type)){
  if(!['train','validation','home'].includes(message.target)||typeof message.path!=='string'||!message.path.trim())return;
  latest.set(message.target,message.requestId);
- const data=await backend(context,root,'preview',{path:message.path,mapping:message.mapping,validateValues:message.type==='data/check',fragmenterParams:message.fragmenterParams});if(latest.get(message.target)===message.requestId)post({type:message.type,target:message.target,requestId:message.requestId,data});
+ // data/columns is a fast, load-only column-existence check (no peak stats, adducts
+ // or row preview) so Column Mapping can turn green/red before the slower data/preview
+ // summary or data/check per-record validation finishes on a large dataset.
+ const data=message.type==='data/columns'
+   ?await backend(context,root,'columns',{path:message.path,mapping:message.mapping})
+   :await backend(context,root,'preview',{path:message.path,mapping:message.mapping,validateValues:message.type==='data/check',fragmenterParams:message.fragmenterParams});
+ if(latest.get(message.target)===message.requestId)post({type:message.type,target:message.target,requestId:message.requestId,data});
  }
  if(message.type==='data/preflight')post({type:'data/preflight',requestId:message.requestId,...await backend(context,root,'validate',message.config)});
  }catch(error){post({type:'data/error',source:message.type,target:message.target,requestId:message.requestId,error:error.message});}

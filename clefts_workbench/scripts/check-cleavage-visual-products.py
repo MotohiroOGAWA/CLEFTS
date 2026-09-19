@@ -157,23 +157,27 @@ assert backend.validate({
     "products": [],
 })["valid"]
 
-extension = (Path(__file__).parents[1] / "src/extension.js").read_text(encoding="utf-8")
-assert 'id="builderProductSelect"' in extension
-assert "chemistry('productFromStructure'" in extension
-assert "atom.mapNumber||index+1" in extension
-assert 'id="allowProductAtomTypes"' in extension
-assert "Delete Atom" in extension
-assert "Delete Selected" in extension
-assert "productSelectedAtoms" in extension
-assert "productCanvas.onpointerdown" in extension
-assert "data-delete-selected-product-atoms" in extension
-assert "stroke:var(--accent,#168bdf)" in extension
-assert "Start New Bond" in extension
-assert "Update Product" in extension
-assert "Custom SMARTS" in extension
-assert "atomMapBySource" in extension
-assert 'id="builderSourceType"' in extension
-assert "Source SMILES / SMARTS" in extension
+# The Workbench's cleavage editor markup/script and the standalone .cleavage.json /
+# .clevageset.json custom editors (editor.js) both render from these shared modules,
+# so checking them here (instead of extension.js's own source) covers both editors at once.
+cleavage_dir = Path(__file__).parents[1] / "src/features/cleavage-pattern-set"
+shared = "".join((cleavage_dir / name).read_text(encoding="utf-8") for name in ("ui.js", "visual-editor.js", "styles.js"))
+assert 'id="builderProductSelect"' in shared
+assert "chemistry('productFromStructure'" in shared
+assert "atom.mapNumber||index+1" in shared
+assert 'id="allowProductAtomTypes"' in shared
+assert "Delete Atom" in shared
+assert "Delete Selected" in shared
+assert "productSelectedAtoms" in shared
+assert "productCanvas.onpointerdown" in shared
+assert "data-delete-selected-product-atoms" in shared
+assert "stroke:var(--accent,#168bdf)" in shared
+assert "Start New Bond" in shared
+assert "Update Product" in shared
+assert "Custom SMARTS" in shared
+assert "atomMapBySource" in shared
+assert 'id="builderSourceType"' in shared
+assert "Source SMILES / SMARTS" in shared
 print("Complex reactant and visual product round-trip checks passed.")
 
 # Query semantics are checked by matching real molecules, rather than string spelling.
@@ -260,8 +264,28 @@ def selected_product(atoms=(0, 1, 2), bonds=(0, 1), **edits):
 unchanged = selected_product()
 source_query = backend.Chem.MolFromSmarts(base)
 unchanged_query = backend.Chem.MolFromSmarts(unchanged)
-assert [a.GetSmarts() for a in unchanged_query.GetAtoms()] == [a.GetSmarts() for a in source_query.GetAtoms()]
+# "Unchanged" atoms only need to carry the atom map now, not the reactant-side
+# element/non-H query: when the reaction actually runs, RDKit copies the real
+# matched atom's element/charge/isotope onto the product unless the product
+# template overrides them explicitly, so repeating the query would be redundant.
+assert [a.GetSmarts() for a in unchanged_query.GetAtoms()] == ['[*:1]', '[*:2]', '[*:3]']
+assert [a.GetAtomMapNum() for a in unchanged_query.GetAtoms()] == [a.GetAtomMapNum() for a in source_query.GetAtoms()]
 assert [b.GetSmarts() for b in unchanged_query.GetBonds()] == [b.GetSmarts() for b in source_query.GetBonds()]
+# The wildcard template must still reproduce each reactant's actual matched atoms
+# (here: C vs N at atom 1) when the reaction is really run, proving no information
+# is lost by dropping the explicit element/non-H query on "Unchanged" atoms.
+unchanged_rxn = rdChemReactions.ReactionFromSmarts(base + '>>' + unchanged)
+for smiles, expected_symbol in [('CC(=O)C', 'C'), ('NC(=O)C', 'N')]:
+    groups = unchanged_rxn.RunReactants((backend.Chem.MolFromSmiles(smiles),))
+    assert groups, f'No match for {smiles}'
+    fragment = groups[0][0]
+    backend.Chem.SanitizeMol(fragment, catchErrors=True)
+    # RunReactants clears GetAtomMapNum() on generated atoms but keeps the
+    # original map number under the "old_mapno" property (the same property
+    # _CleavagePattern.fragment() reads to restore atom maps on real products).
+    mapped = {atom.GetIntProp('old_mapno'): atom for atom in fragment.GetAtoms() if atom.HasProp('old_mapno')}
+    assert mapped[1].GetSymbol() == expected_symbol, smiles
+    assert mapped[3].GetSymbol() == 'O', smiles
 split = selected_product(bonds=(1,))
 assert split.count('.') == 1
 assert selected_product(bonds=()).count('.') == 2

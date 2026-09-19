@@ -1,8 +1,9 @@
 export interface JobInfo {
-  id: string; type: 'training' | 'mol-training' | 'preparation' | 'prediction'; name: string;
+  id: string; type: 'training' | 'mol-training' | 'preparation' | 'prediction' | 'batch-prediction'; name: string;
   status: 'running' | 'completed' | 'failed' | 'cancelled';
   pid?: number; startedAt: string; finishedAt?: string;
   outputDir: string; logPath: string; command: string[]; epochs?: number; detached?: boolean; resultsPath?: string;
+  configurationId?: string; projectRoot?: string | null; warning?: string; trackingError?: string;
   error?: string; exitCode?: number | null;
 }
 export type WorkbenchRequest =

@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import torch
 from clefts.libs.mmkit.mmkit import Compound, Adduct
 from clefts.domain.fragment.cleavage import CleavageActionSequence
-from .source_action_structure import SourceActionStructure, prepare_source_actions
+from .source_action_structure import SourceActionStructure, prepare_source_actions, UnresolvedPrecursorError
 from ..specgen.source_anchored_spectrum_predictor import SourceAnchoredFragmentSpectrumGenerator
 from ..specgen.components.action.action_decoder import ActionDecoderOutput
 from ..specgen.materialization import materialize_action_states
@@ -43,7 +43,16 @@ class ActionStructureBuilder:
         self.max_edge = max_edge
 
     def build(self, source: Compound, precursor_types: Sequence[Adduct], collision_energy: Sequence[float],
-              peaks_mz: Sequence[Sequence[float]], peaks_intensity: Sequence[Sequence[float]]) -> SourceActionStructure:
+              peaks_mz: Sequence[Sequence[float]], peaks_intensity: Sequence[Sequence[float]]) -> tuple[SourceActionStructure, tuple[int, ...]]:
+        """Return the built structure plus which input sample indices it kept.
+
+        A sample whose precursor ion is unreachable under the configured
+        cleavage patterns (e.g. an ion shift the patterns cannot produce) is
+        dropped rather than failing the whole group: real MS2 fragmentation
+        never happens on an unreachable precursor, so such a sample has
+        nothing to supervise. The caller uses the returned indices to report
+        which of its original records were actually kept.
+        """
         if not precursor_types or not len(precursor_types)==len(collision_energy)==len(peaks_mz)==len(peaks_intensity):
             raise ValueError("Every spectrum needs precursor, CE, peaks and intensities")
         for mz,intensity in zip(peaks_mz,peaks_intensity):
@@ -54,6 +63,25 @@ class ActionStructureBuilder:
         actions=fragmenter.fragment_ion_tree_builder.create_cleavage_actions(source)
         # Full chemistry is permitted here, never inside neural forward.
         tree=fragmenter.build_fragment_ion_tree(source,max_node=self.max_node,max_edge=self.max_edge,_include_fragment_compound_cache=True)
+        # Recorded once per sample, from the SAME already-built tree: which
+        # Source action set(s) already select this sample's precursor ion.
+        # Real MS2 fragmentation always happens on that selected ion, so
+        # prepare_source_actions requires every other teacher state to be
+        # consistent with one of these alternatives. Computed before anything
+        # else so unreachable samples can be dropped up front.
+        precursor_sequences_all=[tuple(pa.action_sequence for pa in fragmenter.resolve_precursor_actions(tree,precursor_type))
+                                 for precursor_type in precursor_types]
+        kept=tuple(index for index,sequences in enumerate(precursor_sequences_all) if sequences)
+        if not kept:
+            raise UnresolvedPrecursorError("No sample in this group has a valid precursor action sequence from Source")
+        if len(kept)!=len(precursor_types):
+            precursor_types=[precursor_types[index] for index in kept]
+            collision_energy=[collision_energy[index] for index in kept]
+            peaks_mz=[peaks_mz[index] for index in kept]
+            peaks_intensity=[peaks_intensity[index] for index in kept]
+            precursor_sequences=[precursor_sequences_all[index] for index in kept]
+        else:
+            precursor_sequences=precursor_sequences_all
         assignments=fragmenter.assign_fragment_pathways_to_peak_sets(tree,zip(precursor_types,peaks_mz))
         targets=[]
         for _,groups in assignments:
@@ -62,13 +90,6 @@ class ActionStructureBuilder:
                 for pathway in group:
                     sequences.update(_walk_pathway(tree,fragmenter,pathway))
             targets.append(tuple(sorted(sequences,key=lambda seq:seq.key if seq else ())))
-        # Recorded once per sample, from the SAME already-built tree: which
-        # Source action set(s) already select this sample's precursor ion.
-        # Real MS2 fragmentation always happens on that selected ion, so
-        # prepare_source_actions requires every other teacher state to be
-        # consistent with one of these alternatives.
-        precursor_sequences=[tuple(pa.action_sequence for pa in fragmenter.resolve_precursor_actions(tree,precursor_type))
-                             for precursor_type in precursor_types]
         conditions=torch.tensor([[generator.adduct_type_strs.index(str(adduct)),ce]
                                  for adduct,ce in zip(precursor_types,collision_energy)],dtype=torch.float32)
         data=prepare_source_actions(source=source,actions=actions,graph_builder=generator.mol_encoder.graph_builder,
@@ -162,4 +183,4 @@ class ActionStructureBuilder:
                                     assignmentScore=score(peaks),
                                     assignmentScoreWithoutPrecursor=score([peak for peak in peaks if not peak['precursor']])))
         return replace(data,state_fragment_node_index=state_nodes,sample_annotations=tuple(annotations),
-                       downstream=replace(downstream,target_intensity=torch.tensor(target)))
+                       downstream=replace(downstream,target_intensity=torch.tensor(target))),kept
