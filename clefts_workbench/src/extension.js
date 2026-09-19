@@ -75,7 +75,9 @@ function defaultConfig(context) {
   const defaultParams = path.join(root, 'clefts', 'presets', 'spectrum_generator_params', 'source_anchored_pos_model_config.json');
   return workbenchDefaults.workflowDefaults('data',{
     application: 'fragment-tree-data-preparation', modelConfig: parameterService.defaults(root),
-    input: '', params: defaultParams, smilesColumn:'SMILES', adductTypeColumn:'AdductType', collisionEnergyColumn:'CollisionEnergy', precursorMzColumn:'PrecursorMZ', validationInput:'', validationRatio:0.1, validationSeed:0, minimumRelativeIntensity:0, normalizeIntensities:true, overwrite:false, numWorkers:1, chunkSize:1,
+    input: '', params: defaultParams, smilesColumn:'SMILES', adductTypeColumn:'AdductType', collisionEnergyColumn:'CollisionEnergy', precursorMzColumn:'PrecursorMZ',
+    validationSmilesColumn:'', validationAdductTypeColumn:'', validationCollisionEnergyColumn:'', validationPrecursorMzColumn:'',
+    validationInput:'', validationRatio:0.1, validationSeed:0, minimumRelativeIntensity:0, normalizeIntensities:true, overwrite:false, numWorkers:1, chunkSize:1,
     outputDir: ''
   },root);
 }
@@ -260,7 +262,9 @@ function normalizeConfig(config) {
   delete result.workbench_config;
   const aliases={validation_input:'validationInput',validation_ratio:'validationRatio',validation_seed:'validationSeed',
     output_dir:'outputDir',smiles_column:'smilesColumn',adduct_type_column:'adductTypeColumn',collision_energy_column:'collisionEnergyColumn',
-    precursor_mz_column:'precursorMzColumn',minimum_relative_intensity:'minimumRelativeIntensity',normalize_intensities:'normalizeIntensities',
+    precursor_mz_column:'precursorMzColumn',validation_smiles_column:'validationSmilesColumn',validation_adduct_type_column:'validationAdductTypeColumn',
+    validation_collision_energy_column:'validationCollisionEnergyColumn',validation_precursor_mz_column:'validationPrecursorMzColumn',
+    minimum_relative_intensity:'minimumRelativeIntensity',normalize_intensities:'normalizeIntensities',
     num_workers:'numWorkers',chunk_size:'chunkSize',max_node:'maxNode',max_edge:'maxEdge',model_config:'modelConfig'};
   for(const [from,to] of Object.entries(aliases)){if(result[from]!==undefined&&result[to]===undefined)result[to]=result[from];delete result[from];}
   if(result.modelConfig){const model=result.modelConfig.params||result.modelConfig;result.fragmenterParams??=model.fragmenter_params;result.symbols??=model.symbols||model.mol_encoder_params?.symbols;result.maxNode??=model.max_node;result.maxEdge??=model.max_edge;if(result.fragmenterParams)delete result.modelConfig;}
@@ -336,6 +340,8 @@ function buildArgs(c) {
   if(c.symbols)args.push('--symbols-json',JSON.stringify(c.symbols));
   for(const [key,flag]of Object.entries({maxNode:'--max-node',maxEdge:'--max-edge'}))if(c[key]!==undefined)args.push(flag,String(c[key]));
   for(const [key,flag] of Object.entries({smilesColumn:'--smiles-column',adductTypeColumn:'--adduct-type-column',collisionEnergyColumn:'--collision-energy-column',precursorMzColumn:'--precursor-mz-column'}))if(c[key])args.push(flag,c[key]);
+  // Only emitted when the validation dataset genuinely needs a different column name than training.
+  if(c.validationInput)for(const [key,flag,trainKey] of [['validationSmilesColumn','--validation-smiles-column','smilesColumn'],['validationAdductTypeColumn','--validation-adduct-type-column','adductTypeColumn'],['validationCollisionEnergyColumn','--validation-collision-energy-column','collisionEnergyColumn'],['validationPrecursorMzColumn','--validation-precursor-mz-column','precursorMzColumn']])if(c[key]&&c[key]!==c[trainKey])args.push(flag,c[key]);
   if(c.validationInput) args.push('--validation-input',c.validationInput);
   else if(c.validationRatio !== undefined && c.validationRatio !== '') args.push('--validation-ratio',String(c.validationRatio));
   for(const [key,flag] of Object.entries({validationSeed:'--validation-seed',minimumRelativeIntensity:'--minimum-relative-intensity',numWorkers:'--num-workers',chunkSize:'--chunk-size'}))if(c[key] !== undefined && c[key] !== '')args.push(flag,String(c[key]));

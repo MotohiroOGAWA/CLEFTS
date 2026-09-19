@@ -85,9 +85,12 @@ def validate(payload: dict, *, check_datasets: bool = True) -> dict:
         ratio=float(payload.get('validationRatio',0.1))
         if not math.isfinite(ratio) or not 0<ratio<1: raise ValueError('Validation ratio must be between 0 and 1.')
     if check_datasets and payload.get('input'):
-        mapping={key:payload.get(key,default) for key,default in DEFAULT_MAPPING.items()}
+        train_mapping={key:payload.get(key,default) for key,default in DEFAULT_MAPPING.items()}
+        # Falls back to the training column for anything not explicitly overridden,
+        # matching buildArgs()'s --validation-*-column behavior on the CLI side.
+        validation_mapping={key:payload.get('validation'+key[0].upper()+key[1:]) or value for key,value in train_mapping.items()}
         sources=[]
-        for file in (payload['input'],payload.get('validationInput')):
+        for file,mapping in ((payload['input'],train_mapping),(payload.get('validationInput'),validation_mapping)):
             if not file: continue
             result=preview({'path':file,'mapping':mapping,'limit':1,'_identifiers':True,'validateValues':True,'fragmenterParams':generator.fragmenter.to_dict()})
             sources.append(set(result.pop('_smiles',[])))

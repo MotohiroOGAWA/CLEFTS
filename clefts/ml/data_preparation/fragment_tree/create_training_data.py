@@ -171,6 +171,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     configure_model_options(parser)
     for name,default in (('smiles','SMILES'),('adduct-type','AdductType'),('collision-energy','CollisionEnergy'),('precursor-mz','PrecursorMZ')):
         parser.add_argument('--'+name+'-column',default=default,help='Dataset metadata column.')
+        parser.add_argument('--validation-'+name+'-column',help='Validation dataset column, if it differs from --'+name+'-column.')
     parser.add_argument('--symbols-json',help='JSON array of selected element symbols; overrides imported symbols.')
     parser.add_argument('--max-node',type=int,help='Maximum unique fragment nodes, including source; -1 is unlimited.')
     parser.add_argument('--max-edge',type=int,help='Maximum total distinct cleavage transitions, including multiple routes between merged nodes; -1 is unlimited.')
@@ -201,10 +202,17 @@ def main(argv: list[str] | None = None) -> None:
     checker=create_preparation_context(config).fragmenter
     mapping=dict(smilesColumn=args.smiles_column,adductTypeColumn=args.adduct_type_column,
                  collisionEnergyColumn=args.collision_energy_column,precursorMzColumn=args.precursor_mz_column)
+    # Falls back to the training column name for anything not explicitly
+    # overridden; only takes effect when validation is a separate dataset
+    # (--validation-input) since an auto ratio split reuses the same columns.
+    validation_mapping=dict(smilesColumn=args.validation_smiles_column or args.smiles_column,
+        adductTypeColumn=args.validation_adduct_type_column or args.adduct_type_column,
+        collisionEnergyColumn=args.validation_collision_energy_column or args.collision_energy_column,
+        precursorMzColumn=args.validation_precursor_mz_column or args.precursor_mz_column)
     reports={}
     for name,data in (('train',dataset),('validation',validation_dataset)):
         if data is None: continue
-        report=inspect_records(data,checker,mapping)
+        report=inspect_records(data,checker,mapping if name=='train' else validation_mapping)
         reports[name]=report['invalidRecords']
         filtered=data[report['validIndexes']]
         if not len(filtered): raise ValueError(name+' dataset contains no valid records to prepare.')
@@ -213,7 +221,7 @@ def main(argv: list[str] | None = None) -> None:
     output=Path(args.output_dir);output.mkdir(parents=True,exist_ok=True)
     print(json.dumps(dict(event='excluded_records',counts={name:len(rows) for name,rows in reports.items()})),flush=True)
     observed=list(dataset[args.adduct_type_column].unique())
-    if validation_dataset is not None: observed.extend(validation_dataset[args.adduct_type_column].unique())
+    if validation_dataset is not None: observed.extend(validation_dataset[validation_mapping['adductTypeColumn']].unique())
     config['adduct_type_strs']=list(create_preparation_context(config,observed_adducts=observed).adduct_type_strs)
     kwargs=dict(model_config=config,smiles_column=args.smiles_column,adduct_type_column=args.adduct_type_column,
         collision_energy_column=args.collision_energy_column,precursor_mz_column=args.precursor_mz_column,
@@ -222,15 +230,22 @@ def main(argv: list[str] | None = None) -> None:
     if args.validation_input and args.validation_ratio is not None:
         raise ValueError('Use a separate validation input or a SMILES split, not both.')
     preparation_config=dict(input=args.input,validation_input=args.validation_input,
-        validation_ratio=args.validation_ratio,validation_seed=args.validation_seed,output_dir=args.output_dir,**kwargs)
+        validation_ratio=args.validation_ratio,validation_seed=args.validation_seed,output_dir=args.output_dir,
+        # Blank means "same as the training column"; only a real override is persisted,
+        # so reloading a saved configuration keeps showing it as inherited, not explicit.
+        validation_smiles_column=args.validation_smiles_column or '',validation_adduct_type_column=args.validation_adduct_type_column or '',
+        validation_collision_energy_column=args.validation_collision_energy_column or '',validation_precursor_mz_column=args.validation_precursor_mz_column or '',
+        **kwargs)
     kwargs['preparation_config']=preparation_config
+    validation_kwargs={**kwargs,'smiles_column':validation_mapping['smilesColumn'],'adduct_type_column':validation_mapping['adductTypeColumn'],
+        'collision_energy_column':validation_mapping['collisionEnergyColumn'],'precursor_mz_column':validation_mapping['precursorMzColumn']}
     if args.validation_input:
         train,validation=dataset,validation_dataset
     elif args.validation_ratio is not None:
         train,validation=split_by_smiles(dataset,args.smiles_column,args.validation_ratio,args.validation_seed)
     else:
         train,validation=dataset,None
-    if validation is not None and set(train[args.smiles_column].astype(str)) & set(validation[args.smiles_column].astype(str)):
+    if validation is not None and set(train[args.smiles_column].astype(str)) & set(validation[validation_mapping['smilesColumn']].astype(str)):
         raise ValueError('Training and validation datasets share SMILES. Choose molecule-disjoint datasets.')
     if not args.overwrite and (list(output.rglob('*.preft.pt')) or any(list((output/name).rglob('*.preft.pt')) for name in ('train_structures','validation_structures'))):
         raise FileExistsError('Output already contains training structures. Enable overwrite or choose another directory.')
@@ -248,6 +263,8 @@ def main(argv: list[str] | None = None) -> None:
     aliases={'validation_input':'validationInput','validation_ratio':'validationRatio','validation_seed':'validationSeed',
         'output_dir':'outputDir','smiles_column':'smilesColumn','adduct_type_column':'adductTypeColumn',
         'collision_energy_column':'collisionEnergyColumn','precursor_mz_column':'precursorMzColumn',
+        'validation_smiles_column':'validationSmilesColumn','validation_adduct_type_column':'validationAdductTypeColumn',
+        'validation_collision_energy_column':'validationCollisionEnergyColumn','validation_precursor_mz_column':'validationPrecursorMzColumn',
         'minimum_relative_intensity':'minimumRelativeIntensity','normalize_intensities':'normalizeIntensities',
         'max_node':'maxNode','max_edge':'maxEdge','num_workers':'numWorkers','chunk_size':'chunkSize'}
     restored={**previous,'application':'fragment-tree-data-preparation'}
@@ -267,7 +284,7 @@ def main(argv: list[str] | None = None) -> None:
         split_config={**restored,'split':name,'status':'running'}
         (directory/'fragment-tree.pft.json').write_text(json.dumps(split_config,indent=2))
         # The split is newly empty after resetting Output Directory. Do not delete its configuration.
-        create_action_training_data(dataset=split_dataset,output_dir=directory,split=name,**{**kwargs,'overwrite':False})
+        create_action_training_data(dataset=split_dataset,output_dir=directory,split=name,**{**(kwargs if name=='train' else validation_kwargs),'overwrite':False})
         split_config['status']='completed'
         (directory/'fragment-tree.pft.json').write_text(json.dumps(split_config,indent=2))
     (output/'invalid_records.json').write_text(json.dumps(reports,indent=2))
