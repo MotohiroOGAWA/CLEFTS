@@ -6,6 +6,10 @@ A VS Code extension for configuring, running, and inspecting CLEFTS applications
 
 Choose **Home > Open / Create Project** to keep automatic form drafts, named configuration snapshots, tracked files, notes, and run logs in a research directory. Restore settings from history, compare parameter changes, and switch between recent projects. See [Workbench projects](content/projects.md) for details.
 
+## Cleavage file editors
+
+Open `*.cleavage.json` directly in VS Code to edit one cleavage pattern: its name, reactant SMARTS, and products. Ctrl/Cmd+S saves the single-pattern JSON format. `*.clevageset.json` continues to open the pattern-set editor; the legacy `*.clevage.json` suffix also opens the single-pattern editor.
+
 ## Development
 
 1. Open this directory in VS Code and press `F5` to launch an Extension Development Host, or run `npm run dev`. The F5 launch configuration automatically opens the parent CLEFTS application directory, so `Open Folder` is not required on each restart.
