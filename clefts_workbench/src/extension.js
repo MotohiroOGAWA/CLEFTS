@@ -343,7 +343,10 @@ function buildArgs(c) {
   // Only emitted when the validation dataset genuinely needs a different column name than training.
   if(c.validationInput)for(const [key,flag,trainKey] of [['validationSmilesColumn','--validation-smiles-column','smilesColumn'],['validationAdductTypeColumn','--validation-adduct-type-column','adductTypeColumn'],['validationCollisionEnergyColumn','--validation-collision-energy-column','collisionEnergyColumn'],['validationPrecursorMzColumn','--validation-precursor-mz-column','precursorMzColumn']])if(c[key]&&c[key]!==c[trainKey])args.push(flag,c[key]);
   if(c.validationInput) args.push('--validation-input',c.validationInput);
-  else if(c.validationRatio !== undefined && c.validationRatio !== '') args.push('--validation-ratio',String(c.validationRatio));
+  // With --validation-input this caps validation to this fraction of training's
+  // unique SMILES after removing molecules shared with training, instead of
+  // splitting a single dataset (which is what it does without --validation-input).
+  if(c.validationRatio !== undefined && c.validationRatio !== '') args.push('--validation-ratio',String(c.validationRatio));
   for(const [key,flag] of Object.entries({validationSeed:'--validation-seed',minimumRelativeIntensity:'--minimum-relative-intensity',numWorkers:'--num-workers',chunkSize:'--chunk-size'}))if(c[key] !== undefined && c[key] !== '')args.push(flag,String(c[key]));
   for(const [key,flag] of Object.entries({normalizeIntensities:'--normalize-intensities',overwrite:'--overwrite'}))if(c[key]!==undefined)args.push(flag,c[key]?'1':'0');
   return args;

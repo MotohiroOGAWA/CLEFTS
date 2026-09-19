@@ -8,6 +8,25 @@ from pathlib import Path
 
 DEFAULT_MAPPING={'smilesColumn':'SMILES','adductTypeColumn':'AdductType','collisionEnergyColumn':'CollisionEnergy','precursorMzColumn':'PrecursorMZ'}
 
+def columns(payload: dict) -> dict:
+    """Column-mapping validity only: no peak stats, adduct list or row preview.
+
+    Costs only a dataset load (dominated by file I/O, not row/column count),
+    so the Column Mapping indicators can update immediately after choosing a
+    file, before the slower per-record value checks (preview/data/check) run.
+    """
+    from clefts.ml.data_preparation.fragment_tree.datasets import load_spectrum_dataset
+    file=Path(payload['path']).resolve()
+    dataset=load_spectrum_dataset(file)
+    mapping={**DEFAULT_MAPPING,**payload.get('mapping',{})}
+    dataset_columns=dataset.columns
+    validation={key:{'column':name,'exists':name in dataset_columns,'valid':0,'total':len(dataset)} for key,name in mapping.items()}
+    errors=[]
+    for key,item in validation.items():
+        if not item['exists']: errors.append('Missing '+key+': '+item['column'])
+    return {'path':str(file),'format':file.suffix.lstrip('.').upper(),'size':file.stat().st_size,'records':len(dataset),
+            'columns':dataset_columns,'validation':validation,'errors':errors}
+
 def preview(payload: dict) -> dict:
     from rdkit import Chem
     from rdkit.Chem import Descriptors,rdMolDescriptors
@@ -42,21 +61,27 @@ def preview(payload: dict) -> dict:
     if np.any(checked_peaks.lengths==0): errors.append(f'{int((checked_peaks.lengths==0).sum())} spectra have no peaks.')
     if not np.isfinite(checked_peaks.mz).all() or np.any(checked_peaks.mz<=0): errors.append('Peak m/z values must be finite and positive.')
     if not np.isfinite(checked_peaks.intensity).all() or np.any(checked_peaks.intensity<0): errors.append('Peak intensities must be finite and non-negative.')
-    adducts=dataset[mapping['adductTypeColumn']].astype(str).value_counts().to_dict() if mapping['adductTypeColumn'] in columns else {}
+    # MSDataset.metadata rebuilds a full-length view on every dataset[name]
+    # access, so each mapped/id column is fetched exactly once here; reading
+    # them inside the row loop below would otherwise cost O(limit * columns)
+    # full-dataset rebuilds instead of O(columns) for a large dataset.
+    mapped_series={key:dataset[name] if name in columns else None for key,name in mapping.items()}
+    spec_id_series=dataset['SpecID'] if 'SpecID' in columns else None
+    adducts=mapped_series['adductTypeColumn'].astype(str).value_counts().to_dict() if mapped_series['adductTypeColumn'] is not None else {}
     normalized_adducts=[]
     for value in adducts:
         try: normalized_adducts.append(str(Adduct.parse(value)))
         except Exception: pass
-    smiles=dataset[mapping['smilesColumn']].astype(str) if mapping['smilesColumn'] in columns else None
+    smiles=mapped_series['smilesColumn'].astype(str) if mapped_series['smilesColumn'] is not None else None
     rows=[]
     limit=min(max(int(payload.get('limit',50)),1),100)
     for index in range(min(len(dataset),limit)):
         record=dataset[index]
-        values={key:str(dataset[name].iloc[index])[:4096] if name in columns else '' for key,name in mapping.items()}
+        values={key:str(series.iloc[index])[:4096] if series is not None else '' for key,series in mapped_series.items()}
         spectrum=list(record.peaks)
         if index in eligible and any(not math.isfinite(float(p.mz)) or float(p.mz)<=0 or not math.isfinite(float(p.intensity)) or float(p.intensity)<0 for p in spectrum):
             errors.append(f'Invalid peak values in preview record {index}')
-        rows.append({'index':index,'id':str(dataset['SpecID'].iloc[index]) if 'SpecID' in columns else str(index),**values,'numPeaks':int(lengths[index]),
+        rows.append({'index':index,'id':str(spec_id_series.iloc[index]) if spec_id_series is not None else str(index),**values,'numPeaks':int(lengths[index]),
                      'peaks':[{'mz':float(p.mz),'intensity':float(p.intensity)} for p in spectrum[:2000] if math.isfinite(float(p.mz)) and math.isfinite(float(p.intensity))]})
     structure=None
     if rows:
@@ -232,7 +257,7 @@ def main():
     request=json.loads(sys.stdin.read())
     try:
         with contextlib.redirect_stdout(sys.stderr):
-            result={'mol-smiles':mol_smiles,'mol-preflight':mol_preflight,'training-sources':training_sources,'training-checkpoint':training_checkpoint,'structure-manifest':structure_manifest,'preview':preview,'validate':validate,'validate-config':lambda payload:validate(payload,check_datasets=False),'model':model}[request['command']](request['payload'])
+            result={'mol-smiles':mol_smiles,'mol-preflight':mol_preflight,'training-sources':training_sources,'training-checkpoint':training_checkpoint,'structure-manifest':structure_manifest,'columns':columns,'preview':preview,'validate':validate,'validate-config':lambda payload:validate(payload,check_datasets=False),'model':model}[request['command']](request['payload'])
         print(json.dumps({'ok':True,'result':result},allow_nan=False))
     except Exception as error:
         import traceback

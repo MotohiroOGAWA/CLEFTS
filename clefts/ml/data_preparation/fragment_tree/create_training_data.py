@@ -14,7 +14,7 @@ from clefts.ml.input.source_action_structure import save_fragment_tree_structure
 from .manifest_summary import structure_manifest_fields
 from .context import create_preparation_context, validate_limits
 from clefts.ml.specgen.config_options import configure_model_options, resolve_model_options
-from .datasets import load_spectrum_dataset, split_by_smiles
+from .datasets import load_spectrum_dataset, split_by_smiles, dedupe_validation
 from .record_validation import inspect_records
 
 
@@ -178,7 +178,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument('--num-workers',type=int,default=1,help='Parallel worker processes per split; 1 runs serially.')
     parser.add_argument('--chunk-size',type=int,default=1,help='SMILES groups dispatched per worker chunk.')
     parser.add_argument('--validation-input',help='Optional held-out spectrum dataset. Produces train_structures and validation_structures.')
-    parser.add_argument('--validation-ratio',type=float,help='Split unique SMILES when validation input is omitted.')
+    parser.add_argument('--validation-ratio',type=float,help='Split unique SMILES when validation input is omitted. With --validation-input, instead caps validation to this fraction of training\'s unique SMILES count after removing molecules shared with training.')
     parser.add_argument('--validation-seed',type=int,default=0)
     parser.add_argument('--minimum-relative-intensity',type=float,default=0.0)
     parser.add_argument('--normalize-intensities',type=int,choices=(0,1),default=1)
@@ -227,8 +227,6 @@ def main(argv: list[str] | None = None) -> None:
         collision_energy_column=args.collision_energy_column,precursor_mz_column=args.precursor_mz_column,
         minimum_relative_intensity=args.minimum_relative_intensity,normalize_intensities=bool(args.normalize_intensities),
         overwrite=bool(args.overwrite),max_node=args.max_node,max_edge=args.max_edge,num_workers=args.num_workers,chunk_size=args.chunk_size)
-    if args.validation_input and args.validation_ratio is not None:
-        raise ValueError('Use a separate validation input or a SMILES split, not both.')
     preparation_config=dict(input=args.input,validation_input=args.validation_input,
         validation_ratio=args.validation_ratio,validation_seed=args.validation_seed,output_dir=args.output_dir,
         # Blank means "same as the training column"; only a real override is persisted,
@@ -240,13 +238,26 @@ def main(argv: list[str] | None = None) -> None:
     validation_kwargs={**kwargs,'smiles_column':validation_mapping['smilesColumn'],'adduct_type_column':validation_mapping['adductTypeColumn'],
         'collision_energy_column':validation_mapping['collisionEnergyColumn'],'precursor_mz_column':validation_mapping['precursorMzColumn']}
     if args.validation_input:
-        train,validation=dataset,validation_dataset
+        train=dataset
+        # A model must not be scored on a molecule it trained on, so overlapping
+        # SMILES are always dropped from validation rather than failing the run;
+        # --validation-ratio (optional here) then caps validation to a size
+        # proportional to training instead of using every remaining record.
+        validation,overlap_report=dedupe_validation(train,validation_dataset,args.smiles_column,
+            validation_mapping['smilesColumn'],ratio=args.validation_ratio,seed=args.validation_seed)
+        if overlap_report['removedOverlapRecords']:
+            print(json.dumps(dict(event='validation_overlap_removed',**overlap_report)),flush=True)
+        if 'targetSmiles' in overlap_report and overlap_report['remainingSmiles']<overlap_report['targetSmiles']:
+            print(json.dumps(dict(event='validation_below_target',**overlap_report,
+                note='Validation has fewer molecule-disjoint SMILES than --validation-ratio requests; using all available records instead of failing.')),flush=True)
+        if not len(validation):
+            print(json.dumps(dict(event='validation_empty',
+                note='No validation records remain after removing molecules shared with training; continuing with training only.')),flush=True)
+            validation=None
     elif args.validation_ratio is not None:
         train,validation=split_by_smiles(dataset,args.smiles_column,args.validation_ratio,args.validation_seed)
     else:
         train,validation=dataset,None
-    if validation is not None and set(train[args.smiles_column].astype(str)) & set(validation[validation_mapping['smilesColumn']].astype(str)):
-        raise ValueError('Training and validation datasets share SMILES. Choose molecule-disjoint datasets.')
     if not args.overwrite and (list(output.rglob('*.preft.pt')) or any(list((output/name).rglob('*.preft.pt')) for name in ('train_structures','validation_structures'))):
         raise FileExistsError('Output already contains training structures. Enable overwrite or choose another directory.')
     workbench_path=output/'fragment-tree.pft.json'

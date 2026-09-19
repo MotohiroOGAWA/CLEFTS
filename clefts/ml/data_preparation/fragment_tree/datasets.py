@@ -39,3 +39,32 @@ def split_by_smiles(dataset: MSDataset, column: str, ratio: float, seed: int) ->
     held_out=set(smiles[:count])
     mask=dataset[column].astype(str).isin(held_out)
     return dataset[~mask],dataset[mask]
+
+def dedupe_validation(train: MSDataset, validation: MSDataset, train_column: str, validation_column: str,
+                       ratio: float | None = None, seed: int = 0) -> tuple[MSDataset, dict]:
+    """Remove validation records whose SMILES also appears in training, then
+    optionally cap validation to `ratio` of training's unique SMILES count.
+
+    A model must not be scored on a molecule it trained on, so the overlap is
+    always removed rather than raising. Likewise, a validation set smaller
+    than the requested ratio (or empty) is reported back for the caller to
+    warn about, never a reason to abort an otherwise valid run.
+    """
+    train_smiles=set(train[train_column].astype(str))
+    overlap_mask=validation[validation_column].astype(str).isin(train_smiles)
+    report={'removedOverlapRecords':int(overlap_mask.sum())}
+    validation=validation[~overlap_mask]
+    if ratio is not None:
+        if not 0<ratio<1: raise ValueError('Validation ratio must be between 0 and 1.')
+        target_smiles=list(dict.fromkeys(train[train_column].astype(str).tolist()))
+        target_count=max(1,round(len(target_smiles)*ratio))
+        available=list(dict.fromkeys(validation[validation_column].astype(str).tolist()))
+        report['targetSmiles']=target_count
+        report['availableSmiles']=len(available)
+        if len(available)>target_count:
+            random.Random(seed).shuffle(available)
+            kept=set(available[:target_count])
+            validation=validation[validation[validation_column].astype(str).isin(kept)]
+    report['remainingRecords']=len(validation)
+    report['remainingSmiles']=len(set(validation[validation_column].astype(str)))
+    return validation,report
