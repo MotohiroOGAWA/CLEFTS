@@ -1,0 +1,49 @@
+{
+  "cleavage_pattern_set": {
+    "name": "nonring_single_bond",
+    "patterns": [
+      {
+        "name": "nonring_o_single_bond",
+        "reactant_smarts": "[#8&!#1:1]-&!@[!#1:2]",
+        "products": [
+          {
+            "name": "o_side",
+            "smarts": "[#8&!#1:1]"
+          },
+          {
+            "name": "other_side",
+            "smarts": "[!#1:2]"
+          }
+        ]
+      },
+      {
+        "name": "nonring_n_single_bond",
+        "reactant_smarts": "[#7&!#1:1]-&!@[!#1:2]",
+        "products": [
+          {
+            "name": "n_side",
+            "smarts": "[#7&!#1:1]"
+          },
+          {
+            "name": "other_side",
+            "smarts": "[!#1:2]"
+          }
+        ]
+      },
+      {
+        "name": "nonring_c_single_bond",
+        "reactant_smarts": "[#6&!#1:1]-&!@[!#1:2]",
+        "products": [
+          {
+            "name": "c_side",
+            "smarts": "[#6&!#1:1]"
+          },
+          {
+            "name": "other_side",
+            "smarts": "[!#1:2]"
+          }
+        ]
+      }
+    ]
+  }
+}

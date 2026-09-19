@@ -6,7 +6,7 @@ const load=Module._load;Module._load=function(name,parent,main){return name==='v
 const periodicRows=require('../src/features/cleavage-pattern-set/periodic-table').rows;assert(periodicRows.every(row=>row.length===18));assert.equal(periodicRows[1][12],'B');assert.equal(periodicRows[1][17],'Ne');assert.equal(periodicRows[2][12],'Al');assert.equal(periodicRows[2][17],'Ar');
 const extension=require('../src/extension'),preset=require('../../clefts/presets/spectrum_generator_params/source_anchored_pos_model_config.json');
 const messages=[],errors=[],console=new VirtualConsole();console.on('jsdomError',error=>errors.push(error.detail?.stack||error.message));
-const dom=new JSDOM(extension.workbenchHtml({modelConfig:preset},{modelConfig:preset}),{runScripts:'dangerously',pretendToBeVisual:true,virtualConsole:console,beforeParse(w){w.acquireVsCodeApi=()=>({postMessage:m=>messages.push(m),getState:()=>({}),setState(){}});w.HTMLElement.prototype.scrollIntoView=function(){};w.ResizeObserver=class{observe(){}disconnect(){}};w.matchMedia=()=>({matches:false,addEventListener(){}});w.CSS={escape:s=>s};}});
+const dom=new JSDOM(extension.workbenchHtml({modelConfig:preset},{modelConfig:preset}),{runScripts:'dangerously',pretendToBeVisual:true,virtualConsole:console,beforeParse(w){w.acquireVsCodeApi=()=>({postMessage:m=>messages.push(m),getState:()=>({}),setState(){}});w.HTMLElement.prototype.scrollIntoView=function(){w.lastScrollTarget=this;};w.ResizeObserver=class{observe(){}disconnect(){}};w.matchMedia=()=>({matches:false,addEventListener(){}});w.CSS={escape:s=>s};}});
 (async()=>{
  const w=dom.window,d=w.document,post=data=>w.dispatchEvent(new w.MessageEvent('message',{data}));
  try{
@@ -19,11 +19,11 @@ const dom=new JSDOM(extension.workbenchHtml({modelConfig:preset},{modelConfig:pr
   assert(!d.getElementById('cleavageApp').hidden);assert(nav.classList.contains('active'));
   const original=preset.fragmenter_params.fragment_ion_tree_builder.cleavage_pattern_set.patterns.length;
   assert.equal(d.querySelectorAll('#cleavagePatterns .pattern-card').length,original);
-  d.getElementById('addCleavagePattern').click();const index=original;
+  d.getElementById('addCleavagePattern').click();const index=original;assert.equal(d.activeElement.dataset.pattern,String(index));assert.equal(w.lastScrollTarget,d.activeElement.closest('.pattern-card'));
   function input(selector,value){const element=d.querySelector(selector);assert(element,selector);element.value=value;element.dispatchEvent(new w.Event('input',{bubbles:true}));}
   input('[data-pattern="'+index+'"][data-key=name]','added_carbon_oxygen');
   input('[data-pattern="'+index+'"][data-key=reactant_smarts]','[#6:1]-[#8:2]');
-  d.querySelector('[data-add-product="'+index+'"]').click();
+  d.querySelector('[data-add-product="'+index+'"]').click();assert.equal(d.activeElement.dataset.product,'0');assert.equal(w.lastScrollTarget,d.activeElement.closest('.product-row'));
   input('[data-pattern="'+index+'"][data-product="0"][data-key=name]','carbon');
   input('[data-pattern="'+index+'"][data-product="0"][data-key=smarts]','[#6:1]');
   d.getElementById('saveCleavage').click();assert.equal(messages.at(-1).type,'saveCleavagePatternSet');
@@ -189,10 +189,35 @@ const dom=new JSDOM(extension.workbenchHtml({modelConfig:preset},{modelConfig:pr
   assert.equal(messages.at(-1).type,'loadCleavagePattern');assert.deepEqual(JSON.parse(messages.at(-1).json),pattern);
   post({type:'cleavagePatternLoaded',pattern,index:-1});assert.equal(d.querySelectorAll('#cleavagePatterns .pattern-card').length,original+4);
   post({type:'cleavagePatternError',message:'Invalid JSON'});assert.equal(d.getElementById('cleavageError').textContent,'Invalid JSON');
-  post({type:'cleavagePatternLoaded',pattern,index:-1});assert.equal(d.getElementById('cleavageError').textContent,'');assert.deepEqual(errors,[]);
+  post({type:'cleavagePatternLoaded',pattern:JSON.parse(JSON.stringify(pattern)),index:-1});assert.equal(d.getElementById('cleavageError').textContent,'');assert.deepEqual(errors,[]);
+  // The editor stays attached to the selected pattern across rerenders and renumbering.
+  const last=w.eval('cleavageModel.cleavage_pattern_set.patterns.length-1');
+  await w.eval('editVisualPattern('+last+')');
+  const builder=d.getElementById('visualBuilder');
+  assert.equal(builder.parentElement,d.querySelectorAll('#cleavagePatterns > .pattern-card')[last]);
+  assert.equal(builder.querySelector('h2').textContent,'Cleavage Pattern Editor (Pattern '+(last+1)+')');
+  assert(builder.contains(w.lastScrollTarget));
+  d.getElementById('builderPatternName').value='Unregistered draft';
+  d.querySelector('[data-remove-pattern="0"]').click();
+  assert.equal(d.getElementById('visualBuilder'),builder);
+  assert.equal(builder.parentElement,d.querySelectorAll('#cleavagePatterns > .pattern-card')[last-1]);
+  assert.equal(builder.querySelector('h2').textContent,'Cleavage Pattern Editor (Pattern '+last+')');
+  assert.equal(d.getElementById('builderPatternName').value,'Unregistered draft');
+  d.getElementById('closeBuilder').click();assert(builder.hidden);assert.equal(d.activeElement.dataset.pattern,String(last-1));
+  await w.eval('editVisualPattern(0)');assert.equal(builder.parentElement,d.querySelector('#cleavagePatterns > .pattern-card'));
+  d.querySelector('[data-remove-pattern="0"]').click();assert(builder.hidden);assert(builder.isConnected);
+  d.getElementById('addVisualPattern').click();assert.equal(builder.parentElement.id,'cleavageApp');assert.equal(builder.querySelector('h2').textContent,'Cleavage Pattern Editor');
+  assert.equal(w.lastScrollTarget,builder);assert.equal(d.activeElement.id,'builderSmiles');assert.deepEqual(errors,[]);
+
  }finally{dom.window.close();}
  const filename=require.resolve('../src/extension'),compiled=new Module(filename,module);compiled.filename=filename;compiled.paths=module.paths;
- compiled._compile(fs.readFileSync(filename,'utf8')+'\nmodule.exports.readCleavageImport=readCleavageImport;',filename);
+ compiled._compile(fs.readFileSync(filename,'utf8')+'\nmodule.exports.readCleavageImport=readCleavageImport;module.exports.cleavagePatternSetSavePath=cleavagePatternSetSavePath;',filename);
+ const savePath=compiled.exports.cleavagePatternSetSavePath;
+ assert.equal(savePath('my_set'),'my_set.clevageset.json');
+ assert.equal(savePath('新しいセット','/tmp/old.clevageset.json'),'/tmp/新しいセット.clevageset.json');
+ assert.equal(savePath('a/b:c'),'a_b_c.clevageset.json');
+ assert.equal(savePath('   '),'patterns.clevageset.json');
+ assert.equal(savePath('named.clevageset.json'),'named.clevageset.json');
  const root=fs.mkdtempSync(path.join(os.tmpdir(),'clefts-pattern-import-'));
  try{
   const file=path.join(root,'set.clevageset.json'),value={cleavage_pattern_set:{name:'imported_set',patterns:[]}};
