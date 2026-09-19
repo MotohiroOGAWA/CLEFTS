@@ -75,7 +75,8 @@ def create_action_training_data(*, dataset: MSDataset, model_config: dict, outpu
                                 smiles_column: str = 'SMILES', adduct_type_column: str = 'AdductType',
                                 collision_energy_column: str = 'CollisionEnergy', precursor_mz_column: str = 'PrecursorMZ',
                                 minimum_relative_intensity: float = 0.0, normalize_intensities: bool = True,
-                                overwrite: bool = True, split: str = 'dataset', max_node: int = -1, max_edge: int = -1, num_workers: int = 1, chunk_size: int = 1, preparation_config: dict | None = None) -> list[Path]:
+                                overwrite: bool = True, split: str = 'dataset', max_node: int = -1, max_edge: int = -1, num_workers: int = 1, chunk_size: int = 1, preparation_config: dict | None = None,
+                                _check_existing: bool = True) -> list[Path]:
     if not math.isfinite(minimum_relative_intensity) or not 0<=minimum_relative_intensity<=1:
         raise ValueError('Minimum relative intensity must be between 0 and 1.')
     validate_limits(max_node,max_edge)
@@ -92,7 +93,13 @@ def create_action_training_data(*, dataset: MSDataset, model_config: dict, outpu
     grouped={}
     for index,smiles in enumerate(dataset[smiles_column].tolist()):grouped.setdefault(str(smiles),[]).append(index)
     output=Path(output_dir)
-    if not overwrite:
+    # main() already verified (and, with --overwrite, cleared) the whole output tree
+    # before any split started computing; skip this redundant re-check there via
+    # _check_existing=False so it can never abort a run mid-way, after training's
+    # (possibly expensive) split has already completed, over a directory main()
+    # already accounted for. overwrite still stays False for that caller so this
+    # call's own _reset_output does not delete the split config main() just wrote.
+    if _check_existing and not overwrite:
         existing=list(output.rglob('*.preft.pt'))
         if existing: raise FileExistsError('Output already contains training structures. Enable overwrite or choose another directory.')
     _reset_output(output,overwrite)
@@ -295,7 +302,7 @@ def main(argv: list[str] | None = None) -> None:
         split_config={**restored,'split':name,'status':'running'}
         (directory/'fragment-tree.pft.json').write_text(json.dumps(split_config,indent=2))
         # The split is newly empty after resetting Output Directory. Do not delete its configuration.
-        create_action_training_data(dataset=split_dataset,output_dir=directory,split=name,**{**(kwargs if name=='train' else validation_kwargs),'overwrite':False})
+        create_action_training_data(dataset=split_dataset,output_dir=directory,split=name,**{**(kwargs if name=='train' else validation_kwargs),'overwrite':False},_check_existing=False)
         split_config['status']='completed'
         (directory/'fragment-tree.pft.json').write_text(json.dumps(split_config,indent=2))
     (output/'invalid_records.json').write_text(json.dumps(reports,indent=2))
