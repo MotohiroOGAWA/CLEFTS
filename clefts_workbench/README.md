@@ -2,6 +2,10 @@
 
 A VS Code extension for configuring, running, and inspecting CLEFTS applications. It includes Fragment Tree data preparation and model training.
 
+## Research projects
+
+Choose **Home > Open / Create Project** to keep automatic form drafts, named configuration snapshots, tracked files, notes, and run logs in a research directory. Restore settings from history, compare parameter changes, and switch between recent projects. See [Workbench projects](content/projects.md) for details.
+
 ## Development
 
 1. Open this directory in VS Code and press `F5` to launch an Extension Development Host, or run `npm run dev`. The F5 launch configuration automatically opens the parent CLEFTS application directory, so `Open Folder` is not required on each restart.

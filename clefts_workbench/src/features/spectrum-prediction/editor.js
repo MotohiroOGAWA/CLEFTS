@@ -1,3 +1,5 @@
+const projects=require('../../workbench/project');
+const jobs=require('../../workbench/panel');
 const vscode = require('vscode');
 const { spawn } = require('child_process');
 const path = require('path');
@@ -32,8 +34,11 @@ function shellDisplay(program, args) {
 
 function attach(panel, context, projectRoot, output) {
   let child;
+  const panelContext=context;
   panel.onDidDispose(() => { if (child) child.kill('SIGTERM'); });
   panel.webview.onDidReceiveMessage(async message => {
+    const context=projects.capture(panelContext);
+    let observed;
     if (!['predictBatchPick', 'predictBatchCopy', 'predictBatchRun', 'predictBatchStop', 'predictSaveConfig', 'predictLoadConfig'].includes(message.type)) return;
     const post = data => panel.webview.postMessage({ type: 'predictBatchStatus', ...data });
     try {
@@ -72,8 +77,10 @@ function attach(panel, context, projectRoot, output) {
       post({ running: true, clear: true, text: 'Predicting MSDataset…', command });
       child = spawn(python, args, { cwd: root, env: { ...process.env, PYTHONUNBUFFERED: '1',
         PYTHONPATH: [root, process.env.PYTHONPATH].filter(Boolean).join(path.delimiter) } });
+      observed=jobs.observeJob(context,{type:'batch-prediction',workflow:'prediction',name:config.outputName||'Batch prediction',outputDir:config.outputDir,child,command:[python,...args],config,base:root});
       child.stdin.on('error', () => {}); child.stdin.end();
       const stream = data => {
+        observed.log(data.toString());
         const clean = data.toString().replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '');
         const lines = clean.split(/[\r\n]+/).map(line => line.trim()).filter(Boolean);
         const isProgress = line => /\d+%.*\|/.test(line) || /^\[\d+\/\d+\]/.test(line);
@@ -87,9 +94,11 @@ function attach(panel, context, projectRoot, output) {
         child.on('error', reject);
         child.on('close', (exitCode, signal) => signal ? reject(new Error('Batch prediction cancelled.')) : resolve(exitCode));
       });
+      observed.finish({code,partial:code===3});
       if (code !== 0 && code !== 3) throw new Error(`Prediction CLI failed (exit ${code}). See output for details.`);
       post({ running: false, text: code === 3 ? 'Prediction completed with some failed records.' : 'MSDataset prediction completed.' });
     } catch (error) {
+      if(observed)observed.finish({error:error.message});
       post({ running: false, text: error.message });
     } finally {
       if (message.type === 'predictBatchRun') child = undefined;

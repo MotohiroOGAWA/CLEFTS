@@ -1,3 +1,4 @@
+const projects=require('./project');
 const fs=require('fs');
 const path=require('path');
 const vscode=require('vscode');
@@ -80,13 +81,14 @@ function html(initial={}){
 }
 function displayCommand(python,args){return [python,...args].map(value=>/^[A-Za-z0-9_./:=,+-]+$/.test(String(value))?String(value):"'"+String(value).replace(/'/g,"'\\''")+"'").join(' ');}
 async function checkFiles(root,config){for(const file of [...config.trainSmiles,...config.valSmiles]){const resolved=path.resolve(root,file);await fs.promises.access(resolved,fs.constants.R_OK);if(!(await fs.promises.stat(resolved)).isFile())throw new Error('Not a SMILES file: '+file);}let parent=path.resolve(root,config.outputDir);while(!fs.existsSync(parent)){const next=path.dirname(parent);if(next===parent)break;parent=next;}if(!(await fs.promises.stat(parent)).isDirectory())throw new Error('Output directory must be a directory.');await fs.promises.access(parent,fs.constants.W_OK);}
-function attach(panel,context,projectRoot,output){panel.webview.onDidReceiveMessage(async message=>{
+function attach(panel,context,projectRoot,output){const panelContext=context;panel.webview.onDidReceiveMessage(async message=>{
+ const context=projects.capture(panelContext);
  if(!message?.type?.startsWith('mol/'))return;
  const post=data=>panel.webview.postMessage(data);
  try{
   if(message.type==='mol/pick'){if(!['trainSmiles','valSmiles','outputDir','preprocessingCache'].includes(message.field))return;const folder=message.field==='outputDir';const selected=await vscode.window.showOpenDialog({canSelectMany:!folder&&message.field!=='preprocessingCache',canSelectFiles:!folder,canSelectFolders:folder});if(selected?.length)post({type:'mol/picked',field:message.field,paths:selected.map(uri=>uri.fsPath)});return;}
   if(message.type==='mol/inspect'){post({type:'mol/inspected',field:message.field,requestId:message.requestId,...await services.backend(context,projectRoot(context),'mol-smiles',{paths:message.paths})});return;}
-  if(message.type==='mol/save'){await saveConfiguration('mol-training',message.config,'mol-training.json');return;}
+  if(message.type==='mol/save'){const saved=await saveConfiguration('mol-training',message.config,'mol-training.json');if(saved)projects.record(context,'molTraining',message.config,{label:path.basename(saved),reason:'exported',sourcePath:saved,base:projectRoot(context)});return;}
   if(message.type==='mol/load'){const loaded=await loadConfiguration('mol-training',parseMolConfiguration);if(loaded)post({type:'mol/config',config:loaded.config,path:loaded.path});return;}
   if(!['mol/copy','mol/preflight','mol/start'].includes(message.type))return;
   const config={...defaults(),...message.config},result=validate(config);if(result.errors.length)throw new Error(result.errors.join('\n'));
@@ -115,6 +117,7 @@ function client(){
   for(const input of inputs)if(!selected.includes(input.dataset.molDescriptor))box.append(input.closest('label'));
  }
  function snapshot(){const value={trainSmiles:config.trainSmiles||[],valSmiles:config.valSmiles||[]};for(const input of form.elements)if(input.name)value[input.name]=input.type==='checkbox'?(input.dataset.invert!==undefined?!input.checked:input.checked):input.type==='number'?(input.value===''?'':Number(input.value)):input.value;return value;}
+ window.cleftsMolSnapshot=snapshot;
  function files(key){const box=el(key+'MolFiles');box.replaceChildren();for(const [index,path]of (config[key]||[]).entries()){const row=document.createElement('div');row.className='mol-file-row';const input=document.createElement('input');input.value=path;input.setAttribute('aria-label','SMILES file path');input.onchange=()=>{config[key][index]=input.value.trim();delete datasets[key];inspections[key]='';el(key+'MolPreview').replaceChildren();render();inspect(key);};const remove=document.createElement('button');remove.type='button';remove.textContent='×';remove.setAttribute('aria-label','Remove '+path);remove.onclick=()=>{config[key].splice(index,1);delete datasets[key];inspections[key]='';el(key+'MolPreview').replaceChildren();files(key);render();if(config[key].length)inspect(key);};row.append(input,remove);box.append(row);}}
  function appendPaths(key,paths){config[key]=[...new Set([...(config[key]||[]),...paths])];delete datasets[key];inspections[key]='';el(key+'MolPreview').replaceChildren();files(key);render();inspect(key);}
  function inspect(key){const paths=config[key]||[];if(!paths.length)return;const requestId=JSON.stringify(paths);inspections[key]=requestId;el(key+'MolPreview').textContent='Inspecting molecules…';vscode.postMessage({type:'mol/inspect',field:key,requestId,paths});}

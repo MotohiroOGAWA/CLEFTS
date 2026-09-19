@@ -187,7 +187,8 @@
     "check:training-ui": "node scripts/check-training-ui.js",
     "check:cleavage-pattern-ui": "node scripts/check-cleavage-pattern-ui.js",
     "check:reaction-preview": "node scripts/check-reaction-preview-ui.js && python scripts/check-reaction-preview.py && node scripts/check-reaction-service.js",
-    "check:workbench": "node scripts/check-workbench.js && node scripts/check-workbench-jobs.js && node scripts/check-parameter-editor.js && node scripts/check-defaults.js",
+    "check:projects": "node scripts/check-projects.js",
+    "check:workbench": "node scripts/check-projects.js && node scripts/check-workbench.js && node scripts/check-workbench-jobs.js && node scripts/check-parameter-editor.js && node scripts/check-defaults.js",
     "check:mol-training": "node scripts/check-mol-training.js && python scripts/check-mol-backend.py && python scripts/check-mol-startup.py"
   },
   "devDependencies": {

@@ -1,3 +1,4 @@
+const projects = require('./workbench/project');
 const periodicTable = require('./features/cleavage-pattern-set/periodic-table');
 const cleavageVisualEditor = require('./features/cleavage-pattern-set/visual-editor');
 const cleavageReactionPreview = require('./features/cleavage-pattern-set/reaction-preview');
@@ -120,9 +121,11 @@ function defaultTrainingConfig(context) {
 }
 
 function openWorkbench(context, output, initialPage = "home") {
+  context = projects.createContext(context);
   const panel = vscode.window.createWebviewPanel('clefts.workbench', 'CLEFTS Workbench', vscode.ViewColumn.One, {
     enableScripts: true, retainContextWhenHidden: true, localResourceRoots: []
   });
+  projects.attach(panel, context, projectRoot);
   smartsSearch.attach(panel, context, projectRoot);
   fineTune.attach(panel, context, projectRoot, output);
   spectrumPrediction.attach(panel, context, projectRoot, output);
@@ -136,7 +139,9 @@ function openWorkbench(context, output, initialPage = "home") {
   const initialConfig = defaultConfig(context);
   const initialTrainingConfig = defaultTrainingConfig(context);
   panel.webview.html = workbench.secure(workbenchHtml(initialConfig, initialTrainingConfig,workbenchDefaults.workflowDefaults('prediction',{},projectRoot(context)),workbenchDefaults.workflowDefaults('molTraining',molTraining.defaults(),projectRoot(context))), panel.webview);
+  const panelContext = context;
   panel.webview.onDidReceiveMessage(async message => {
+    const context = projects.capture(panelContext);
     try {
       if (message.type === 'pick') {
         const folders = message.kind === 'folder';
@@ -146,24 +151,24 @@ function openWorkbench(context, output, initialPage = "home") {
         }
       } else if (message.type === 'saveConfig') {
         const target = await vscode.window.showSaveDialog({ filters: { 'CLEFTS run configuration': ['pft.json', 'json'] }, defaultUri: vscode.Uri.file('fragment-tree.pft.json') });
-        if (target) await fs.promises.writeFile(target.fsPath, JSON.stringify(normalizeConfig(message.config), null, 2) + '\n');
+        if (target) {await fs.promises.writeFile(target.fsPath, JSON.stringify(normalizeConfig(message.config), null, 2) + '\n');projects.record(context,'data',message.config,{label:path.basename(target.fsPath),reason:'exported',sourcePath:target.fsPath,base:projectRoot(context)});}
       } else if (['loadConfig','loadConfigFile','loadConfigJSON'].includes(message.type)) {
         const picked = message.type==='loadConfigFile'?[vscode.Uri.file(message.path)]:message.type==='loadConfigJSON'?[{fsPath:message.name||'fragment-tree.pft.json'}]:await vscode.window.showOpenDialog({ filters: { 'CLEFTS run configuration': ['pft.json', 'json'] }, canSelectMany: false });
         if (picked && picked[0]) {
           const config = normalizeConfig(JSON.parse(message.type==='loadConfigJSON'?message.json:await fs.promises.readFile(picked[0].fsPath, 'utf8')));
           if (!config.modelConfig && config.params) config.modelConfig = parameterService.merge(parameterService.defaults(projectRoot(context)), parameterService.unpack(JSON.parse(await fs.promises.readFile(path.resolve(path.dirname(picked[0].fsPath), config.params), 'utf8'))));
           if(!config.modelConfig && config.fragmenterParams && !config.symbols) config.modelConfig=parameterService.merge(parameterService.defaults(projectRoot(context)),{fragmenter_params:config.fragmenterParams});
-          panel.webview.postMessage({ type: 'config', config: normalizeConfig({ ...defaultConfig(context), ...config }) });
+          panel.webview.postMessage({ type: 'config', path: message.type==='loadConfigJSON'?undefined:picked[0].fsPath, config: normalizeConfig({ ...defaultConfig(context), ...config }) });
         }
       } else if (message.type === 'saveTrainingConfig') {
         const target = await vscode.window.showSaveDialog({ filters: { 'CLEFTS training configuration': ['pfttrain.json'] }, defaultUri: vscode.Uri.file('fragment_tree.pfttrain.json') });
-        if (target) await fs.promises.writeFile(target.fsPath, JSON.stringify(normalizeTrainingConfig(message.config), null, 2) + '\n');
+        if (target) {await fs.promises.writeFile(target.fsPath, JSON.stringify(normalizeTrainingConfig(message.config), null, 2) + '\n');projects.record(context,'training',message.config,{label:path.basename(target.fsPath),reason:'exported',sourcePath:target.fsPath,base:projectRoot(context)});}
       } else if (message.type === 'loadTrainingConfig') {
         const picked = await vscode.window.showOpenDialog({ filters: { 'CLEFTS training configuration': ['pfttrain.json'] }, canSelectMany: false });
         if (picked && picked[0]) {
           const config = JSON.parse(await fs.promises.readFile(picked[0].fsPath, 'utf8'));
           if(!config.modelConfig && config.params)config.modelConfig=parameterService.merge(parameterService.defaults(projectRoot(context)),parameterService.unpack(JSON.parse(await fs.promises.readFile(path.resolve(path.dirname(picked[0].fsPath),config.params),'utf8'))));
-          panel.webview.postMessage({ type: 'trainingConfig', config: { ...defaultTrainingConfig(context), ...config } });
+          panel.webview.postMessage({ type: 'trainingConfig', path: picked[0].fsPath, config: { ...defaultTrainingConfig(context), ...config } });
         }
       } else if (message.type === 'openResult') {
         await openResultPicker();
@@ -209,7 +214,7 @@ function openWorkbench(context, output, initialPage = "home") {
         const source = await readCleavageImport(context, message);
         if (source) {
           const pattern = normalizePattern(source.value);
-          panel.webview.postMessage({ type: 'cleavagePatternLoaded', pattern, index: message.index });
+          panel.webview.postMessage({ type: 'cleavagePatternLoaded', path: source.path, pattern, index: message.index });
         }
       } else if (message.type === 'saveCleavagePattern') {
         const pattern = normalizePattern(message.pattern);
@@ -342,7 +347,7 @@ function runSpectrumPredictionBackend(context, payload) {
     if (!isCleftsRoot(root)) { reject(new Error('The detected working directory is not a CLEFTS application.')); return; }
     const pythonPath = ['.', process.env.PYTHONPATH].filter(Boolean).join(path.delimiter);
     const child = spawn(python, [script], { cwd: root, env: { ...process.env, PYTHONPATH: pythonPath } });
-    const observed=payload.command==='predict'?workbench.observeJob(context,{type:'prediction',name:String(payload.payload?.smiles||'Spectrum prediction').slice(0,72),child,command:[python,script]}):null;
+    const observed=payload.command==='predict'?workbench.observeJob(context,{type:'prediction',name:String(payload.payload?.smiles||'Spectrum prediction').slice(0,72),child,command:[python,script],config:payload.payload,workflow:'prediction',base:projectRoot(context)}):null;
     let stdout = '', stderr = '';
     child.stdout.on('data', chunk => { stdout += chunk.toString(); });
     child.stderr.on('data', chunk => { const text=chunk.toString();stderr += text;if(observed)observed.log(text); });
@@ -402,7 +407,7 @@ async function runFragmentTree(context, output, config, panel) {
   panel.webview.postMessage({ type: 'status', status: 'running', text: 'Running CLI…', command });
   const startedAt = new Date().toISOString();
   runningProcess = spawn(python, args, { cwd: root, detached:process.platform!=='win32', env: { ...process.env, PYTHONUNBUFFERED:'1', PYTHONPATH:[root,process.env.PYTHONPATH].filter(Boolean).join(path.delimiter) } });
-  const observed=workbench.observeJob(context,{type:'preparation',name:path.basename(config.outputDir),outputDir:config.outputDir,child:runningProcess,detached:process.platform!=='win32',command:[python,...args]});
+  const observed=workbench.observeJob(context,{type:'preparation',name:path.basename(config.outputDir),outputDir:config.outputDir,child:runningProcess,detached:process.platform!=='win32',command:[python,...args],config,workflow:'data',base:root});
   const stream=chunk=>{const text=chunk.toString();observed.log(text);output.append(text);panel.webview.postMessage({type:'data/log',text});};
   runningProcess.stdout.on('data', stream);
   runningProcess.stderr.on('data', stream);
@@ -786,7 +791,7 @@ function workbenchHtml(config, trainingConfig, predictionConfig = {}, molConfig 
     <section><h2>Molecule and conditions</h2><label>SMILES *<input name="smiles" placeholder="CC(=O)Oc1ccccc1C(=O)O"></label><div class="grid">${field('ce','Collision energy (eV) *','text')}<label>Adduct type *<select name="adductType"><option value="">Apply a model first…</option></select></label></div><div class="actions"><button type="button" id="predictPreview">Preview Molecule</button></div><div id="predictMoleculePreview" class="molecule-preview" hidden></div></section>
     <section id="predictResultSection" hidden><h2>Predicted Spectrum</h2><div id="predictResult"></div></section>
     <footer><div><div id="predictStatus" class="status idle">Ready</div></div><div class="actions"><button type="submit" class="primary" id="predictSubmit">Predict Spectrum</button></div></footer>
-  </form><div id="helpTooltip" role="tooltip"></div><script>const vscode=acquireVsCodeApi(); const initial=${safeJson(config)}; const initialTraining=${safeJson(trainingConfig)};const initialPrediction=${safeJson(predictionConfig)}; ${webviewScript()}${cleavageVisualEditor.script()}${cleavageReactionPreview.script()}${spectrumPrediction.script()}${pathDrop.script()}${workbench.script()}${parameterEditor.script()}${layout.script()}${datasetUpload.script()}${preparation.script()}${workbenchDefaults.script()}${trainingWorkbench.script()}${molTraining.script(molConfig)}</script></main></body></html>`;
+  </form><div id="helpTooltip" role="tooltip"></div><script>const vscode=acquireVsCodeApi(); const initial=${safeJson(config)}; const initialTraining=${safeJson(trainingConfig)};const initialPrediction=${safeJson(predictionConfig)}; ${webviewScript()}${cleavageVisualEditor.script()}${cleavageReactionPreview.script()}${spectrumPrediction.script()}${pathDrop.script()}${workbench.script()}${parameterEditor.script()}${layout.script()}${datasetUpload.script()}${preparation.script()}${workbenchDefaults.script()}${trainingWorkbench.script()}${molTraining.script(molConfig)}${projects.script()}</script></main></body></html>`;
 }
 function pathField(name,label,kind,form='data') { return `<label data-help="${HELP[name] || ''}">${label}<div class="path"><input name="${name}" data-path-kind="${kind}"><button type="button" data-pick="${name}" data-kind="${kind}" data-form="${form}">Browse</button></div>${HELP[name]?`<small class="field-help">${HELP[name]}</small>`:''}</label>`; }
 function field(name,label,type,step='1') { return `<label data-help="${HELP[name] || ''}">${label}<input name="${name}" type="${type}"${type==='number'?` step="${step}"`:''}>${HELP[name]?`<small class="field-help">${HELP[name]}</small>`:''}</label>`; }
