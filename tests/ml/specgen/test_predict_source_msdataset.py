@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import pytest
+
 from clefts.ml.specgen.predict_spectrum import direct_input_dataset
-from clefts.ml.specgen.source_action_msdataset import predict_source_msdataset
+from clefts.ml.specgen.source_action_msdataset import build_prediction_cache, predict_source_msdataset
 from clefts.ml.specgen.spectrum_generator import create_spectrum_generator
 from tests.ml.action.TestActionPipeline import config
 
@@ -97,6 +99,103 @@ def test_predict_source_msdataset_adds_main_adduct_and_model_collision_energy_co
     assert failures.empty
     assert predicted.metadata['MainAdduct'].tolist() == ['[M+H]+']
     assert predicted.metadata['ModelCollisionEnergyEV'].tolist() == [20.0]
+
+
+def test_predict_source_msdataset_skips_adducts_unsupported_by_this_model():
+    # [M+K]+ is syntactically valid but outside this model's trained adduct
+    # vocabulary (unlike training's validation split, real input isn't
+    # limited to it). Left unchecked this crashes deep inside
+    # generator.prepare()'s conditions tensor, which is built once per
+    # shared-compound group -- taking every other same-compound row down
+    # with it. All three rows here share one SMILES to exercise exactly that
+    # grouped-batching failure mode.
+    dataset = direct_input_dataset(
+        smiles_values=['CCCO', 'CCCO', 'CCCO'],
+        collision_energy='20 eV',
+        adduct_type='[M+H]+',
+    )
+    dataset['AdductType'] = ['[M+H]+', '[M+K]+', '[M+H]+']
+
+    predicted, failures = predict_source_msdataset(
+        dataset, _generator(),
+        smiles_column='SMILES', adduct_type_column='AdductType',
+        collision_energy_column='CollisionEnergy', precursor_mz_column='PrecursorMZ',
+        instrument_column=None,
+    )
+
+    assert len(predicted) == 2
+    assert len(failures) == 1
+    assert failures.iloc[0]['index'] == 1
+    assert 'supported adduct types' in failures.iloc[0]['error']
+
+
+def test_predict_source_msdataset_reports_a_compound_rdkit_cannot_fragment():
+    # Fragmentation now runs once per unique compound in a separate
+    # precompute phase, not inline per row during parsing; a compound RDKit
+    # rejects there must still fail only its own rows, exactly like a bad
+    # adduct or an unparseable collision energy does.
+    dataset = direct_input_dataset(
+        smiles_values=['CCCO', 'CCCO', 'CCN'],
+        collision_energy='20 eV',
+        adduct_type='[M+H]+',
+    )
+    dataset['SMILES'] = ['CCCO', 'not-a-smiles', 'CCN']
+
+    predicted, failures = predict_source_msdataset(
+        dataset, _generator(),
+        smiles_column='SMILES', adduct_type_column='AdductType',
+        collision_energy_column='CollisionEnergy', precursor_mz_column='PrecursorMZ',
+        instrument_column=None,
+    )
+
+    assert len(predicted) == 2
+    assert len(failures) == 1
+    assert failures.iloc[0]['index'] == 1
+    assert 'not-a-smiles' in failures.iloc[0]['error']
+
+
+@pytest.mark.parametrize('num_workers,chunk_size', [(1, 1), (2, 1), (2, 4)])
+def test_predict_source_msdataset_parallel_prepare_matches_serial(num_workers, chunk_size):
+    # num_workers>1 fans the RDKit-heavy precompute out to real subprocesses
+    # (clefts.ml.specgen.prepare_worker); results must match the in-process
+    # (num_workers=1) path exactly, both for compounds that fragment fine and
+    # one that fails outright.
+    dataset = direct_input_dataset(
+        smiles_values=['CCCO', 'CCN', 'c1ccccc1', 'CCCO'],
+        collision_energy='20 eV',
+        adduct_type='[M+H]+',
+    )
+    dataset['SMILES'] = ['CCCO', 'CCN', 'c1ccccc1', 'not-a-smiles']
+
+    predicted, failures = predict_source_msdataset(
+        dataset, _generator(),
+        smiles_column='SMILES', adduct_type_column='AdductType',
+        collision_energy_column='CollisionEnergy', precursor_mz_column='PrecursorMZ',
+        instrument_column=None, num_workers=num_workers, chunk_size=chunk_size,
+    )
+
+    assert len(predicted) == 3
+    assert list(predicted.metadata['SMILES']) == ['CCCO', 'CCN', 'c1ccccc1']
+    assert len(failures) == 1
+    assert failures.iloc[0]['index'] == 3
+
+
+def test_build_prediction_cache_serial_and_parallel_agree_on_keys_and_actions():
+    generator = _generator()
+    groups = {'CCCO': ['[M+H]+'], 'CCN': ['[M+H]+'], 'not-a-smiles': ['[M+H]+']}
+    prep_config = {
+        'fragmenter_params': generator.fragmenter.to_dict(),
+        'symbols': list(generator.mol_encoder.symbols),
+        'adduct_type_strs': list(generator.adduct_type_strs),
+    }
+    serial = build_prediction_cache(groups, prep_config, num_workers=1)
+    parallel = build_prediction_cache(groups, prep_config, num_workers=2, chunk_size=1)
+
+    assert set(serial) == set(parallel) == {'CCCO', 'CCN', 'not-a-smiles'}
+    assert serial['not-a-smiles']['ok'] is False and parallel['not-a-smiles']['ok'] is False
+    assert serial['CCCO']['ok'] is True and parallel['CCCO']['ok'] is True
+    assert serial['CCCO']['actions'] == parallel['CCCO']['actions']
+    assert serial['CCCO']['precursor_sequences'] == parallel['CCCO']['precursor_sequences']
 
 
 def test_predict_source_msdataset_ion_prediction_threshold_filters_low_confidence_peaks():

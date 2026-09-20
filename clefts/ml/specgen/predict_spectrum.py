@@ -104,8 +104,12 @@ def parse_args() -> argparse.Namespace:
         help="Use strict state_dict loading.",
     )
     parser.add_argument('--max-samples',type=int,default=128,help='Maximum simultaneous prediction samples; larger inputs are split.')
+    parser.add_argument('--num-workers',type=int,default=1,help='Parallel worker processes for RDKit fragmentation precompute; 1 runs serially.')
+    parser.add_argument('--chunk-size',type=int,default=1,help='Compounds dispatched per worker chunk.')
     args = parser.parse_args()
     if args.max_samples<1:parser.error('--max-samples must be positive')
+    if args.num_workers<1:parser.error('--num-workers must be positive')
+    if args.chunk_size<1:parser.error('--chunk-size must be positive')
     if args.input is None:
         missing = [
             name
@@ -362,6 +366,8 @@ def predict_msdataset(
     precursor_mz_column: str,
     instrument_column: Optional[str],
     include_formula_annotation: bool,
+    num_workers: int = 1,
+    chunk_size: int = 1,
 ) -> tuple[MSDataset, pd.DataFrame]:
     """Predict every selected compound in one batched forward, then apply the
     shared provenance contract (SpecID/PredictionTool/... columns)."""
@@ -369,7 +375,8 @@ def predict_msdataset(
     predicted, failures = predict_source_msdataset(
         dataset, generator, smiles_column=smiles_column, adduct_type_column=adduct_type_column,
         collision_energy_column=collision_energy_column, precursor_mz_column=precursor_mz_column,
-        instrument_column=instrument_column, include_formula_annotation=include_formula_annotation)
+        instrument_column=instrument_column, include_formula_annotation=include_formula_annotation,
+        num_workers=num_workers, chunk_size=chunk_size)
     timestamp = datetime.now(timezone.utc).isoformat()
     enriched_metadata = prediction_metadata(
         predicted.metadata, db=db, model_path=model_path, spec_id_column=spec_id_column,
@@ -392,6 +399,32 @@ def predict_msdataset(
     )
     validate_prediction_output(enriched)
     return enriched, failures
+
+
+def prediction_run_settings(args: argparse.Namespace) -> Dict[str, Any]:
+    """CLI settings for this run, camelCased flat like
+    fragment-tree.pft.json, so the Workbench's existing "Load Configuration"
+    (drag-drop or Browse, filtered to pft.json/json) can restore a prediction
+    form from a past run's output directory the same way it already does
+    for data preparation and training."""
+    return {
+        "application": "spectrum-prediction",
+        "input": str(Path(args.input).resolve()) if args.input else None,
+        "outputDir": str(Path(args.output_dir).resolve()),
+        "modelPath": str(Path(args.model).resolve()),
+        "db": args.db,
+        "device": args.device,
+        "maxSamples": args.max_samples,
+        "numWorkers": args.num_workers,
+        "chunkSize": args.chunk_size,
+        "overwrite": bool(args.overwrite),
+        "specIdColumn": args.spec_id_column,
+        "smilesColumn": args.smiles_column,
+        "precursorMzColumn": args.precursor_mz_column,
+        "adductTypeColumn": args.adduct_type_column,
+        "collisionEnergyColumn": args.collision_energy_column,
+        "instrumentColumn": args.instrument_column or "",
+    }
 
 
 def _atomic_save(dataset: MSDataset, output_path: Path) -> None:
@@ -480,6 +513,8 @@ def main() -> None:
         instrument_column=args.instrument_column,
         spec_id_column=args.spec_id_column,
         include_formula_annotation=not args.no_formula_annotation,
+        num_workers=args.num_workers,
+        chunk_size=args.chunk_size,
     )
 
     _atomic_save(predicted, output_path)
@@ -520,6 +555,10 @@ def main() -> None:
     (run_dir / "run.json").write_text(
         json.dumps(run_info, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
+    pft_path = output_dir / "prediction.pft.json"
+    pft_path.write_text(
+        json.dumps(prediction_run_settings(args), ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
 
     print(
         f"predicted spectra: n_spectra={len(predicted)}, "
@@ -528,6 +567,7 @@ def main() -> None:
     print(f"saved: {output_path}")
     print(f"saved similarity dataset: {similarity_path}")
     print(f"run information: {run_dir}")
+    print(f"saved configuration: {pft_path}")
     if len(failures):
         print(f"partial success: {len(failures)} record(s) failed", file=sys.stderr)
         raise SystemExit(3)
