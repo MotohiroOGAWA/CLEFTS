@@ -10,6 +10,19 @@ Module._load = function(request, parent, isMain) {
 };
 
 const { resultHtml, summarizeStructureManifests } = require('../src/extension');
+const fragmentTreeView = require('../src/features/fragment-tree-result/view');
+
+// Precursor identity is conveyed by the diamond shape. Its colors must follow
+// the same normal/detected rules as circular fragment nodes.
+if (fragmentTreeView.css.includes('.tree-node.precursor polygon')) throw new Error('Precursor must not have a dedicated color.');
+if (!fragmentTreeView.css.includes('.tree-node.detected circle,.tree-node.detected polygon')) throw new Error('Detected color must apply equally to circles and precursor polygons.');
+
+const fragmentTreeScript = fragmentTreeView.script();
+if (!fragmentTreeScript.includes("peakSort={key:'mz',direction:1}")) throw new Error('Peak assignments must initially sort by m/z ascending.');
+if (!fragmentTreeScript.includes("peakSort.direction*(Number(a.peak[peakSort.key])-Number(b.peak[peakSort.key]))")) throw new Error('Peak assignment sorting must compare numeric values.');
+if (!fragmentTreeScript.includes("peakSort.key===key?{key,direction:-peakSort.direction}:{key,direction:1}")) throw new Error('Peak headers must toggle direction and start a newly selected column ascending.');
+if (!fragmentTreeScript.includes("[[1,'mz','m/z'],[2,'intensity','Intensity']]")) throw new Error('Both m/z and intensity headers must be sortable.');
+if (!fragmentTreeView.css.includes('.peak-sort')) throw new Error('Sortable peak headers must have button styling.');
 
 const statistics = summarizeStructureManifests([
   { directory: 'train_structures', rows: [

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any
+from collections.abc import Sequence
+
+from ..cleavage.CleavageActionSequence import CleavageActionSequence
 
 from ....libs.mmkit.mmkit import Compound
 from ..cleavage.CleavagePatternSet import CleavagePatternSet
@@ -49,7 +52,8 @@ class FragmentIonTreeBuilder(FragmentTreeBuilder):
         *,
         max_node: int = -1,
         max_edge: int = -1,
-        max_depth: Optional[int] = None,
+        max_action_count: int | None = None,
+        seed_action_sequences: Sequence[CleavageActionSequence] | None = None,
         print_info: bool = False,
         _include_fragment_compound_cache: bool = False,
     ) -> FragmentIonTree:
@@ -59,7 +63,8 @@ class FragmentIonTreeBuilder(FragmentTreeBuilder):
             compound,
             max_node=max_node,
             max_edge=max_edge,
-            max_depth=max_depth,
+            max_action_count=max_action_count,
+            seed_action_sequences=seed_action_sequences,
             print_info=print_info,
         )
 
@@ -99,7 +104,8 @@ class FragmentIonTreeBuilder(FragmentTreeBuilder):
         *,
         max_node: int = -1,
         max_edge: int = -1,
-        max_depth: Optional[int] = None,
+        max_action_count: int | None = None,
+        seed_action_sequences: Sequence[CleavageActionSequence] | None = None,
         print_info: bool = False,
     ) -> FragmentTree:
         """Build only FragmentTree."""
@@ -108,7 +114,8 @@ class FragmentIonTreeBuilder(FragmentTreeBuilder):
             compound,
             max_node=max_node,
             max_edge=max_edge,
-            max_depth=max_depth,
+            max_action_count=max_action_count,
+            seed_action_sequences=seed_action_sequences,
             print_info=print_info,
         )
 
@@ -183,29 +190,8 @@ class FragmentIonTreeBuilder(FragmentTreeBuilder):
     def _get_compound_atom_symbols(
         compound: Compound,
     ) -> frozenset[str]:
-        """Return atom symbols contained in one Compound.
-
-        This assumes mmkit Compound exposes an RDKit-like mol object.
-        If your Compound API is different, only this method needs to be
-        adjusted.
-        """
-
-        if hasattr(compound, "mol"):
-            mol = compound.mol
-        elif hasattr(compound, "rdmol"):
-            mol = compound.rdmol
-        elif hasattr(compound, "to_mol"):
-            mol = compound.to_mol()
-        else:
-            raise TypeError(
-                "Compound must expose mol, rdmol, or to_mol() to collect "
-                "atom symbols."
-            )
-
-        return frozenset(
-            atom.GetSymbol()
-            for atom in mol.GetAtoms()
-        )
+        """Return atom symbols contained in one Compound."""
+        return frozenset(atom.GetSymbol() for atom in compound.mol.GetAtoms())
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -221,12 +207,11 @@ class FragmentIonTreeBuilder(FragmentTreeBuilder):
         data: dict[str, Any],
     ) -> FragmentIonTreeBuilder:
         return cls(
-            max_depth=data["max_depth"],
+            max_action_count=data["max_action_count"],
             cleavage_pattern_set=CleavagePatternSet.from_dict(
                 data["cleavage_pattern_set"]
             ),
-            only_add_min_depth=data["only_add_min_depth"],
-            min_depth_only_from=data["min_depth_only_from"],
+            only_add_min_action_count=data.get("only_add_min_action_count", True),
             fragment_ion_adduct_rule_set=FragmentIonAdductRuleSet.from_dict(
                 data["fragment_ion_adduct_rule_set"]
             ),
@@ -234,10 +219,9 @@ class FragmentIonTreeBuilder(FragmentTreeBuilder):
 
     def copy(self) -> FragmentIonTreeBuilder:
         return FragmentIonTreeBuilder(
-            max_depth=self.max_depth,
+            max_action_count=self.max_action_count,
             cleavage_pattern_set=self.cleavage_pattern_set.copy(),
-            only_add_min_depth=self.only_add_min_depth,
-            min_depth_only_from=self.min_depth_only_from,
+            only_add_min_action_count=self.only_add_min_action_count,
             fragment_ion_adduct_rule_set=(
                 self.fragment_ion_adduct_rule_set.copy()
             ),

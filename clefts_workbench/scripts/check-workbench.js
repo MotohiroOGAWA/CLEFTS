@@ -1,0 +1,45 @@
+const assert = require('assert/strict');
+const Module = require('module');
+const load=Module._load;
+Module._load=function(name,parent,main){if(name==='vscode')return {};return load.call(this,name,parent,main);};
+const panel=require('../src/workbench/panel');
+const extension=require('../src/extension');
+const html=extension.workbenchHtml({},{});
+for(const id of ['homePage','navigationRail','jobPage','environmentPage','dataParameterEditor','trainingParameterEditor','predictForm','trainingForm'])assert(html.includes('id="'+id+'"'));
+for(const match of html.matchAll(/<script>([\s\S]*?)<\/script>/g))new Function(match[1]);
+const secured=panel.secure(html,{cspSource:'vscode-webview://test'});
+assert(secured.includes("default-src 'none'"));assert(!secured.includes('<script>'));assert(secured.includes('script nonce='));
+const args=extension.buildTrainingArgs({params:'a b.json',trainDir:'train',valDir:'val',outputDir:'out',epochs:2,batchSize:4,weightDecay:0,gradientClip:1,absoluteWeight:0});
+assert.deepEqual(args.slice(0,4),['-m','clefts.cli','train','fragment-tree']);assert(!args.includes('--params')); assert.equal(args[args.indexOf('--weight-decay')+1],'0');assert.equal(args[args.indexOf('--absolute-weight')+1],'0');
+assert(!args.includes('--overwrite'));
+assert(extension.buildTrainingArgs({trainDir:'train',valDir:'val',outputDir:'out',overwrite:true}).includes('--overwrite'));
+assert(html.indexOf('<strong>Prepare Data</strong>') < html.indexOf('<strong>Train a Model</strong>'));
+const dataArgs=extension.buildArgs({input:'x.msds',outputDir:'out',params:'unused.json',modelConfig:{fragmenter_params:{mass_tolerance:'0.02Da'}}});assert(!dataArgs.includes('--params'));assert.deepEqual(JSON.parse(dataArgs[dataArgs.indexOf('--params-json')+1]),{fragmenter_params:{mass_tolerance:'0.02Da'}});
+console.log('Workbench HTML, script, CSP and CLI parameter checks passed.');
+
+assert(!html.includes('Initialize weights'));
+assert(!html.includes('Source Anchored Action Model (v1)'));
+assert(html.includes('name="molEncoderCheckpoint"'));
+assert(html.includes('name="experimentName" value="exp_main"'));
+assert(html.includes('data-model-checkpoint'));
+const encoderArgs=extension.buildTrainingArgs({modelConfig:{architecture:'test'},molEncoderCheckpoint:'/models/mol.pt'});
+assert.equal(encoderArgs[encoderArgs.indexOf('--mol-encoder-checkpoint')+1],'/models/mol.pt');assert(!encoderArgs.includes('--params-json'));
+console.log('Training model controls and molecular checkpoint command checks passed.');
+
+assert(!html.includes('Save as Workbench Defaults'));
+assert(html.includes('name="fineTuneResume"'));
+assert(!html.includes('id="trainingLossFields" hidden'));
+assert(html.includes('<footer class="training-bottom">'));
+const resumedArgs=extension.buildTrainingArgs({resume:'resume.pt',fineTuneCheckpoint:'base.pt',fineTunePatternSet:'patterns.json'});
+assert(resumedArgs.includes('--resume'));
+assert(!resumedArgs.includes('--fine-tune-checkpoint'));
+const layoutSource=require('fs').readFileSync(require.resolve('../src/workbench/layout'),'utf8');
+assert(!layoutSource.includes('initializeFrom'));
+console.log('Training settings visibility, execution placement and resume command checks passed.');
+
+const inheritedArgs=extension.buildTrainingArgs({modelConfig:{fragmenter_params:{ignored:true},mol_encoder_params:{node_dim:999},adduct_type_strs:['ignored'],action_model_params:{hidden_dim:64}},molEncoderCheckpoint:'encoder.pt',dropout:0.3});
+assert(!inheritedArgs.includes('--params-json'));assert(!inheritedArgs.includes('--fragmenter-params-json'));
+assert.equal(inheritedArgs[inheritedArgs.indexOf('--action-hidden-dim')+1],'64');
+assert.equal(inheritedArgs[inheritedArgs.indexOf('--dropout')+1],'0.3');
+assert(!inheritedArgs.includes('--action-state-dropout'));assert(!inheritedArgs.includes('--post-dropout'));
+assert(!html.match(/<form id="trainingForm"[\s\S]*?<\/form>/)[0].includes('name="fineTunePatternSet"'));

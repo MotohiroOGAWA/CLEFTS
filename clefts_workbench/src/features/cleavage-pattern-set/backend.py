@@ -3,9 +3,11 @@ from __future__ import annotations
 
 import json
 import sys
+from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, ".")
+sys.path.insert(0, str(Path(__file__).parent))
 
 from rdkit import Chem
 from rdkit.Chem import rdDepictor
@@ -13,6 +15,7 @@ from rdkit.Chem.Draw import rdMolDraw2D
 
 from clefts.domain.fragment.cleavage._CleavagePattern import _CleavagePattern, ProductRule
 from clefts.libs.mmkit.mmkit import Adduct, Formula
+from reaction_preview import reaction_preview, reaction_preview_products
 
 
 def molecule(payload: dict[str, Any]) -> dict[str, Any]:
@@ -35,7 +38,7 @@ def molecule(payload: dict[str, Any]) -> dict[str, Any]:
         bonds.append({
             "index": bond.GetIdx(), "begin": bond.GetBeginAtomIdx(), "end": bond.GetEndAtomIdx(),
             "order": 1.5 if bond.GetIsAromatic() else float(bond.GetBondTypeAsDouble()),
-            "aromatic": bond.GetIsAromatic(), "inRing": bond.IsInRing(),
+            "aromatic": bond.GetIsAromatic(), "inRing": bond.IsInRing(), "smarts": bond.GetSmarts(),
         })
     return {"canonicalSmiles": "" if is_smarts else Chem.MolToSmiles(mol), "sourceType": "smarts" if is_smarts else "smiles", "atoms": atoms, "bonds": bonds}
 
@@ -104,6 +107,16 @@ def _atom_query_body(value: str) -> str:
     return canonical[1:-1] if canonical.startswith("[") and canonical.endswith("]") else canonical
 
 
+def _selected_fragment_smarts(editable: Chem.RWMol, atom_ids: list[int], bond_ids: list[int]) -> str:
+    """Remove excluded edges because RDKit interprets an empty bond list as all."""
+    kept_bonds = set(bond_ids)
+    excluded_pairs = [(bond.GetBeginAtomIdx(), bond.GetEndAtomIdx())
+                      for bond in editable.GetBonds() if bond.GetIdx() not in kept_bonds]
+    for begin, end in excluded_pairs:
+        editable.RemoveBond(begin, end)
+    return Chem.MolFragmentToSmarts(editable.GetMol(), atomsToUse=atom_ids, isomericSmarts=False)
+
+
 def reactant(payload: dict[str, Any]) -> dict[str, Any]:
     mol = _source(payload)
     atom_ids = sorted({int(value) for value in payload.get("atoms", [])})
@@ -132,7 +145,7 @@ def reactant(payload: dict[str, Any]) -> dict[str, Any]:
     editable = Chem.RWMol(mol)
     for bond_id in bond_ids:
         constraint = bond_constraints.get(str(bond_id), {})
-        requested_types = constraint.get("types")
+        requested_types = ["any"] if constraint.get("mode") == "any" else constraint.get("types")
         bond_type = str(constraint.get("type", "preserve"))
         if requested_types is None and bond_type == "preserve" and not constraint.get("ring"):
             continue
@@ -145,7 +158,8 @@ def reactant(payload: dict[str, Any]) -> dict[str, Any]:
             token = ",".join(tokens)
         else:
             token = symbols.get(bond_type, preserved)
-        query = "@" if constraint.get("ring") and token == "~" else (f"{token};@" if constraint.get("ring") else token)
+        ring = "any" if constraint.get("mode") == "any" else constraint.get("ringStatus", "inRing" if constraint.get("ring") else "any")
+        query = token + (";@" if ring == "inRing" else ";!@" if ring == "notInRing" else "")
         editable.ReplaceBond(bond_id, Chem.BondFromSmarts(query))
     mol = editable.GetMol()
     constraints = payload.get("constraints", {})
@@ -159,16 +173,23 @@ def reactant(payload: dict[str, Any]) -> dict[str, Any]:
         if isinstance(constraint, dict):
             mode = constraint.get("mode", "elements")
             elements = constraint.get("elements", [atom.GetSymbol()])
-            if mode == "custom": replacement = _atom_query_body(str(constraint.get("smarts", "")))
-            elif mode == "any": replacement = "*"
+            if mode == "custom":
+                replacement = _atom_query_body(str(constraint.get("smarts", "")))
+                if constraint.get("nonHydrogen", False):
+                    replacement += ";!#1"
+            elif mode == "any": replacement = "!#1" if constraint.get("nonHydrogen", False) else "*"
             elif mode == "any-heavy": replacement = "!#1"
             else:
                 numbers = []
                 for symbol in elements:
                     number = Chem.GetPeriodicTable().GetAtomicNumber(str(symbol))
                     if number and number not in numbers: numbers.append(number)
-                if not numbers: raise ValueError(f"Choose at least one element for atom {atom_id}.")
-                replacement = ",".join(f"#{number}" for number in numbers)
+                excluded = bool(constraint.get("excludeElements", False))
+                if not numbers and not excluded:
+                    raise ValueError(f"Choose at least one element for atom {atom_id}.")
+                replacement = (";".join(f"!#{number}" for number in numbers) or "*") if excluded else ",".join(f"#{number}" for number in numbers)
+                if constraint.get("nonHydrogen", False):
+                    replacement += ";!#1"
         else:
             mode = constraint
             if mode == "any": replacement = "*"
@@ -181,9 +202,7 @@ def reactant(payload: dict[str, Any]) -> dict[str, Any]:
         query_atom.SetAtomMapNum(map_number)
         atom_editable.ReplaceAtom(atom_id, query_atom)
     mol = atom_editable.GetMol()
-    smarts = Chem.MolFragmentToSmarts(
-        mol, atomsToUse=atom_ids, bondsToUse=bond_ids, isomericSmarts=False
-    )
+    smarts = _selected_fragment_smarts(Chem.RWMol(mol), atom_ids, bond_ids)
     _CleavagePattern.from_rules(name=str(payload.get("name", "")), reactant_smarts=smarts, products=())
     return {"smarts": smarts, "atomMapBySource": {str(atom_id): map_by_atom[atom_id] for atom_id in atom_ids}}
 
@@ -298,13 +317,119 @@ def product_from_structure(payload: dict[str, Any]) -> dict[str, Any]:
         if order not in bond_smarts:
             raise ValueError(f"Unsupported new product bond type: {order}")
         editable.AddBond(begin, end, Chem.BondType.SINGLE)
-        editable.ReplaceBond(editable.GetNumBonds() - 1, Chem.BondFromSmarts(bond_smarts[order]))
+        constraint = item.get("constraint") or {}
+        if constraint.get("mode") == "any":
+            token = "~"
+        elif constraint:
+            symbols = {"single": "-", "double": "=", "triple": "#", "aromatic": ":"}
+            tokens = [symbols[value] for value in constraint.get("types", []) if value in symbols]
+            if not tokens:
+                raise ValueError("Choose at least one new product bond type.")
+            token = ",".join(tokens)
+            ring = constraint.get("ringStatus", "any")
+            token += ";@" if ring == "inRing" else ";!@" if ring == "notInRing" else ""
+        else:
+            token = bond_smarts[order]
+        editable.ReplaceBond(editable.GetNumBonds() - 1, Chem.BondFromSmarts(token))
         active_pairs.add(pair)
+
+    for key, constraint in payload.get("bondConstraints", {}).items():
+        bond_id = int(key)
+        if overrides.get(bond_id) == "remove":
+            continue
+        original = mol.GetBondWithIdx(bond_id)
+        bond = editable.GetBondBetweenAtoms(original.GetBeginAtomIdx(), original.GetEndAtomIdx())
+        if bond is None:
+            continue
+        if constraint.get("mode") == "any":
+            query = "~"
+        else:
+            symbols = {"single": "-", "double": "=", "triple": "#", "aromatic": ":"}
+            tokens = [symbols[value] for value in constraint.get("types", []) if value in symbols]
+            if not tokens:
+                raise ValueError("Choose at least one product bond type.")
+            query = ",".join(tokens)
+            ring = constraint.get("ringStatus", "any")
+            query += ";@" if ring == "inRing" else ";!@" if ring == "notInRing" else ""
+        editable.ReplaceBond(bond.GetIdx(), Chem.BondFromSmarts(query))
 
     for atom_id in sorted(deleted_atoms, reverse=True):
         editable.RemoveAtom(atom_id)
 
     return {"smarts": Chem.MolToSmarts(editable.GetMol(), isomericSmiles=False)}
+
+
+def product_from_selection(payload: dict[str, Any]) -> dict[str, Any]:
+    """Select a mapped reactant subgraph, preserving its queries unless edited."""
+    mol = Chem.MolFromSmarts(str(payload.get("reactantSmarts", "")))
+    if mol is None:
+        raise ValueError("Invalid reactant SMARTS.")
+    atom_ids = sorted({int(value) for value in payload.get("atoms", [])})
+    if not atom_ids:
+        raise ValueError("Select at least one product atom.")
+    if not set(atom_ids) <= set(range(mol.GetNumAtoms())):
+        raise ValueError("Unknown product atom.")
+    selected = set(atom_ids)
+    editable = Chem.RWMol(mol)
+    overridden_atoms = {int(key) for key in payload.get("atomOverrides", {})}
+    for key, value in payload.get("atomOverrides", {}).items():
+        index = int(key)
+        if index not in selected:
+            continue
+        body = _atom_query_body(str(value))
+        atom = Chem.AtomFromSmarts(f"[{body}]")
+        atom.SetAtomMapNum(mol.GetAtomWithIdx(index).GetAtomMapNum())
+        editable.ReplaceAtom(index, atom)
+    for index in selected - overridden_atoms:
+        # "Unchanged" only needs to carry the atom map: when the reaction actually
+        # runs, RDKit copies the matched atom's element/charge/isotope onto the
+        # product unless the product template sets them explicitly, so repeating
+        # the reactant-side element/non-H query here would be redundant.
+        atom = Chem.AtomFromSmarts("[*]")
+        atom.SetAtomMapNum(mol.GetAtomWithIdx(index).GetAtomMapNum())
+        editable.ReplaceAtom(index, atom)
+    symbols = {"1": "-", "2": "=", "3": "#", "1.5": ":"}
+    bond_ids = []
+    for value in payload.get("bonds", []):
+        index = int(value)
+        if index < 0 or index >= mol.GetNumBonds():
+            raise ValueError("Unknown product bond.")
+        bond = mol.GetBondWithIdx(index)
+        if bond.GetBeginAtomIdx() not in selected or bond.GetEndAtomIdx() not in selected:
+            continue
+        override = str(payload.get("bondOverrides", {}).get(str(index), "preserve"))
+        if override == "remove":
+            continue
+        query = payload.get("bondQueries", {}).get(str(index))
+        if override in symbols and not query:
+            query = symbols[override]
+        if query:
+            replacement = Chem.BondFromSmarts(str(query))
+            if replacement is None:
+                raise ValueError("Invalid product bond query.")
+            editable.ReplaceBond(index, replacement)
+        bond_ids.append(index)
+    pairs = {tuple(sorted((b.GetBeginAtomIdx(), b.GetEndAtomIdx()))) for b in mol.GetBonds()}
+    for item in payload.get("addedBonds", []):
+        if not item.get("selected", True):
+            continue
+        begin, end = int(item["begin"]), int(item["end"])
+        if begin not in selected or end not in selected:
+            continue
+        pair = tuple(sorted((begin, end)))
+        if begin == end or pair in pairs:
+            raise ValueError("New product bonds must connect different atoms without an existing bond.")
+        query = str(item.get("query") or symbols.get(str(item.get("order", "1")), ""))
+        replacement = Chem.BondFromSmarts(query)
+        if replacement is None:
+            raise ValueError("Invalid new product bond type.")
+        editable.AddBond(begin, end, Chem.BondType.SINGLE)
+        index = editable.GetNumBonds() - 1
+        editable.ReplaceBond(index, replacement)
+        bond_ids.append(index)
+        pairs.add(pair)
+    smarts = _selected_fragment_smarts(editable, atom_ids, bond_ids)
+    return {"smarts": smarts}
 
 
 def product_state(payload: dict[str, Any]) -> dict[str, Any]:
@@ -335,12 +460,14 @@ def product_state(payload: dict[str, Any]) -> dict[str, Any]:
     kept_atoms = sorted(reactant_by_map[number] for number in product_by_map)
     atom_map_by_source = {str(source): number for number, source in reactant_by_map.items()}
     product_bonds: dict[tuple[int, int], float] = {}
+    product_queries = {}
     for bond in product_mol.GetBonds():
         begin = product_mol.GetAtomWithIdx(bond.GetBeginAtomIdx()).GetAtomMapNum()
         end = product_mol.GetAtomWithIdx(bond.GetEndAtomIdx()).GetAtomMapNum()
         if begin > 0 and end > 0:
             order = 1.5 if bond.GetIsAromatic() else float(bond.GetBondTypeAsDouble())
             product_bonds[tuple(sorted((begin, end)))] = order
+            product_queries[tuple(sorted((begin, end)))] = bond.GetSmarts()
 
     overrides: dict[str, str] = {}
     kept = set(kept_atoms)
@@ -358,8 +485,38 @@ def product_state(payload: dict[str, Any]) -> dict[str, Any]:
         if product_order != reactant_order:
             overrides[str(bond.GetIdx())] = f"{product_order:g}"
 
+    kept_bonds = [bond.GetIdx() for bond in reactant.GetBonds()
+                  if tuple(sorted((reactant.GetAtomWithIdx(bond.GetBeginAtomIdx()).GetAtomMapNum(),
+                                   reactant.GetAtomWithIdx(bond.GetEndAtomIdx()).GetAtomMapNum()))) in product_bonds]
+    reactant_pairs = {tuple(sorted((reactant.GetAtomWithIdx(b.GetBeginAtomIdx()).GetAtomMapNum(),
+                                    reactant.GetAtomWithIdx(b.GetEndAtomIdx()).GetAtomMapNum())))
+                      for b in reactant.GetBonds()}
+    added_bonds = [{"id": index + 1, "begin": reactant_by_map[pair[0]],
+                    "end": reactant_by_map[pair[1]], "order": order, "query": product_queries[pair]}
+                   for index, (pair, order) in enumerate(product_bonds.items()) if pair not in reactant_pairs]
+    atom_overrides = {}
+    for number, index in product_by_map.items():
+        product_query = _atom_query_body(product_mol.GetAtomWithIdx(index).GetSmarts())
+        # A bare "*" is the sentinel product_from_selection now writes for "Unchanged"
+        # atoms, so it must not be recovered as an explicit override.
+        if product_query == "*":
+            continue
+        reactant_query = _atom_query_body(reactant.GetAtomWithIdx(reactant_by_map[number]).GetSmarts())
+        if product_query != reactant_query:
+            atom_overrides[str(reactant_by_map[number])] = f"[{product_query}]"
+    bond_queries = {}
+    for bond in reactant.GetBonds():
+        pair = tuple(sorted((reactant.GetAtomWithIdx(bond.GetBeginAtomIdx()).GetAtomMapNum(),
+                             reactant.GetAtomWithIdx(bond.GetEndAtomIdx()).GetAtomMapNum())))
+        if pair in product_queries and product_queries[pair] != bond.GetSmarts():
+            bond_queries[str(bond.GetIdx())] = product_queries[pair]
+
     return {
         "keptAtoms": kept_atoms,
+        "keptBonds": kept_bonds,
+        "addedBonds": added_bonds,
+        "atomOverrides": atom_overrides,
+        "bondQueries": bond_queries,
         "atomMapBySource": atom_map_by_source,
         "bondOverrides": overrides,
     }
@@ -372,23 +529,38 @@ def validate(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 COMMANDS = {
-    "molecule": molecule, "depict": depict, "reactant": reactant,
+    "reactionPreview": reaction_preview, "reactionPreviewProducts": reaction_preview_products, "molecule": molecule, "depict": depict, "reactant": reactant,
     "product": product, "productFromStructure": product_from_structure,
-    "productState": product_state, "validate": validate,
+    "productState": product_state, "productFromSelection": product_from_selection, "validate": validate,
 }
 
 
-def main() -> int:
+def response(request):
     try:
-        request = json.load(sys.stdin)
         command = str(request.get("command", ""))
         if command not in COMMANDS:
             raise ValueError(f"Unknown command: {command}")
-        print(json.dumps({"ok": True, "result": COMMANDS[command](request.get("payload", {}))}))
-        return 0
+        return {"ok": True, "result": COMMANDS[command](request.get("payload", {}))}
     except Exception as error:
-        print(json.dumps({"ok": False, "error": str(error)}))
-        return 1
+        return {"ok": False, "error": str(error)}
+
+
+def main() -> int:
+    if "--server" in sys.argv:
+        for line in sys.stdin:
+            try:
+                request = json.loads(line)
+                reply = {**response(request), "requestId": request.get("requestId")}
+            except Exception as error:
+                reply = {"ok": False, "error": str(error)}
+            print(json.dumps(reply), flush=True)
+        return 0
+    try:
+        reply = response(json.load(sys.stdin))
+    except Exception as error:
+        reply = {"ok": False, "error": str(error)}
+    print(json.dumps(reply))
+    return 0 if reply["ok"] else 1
 
 
 if __name__ == "__main__":

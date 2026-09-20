@@ -142,7 +142,7 @@ class MolPretrainingDataset(Dataset):
         for group in groups:
             index[group.name] = {label: [] for label in group.labels}
 
-        for item_index, data in enumerate(self.items):
+        for item_index, data in enumerate(tqdm(self.items, desc=f"Indexing {attr_name} classes", unit="mol", mininterval=1.0)):
             features = getattr(data, attr_name)
             if features.numel() == 0:
                 continue

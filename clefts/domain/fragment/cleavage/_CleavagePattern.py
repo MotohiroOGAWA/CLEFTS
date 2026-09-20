@@ -35,7 +35,7 @@ class _CleavageResult:
     reactant_compound: Compound
     products: Tuple[CleavageProduct, ...]
 
-    def __init_subclass__(cls, **kwargs):
+    def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
 
         if "copy" not in cls.__dict__:
@@ -99,7 +99,7 @@ class _CleavagePattern:
     reactant_query: Chem.Mol
     cleavage_reactions: Tuple[CleavageReaction, ...]
 
-    def __init_subclass__(cls, **kwargs):
+    def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
 
         if "copy" not in cls.__dict__:

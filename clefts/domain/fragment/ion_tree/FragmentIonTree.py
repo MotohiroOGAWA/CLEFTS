@@ -499,12 +499,17 @@ class FragmentIonTree(FragmentTree):
         formula_candidate_groups is a lazy cache, so it is intentionally
         not copied.
         """
-        return self.from_fragment_tree(
+        copied = self.from_fragment_tree(
             fragment_tree=super().copy(),
             fragment_ion_adduct_rule_set=self.fragment_ion_adduct_rule_set,
             hydrogen_state_candidate_store=self.hydrogen_state_candidate_store.copy(),
             ion_shift_candidate_store=self.ion_shift_candidate_store.copy(),
         )
+
+        cached = getattr(self, "_fragment_compound_by_index", None)
+        if cached is not None:
+            object.__setattr__(copied, "_fragment_compound_by_index", dict(cached))
+        return copied
 
     def _validate_hydrogen_state_candidate_store(self) -> None:
         """Validate hydrogen candidate store against the adduct rule set."""

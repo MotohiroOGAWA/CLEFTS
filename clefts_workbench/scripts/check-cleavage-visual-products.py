@@ -157,21 +157,170 @@ assert backend.validate({
     "products": [],
 })["valid"]
 
-extension = (Path(__file__).parents[1] / "src/extension.js").read_text(encoding="utf-8")
-assert 'id="builderProductSelect"' in extension
-assert "chemistry('productFromStructure'" in extension
-assert "atom.mapNumber||index+1" in extension
-assert 'id="allowProductAtomTypes"' in extension
-assert "Delete Atom" in extension
-assert "Delete Selected" in extension
-assert "productSelectedAtoms" in extension
-assert "productCanvas.onpointerdown" in extension
-assert "data-delete-selected-product-atoms" in extension
-assert ".selection-lasso{stroke:#fff}" in extension
-assert "Start New Bond" in extension
-assert "Update Product" in extension
-assert "Custom SMARTS" in extension
-assert "atomMapBySource" in extension
-assert 'id="builderSourceType"' in extension
-assert "Source SMILES / SMARTS" in extension
+# The Workbench's cleavage editor markup/script and the standalone .cleavage.json /
+# .clevageset.json custom editors (editor.js) both render from these shared modules,
+# so checking them here (instead of extension.js's own source) covers both editors at once.
+cleavage_dir = Path(__file__).parents[1] / "src/features/cleavage-pattern-set"
+shared = "".join((cleavage_dir / name).read_text(encoding="utf-8") for name in ("ui.js", "visual-editor.js", "styles.js"))
+assert 'id="builderProductSelect"' in shared
+assert "chemistry('productFromStructure'" in shared
+assert "atom.mapNumber||index+1" in shared
+assert 'id="allowProductAtomTypes"' in shared
+assert "Delete Atom" in shared
+assert "Delete Selected" in shared
+assert "productSelectedAtoms" in shared
+assert "productCanvas.onpointerdown" in shared
+assert "data-delete-selected-product-atoms" in shared
+assert "stroke:var(--accent,#168bdf)" in shared
+assert "Start New Bond" in shared
+assert "Update Product" in shared
+assert "Custom SMARTS" in shared
+assert "atomMapBySource" in shared
+assert 'id="builderSourceType"' in shared
+assert "Source SMILES / SMARTS" in shared
 print("Complex reactant and visual product round-trip checks passed.")
+
+# Query semantics are checked by matching real molecules, rather than string spelling.
+def query(atom=None, bond=None):
+    return backend.Chem.MolFromSmarts(backend.reactant({
+        "sourceType": "smiles", "smiles": "CC", "atoms": [0, 1], "bonds": [0],
+        "constraints": {"0": atom or {"mode": "any"}, "1": {"mode": "any"}},
+        "bondConstraints": {"0": bond or {"mode": "any"}},
+    })["smarts"])
+
+def matches(q, smiles):
+    return backend.Chem.MolFromSmiles(smiles).HasSubstructMatch(q)
+
+assert matches(query({"mode": "any", "elements": ["O"], "nonHydrogen": True}), "NN")
+q = query({"mode": "elements", "elements": ["N", "O"], "nonHydrogen": True})
+assert matches(q, "NC") and matches(q, "OC") and not matches(q, "CC")
+assert matches(query({"mode": "custom", "smarts": "[#7,#8]"}), "NC")
+hydrogen = backend.Chem.MolFromSmiles("[H][H]")
+assert hydrogen.HasSubstructMatch(query({"mode": "any", "nonHydrogen": False}))
+assert not hydrogen.HasSubstructMatch(query({"mode": "any", "nonHydrogen": True}))
+assert not hydrogen.HasSubstructMatch(query({"mode": "elements", "elements": ["H", "C"], "nonHydrogen": True}))
+# NOT (C OR N OR O) is NOT C AND NOT N AND NOT O, not an OR of negations.
+def exclusion_query(elements, non_h=False):
+    return backend.Chem.MolFromSmarts(backend.reactant({
+        "smiles":"C", "atoms":[0], "bonds":[],
+        "constraints":{"0":{"mode":"elements", "elements":elements,
+                             "excludeElements":True, "nonHydrogen":non_h}},
+    })["smarts"])
+excluded = exclusion_query(["C", "N", "O"])
+for smiles in ["C", "N", "O", "c1ccccc1", "[13CH4]"]:
+    assert not matches(excluded, smiles), smiles
+for smiles in ["F", "Cl", "S", "P", "B"]:
+    assert matches(excluded, smiles), smiles
+assert hydrogen.HasSubstructMatch(excluded)
+assert not hydrogen.HasSubstructMatch(exclusion_query(["C", "N", "O"], True))
+assert not hydrogen.HasSubstructMatch(exclusion_query(["H"], False))
+assert matches(exclusion_query([], False), "C") and hydrogen.HasSubstructMatch(exclusion_query([], False))
+assert not hydrogen.HasSubstructMatch(exclusion_query([], True))
+print("Element exclusion: NOT (C OR N OR O), aromatic/isotope atoms, hydrogen independence and empty exclusion set passed.")
+
+q = query(bond={"mode": "any", "types": ["single"], "ringStatus": "notInRing"})
+assert matches(q, "C=C") and matches(q, "C1CC1")
+q = query(bond={"mode": "custom", "types": ["single", "double"], "ringStatus": "any"})
+assert matches(q, "CC") and matches(q, "C=C") and not matches(q, "C#C")
+q = query(bond={"mode": "custom", "types": ["single"], "ringStatus": "inRing"})
+assert matches(q, "C1CC1") and not matches(q, "CC")
+q = query(bond={"mode": "custom", "types": ["single"], "ringStatus": "notInRing"})
+assert matches(q, "CC") and not matches(q, "C1CC1")
+from rdkit.Chem import rdChemReactions
+reaction = rdChemReactions.ReactionFromSmarts(reactant + ">>" + round_trip["smarts"])
+assert reaction is not None and reaction.GetNumProductTemplates() == 1
+print("Any/custom, element OR, Non-H, bond OR, ring status and mapped reaction serialization checks passed.")
+
+# Product graph edits and query constraints use the same mapped serializer.
+changed = backend.product_from_structure({
+    "sourceType": "smiles", "smiles": "CCO", "reactantSmarts": "[#6:1]-[#6:2]-[#8:3]",
+    "atomMaps": {"0": 1, "1": 2, "2": 3}, "bondOverrides": {"0": "2"},
+    "atomOverrides": {"2": "[!#1]"},
+    "bondConstraints": {"0": {"mode": "custom", "types": ["double"], "ringStatus": "any"}},
+})
+changed_mol = backend.Chem.MolFromSmarts(changed["smarts"])
+assert changed_mol.GetBondBetweenAtoms(0, 1).GetBondTypeAsDouble() == 2
+assert backend.Chem.MolFromSmiles("C=CN").HasSubstructMatch(changed_mol)
+assert not backend.Chem.MolFromSmiles("CCN").HasSubstructMatch(changed_mol)
+new_bond = backend.product_from_structure({
+    "sourceType": "smiles", "smiles": "CCC", "reactantSmarts": "[#6:1]-[#6:2]-[#6:3]",
+    "atomMaps": {"0": 1, "1": 2, "2": 3}, "bondOverrides": {"0": "remove"},
+    "addedBonds": [{"begin": 0, "end": 2, "order": "2", "constraint": {
+        "mode": "custom", "types": ["double"], "ringStatus": "any"}}],
+})
+new_mol = backend.Chem.MolFromSmarts(new_bond["smarts"])
+mapped = {atom.GetAtomMapNum(): atom.GetIdx() for atom in new_mol.GetAtoms()}
+assert new_mol.GetBondBetweenAtoms(mapped[1], mapped[3]).GetBondTypeAsDouble() == 2
+assert new_mol.GetBondBetweenAtoms(mapped[1], mapped[2]) is None
+print("Any + Non-H, product type edits and added-bond query serialization checks passed.")
+
+# Selection-based products inherit the entire mapped reactant query by default.
+base = '[#6,#7;!#1:1]-[#6:2]=[#8:3]'
+def selected_product(atoms=(0, 1, 2), bonds=(0, 1), **edits):
+    return backend.product_from_selection({
+        'reactantSmarts': base, 'atoms': list(atoms), 'bonds': list(bonds), **edits,
+    })['smarts']
+
+unchanged = selected_product()
+source_query = backend.Chem.MolFromSmarts(base)
+unchanged_query = backend.Chem.MolFromSmarts(unchanged)
+# "Unchanged" atoms only need to carry the atom map now, not the reactant-side
+# element/non-H query: when the reaction actually runs, RDKit copies the real
+# matched atom's element/charge/isotope onto the product unless the product
+# template overrides them explicitly, so repeating the query would be redundant.
+assert [a.GetSmarts() for a in unchanged_query.GetAtoms()] == ['[*:1]', '[*:2]', '[*:3]']
+assert [a.GetAtomMapNum() for a in unchanged_query.GetAtoms()] == [a.GetAtomMapNum() for a in source_query.GetAtoms()]
+assert [b.GetSmarts() for b in unchanged_query.GetBonds()] == [b.GetSmarts() for b in source_query.GetBonds()]
+# The wildcard template must still reproduce each reactant's actual matched atoms
+# (here: C vs N at atom 1) when the reaction is really run, proving no information
+# is lost by dropping the explicit element/non-H query on "Unchanged" atoms.
+unchanged_rxn = rdChemReactions.ReactionFromSmarts(base + '>>' + unchanged)
+for smiles, expected_symbol in [('CC(=O)C', 'C'), ('NC(=O)C', 'N')]:
+    groups = unchanged_rxn.RunReactants((backend.Chem.MolFromSmiles(smiles),))
+    assert groups, f'No match for {smiles}'
+    fragment = groups[0][0]
+    backend.Chem.SanitizeMol(fragment, catchErrors=True)
+    # RunReactants clears GetAtomMapNum() on generated atoms but keeps the
+    # original map number under the "old_mapno" property (the same property
+    # _CleavagePattern.fragment() reads to restore atom maps on real products).
+    mapped = {atom.GetIntProp('old_mapno'): atom for atom in fragment.GetAtoms() if atom.HasProp('old_mapno')}
+    assert mapped[1].GetSymbol() == expected_symbol, smiles
+    assert mapped[3].GetSymbol() == 'O', smiles
+split = selected_product(bonds=(1,))
+assert split.count('.') == 1
+assert selected_product(bonds=()).count('.') == 2
+split_state = backend.product_state({'reactantSmarts': base, 'productSmarts': split})
+assert split_state['keptAtoms'] == [0, 1, 2]
+assert split_state['keptBonds'] == [1]
+assert backend.validate({'name': 'selected_fragments', 'reactant_smarts': base,
+                         'products': [{'name': 'fragments', 'smarts': split}]})['valid']
+# Excluding an atom also excludes any selected bonds that end at that atom.
+subset = backend.Chem.MolFromSmarts(selected_product(atoms=(0, 1)))
+assert subset.GetNumAtoms() == 2 and subset.GetNumBonds() == 1
+assert {a.GetAtomMapNum() for a in subset.GetAtoms()} == {1, 2}
+changed_selection = selected_product(atomOverrides={'2': '[#7]'}, bondOverrides={'1': '1'})
+changed_query = backend.Chem.MolFromSmarts(changed_selection)
+assert changed_query.GetAtomWithIdx(2).GetAtomicNum() == 7
+assert changed_query.GetBondWithIdx(1).GetBondTypeAsDouble() == 1
+recovered = backend.product_state({'reactantSmarts': base, 'productSmarts': changed_selection})
+assert recovered['atomOverrides'] == {'2': '[#7]'}
+assert selected_product(atomOverrides=recovered['atomOverrides'], bondOverrides=recovered['bondOverrides'],
+                        bondQueries=recovered['bondQueries']) == changed_selection
+for included in (True, False):
+    formed = selected_product(addedBonds=[{'id': 1, 'begin': 0, 'end': 2, 'order': '1', 'selected': included}])
+    formed_query = backend.Chem.MolFromSmarts(formed)
+    assert formed_query.GetNumBonds() == (3 if included else 2)
+    if included:
+        saved = backend.product_state({'reactantSmarts': base, 'productSmarts': formed})
+        assert len(saved['addedBonds']) == 1
+        rebuilt = selected_product(addedBonds=saved['addedBonds'])
+        assert backend.Chem.MolFromSmarts(rebuilt).GetNumBonds() == 3
+try:
+    selected_product(atoms=())
+except ValueError as error:
+    assert 'Select at least one product atom' in str(error)
+else:
+    raise AssertionError('Empty products must not be generated')
+print('Selection-based products: unchanged queries, dot-separated fragments, subset maps, explicit edits, new-bond selection and recovery passed.')
+
+assert backend.reactant({'sourceType': 'smiles', 'smiles': 'CC', 'atoms': [0, 1], 'bonds': []})['smarts'].count('.') == 1

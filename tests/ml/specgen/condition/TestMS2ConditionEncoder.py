@@ -15,7 +15,7 @@ class TestMS2ConditionEncoder(unittest.TestCase):
         return MS2ConditionEncoder(
             adduct_type_strs=("[M+H]+", "[M+Na]+", "[M-H]-"),
             adduct_embedding_dim=8,
-            ce_feature_dim=12,
+            ce_feature_dim=16,
             ce_fc_dims=(16,),
             feature_dim=20,
             fc_dims=(32,),
@@ -24,7 +24,7 @@ class TestMS2ConditionEncoder(unittest.TestCase):
     def test_properties_are_correct(self) -> None:
         encoder = self._make_encoder()
 
-        self.assertEqual(encoder.in_feature_dim, 8 + 12)
+        self.assertEqual(encoder.in_feature_dim, 8 + 16)
         self.assertEqual(encoder.feature_dim, 20)
         self.assertEqual(
             encoder.adduct_type_strs,

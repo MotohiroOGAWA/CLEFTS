@@ -32,8 +32,27 @@ function pathFromDataTransfer(transfer) {
 }
 
 function installPathDrop() {
+  // Turn existing pickers into a shared drop surface, preserving their handlers.
+  function decorate() {
+    for (const button of document.querySelectorAll('button')) {
+      if (!/^Browse[.…]*$/i.test(button.textContent.trim())) continue;
+      const input = button.parentElement.querySelector('input:not([type=checkbox]):not([type=radio]):not([type=number])');
+      if (input && !input.dataset.pathKind) input.dataset.pathKind = /dir|folder|run/i.test(input.name || input.id) ? 'folder' : 'file';
+    }
+    for (const input of document.querySelectorAll('input[data-path-kind]')) {
+      const host = input.closest('.path') || input.parentElement;
+      if (!host || host.querySelector('[data-path-drop-zone]')) continue;
+      const picker = [...host.querySelectorAll('button')].find(button => /browse/i.test(button.textContent));
+      if (!picker) continue;
+      picker.dataset.pathDropZone = '';
+      picker.classList.add('file-drop-zone');
+      picker.textContent = 'Drop ' + (input.dataset.pathKind === 'folder' ? 'a folder' : 'a file') + ' here or click to Browse';
+    }
+  }
+  decorate();
+  new MutationObserver(decorate).observe(document.body, {childList:true, subtree:true});
   const inputFor = target => target && target.closest
-    ? target.closest('input[data-path-kind]') : null;
+    ? target.closest('input[data-path-kind]') || target.closest('[data-path-drop-zone]')?.parentElement.querySelector('input[data-path-kind]') : null;
   let active;
   document.addEventListener('dragover', event => {
     const input = inputFor(event.target);
@@ -48,14 +67,19 @@ function installPathDrop() {
     const input = inputFor(event.target);
     if (input && !input.contains(event.relatedTarget)) input.classList.remove('path-drop-active');
   });
-  document.addEventListener('drop', event => {
+  document.addEventListener('drop', async event => {
     const input = inputFor(event.target);
     if (!input || input.disabled) return;
     event.preventDefault();
     input.classList.remove('path-drop-active');
     active = undefined;
-    const value = pathFromDataTransfer(event.dataTransfer);
+    let value = pathFromDataTransfer(event.dataTransfer);
+    if (!value && input.dataset.pathKind === 'file' && event.dataTransfer?.files?.[0] && window.uploadDataset) {
+      try { value = await window.uploadDataset(event.dataTransfer.files[0]); }
+      catch (error) { input.setCustomValidity(error.message); input.reportValidity(); return; }
+    }
     if (!value) return;
+    input.setCustomValidity('');
     input.value = value;
     input.dispatchEvent(new Event('input', { bubbles: true }));
     input.dispatchEvent(new Event('change', { bubbles: true }));
@@ -71,7 +95,7 @@ function script() {
 }
 
 function css() {
-  return 'input[data-path-kind]{transition:border-color .12s,box-shadow .12s,background-color .12s}input[data-path-kind].path-drop-active{border-color:var(--vscode-focusBorder,#36c5a2)!important;box-shadow:0 0 0 1px var(--vscode-focusBorder,#36c5a2);background:color-mix(in srgb,var(--vscode-focusBorder,#36c5a2) 12%,var(--vscode-input-background))}';
+  return '.file-drop-zone{border:1px dashed var(--vscode-input-border,#888);padding:18px;min-width:180px;white-space:normal}.path:has(.file-drop-zone){flex-wrap:wrap}.path .file-drop-zone{flex-basis:100%}input[data-path-kind]{transition:border-color .12s,box-shadow .12s,background-color .12s}input[data-path-kind].path-drop-active{border-color:var(--vscode-focusBorder,#36c5a2)!important;box-shadow:0 0 0 1px var(--vscode-focusBorder,#36c5a2);background:color-mix(in srgb,var(--vscode-focusBorder,#36c5a2) 12%,var(--vscode-input-background))}';
 }
 
 module.exports = { pathFromDroppedValue, pathFromDataTransfer, script, css };

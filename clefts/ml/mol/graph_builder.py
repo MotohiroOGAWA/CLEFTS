@@ -32,6 +32,11 @@ class MolGraphBuilder:
     def symbols(self) -> Tuple[str]:
         return self.atom_layer.symbols
 
+    def graph_atoms(self, compound):
+        """Atoms represented by this encoder; hydrogen counts remain features."""
+        return [atom for atom in compound.mapped_mol.GetAtoms()
+                if atom.GetAtomicNum() != 1 or 'H' in self.symbols]
+
     def build(self, compound: Compound, *, device: Optional[torch.device] = None) -> Data:
         """
         Build a PyTorch Geometric Data object from a Compound.
@@ -50,8 +55,10 @@ class MolGraphBuilder:
             device = torch.device("cpu")
 
         # --- atom features ---
-        atom_features = [self.atom_layer.encode(atom) for atom in mol.GetAtoms()]
-        x = torch.stack(atom_features, dim=0).to(device=device)  # [num_atoms, atom_dim]
+        atoms = self.graph_atoms(compound)
+        atom_indices = {atom.GetIdx(): index for index, atom in enumerate(atoms)}
+        atom_features = [self.atom_layer.encode(atom) for atom in atoms]
+        x = (torch.stack(atom_features, dim=0) if atom_features else torch.empty((0, self.atom_dim))).to(device=device)  # [num_atoms, atom_dim]
 
         # --- bond features (bidirectional) ---
         edge_indices = []
@@ -59,6 +66,9 @@ class MolGraphBuilder:
 
         for bond in mol.GetBonds():
             i, j = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
+            if i not in atom_indices or j not in atom_indices:
+                continue
+            i, j = atom_indices[i], atom_indices[j]
             bond_vec = self.bond_layer.encode(bond).to(device=device)
 
             edge_indices.append((i, j))
