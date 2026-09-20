@@ -137,7 +137,9 @@ def create_action_training_data(*, dataset: MSDataset, model_config: dict, outpu
                 progress.update(1)
     else:
         # Use the shared subprocess runner; only temporary task files cross the boundary.
-        with tempfile.TemporaryDirectory(prefix='clefts-preparation-') as directory:
+        # Placed under output_dir (not the system temp dir) since task files can be very
+        # large and output_dir is where the caller has already provisioned enough space.
+        with tempfile.TemporaryDirectory(prefix='clefts-preparation-',dir=str(output)) as directory:
             commands=[]
             effective_chunk_size=min(chunk_size,max(1,len(grouped)//num_workers))
             while True:
