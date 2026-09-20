@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import sys
 import tempfile
 from pathlib import Path
 import torch
@@ -10,6 +11,24 @@ from tqdm.auto import tqdm
 from clefts.ml.input.source_action_structure import SourceActionStructure
 from clefts.ml.specgen.spectrum_generator import create_spectrum_generator
 from .model import ActionFragmentTreeTrainingModel
+
+
+def confirm_output_overwrite(output: Path, *, overwrite: bool, resume) -> None:
+    """A fresh run into a non-empty output directory can silently clobber a
+    previous run's checkpoints/metrics. Resuming into that same directory is
+    the normal, intentional case and is never asked about."""
+    if resume or overwrite or not output.exists() or not any(output.iterdir()):
+        return
+    if sys.stdin.isatty():
+        answer = input(f'Output directory {output} already exists and is not empty. Overwrite it? [y/N] ')
+        if answer.strip().lower() in ('y', 'yes'):
+            return
+        raise SystemExit('Aborted: pass --overwrite to reuse a non-empty output directory without asking.')
+    raise SystemExit(
+        f'Output directory {output} already exists and is not empty. '
+        'Pass --overwrite to reuse it, or choose an empty directory. '
+        '(No interactive terminal is attached, so confirmation cannot be prompted for.)'
+    )
 
 
 PROGRESS_WIDTH = 100
@@ -399,6 +418,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument('--initialize-from',help='Initialize compatible pretrained weights with a fresh optimizer for fine-tuning.')
     parser.add_argument('--fine-tune-checkpoint',help='Base action training model.pt to expand with a new cleavage pattern set.')
     parser.add_argument('--adapter-width',type=int,default=8,help='Extra low-rank nodes per linear/attention projection (default: 8).')
+    parser.add_argument('--overwrite',action='store_true',help='Reuse an existing, non-empty output directory without asking for confirmation.')
     for name, default in (("weight-decay",0.01),("gradient-clip",1.0),
                           ("absolute-weight",1.0),("next-weight",1.0),
                           ("negative-weight",0.2),("minimum-positive-weight",0.05),("intensity-weight",1.0),("absolute-intensity-weight",1.0),("min-lr",1e-6)):
@@ -415,7 +435,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> None:
     args=build_arg_parser().parse_args(argv)
-    output=Path(args.output_dir);output.mkdir(parents=True,exist_ok=True)
+    output=Path(args.output_dir)
+    confirm_output_overwrite(output,overwrite=args.overwrite,resume=args.resume)
+    output.mkdir(parents=True,exist_ok=True)
     (output/'training_args.json').write_text(json.dumps(vars(args),indent=2))
     if not (args.resume or args.fine_tune_checkpoint or args.mol_encoder_checkpoint):
         raise SystemExit('--mol-encoder-checkpoint is required for new training.')

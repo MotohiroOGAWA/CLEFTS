@@ -89,7 +89,7 @@ function defaultTrainingConfig(context) {
   return workbenchDefaults.workflowDefaults('training',{
     application: 'fragment-tree-training', modelConfig: {...parameterService.defaults(root),action_model_params:{...parameterService.defaults(root).action_model_params,action_prefilter_threshold_logit:1}}, params: defaultParams, trainDir: '', valDir: '',
     outputDir: '',
-    experimentName: 'exp_main', molEncoderCheckpoint: '', epochs: 1, batchSize: 4, device: 'cuda', maxSamples:128, seed:42, warmupSteps:100, validationIntervalSteps:0, validationFraction:0.1, lrPatience:3, earlyStoppingPatience:10, minLr:0.000001, absoluteIntensityWeight:1, gradientClip:1, lr: 0.0001, resume: '',
+    experimentName: 'exp_main', molEncoderCheckpoint: '', epochs: 1, batchSize: 4, device: 'cuda', maxSamples:128, seed:42, warmupSteps:100, validationIntervalSteps:0, validationFraction:0.1, lrPatience:3, earlyStoppingPatience:10, minLr:0.000001, absoluteIntensityWeight:1, gradientClip:1, lr: 0.0001, dropout: 0.5, resume: '',
     fineTuneCheckpoint: '', fineTunePatternSet: '', adapterWidth: 8
   },root);
 }
@@ -366,6 +366,7 @@ function buildTrainingArgs(c) {
   }
   for (const [key, flag] of Object.entries(workbench.trainingFlags)) if (c[key] !== undefined && c[key] !== '') a.push(flag, String(c[key]));
   if(c.trainMolEncoder)a.push('--train-mol-encoder');
+  if(c.overwrite)a.push('--overwrite');
   if (c.initializeFrom) a.push('--initialize-from', c.initializeFrom);
   if (c.resume) a.push('--resume', c.resume);
   if (c.fineTuneCheckpoint && !c.resume) a.push('--fine-tune-checkpoint', c.fineTuneCheckpoint, '--adapter-width', String(c.adapterWidth || 8));

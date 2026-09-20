@@ -17,7 +17,7 @@ from clefts.ml.input.structure_builder import ActionStructureBuilder
 from clefts.ml.specgen.spectrum_generator import create_spectrum_generator
 from clefts.ml.specgen.post_materialization_model import deduplicate_molecular_graphs
 from clefts.ml.training.fragment_tree_training.model import ActionFragmentTreeTrainingModel,multi_positive_loss
-from clefts.ml.training.fragment_tree_training.training import train_actions
+from clefts.ml.training.fragment_tree_training.training import train_actions,confirm_output_overwrite
 from .TestActionPipeline import config
 
 
@@ -172,6 +172,24 @@ class TestActionTrainingRevision(unittest.TestCase):
             self.assertEqual(resumed['history'][-1]['global_step'],242)
             self.assertEqual(len(resumed['history']),121)
             print(f'CUDA overfit check: train loss {first:.6f} -> {last:.6f}; filter recall {report["history"][-1]["validation/intensity_recall_at_filter"]:.6f}; validation cosine {report["history"][-1]["validation/spectrum_cosine_similarity"]:.6f}')
+
+    def test_confirm_output_overwrite(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary)
+            empty=root/'empty';empty.mkdir()
+            confirm_output_overwrite(empty,overwrite=False,resume=None)  # never asks about an empty/missing directory
+            confirm_output_overwrite(root/'missing',overwrite=False,resume=None)
+            nonempty=root/'nonempty';nonempty.mkdir();(nonempty/'last.pt').write_text('x')
+            confirm_output_overwrite(nonempty,overwrite=False,resume='some/checkpoint.pt')  # resuming is always allowed
+            confirm_output_overwrite(nonempty,overwrite=True,resume=None)  # --overwrite is always allowed
+            with patch('sys.stdin.isatty',return_value=False):
+                with self.assertRaisesRegex(SystemExit,'already exists and is not empty'):
+                    confirm_output_overwrite(nonempty,overwrite=False,resume=None)
+            with patch('sys.stdin.isatty',return_value=True),patch('builtins.input',return_value='y'):
+                confirm_output_overwrite(nonempty,overwrite=False,resume=None)
+            with patch('sys.stdin.isatty',return_value=True),patch('builtins.input',return_value='n'):
+                with self.assertRaisesRegex(SystemExit,'Aborted'):
+                    confirm_output_overwrite(nonempty,overwrite=False,resume=None)
 
     def test_cpu_training_rejected(self):
         with tempfile.TemporaryDirectory() as temporary:

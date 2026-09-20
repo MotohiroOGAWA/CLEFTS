@@ -44,21 +44,54 @@ function createParameterEditor(container, initial, kind = "training", editCleava
   };
   const templates={patterns:{name:'new_pattern',reactant_smarts:'[!#1:1]-[!#1:2]',products:[{name:'product',smarts:'[!#1:1]'}]},products:{name:'product',smarts:'[!#1:1]'},adduct_rules:{name:'new_rule',adduct_type:'[M+H]+',radical:false,unsaturation:0,ion_shifts:[]},ion_shifts:{ion_shift:'[M+H]+'},atoms:'C',symbols:'C',adduct_type_strs:'[M+H]+'};
   const optional={action_model_params:{num_heads:4,max_roles:64,state_num_layers:2,prediction_threshold:0.5},mol_encoder_params:{dropout:0},post_model_params:{cosine_loss_weight:0.5,ion_loss_weight:0.5,ion_prediction_threshold:0.5,intensity_power:0.5,precursor_free_loss_weight:0.5}};
+  // Purely cosmetic sub-headings for the sections with the most fields; any
+  // field not listed here (e.g. a newer option) still renders, just ungrouped.
+  const fieldGroups={
+    action_model_params:{
+      'Architecture':['hidden_dim','condition_dim','num_heads','max_roles'],
+      'Action selection':['action_prefilter_top_k','action_prefilter_max_k','action_prefilter_threshold_logit'],
+      'Branch decoding':['beam_size','max_decode_steps','state_num_layers','prediction_threshold'],
+    },
+    post_model_params:{
+      'Architecture':['hidden_dim','num_layers','num_heads'],
+      'Loss weights':['cosine_loss_weight','ion_loss_weight','intensity_power','precursor_free_loss_weight'],
+      'Generation':['ion_prediction_threshold'],
+    },
+  };
+  // A resumed/saved model_config always has these (training_model_config writes
+  // them from the single shared --dropout), but they must never be editable
+  // here independently of it -- only one dropout value can ever be specified.
+  const linkedToSharedDropout=new Set(['action_model_params.state_dropout','post_model_params.dropout']);
   const basic=new Set(['fragmenter_params.fragment_ion_tree_builder.max_action_count','fragmenter_params.precursor_candidate_max_action_count','fragmenter_params.mass_tolerance']);
   const node=(tag,text)=>{const n=document.createElement(tag);if(text!==undefined)n.textContent=text;return n;};
   const button=(text,fn)=>{const b=node('button',text);b.type='button';b.onclick=fn;return b;};
   const title=key=>String(key).replaceAll('_',' ').replace(/\b\w/g,c=>c.toUpperCase()).replace('Smarts','SMARTS');
   function help(key,path){return descriptions[key]||'Configure '+path.replaceAll('_',' ').replaceAll('.',' / ')+'. This value is passed to the CLEFTS Python workflow.';}
   function renderValue(parent,key,host,path,excludeBasic=false){
-    const full=path?path+'.'+key:String(key),value=parent[key];if(excludeBasic&&basic.has(full))return;
+    const full=path?path+'.'+key:String(key),value=parent[key];if(excludeBasic&&basic.has(full))return;if(linkedToSharedDropout.has(full))return;
     if(Array.isArray(value)||value&&typeof value==='object'){
       const group=node('fieldset'),legend=node('legend',title(key));legend.dataset.help=help(key,full);group.append(legend);
       if(Array.isArray(value)){
         value.forEach((item,index)=>{const row=node('div');row.className='parameter-array-item';renderValue(value,index,row,full);row.append(button('Remove',()=>{value.splice(index,1);render();}));group.append(row);});
         group.append(button('Add '+title(key),()=>{value.push(clone(templates[key]??value[0]??''));render();}));
       }else{
-        Object.keys(value).forEach(child=>renderValue(value,child,group,full,excludeBasic));
-        for(const [field,defaultValue]of Object.entries(optional[key]||{}))if(!(field in value))group.append(button('Override '+title(field),()=>{value[field]=defaultValue;render();}));
+        // Every optional field is filled in with its default up front instead
+        // of behind a one-by-one "Override" button; "Use Default" (below) still
+        // resets a single field.
+        for(const [field,defaultValue]of Object.entries(optional[key]||{}))if(!(field in value))value[field]=defaultValue;
+        const groups=fieldGroups[key];
+        if(groups){
+          const grouped=new Set();
+          for(const [label,fields]of Object.entries(groups)){
+            const present=fields.filter(field=>field in value);
+            if(!present.length)continue;
+            const heading=node('div',label);heading.className='parameter-group-heading';group.append(heading);
+            for(const field of present){grouped.add(field);renderValue(value,field,group,full,excludeBasic);}
+          }
+          for(const field of Object.keys(value))if(!grouped.has(field))renderValue(value,field,group,full,excludeBasic);
+        }else{
+          Object.keys(value).forEach(child=>renderValue(value,child,group,full,excludeBasic));
+        }
         if('ion_shift' in value&&!('atoms' in value))group.append(button('Add Atom Restrictions',()=>{value.atoms=[];render();}));
         if('ion_shift' in value&&'atoms' in value)group.append(button('Remove Atom Restrictions',()=>{delete value.atoms;render();}));
       }
@@ -121,4 +154,4 @@ function client(){
   let timer;const tooltip=el('helpTooltip');document.addEventListener('mouseover',event=>{const label=event.target.closest('[data-help]');if(!label||!label.dataset.help)return;clearTimeout(timer);timer=setTimeout(()=>{const rect=label.getBoundingClientRect();tooltip.textContent=label.dataset.help;tooltip.style.left=Math.max(8,Math.min(rect.left,innerWidth-390))+'px';tooltip.style.top=Math.min(rect.bottom+7,innerHeight-110)+'px';tooltip.classList.add('visible');},500);});document.addEventListener('mouseout',event=>{if(event.target.closest('[data-help]')){clearTimeout(timer);tooltip.classList.remove('visible');}});
 }
 function importHtml(target){return `<section><h2>Import Parameters</h2><p class="muted">${target==='training'?'Drop an Action Model / Post Model parameter JSON to populate the trainable model settings. Dataset and encoder settings are loaded automatically.':'Optionally browse or drop a fragmenter / model JSON file to populate the fields below. Execution uses the current form values.'}</p><button type="button" id="${target}ParameterDrop" class="parameter-drop">Drop a parameter JSON file here or click to Browse</button><label><span data-help="Load a configuration into individual parameter fields. Later edits to the form override the imported file.">Parameter File</span><div class="path"><input id="${target}ParameterFile" data-path-kind="file" placeholder="Drop a JSON file here"><button type="button" id="${target}ParameterBrowse">Browse</button><button type="button" id="${target}ParameterLoad">Load Parameters</button></div></label><p id="${target}ParameterStatus" role="status"></p></section><div id="${target}ParameterEditor" class="parameter-editor"></div>`;}
-module.exports={createParameterEditor,importHtml,script:()=>`${createParameterEditor.toString()}(${client.toString()})();`,css:()=>`.parameter-editor fieldset{border:1px solid var(--border);border-radius:5px;margin:12px 0;padding:14px;min-width:0}.parameter-editor legend{font-weight:600}.parameter-editor input[type=checkbox]{width:auto}.parameter-array-item{border-left:2px solid var(--border);margin:10px 0;padding:0 12px}.parameter-editor fieldset>label{display:inline-block;vertical-align:top;width:calc(50% - 16px);margin-right:16px}.parameter-editor .check{display:inline-flex}#helpTooltip{pointer-events:none}@media(max-width:700px){.parameter-editor fieldset>label{width:100%}}`};
+module.exports={createParameterEditor,importHtml,script:()=>`${createParameterEditor.toString()}(${client.toString()})();`,css:()=>`.parameter-editor fieldset{border:1px solid var(--border);border-radius:5px;margin:12px 0;padding:14px;min-width:0}.parameter-editor legend{font-weight:600}.parameter-editor input[type=checkbox]{width:auto}.parameter-array-item{border-left:2px solid var(--border);margin:10px 0;padding:0 12px}.parameter-editor fieldset>label{display:inline-block;vertical-align:top;width:calc(50% - 16px);margin-right:16px}.parameter-editor .check{display:inline-flex}.parameter-group-heading{flex-basis:100%;font-size:11px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;opacity:.65;margin:14px 0 2px}.parameter-group-heading:first-child{margin-top:0}#helpTooltip{pointer-events:none}@media(max-width:700px){.parameter-editor fieldset>label{width:100%}}`};

@@ -11,6 +11,8 @@ const secured=panel.secure(html,{cspSource:'vscode-webview://test'});
 assert(secured.includes("default-src 'none'"));assert(!secured.includes('<script>'));assert(secured.includes('script nonce='));
 const args=extension.buildTrainingArgs({params:'a b.json',trainDir:'train',valDir:'val',outputDir:'out',epochs:2,batchSize:4,weightDecay:0,gradientClip:1,absoluteWeight:0});
 assert.deepEqual(args.slice(0,4),['-m','clefts.cli','train','fragment-tree']);assert(!args.includes('--params')); assert.equal(args[args.indexOf('--weight-decay')+1],'0');assert.equal(args[args.indexOf('--absolute-weight')+1],'0');
+assert(!args.includes('--overwrite'));
+assert(extension.buildTrainingArgs({trainDir:'train',valDir:'val',outputDir:'out',overwrite:true}).includes('--overwrite'));
 assert(html.indexOf('<strong>Prepare Data</strong>') < html.indexOf('<strong>Train a Model</strong>'));
 const dataArgs=extension.buildArgs({input:'x.msds',outputDir:'out',params:'unused.json',modelConfig:{fragmenter_params:{mass_tolerance:'0.02Da'}}});assert(!dataArgs.includes('--params'));assert.deepEqual(JSON.parse(dataArgs[dataArgs.indexOf('--params-json')+1]),{fragmenter_params:{mass_tolerance:'0.02Da'}});
 console.log('Workbench HTML, script, CSP and CLI parameter checks passed.');
