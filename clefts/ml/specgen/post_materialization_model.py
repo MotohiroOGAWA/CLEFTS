@@ -26,6 +26,11 @@ class PostMaterializationBatch:
     formula_mz: Tensor
     ion_formula_index: Tensor
     target_intensity: Tensor | None = None
+    # True for a candidate ion whose (node, net adduct) was matched to an
+    # observed peak during dataset preparation; None when unavailable (e.g.
+    # inference). Multiple mass-degenerate candidates at the same node can
+    # be positive together: they are indistinguishable from MS data alone.
+    ion_is_positive: Tensor | None = None
     unique_node_graph: Batch | None = None
     node_graph_inverse: Tensor | None = None
     unique_source_index: Tensor | None = None
@@ -34,7 +39,7 @@ class PostMaterializationBatch:
 
     def to(self, device: str | torch.device) -> PostMaterializationBatch:
         return replace(self, decoded=self.decoded.to(device), tree_graph=self.tree_graph.to(device),unique_node_graph=self.unique_node_graph.to(device) if self.unique_node_graph is not None else None,
-            **{name: getattr(self,name).to(device) for name in ("ion_node_index","ion_features","formula_sample_index","formula_tensor","formula_mz","ion_formula_index","target_intensity","node_graph_inverse","unique_source_index") if getattr(self,name) is not None})
+            **{name: getattr(self,name).to(device) for name in ("ion_node_index","ion_features","formula_sample_index","formula_tensor","formula_mz","ion_formula_index","target_intensity","ion_is_positive","node_graph_inverse","unique_source_index") if getattr(self,name) is not None})
 
 
 @dataclass(frozen=True)
@@ -52,11 +57,13 @@ class PostMaterializationFragmentTreeModel(nn.Module):
     def __init__(self, mol_encoder: nn.Module, action_dim: int, condition_dim: int,
                  formula_dim: int, hidden_dim: int = 128, num_heads: int = 4,
                  num_layers: int = 2, max_action_count: int = 3,
-                 cosine_loss_weight: float = 0.5, dropout: float = 0.) -> None:
+                 cosine_loss_weight: float = 0.5, ion_loss_weight: float = 0.5, dropout: float = 0.) -> None:
         super().__init__()
         if not 0<=cosine_loss_weight or not torch.isfinite(torch.tensor(cosine_loss_weight)):raise ValueError("cosine_loss_weight must be non-negative and finite")
+        if not 0<=ion_loss_weight or not torch.isfinite(torch.tensor(ion_loss_weight)):raise ValueError("ion_loss_weight must be non-negative and finite")
         if not 0<=dropout<1:raise ValueError("dropout must be in [0,1)")
         self.cosine_loss_weight=cosine_loss_weight
+        self.ion_loss_weight=ion_loss_weight
         self.mol_encoder = mol_encoder
         self.edge_encoder = nn.Sequential(nn.Linear(action_dim + mol_encoder.graph_dim * 2, hidden_dim), nn.GELU(), nn.Linear(hidden_dim,hidden_dim))
         self.tree_encoder = GraphormerEncoder(node_dim=mol_encoder.graph_dim,hidden_dim=hidden_dim,edge_dim=hidden_dim,
@@ -107,7 +114,8 @@ class PostMaterializationFragmentTreeModel(nn.Module):
         tree.edge_attr = edge_h
         node_h, _ = self.tree_encoder(tree,condition_repr=condition_h)
         ion_h = node_h[data.ion_node_index] + self.ion_encoder(data.ion_features)
-        ion_score = F.softplus(self.ion_score(F.gelu(ion_h)).squeeze(-1))
+        ion_logit = self.ion_score(F.gelu(ion_h)).squeeze(-1)
+        ion_score = F.softplus(ion_logit)
         score = ion_score.new_zeros(data.formula_tensor.shape[0]).scatter_add_(0,data.ion_formula_index,ion_score)
         count = ion_score.new_zeros(data.formula_tensor.shape[0]).scatter_add_(0,data.ion_formula_index,torch.ones_like(ion_score))
         intensity = self.formula_intensity(data.formula_tensor,score,count)
@@ -131,13 +139,33 @@ class PostMaterializationFragmentTreeModel(nn.Module):
             observed=target_norm>0
             cosine=dot/(pred_norm*target_norm).clamp_min(1e-16).sqrt()
             if torch.any(observed):loss=loss+self.cosine_loss_weight*(1-cosine[observed]).mean()
+        if data.ion_is_positive is not None and ion_logit.numel():
+            # Positive and negative candidate ions are mean-normalized separately
+            # (like multi_positive_loss in fragment_tree_training/model.py) so an
+            # imbalanced count on either side cannot let the model coast by
+            # scoring every candidate the same way.
+            positive = data.ion_is_positive
+            positive_loss = F.softplus(-ion_logit[positive])
+            negative_loss = F.softplus(ion_logit[~positive])
+            ion_loss = (positive_loss.mean() if positive_loss.numel() else ion_logit.sum()*0) \
+                + (negative_loss.mean() if negative_loss.numel() else ion_logit.sum()*0)
+            loss = loss + self.ion_loss_weight*ion_loss
         return PostMaterializationOutput(intensity,data.formula_sample_index,data.formula_tensor,data.formula_mz,loss)
 
 
 def prepare_post_materialization(decoded: DecodedFragmentTreeBatch, fragmenter: Fragmenter,
-                                 precursor_types: Sequence[Adduct], tensorizer: FormulaTensorizer) -> PostMaterializationBatch:
-    """Ion/formula preparation is outside all neural forwards."""
+                                 precursor_types: Sequence[Adduct], tensorizer: FormulaTensorizer,
+                                 ion_positive_sets: Sequence[set[tuple[int, str]]] | None = None) -> PostMaterializationBatch:
+    """Ion/formula preparation is outside all neural forwards.
+
+    ion_positive_sets, when given, has one set per sample of (node_index, str(adduct))
+    pairs already confirmed by an observed peak during dataset preparation (see
+    ActionStructureBuilder.build). A candidate ion is positive when its own
+    (node, net adduct) is in that set; nothing is asserted for inference callers,
+    which omit this argument entirely.
+    """
     graphs, node_ids, ion_features, formulas, formula_samples, mzs, formula_ids = [], [], [], [], [], [], []
+    ion_is_positive = [] if ion_positive_sets is not None else None
     node_offset = 0
     # Every generated node can emit ions, including observed intermediates
     # that also have positive outgoing branches. Terminal only stops expansion.
@@ -165,26 +193,30 @@ def prepare_post_materialization(decoded: DecodedFragmentTreeBatch, fragmenter: 
                 adduct = group.candidate_adducts[group.candidate_adduct_indices[entry]]
                 if node == 0 and adduct.apply_to_formula(compounds[0].formula).normalized != precursor_types[sample].apply_to_formula(compounds[0].formula).normalized:
                     continue
-                selected.append((node,float(group.hydrogen_candidate_indices[entry]),float(group.shift_rule_indices[entry]),float(adduct.charge)))
+                selected.append((node,float(group.hydrogen_candidate_indices[entry]),float(group.shift_rule_indices[entry]),float(adduct.charge),adduct))
             if not selected:
                 continue
             new_index=len(formulas)
             formulas.append(formula)
             formula_samples.append(sample)
             mzs.append(formula.exact_mass)
-            for node,hydrogen,shift,charge in selected:
+            for node,hydrogen,shift,charge,adduct in selected:
                 node_ids.append(node_offset+node)
                 ion_features.append((hydrogen,shift,charge))
                 formula_ids.append(new_index)
+                if ion_is_positive is not None:
+                    ion_is_positive.append((node,str(adduct)) in ion_positive_sets[sample])
         node_offset += tree.num_nodes
     return PostMaterializationBatch(decoded,Batch.from_data_list(graphs),torch.tensor(node_ids,dtype=torch.long),
         torch.tensor(ion_features,dtype=torch.float32).reshape(-1,3),torch.tensor(formula_samples,dtype=torch.long),
-        tensorizer.formulas_to_tensor(formulas),torch.tensor(mzs,dtype=torch.float64),torch.tensor(formula_ids,dtype=torch.long),node_smiles=tuple(compound.smiles for compound in decoded.compounds))
+        tensorizer.formulas_to_tensor(formulas),torch.tensor(mzs,dtype=torch.float64),torch.tensor(formula_ids,dtype=torch.long),
+        ion_is_positive=torch.tensor(ion_is_positive,dtype=torch.bool) if ion_is_positive is not None else None,
+        node_smiles=tuple(compound.smiles for compound in decoded.compounds))
 
 
 def collate_post_materialization(items: Sequence[PostMaterializationBatch], action_offsets: Sequence[int]) -> PostMaterializationBatch:
     molecules=[];trees=[];compounds=[];metadata_trees=[];edges=[];samples=[];actions=[];terminals=[];scores=[]
-    ion_nodes=[];ion_features=[];formula_samples=[];formulas=[];mzs=[];formula_ids=[];targets=[]
+    ion_nodes=[];ion_features=[];formula_samples=[];formulas=[];mzs=[];formula_ids=[];targets=[];ion_positives=[]
     node_offset=sample_offset=formula_offset=0
     node_smiles=[]
     seed_actions=[];edge_offset=0
@@ -200,13 +232,17 @@ def collate_post_materialization(items: Sequence[PostMaterializationBatch], acti
         ion_features.append(item.ion_features);formula_samples.append(item.formula_sample_index+sample_offset)
         formulas.append(item.formula_tensor);mzs.append(item.formula_mz);formula_ids.append(item.ion_formula_index+formula_offset)
         if item.target_intensity is not None: targets.append(item.target_intensity)
+        if item.ion_is_positive is not None: ion_positives.append(item.ion_is_positive)
         node_offset+=len(decoded.compounds);sample_offset+=len(decoded.trees);formula_offset+=item.formula_tensor.shape[0]
     if targets and len(targets)!=len(items):
         raise ValueError("Cannot mix supervised and inference downstream batches")
+    if ion_positives and len(ion_positives)!=len(items):
+        raise ValueError("Cannot mix downstream batches with and without ion positive/negative labels")
     decoded=DecodedFragmentTreeBatch(Batch.from_data_list(molecules),torch.cat(edges,dim=1),torch.cat(samples),torch.cat(actions),
         torch.cat(terminals),torch.cat(scores),tuple(metadata_trees),tuple(compounds),sum(i.decoded.rdkit_run_count for i in items),sum(i.decoded.failed_effect_count for i in items),edge_seed_action_index=torch.cat(seed_actions,dim=1))
     return PostMaterializationBatch(decoded,Batch.from_data_list(trees),torch.cat(ion_nodes),torch.cat(ion_features),
-        torch.cat(formula_samples),torch.cat(formulas),torch.cat(mzs),torch.cat(formula_ids),torch.cat(targets) if targets else None,node_smiles=tuple(node_smiles))
+        torch.cat(formula_samples),torch.cat(formulas),torch.cat(mzs),torch.cat(formula_ids),torch.cat(targets) if targets else None,
+        ion_is_positive=torch.cat(ion_positives) if ion_positives else None,node_smiles=tuple(node_smiles))
 
 
 def deduplicate_molecular_graphs(data: PostMaterializationBatch, source_smiles=()):

@@ -115,20 +115,20 @@ class ActionStructureBuilder:
             torch.zeros(len(dense_rows)),torch.tensor(terminal),torch.tensor(parents),torch.tensor(added),
             SimpleNamespace(action_index=torch.arange(len(actions)).expand(len(precursor_types),-1)))
         decoded=materialize_action_states(synthetic,(source,),(actions,),data.sample_tree_index,generator.mol_encoder.graph_builder)
-        downstream=prepare_post_materialization(decoded,fragmenter,precursor_types,generator.tensorizer)
-        target=[]
-        for sample,mz in zip(downstream.formula_sample_index.tolist(),downstream.formula_mz.tolist()):
-            matches=[float(intensity) for observed,intensity in zip(peaks_mz[sample],peaks_intensity[sample])
-                     if fragmenter.mass_tolerance.within(observed,mz)]
-            target.append(max(matches,default=0.))
         node_by_state={(dense_sample[row],tuple(i for i in dense_rows[row] if i>=0)):node
                        for row,node in zip(decoded.materialized_state_index.tolist(),decoded.materialized_node_index.tolist())}
         state_nodes=torch.tensor([node_by_state.get((sample,tuple(row)),-1) for sample,row in zip(samples,rows)],dtype=torch.long)
         annotations=[]
+        # (node, str(adduct)) pairs an observed peak actually matched, per sample.
+        # Threaded into prepare_post_materialization so the post model's ion
+        # score can be supervised directly instead of only through the
+        # aggregated formula-level intensity loss.
+        positive_node_adducts=[]
         for sample,((_,groups),adduct,energy,mzs,intensities) in enumerate(zip(assignments,precursor_types,collision_energy,peaks_mz,peaks_intensity)):
             main=fragmenter._resolve_main_adduct_type(adduct)
             precursor_mz=adduct.apply_to_formula(source.formula).normalized.exact_mass
             peaks=[]
+            positive=set()
             for peak_index,(mz,intensity,group) in enumerate(zip(mzs,intensities,groups)):
                 matches=[]
                 for pathway in group:
@@ -136,6 +136,7 @@ class ActionStructureBuilder:
                     local_nodes=sorted({node_by_state[(sample,tuple(sorted(actions.index(action) for action in seq.actions)) if seq else ())]
                                         for seq in sequences if (sample,tuple(sorted(actions.index(action) for action in seq.actions)) if seq else ()) in node_by_state})
                     if not local_nodes:continue
+                    for node in local_nodes:positive.add((node,str(pathway.adduct)))
                     match=dict(nodeIndices=local_nodes,smiles=pathway.terminal_node.smiles,
                                formula=str(pathway.formula),theoreticalMz=float(pathway.formula.exact_mass),
                                massErrorPpm=(float(mz)-pathway.formula.exact_mass)/pathway.formula.exact_mass*1e6,
@@ -143,6 +144,7 @@ class ActionStructureBuilder:
                     if match not in matches:matches.append(match)
                 peaks.append(dict(index=peak_index,mz=float(mz),intensity=float(intensity),
                                   precursor=bool(fragmenter.mass_tolerance.within(float(mz),precursor_mz)),matches=matches))
+            positive_node_adducts.append(positive)
             def score(selected):
                 total=sum(peak['intensity'] for peak in selected)
                 return sum(peak['intensity'] for peak in selected if peak['matches'])/total if total>0 else None
@@ -150,5 +152,11 @@ class ActionStructureBuilder:
                                     precursorMz=float(precursor_mz),peaks=peaks,
                                     assignmentScore=score(peaks),
                                     assignmentScoreWithoutPrecursor=score([peak for peak in peaks if not peak['precursor']])))
+        downstream=prepare_post_materialization(decoded,fragmenter,precursor_types,generator.tensorizer,ion_positive_sets=positive_node_adducts)
+        target=[]
+        for sample,mz in zip(downstream.formula_sample_index.tolist(),downstream.formula_mz.tolist()):
+            matches=[float(intensity) for observed,intensity in zip(peaks_mz[sample],peaks_intensity[sample])
+                     if fragmenter.mass_tolerance.within(observed,mz)]
+            target.append(max(matches,default=0.))
         return replace(data,state_fragment_node_index=state_nodes,sample_annotations=tuple(annotations),
                        downstream=replace(downstream,target_intensity=torch.tensor(target))),kept

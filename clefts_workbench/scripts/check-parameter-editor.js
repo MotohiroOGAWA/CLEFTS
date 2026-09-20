@@ -33,6 +33,13 @@ const app=path.resolve(__dirname,'../..'),preset=service.defaults(app);
  const current=editor.getValue(),args=buildArgs({input:'input.msds',outputDir:'output',modelConfig:current,params:'ignored.json'});assert(!args.includes('--params'));assert.deepEqual(JSON.parse(args[args.indexOf('--params-json')+1]),current);
  const dataArgs=buildArgs({input:'input.msds',outputDir:'out',fragmenterParams:current.fragmenter_params,symbols:current.symbols,maxNode:500,maxEdge:1000});assert(dataArgs.includes('--symbols-json'));assert.equal(dataArgs[dataArgs.indexOf('--max-edge')+1],'1000');
  const trainingArgs=buildTrainingArgs({trainDir:'train',valDir:'val',outputDir:'out',modelConfig:current});assert(!trainingArgs.includes('--params'));assert(!trainingArgs.includes('--params-json'));
+ // The balanced ion-score loss weight is a per-component model_config override, like cosine_loss_weight.
+ const ionRoot=new Element('div'),ionEditor=createParameterEditor(ionRoot,{post_model_params:{}},'training');
+ assert(!walk(ionRoot).some(node=>node.dataset.parameterPath==='post_model_params.ion_loss_weight'));
+ walk(ionRoot).find(node=>node.tag==='button'&&node.textContent==='Override Ion Loss Weight').onclick();
+ assert.equal(walk(ionRoot).find(node=>node.dataset.parameterPath==='post_model_params.ion_loss_weight').value,0.5);
+ const ionArgs=buildTrainingArgs({trainDir:'train',valDir:'val',outputDir:'out',modelConfig:ionEditor.getValue()});
+ assert.equal(ionArgs[ionArgs.indexOf('--post-ion-loss-weight')+1],'0.5');
  // Dropout is one shared training-level flag, not a per-component model_config override.
  const dropoutArgs=buildTrainingArgs({trainDir:'train',valDir:'val',outputDir:'out',dropout:0.3});
  assert.equal(dropoutArgs[dropoutArgs.indexOf('--dropout')+1],'0.3');
