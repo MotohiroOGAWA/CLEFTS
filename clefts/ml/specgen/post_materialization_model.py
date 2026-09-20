@@ -69,12 +69,17 @@ class PostMaterializationFragmentTreeModel(nn.Module):
                  formula_dim: int, hidden_dim: int = 128, num_heads: int = 4,
                  num_layers: int = 2, max_action_count: int = 3,
                  cosine_loss_weight: float = 0.5, ion_loss_weight: float = 0.5,
-                 ion_prediction_threshold: float = 0.5, dropout: float = 0.) -> None:
+                 ion_prediction_threshold: float = 0.5, intensity_power: float = 0.5,
+                 precursor_free_loss_weight: float = 0.5, dropout: float = 0.) -> None:
         super().__init__()
         if not 0<=cosine_loss_weight or not torch.isfinite(torch.tensor(cosine_loss_weight)):raise ValueError("cosine_loss_weight must be non-negative and finite")
         if not 0<=ion_loss_weight or not torch.isfinite(torch.tensor(ion_loss_weight)):raise ValueError("ion_loss_weight must be non-negative and finite")
         if not 0<ion_prediction_threshold<1:raise ValueError("ion_prediction_threshold must be between zero and one")
+        if not 0<intensity_power or not torch.isfinite(torch.tensor(intensity_power)):raise ValueError("intensity_power must be positive and finite")
+        if not 0<=precursor_free_loss_weight or not torch.isfinite(torch.tensor(precursor_free_loss_weight)):raise ValueError("precursor_free_loss_weight must be non-negative and finite")
         if not 0<=dropout<1:raise ValueError("dropout must be in [0,1)")
+        self.intensity_power=intensity_power
+        self.precursor_free_loss_weight=precursor_free_loss_weight
         self.cosine_loss_weight=cosine_loss_weight
         self.ion_loss_weight=ion_loss_weight
         self.ion_prediction_threshold=ion_prediction_threshold
@@ -130,47 +135,83 @@ class PostMaterializationFragmentTreeModel(nn.Module):
         ion_h = node_h[data.ion_node_index] + self.ion_encoder(data.ion_features)
         ion_logit = self.ion_score(F.gelu(ion_h)).squeeze(-1)
         ion_score = F.softplus(ion_logit)
-        score = ion_score.new_zeros(data.formula_tensor.shape[0]).scatter_add_(0,data.ion_formula_index,ion_score)
-        count = ion_score.new_zeros(data.formula_tensor.shape[0]).scatter_add_(0,data.ion_formula_index,torch.ones_like(ion_score))
+        num_formulas = data.formula_tensor.shape[0]
+        score = ion_score.new_zeros(num_formulas).scatter_add_(0,data.ion_formula_index,ion_score)
+        count = ion_score.new_zeros(num_formulas).scatter_add_(0,data.ion_formula_index,torch.ones_like(ion_score))
         # The most confident candidate ion explaining each formula. Kept out of
         # the loss/intensity path entirely (that stays exactly as trained) so a
         # caller building a spectrum for display can drop unconfident peaks
         # (e.g. below self.ion_prediction_threshold) without changing what the
         # model was actually optimized and validated against.
-        confidence = ion_logit.new_zeros(data.formula_tensor.shape[0]).scatter_reduce_(0,data.ion_formula_index,ion_logit.sigmoid(),reduce='amax',include_self=True)
+        confidence = ion_logit.new_zeros(num_formulas).scatter_reduce_(0,data.ion_formula_index,ion_logit.sigmoid(),reduce='amax',include_self=True)
         intensity = self.formula_intensity(data.formula_tensor,score,count)
-        # Relative spectra are invariant to overall scale. Normalize each sample
-        # before fitting so reducing every peak cannot hide a wrong spectral shape.
         sample_count=data.tree_graph.num_graphs
+        # Displayed/predicted spectrum always includes the precursor peak and is
+        # never power-transformed; only the training losses below are.
         maximum=intensity.new_zeros(sample_count).scatter_reduce_(0,data.formula_sample_index,intensity,reduce='amax',include_self=True)
-        intensity=intensity/maximum[data.formula_sample_index].clamp_min(1e-8)
-        target=None
-        if data.target_intensity is not None:
-            target=data.target_intensity.clamp_min(0)
-            target_max=target.new_zeros(sample_count).scatter_reduce_(0,data.formula_sample_index,target,reduce='amax',include_self=True)
-            target=target/target_max[data.formula_sample_index].clamp_min(1e-8)
-        loss = intensity.sum()*0 if data.target_intensity is None or intensity.numel()==0 else F.mse_loss(torch.log1p(intensity),torch.log1p(target))
-        if data.target_intensity is not None and intensity.numel():
-            group=data.formula_sample_index
-            s=data.tree_graph.num_graphs
-            dot=intensity.new_zeros(s).scatter_add_(0,group,intensity*target)
-            pred_norm=intensity.new_zeros(s).scatter_add_(0,group,intensity.square())
-            target_norm=intensity.new_zeros(s).scatter_add_(0,group,target.square())
-            observed=target_norm>0
-            cosine=dot/(pred_norm*target_norm).clamp_min(1e-16).sqrt()
-            if torch.any(observed):loss=loss+self.cosine_loss_weight*(1-cosine[observed]).mean()
-        if data.ion_is_positive is not None and ion_logit.numel():
-            # Positive and negative candidate ions are mean-normalized separately
-            # (like multi_positive_loss in fragment_tree_training/model.py) so an
-            # imbalanced count on either side cannot let the model coast by
-            # scoring every candidate the same way.
-            positive = data.ion_is_positive
-            positive_loss = F.softplus(-ion_logit[positive])
-            negative_loss = F.softplus(ion_logit[~positive])
-            ion_loss = (positive_loss.mean() if positive_loss.numel() else ion_logit.sum()*0) \
-                + (negative_loss.mean() if negative_loss.numel() else ion_logit.sum()*0)
-            loss = loss + self.ion_loss_weight*ion_loss
-        return PostMaterializationOutput(intensity,data.formula_sample_index,data.formula_tensor,data.formula_mz,loss,confidence,ion_logit.sigmoid())
+        normalized_intensity=intensity/maximum[data.formula_sample_index].clamp_min(1e-8)
+
+        # Root (source/precursor) node per sample: the first node materialized
+        # for that sample. A formula is "the precursor formula" if one of its
+        # candidate ions sits on that node (prepare_post_materialization already
+        # only keeps a node-0 candidate there when it matches the true precursor).
+        node_sample = data.decoded.node_sample_index
+        root_node = node_sample.new_full((sample_count,), node_sample.numel())
+        root_node.scatter_reduce_(0,node_sample,torch.arange(node_sample.numel(),device=node_sample.device),reduce='amin',include_self=True)
+        ion_is_root = data.ion_node_index==root_node[node_sample[data.ion_node_index]]
+        formula_is_precursor = ion_score.new_zeros(num_formulas).scatter_add_(0,data.ion_formula_index,ion_is_root.to(ion_score.dtype))>0
+
+        def spectrum_loss(keep_formula,keep_ion):
+            """Every loss term recomputed over only keep_formula/keep_ion, each
+            re-normalized to its own max=1. Used once over everything, and once
+            with the precursor excluded so its usually-dominant magnitude cannot
+            starve gradient for the rest of the spectrum; the model itself is
+            never asked to predict anything but the full, precursor-included
+            spectrum (see normalized_intensity above)."""
+            total = intensity.sum()*0
+            if data.target_intensity is not None and intensity.numel() and torch.any(keep_formula):
+                masked=intensity*keep_formula
+                peak_max=masked.new_zeros(sample_count).scatter_reduce_(0,data.formula_sample_index,masked,reduce='amax',include_self=True)
+                pred=(masked/peak_max[data.formula_sample_index].clamp_min(1e-8))[keep_formula]
+                masked_target=data.target_intensity.clamp_min(0)*keep_formula
+                target_max=masked_target.new_zeros(sample_count).scatter_reduce_(0,data.formula_sample_index,masked_target,reduce='amax',include_self=True)
+                target=(masked_target/target_max[data.formula_sample_index].clamp_min(1e-8))[keep_formula]
+                # A square-root-like power transform is standard in spectral
+                # similarity: it keeps the model outputting ordinary intensities,
+                # but the loss itself weighs small peaks much more relative to
+                # the base peak than a raw linear/log1p comparison would.
+                pred=pred.clamp_min(0).pow(self.intensity_power);target=target.pow(self.intensity_power)
+                total=total+F.mse_loss(pred,target)
+                group=data.formula_sample_index[keep_formula]
+                dot=pred.new_zeros(sample_count).scatter_add_(0,group,pred*target)
+                pred_norm=pred.new_zeros(sample_count).scatter_add_(0,group,pred.square())
+                target_norm=pred.new_zeros(sample_count).scatter_add_(0,group,target.square())
+                observed=target_norm>0
+                cosine=dot/(pred_norm*target_norm).clamp_min(1e-16).sqrt()
+                if torch.any(observed):total=total+self.cosine_loss_weight*(1-cosine[observed]).mean()
+            if data.ion_is_positive is not None and ion_logit.numel():
+                # Positive and negative candidate ions are mean-normalized
+                # separately (like multi_positive_loss in
+                # fragment_tree_training/model.py) so an imbalanced count on
+                # either side cannot let the model coast by scoring every
+                # candidate the same way.
+                positive=data.ion_is_positive & keep_ion
+                negative=(~data.ion_is_positive) & keep_ion
+                positive_loss=F.softplus(-ion_logit[positive])
+                negative_loss=F.softplus(ion_logit[negative])
+                ion_loss=(positive_loss.mean() if positive_loss.numel() else ion_logit.sum()*0) \
+                    + (negative_loss.mean() if negative_loss.numel() else ion_logit.sum()*0)
+                total=total+self.ion_loss_weight*ion_loss
+            return total
+
+        keep_all_formula=formula_is_precursor.new_ones(num_formulas)
+        keep_all_ion=ion_logit.new_ones(ion_logit.shape[0],dtype=torch.bool)
+        loss=spectrum_loss(keep_all_formula,keep_all_ion)
+        if self.precursor_free_loss_weight>0 and num_formulas:
+            keep_formula=~formula_is_precursor
+            keep_ion=~formula_is_precursor[data.ion_formula_index] if data.ion_formula_index.numel() else keep_all_ion
+            loss=loss+self.precursor_free_loss_weight*spectrum_loss(keep_formula,keep_ion)
+        return PostMaterializationOutput(normalized_intensity,data.formula_sample_index,data.formula_tensor,data.formula_mz,loss,confidence,ion_logit.sigmoid())
 
 
 def prepare_post_materialization(decoded: DecodedFragmentTreeBatch, fragmenter: Fragmenter,
