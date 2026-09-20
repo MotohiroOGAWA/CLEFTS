@@ -63,6 +63,18 @@ const { readRun } = require('../src/features/training-metrics/editor');
       const facetCard = [...dom.window.document.querySelectorAll('#metricsCharts > section')].find(section => section.querySelector('strong')?.textContent === 'cosine_similarity @main_adduct');
       const swatchColors = [...facetCard.querySelectorAll('label line')].map(line => line.getAttribute('stroke'));
       assert.equal(new Set(swatchColors).size, swatchColors.length, 'faceted categories must not share the same line color');
+
+      // Changing one card's own Display/precursor control must only replace that
+      // card in place, not tear down and rebuild the whole grid (which used to
+      // reset scroll position / jump the page to the top on every such change).
+      const sectionByTitle = title => [...dom.window.document.querySelectorAll('#metricsCharts > section')].find(section => section.querySelector('strong')?.textContent === title);
+      const lossCardBefore = sectionByTitle('loss'), memoryCardBefore = sectionByTitle('cuda_peak_memory_mb');
+      const modeSelect = lossCardBefore.querySelector('select');
+      modeSelect.value = 'distribution';
+      modeSelect.dispatchEvent(new dom.window.Event('change'));
+      const lossCardAfter = sectionByTitle('loss'), memoryCardAfter = sectionByTitle('cuda_peak_memory_mb');
+      assert.notEqual(lossCardBefore, lossCardAfter, 'the edited card should be refreshed');
+      assert.equal(memoryCardBefore, memoryCardAfter, 'unrelated cards must keep their DOM node identity so the page does not jump');
     } finally { dom.window.close(); }
     console.log('Training report wrapper: shared training-metrics UI, auto-load, grouping and representative spectra checks passed.');
   } finally { await fs.rm(directory, { recursive: true, force: true }); }

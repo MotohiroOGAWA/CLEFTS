@@ -189,11 +189,112 @@ function client(groupSeries) {
     el('metricsAddAll').textContent = (el('metricsFilter').value.trim() ? 'Add matching charts' : 'Add all charts') + ' (' + matching.length + ')';
   }
   let renderVersion = 0;
+  let chartsByName = new Map();
+  const cardElements = new Map();
+  function buildCard(name, chart) {
+    const card = document.createElement('section'); card.style.cssText = 'display:block;content-visibility:auto;contain-intrinsic-size:auto 380px';
+    const title = document.createElement('strong'); title.textContent = name;
+    const remove = document.createElement('button'); remove.textContent = '×'; remove.title = 'Remove chart'; remove.style.float = 'right';
+    remove.onclick = () => { selected = selected.filter(n => n !== name); cardElements.delete(name); save(); render(); };
+    card.append(remove, title);
+    const availableWith = chart.variants.withPrecursor.length > 0, availableWithout = chart.variants.withoutPrecursor.length > 0;
+    const settings = { mode:'mean', withoutPrecursor:!availableWith && availableWithout, ...(cardSettings.get(name) || {}) };
+    if (settings.withoutPrecursor && !availableWithout) settings.withoutPrecursor=false;
+    if (!settings.withoutPrecursor && !availableWith) settings.withoutPrecursor=true;
+    cardSettings.set(name,settings);
+    const controls=document.createElement('div');controls.style.cssText='display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:10px 0';
+    const modeLabel=document.createElement('label');modeLabel.append(document.createTextNode('Display '));const mode=document.createElement('select');
+    for(const [value,labelText] of [['mean','Mean'],['median','Median'],['distribution','Distribution']]){const option=document.createElement('option');option.value=value;option.textContent=labelText;mode.append(option);}mode.value=settings.mode;mode.onchange=()=>{settings.mode=mode.value;save();refreshCard(name);};modeLabel.append(mode);controls.append(modeLabel);
+    const precursorLabel=document.createElement('label'),precursor=document.createElement('input');precursor.type='checkbox';precursor.checked=settings.withoutPrecursor;precursor.disabled=!availableWith||!availableWithout;precursor.onchange=()=>{settings.withoutPrecursor=precursor.checked;save();refreshCard(name);};precursorLabel.append(precursor,document.createTextNode(' Exclude precursor'));controls.append(precursorLabel);card.append(controls);
+    const hidden = hiddenLanes.get(name) || new Set();
+    hiddenLanes.set(name, hidden);
+    const allLanes = chart.variants[settings.withoutPrecursor?'withoutPrecursor':'withPrecursor'];
+    const lanes = allLanes.filter(lane => !hidden.has(lane.label));
+    const categories=[...new Set(allLanes.map(lane=>lane.category))];
+    const faceted = !!chart.dimension && categories.length>1;
+    const color = lane => faceted ? categoryColors[categories.indexOf(lane.category)%categoryColors.length] : (splitColors[lane.split] || splitColors.all);
+    const dash = lane => faceted ? (splitDashes[lane.split] || '') : '';
+    const legend = document.createElement('div'); legend.style.cssText = 'display:flex;flex-wrap:wrap;gap:10px;margin:12px 0';
+    for (const lane of allLanes) {
+      const label = document.createElement('label'); label.style.cssText = 'display:inline-flex;align-items:center;gap:6px;cursor:pointer';
+      const toggle = document.createElement('input'); toggle.type = 'checkbox'; toggle.checked = !hidden.has(lane.label);
+      toggle.onchange = () => { if (toggle.checked) hidden.delete(lane.label); else hidden.add(lane.label); refreshCard(name); };
+      const swatch = document.createElementNS('http://www.w3.org/2000/svg','svg'); swatch.setAttribute('viewBox','0 0 28 10'); swatch.style.cssText='width:26px;height:10px;flex:0 0 auto';
+      const swatchLine = document.createElementNS('http://www.w3.org/2000/svg','line'); swatchLine.setAttribute('x1',1); swatchLine.setAttribute('x2',27); swatchLine.setAttribute('y1',5); swatchLine.setAttribute('y2',5);
+      swatchLine.setAttribute('stroke',color(lane)); swatchLine.setAttribute('stroke-width',3); swatchLine.setAttribute('stroke-dasharray',dash(lane)); swatchLine.setAttribute('stroke-linecap','round'); swatch.append(swatchLine);
+      label.append(toggle, swatch, document.createTextNode(lane.label)); legend.append(label);
+    }
+    card.append(legend);
+    if (settings.mode === 'distribution') { const hint = document.createElement('p'); hint.className = 'muted'; hint.textContent = 'Light band: q10–q90 · Dark band: q25–q75 · Line: median'; card.append(hint); }
+    const visibleStats=lane=>settings.mode==='distribution'?['q10','q25','median','q75','q90']:settings.mode==='median'?['median','value']:['mean','value'];
+    const points = lanes.flatMap(lane => visibleStats(lane).flatMap(stat=>lane.stats[stat]||[]));
+    if (!points.length) { const p = document.createElement('p'); p.textContent = 'No measurements available to display.'; card.append(p); }
+    else {
+      const ns = 'http://www.w3.org/2000/svg';
+      const svg = document.createElementNS(ns, 'svg'); svg.setAttribute('viewBox', '0 0 600 260'); svg.style.width = '100%'; svg.setAttribute('role', 'img'); svg.setAttribute('aria-label', name);
+      const node = (tag, attrs, text) => { const n = document.createElementNS(ns, tag); for (const [k,v] of Object.entries(attrs)) n.setAttribute(k,v); if (text !== undefined) n.textContent = text; svg.append(n); return n; };
+      let min = Infinity, max = -Infinity, first = Infinity, last = -Infinity;
+      for (const [step, value] of points) { min = Math.min(min, value); max = Math.max(max, value); first = Math.min(first, step); last = Math.max(last, step); }
+      if (min === max) { min -= Math.abs(min) * .05 || 1; max += Math.abs(max) * .05 || 1; }
+      const x = step => 75 + (step - first) / (last - first || 1) * 500;
+      const y = value => 215 - (value - min) / (max - min) * 190;
+      const coords = values => values.map(p => x(p[0])+','+y(p[1])).join(' ');
+      for (let i = 0; i <= 4; i++) {
+        const value = min + (max-min)*i/4;
+        node('line', { x1:75, x2:575, y1:y(value), y2:y(value), stroke:'currentColor', opacity:'.15' });
+        node('text', { x:70, y:y(value)+4, fill:'currentColor', 'font-size':11, 'text-anchor':'end' }, value.toPrecision(4));
+      }
+      for (const lane of lanes) {
+        const line = (values, opacity = 1, width = 2) => {
+          if (!values?.length) return;
+          node('polyline', { points:coords(values), fill:'none', stroke:color(lane), 'stroke-width':width, 'stroke-dasharray':dash(lane), opacity });
+          if (values.length === 1) node('circle', { cx:x(values[0][0]), cy:y(values[0][1]), r:3, fill:color(lane), opacity });
+        };
+        const band = (lower, upper, opacity) => {
+          const upperMap = new Map(upper || []);
+          const paired = (lower || []).filter(p => upperMap.has(p[0]));
+          if (paired.length === 1) node('line', { x1:x(paired[0][0]), x2:x(paired[0][0]), y1:y(paired[0][1]), y2:y(upperMap.get(paired[0][0])), stroke:color(lane), 'stroke-width':8, opacity });
+          else if (paired.length) node('polygon', { points:coords(paired)+' '+coords(paired.map(p => [p[0], upperMap.get(p[0])]).reverse()), fill:color(lane), opacity });
+        };
+        if (settings.mode === 'distribution') {
+          band(lane.stats.q10, lane.stats.q90, .10); band(lane.stats.q25, lane.stats.q75, .25);
+          for (const stat of ['q10', 'q90', 'q25', 'q75']) line(lane.stats[stat], .45, 1);
+          line(lane.stats.median);
+        } else line(lane.stats[settings.mode] || lane.stats.value);
+      }
+      node('text', { x:75, y:240, fill:'currentColor', 'font-size':12 }, String(first));
+      node('text', { x:575, y:240, fill:'currentColor', 'font-size':12, 'text-anchor':'end' }, String(last));
+      const info = document.createElement('p'); info.className = 'muted'; info.style.whiteSpace = 'pre-line'; info.textContent = (faceted ? 'Color: category · Dashed: intermediate validation' : 'Color: split') + ' · Hover to inspect';
+      svg.onmousemove = event => {
+        const rect = svg.getBoundingClientRect(); const step = first + ((event.clientX-rect.left)/rect.width*600-75)/500*(last-first);
+        info.textContent = lanes.map(lane => {
+          const values = visibleStats(lane).filter(stat=>lane.stats[stat]?.length).map(stat => { const samples=lane.stats[stat];
+            let closest = samples[0]; for (const p of samples) if (Math.abs(p[0]-step)<Math.abs(closest[0]-step)) closest=p;
+            return stat+'='+closest[1].toPrecision(5)+' (step '+closest[0]+')';
+          });
+          return lane.label+': '+values.join(' · ');
+        }).join('\n');
+      };
+      card.append(svg, info);
+    }
+    return card;
+  }
+  // Re-rendering just the one card that changed (instead of tearing down the whole
+  // grid) keeps every other card's DOM node intact, so the page doesn't lose scroll
+  // position or jump to the top whenever a per-card control is touched.
+  function refreshCard(name) {
+    const chart = chartsByName.get(name), old = cardElements.get(name);
+    if (!chart || !old) { render(); return; }
+    const updated = buildCard(name, chart);
+    old.replaceWith(updated);
+    cardElements.set(name, updated);
+  }
   async function render() {
     const version = ++renderVersion;
     let rendered = 0;
     el('metricsCharts').replaceChildren();
-    const chartsByName = new Map(data.map(chart => [chart.name, chart]));
+    cardElements.clear();
+    chartsByName = new Map(data.map(chart => [chart.name, chart]));
     const orderedSelected = [...selected].sort((a,b) => {
       const ca=chartsByName.get(a), cb=chartsByName.get(b);
       const ga = ca ? GROUP_ORDER.indexOf(metricGroup(ca.metric)) : GROUP_ORDER.length;
@@ -217,92 +318,9 @@ function client(groupSeries) {
         el('metricsCharts').append(header);
         lastGroup = group;
       }
-      const card = document.createElement('section'); card.style.cssText = 'display:block;content-visibility:auto;contain-intrinsic-size:auto 380px';
-      const title = document.createElement('strong'); title.textContent = name;
-      const remove = document.createElement('button'); remove.textContent = '×'; remove.title = 'Remove chart'; remove.style.float = 'right';
-      remove.onclick = () => { selected = selected.filter(n => n !== name); save(); render(); };
-      card.append(remove, title);
-      const availableWith = chart.variants.withPrecursor.length > 0, availableWithout = chart.variants.withoutPrecursor.length > 0;
-      const settings = { mode:'mean', withoutPrecursor:!availableWith && availableWithout, ...(cardSettings.get(name) || {}) };
-      if (settings.withoutPrecursor && !availableWithout) settings.withoutPrecursor=false;
-      if (!settings.withoutPrecursor && !availableWith) settings.withoutPrecursor=true;
-      cardSettings.set(name,settings);
-      const controls=document.createElement('div');controls.style.cssText='display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:10px 0';
-      const modeLabel=document.createElement('label');modeLabel.append(document.createTextNode('Display '));const mode=document.createElement('select');
-      for(const [value,labelText] of [['mean','Mean'],['median','Median'],['distribution','Distribution']]){const option=document.createElement('option');option.value=value;option.textContent=labelText;mode.append(option);}mode.value=settings.mode;mode.onchange=()=>{settings.mode=mode.value;save();render();};modeLabel.append(mode);controls.append(modeLabel);
-      const precursorLabel=document.createElement('label'),precursor=document.createElement('input');precursor.type='checkbox';precursor.checked=settings.withoutPrecursor;precursor.disabled=!availableWith||!availableWithout;precursor.onchange=()=>{settings.withoutPrecursor=precursor.checked;save();render();};precursorLabel.append(precursor,document.createTextNode(' Exclude precursor'));controls.append(precursorLabel);card.append(controls);
-      const hidden = hiddenLanes.get(name) || new Set();
-      hiddenLanes.set(name, hidden);
-      const allLanes = chart.variants[settings.withoutPrecursor?'withoutPrecursor':'withPrecursor'];
-      const lanes = allLanes.filter(lane => !hidden.has(lane.label));
-      const categories=[...new Set(allLanes.map(lane=>lane.category))];
-      const faceted = !!chart.dimension && categories.length>1;
-      const color = lane => faceted ? categoryColors[categories.indexOf(lane.category)%categoryColors.length] : (splitColors[lane.split] || splitColors.all);
-      const dash = lane => faceted ? (splitDashes[lane.split] || '') : '';
-      const legend = document.createElement('div'); legend.style.cssText = 'display:flex;flex-wrap:wrap;gap:10px;margin:12px 0';
-      for (const lane of allLanes) {
-        const label = document.createElement('label'); label.style.cssText = 'display:inline-flex;align-items:center;gap:6px;cursor:pointer';
-        const toggle = document.createElement('input'); toggle.type = 'checkbox'; toggle.checked = !hidden.has(lane.label);
-        toggle.onchange = () => { if (toggle.checked) hidden.delete(lane.label); else hidden.add(lane.label); render(); };
-        const swatch = document.createElementNS('http://www.w3.org/2000/svg','svg'); swatch.setAttribute('viewBox','0 0 28 10'); swatch.style.cssText='width:26px;height:10px;flex:0 0 auto';
-        const swatchLine = document.createElementNS('http://www.w3.org/2000/svg','line'); swatchLine.setAttribute('x1',1); swatchLine.setAttribute('x2',27); swatchLine.setAttribute('y1',5); swatchLine.setAttribute('y2',5);
-        swatchLine.setAttribute('stroke',color(lane)); swatchLine.setAttribute('stroke-width',3); swatchLine.setAttribute('stroke-dasharray',dash(lane)); swatchLine.setAttribute('stroke-linecap','round'); swatch.append(swatchLine);
-        label.append(toggle, swatch, document.createTextNode(lane.label)); legend.append(label);
-      }
-      card.append(legend);
-      if (settings.mode === 'distribution') { const hint = document.createElement('p'); hint.className = 'muted'; hint.textContent = 'Light band: q10–q90 · Dark band: q25–q75 · Line: median'; card.append(hint); }
-      const visibleStats=lane=>settings.mode==='distribution'?['q10','q25','median','q75','q90']:settings.mode==='median'?['median','value']:['mean','value'];
-      const points = lanes.flatMap(lane => visibleStats(lane).flatMap(stat=>lane.stats[stat]||[]));
-      if (!points.length) { const p = document.createElement('p'); p.textContent = 'No measurements available to display.'; card.append(p); }
-      else {
-        const ns = 'http://www.w3.org/2000/svg';
-        const svg = document.createElementNS(ns, 'svg'); svg.setAttribute('viewBox', '0 0 600 260'); svg.style.width = '100%'; svg.setAttribute('role', 'img'); svg.setAttribute('aria-label', name);
-        const node = (tag, attrs, text) => { const n = document.createElementNS(ns, tag); for (const [k,v] of Object.entries(attrs)) n.setAttribute(k,v); if (text !== undefined) n.textContent = text; svg.append(n); return n; };
-        let min = Infinity, max = -Infinity, first = Infinity, last = -Infinity;
-        for (const [step, value] of points) { min = Math.min(min, value); max = Math.max(max, value); first = Math.min(first, step); last = Math.max(last, step); }
-        if (min === max) { min -= Math.abs(min) * .05 || 1; max += Math.abs(max) * .05 || 1; }
-        const x = step => 75 + (step - first) / (last - first || 1) * 500;
-        const y = value => 215 - (value - min) / (max - min) * 190;
-        const coords = values => values.map(p => x(p[0])+','+y(p[1])).join(' ');
-        for (let i = 0; i <= 4; i++) {
-          const value = min + (max-min)*i/4;
-          node('line', { x1:75, x2:575, y1:y(value), y2:y(value), stroke:'currentColor', opacity:'.15' });
-          node('text', { x:70, y:y(value)+4, fill:'currentColor', 'font-size':11, 'text-anchor':'end' }, value.toPrecision(4));
-        }
-        for (const lane of lanes) {
-          const line = (values, opacity = 1, width = 2) => {
-            if (!values?.length) return;
-            node('polyline', { points:coords(values), fill:'none', stroke:color(lane), 'stroke-width':width, 'stroke-dasharray':dash(lane), opacity });
-            if (values.length === 1) node('circle', { cx:x(values[0][0]), cy:y(values[0][1]), r:3, fill:color(lane), opacity });
-          };
-          const band = (lower, upper, opacity) => {
-            const upperMap = new Map(upper || []);
-            const paired = (lower || []).filter(p => upperMap.has(p[0]));
-            if (paired.length === 1) node('line', { x1:x(paired[0][0]), x2:x(paired[0][0]), y1:y(paired[0][1]), y2:y(upperMap.get(paired[0][0])), stroke:color(lane), 'stroke-width':8, opacity });
-            else if (paired.length) node('polygon', { points:coords(paired)+' '+coords(paired.map(p => [p[0], upperMap.get(p[0])]).reverse()), fill:color(lane), opacity });
-          };
-          if (settings.mode === 'distribution') {
-            band(lane.stats.q10, lane.stats.q90, .10); band(lane.stats.q25, lane.stats.q75, .25);
-            for (const stat of ['q10', 'q90', 'q25', 'q75']) line(lane.stats[stat], .45, 1);
-            line(lane.stats.median);
-          } else line(lane.stats[settings.mode] || lane.stats.value);
-        }
-        node('text', { x:75, y:240, fill:'currentColor', 'font-size':12 }, String(first));
-        node('text', { x:575, y:240, fill:'currentColor', 'font-size':12, 'text-anchor':'end' }, String(last));
-        const info = document.createElement('p'); info.className = 'muted'; info.style.whiteSpace = 'pre-line'; info.textContent = (faceted ? 'Color: category · Dashed: intermediate validation' : 'Color: split') + ' · Hover to inspect';
-        svg.onmousemove = event => {
-          const rect = svg.getBoundingClientRect(); const step = first + ((event.clientX-rect.left)/rect.width*600-75)/500*(last-first);
-          info.textContent = lanes.map(lane => {
-            const values = visibleStats(lane).filter(stat=>lane.stats[stat]?.length).map(stat => { const samples=lane.stats[stat];
-              let closest = samples[0]; for (const p of samples) if (Math.abs(p[0]-step)<Math.abs(closest[0]-step)) closest=p;
-              return stat+'='+closest[1].toPrecision(5)+' (step '+closest[0]+')';
-            });
-            return lane.label+': '+values.join(' · ');
-          }).join('\n');
-        };
-        card.append(svg, info);
-      }
+      const card = buildCard(name, chart);
       el('metricsCharts').append(card);
+      cardElements.set(name, card);
       rendered++;
     }
   }
