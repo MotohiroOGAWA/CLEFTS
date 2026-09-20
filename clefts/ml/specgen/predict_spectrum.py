@@ -106,6 +106,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--max-samples',type=int,default=128,help='Maximum simultaneous prediction samples; larger inputs are split.')
     parser.add_argument('--num-workers',type=int,default=1,help='Parallel worker processes for RDKit fragmentation precompute; 1 runs serially.')
     parser.add_argument('--chunk-size',type=int,default=1,help='Compounds dispatched per worker chunk.')
+    parser.add_argument('--keep-temp',action='store_true',
+        help='Keep the temporary task/result files exchanged with --num-workers subprocesses (for inspection), instead of deleting them once every chunk completes.')
     args = parser.parse_args()
     if args.max_samples<1:parser.error('--max-samples must be positive')
     if args.num_workers<1:parser.error('--num-workers must be positive')
@@ -368,6 +370,11 @@ def predict_msdataset(
     include_formula_annotation: bool,
     num_workers: int = 1,
     chunk_size: int = 1,
+    keep_temp: bool = False,
+    temp_dir: Optional[str] = None,
+    validate_desc: str = 'Validating records',
+    prepare_desc: str = 'Preparing molecules',
+    predict_desc: str = 'Predicting spectra',
 ) -> tuple[MSDataset, pd.DataFrame]:
     """Predict every selected compound in one batched forward, then apply the
     shared provenance contract (SpecID/PredictionTool/... columns)."""
@@ -376,7 +383,8 @@ def predict_msdataset(
         dataset, generator, smiles_column=smiles_column, adduct_type_column=adduct_type_column,
         collision_energy_column=collision_energy_column, precursor_mz_column=precursor_mz_column,
         instrument_column=instrument_column, include_formula_annotation=include_formula_annotation,
-        num_workers=num_workers, chunk_size=chunk_size)
+        num_workers=num_workers, chunk_size=chunk_size, keep_temp=keep_temp, temp_dir=temp_dir,
+        validate_desc=validate_desc, prepare_desc=prepare_desc, predict_desc=predict_desc)
     timestamp = datetime.now(timezone.utc).isoformat()
     enriched_metadata = prediction_metadata(
         predicted.metadata, db=db, model_path=model_path, spec_id_column=spec_id_column,
@@ -417,6 +425,7 @@ def prediction_run_settings(args: argparse.Namespace) -> Dict[str, Any]:
         "maxSamples": args.max_samples,
         "numWorkers": args.num_workers,
         "chunkSize": args.chunk_size,
+        "keepTemp": bool(args.keep_temp),
         "overwrite": bool(args.overwrite),
         "specIdColumn": args.spec_id_column,
         "smilesColumn": args.smiles_column,
@@ -452,7 +461,16 @@ def main() -> None:
         raise ValueError("The input and final output MSDataset must be different paths.")
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    print("[1/4] Loading input MSDataset")
+    # Written immediately, not only on success: settings should be visible
+    # and loadable (Workbench "Load From Run") even if this run later fails
+    # or is interrupted, just like training/data-prep's own .pft.json.
+    pft_path = output_dir / "prediction.pft.json"
+    pft_path.write_text(
+        json.dumps(prediction_run_settings(args), ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+    print(f"saved configuration: {pft_path}")
+
+    print("[1/6] Loading input MSDataset")
     dataset = (
         MSDataset.load(args.input)
         if args.input is not None
@@ -462,7 +480,7 @@ def main() -> None:
             adduct_type=args.adduct_type,
         )
     )
-    print("[2/4] Validating input and selecting SMILES")
+    print("[2/6] Validating input and selecting SMILES")
     if args.input is None and args.spec_id_column not in dataset.columns:
         dataset[args.spec_id_column] = [f"direct-{index + 1:09d}" for index in range(len(dataset))]
     validate_prediction_input(
@@ -491,7 +509,7 @@ def main() -> None:
 
     started = time.time()
 
-    print("[3/4] Loading prediction model")
+    print("[3/6] Loading prediction model")
     generator = load_generator(
         model_path=args.model,
         params_path=args.params,
@@ -500,7 +518,10 @@ def main() -> None:
     )
 
     generator.max_samples=args.max_samples
-    print("[4/4] Predicting spectra")
+    # Under --output-dir, not the system temp directory, so it's easy to
+    # find while a run is in progress and (with --keep-temp) afterward too.
+    prepare_temp_dir = output_dir / "tmp"
+    prepare_temp_dir.mkdir(parents=True, exist_ok=True)
     predicted, failures = predict_msdataset(
         dataset=dataset,
         generator=generator,
@@ -515,7 +536,17 @@ def main() -> None:
         include_formula_annotation=not args.no_formula_annotation,
         num_workers=args.num_workers,
         chunk_size=args.chunk_size,
+        keep_temp=args.keep_temp,
+        temp_dir=str(prepare_temp_dir),
+        validate_desc='[4/6] Validating records',
+        prepare_desc='[5/6] Preparing molecules',
+        predict_desc='[6/6] Predicting spectra',
     )
+    if not args.keep_temp:
+        try:
+            prepare_temp_dir.rmdir()
+        except OSError:
+            pass
 
     _atomic_save(predicted, output_path)
 
@@ -555,10 +586,6 @@ def main() -> None:
     (run_dir / "run.json").write_text(
         json.dumps(run_info, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
-    pft_path = output_dir / "prediction.pft.json"
-    pft_path.write_text(
-        json.dumps(prediction_run_settings(args), ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-    )
 
     print(
         f"predicted spectra: n_spectra={len(predicted)}, "
@@ -567,7 +594,6 @@ def main() -> None:
     print(f"saved: {output_path}")
     print(f"saved similarity dataset: {similarity_path}")
     print(f"run information: {run_dir}")
-    print(f"saved configuration: {pft_path}")
     if len(failures):
         print(f"partial success: {len(failures)} record(s) failed", file=sys.stderr)
         raise SystemExit(3)

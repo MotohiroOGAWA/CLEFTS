@@ -129,6 +129,33 @@ def test_predict_source_msdataset_skips_adducts_unsupported_by_this_model():
     assert 'supported adduct types' in failures.iloc[0]['error']
 
 
+def test_predict_source_msdataset_skips_a_row_with_no_resolvable_precursor():
+    # [M-2H2O+H]+ is in this model's adduct vocabulary and syntactically
+    # valid, but propanol (CCCO) has no way to lose two waters -- resolving
+    # it finds zero candidate action sequences. Left unchecked, that empty
+    # tuple reaches prepare_source_actions, which raises
+    # UnresolvedPrecursorError deep inside generator.predict_batches(),
+    # crashing every other sample sharing this compound (row 0 here).
+    dataset = direct_input_dataset(
+        smiles_values=['CCCO', 'CCCO'],
+        collision_energy='20 eV',
+        adduct_type='[M+H]+',
+    )
+    dataset['AdductType'] = ['[M+H]+', '[M-2H2O+H]+']
+
+    predicted, failures = predict_source_msdataset(
+        dataset, _generator(),
+        smiles_column='SMILES', adduct_type_column='AdductType',
+        collision_energy_column='CollisionEnergy', precursor_mz_column='PrecursorMZ',
+        instrument_column=None,
+    )
+
+    assert len(predicted) == 1
+    assert len(failures) == 1
+    assert failures.iloc[0]['index'] == 1
+    assert 'No valid precursor action sequence' in failures.iloc[0]['error']
+
+
 def test_predict_source_msdataset_reports_a_compound_rdkit_cannot_fragment():
     # Fragmentation now runs once per unique compound in a separate
     # precompute phase, not inline per row during parsing; a compound RDKit
@@ -196,6 +223,28 @@ def test_build_prediction_cache_serial_and_parallel_agree_on_keys_and_actions():
     assert serial['CCCO']['ok'] is True and parallel['CCCO']['ok'] is True
     assert serial['CCCO']['actions'] == parallel['CCCO']['actions']
     assert serial['CCCO']['precursor_sequences'] == parallel['CCCO']['precursor_sequences']
+
+
+def test_build_prediction_cache_keep_temp_controls_whether_task_files_survive(tmp_path):
+    generator = _generator()
+    groups = {'CCCO': ['[M+H]+'], 'CCN': ['[M+H]+']}
+    prep_config = {
+        'fragmenter_params': generator.fragmenter.to_dict(),
+        'symbols': list(generator.mol_encoder.symbols),
+        'adduct_type_strs': list(generator.adduct_type_strs),
+    }
+
+    default_root = tmp_path / 'default'
+    default_root.mkdir()
+    build_prediction_cache(groups, prep_config, num_workers=2, chunk_size=1, temp_dir=str(default_root))
+    assert list(default_root.iterdir()) == []
+
+    kept_root = tmp_path / 'kept'
+    kept_root.mkdir()
+    build_prediction_cache(groups, prep_config, num_workers=2, chunk_size=1, temp_dir=str(kept_root), keep_temp=True)
+    kept = list(kept_root.iterdir())
+    assert len(kept) == 1
+    assert any(p.suffix == '.pkl' for p in kept[0].iterdir())
 
 
 def test_predict_source_msdataset_ion_prediction_threshold_filters_low_confidence_peaks():

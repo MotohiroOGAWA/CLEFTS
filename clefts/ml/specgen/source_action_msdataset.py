@@ -2,6 +2,7 @@
 from __future__ import annotations
 import os
 import pickle
+import shutil
 import sys
 import tempfile
 from pathlib import Path
@@ -17,7 +18,8 @@ from .spectrum_generator import GeneratedMassSpectrum,GeneratedSpectrumPeak,Frag
 
 
 def build_prediction_cache(groups: dict[str,list[str]], prep_config: dict, *,
-                           num_workers: int = 1, chunk_size: int = 1, desc: str = 'Preparing molecules') -> dict[str,dict]:
+                           num_workers: int = 1, chunk_size: int = 1, desc: str = 'Preparing molecules',
+                           keep_temp: bool = False, temp_dir: str | None = None) -> dict[str,dict]:
     """groups: {smiles: [adduct_str, ...]} for every unique compound in the
     batch. Returns {smiles: result} (see prepare_worker.prepare_chunk) for
     every compound RDKit could process -- a compound left out (or marked
@@ -26,7 +28,10 @@ def build_prediction_cache(groups: dict[str,list[str]], prep_config: dict, *,
 
     num_workers==1 runs in-process, with per-compound progress; num_workers>1
     fans out via clefts.utils.parallel_subprocess (real OS processes -- RDKit
-    does not parallelize well across Python threads)."""
+    does not parallelize well across Python threads). The per-chunk task and
+    result files those subprocesses exchange live under a temporary
+    directory that is removed once every chunk has completed, unless
+    keep_temp is set (for inspecting a chunk's inputs/outputs directly)."""
     if type(num_workers) is not int or num_workers<1:raise ValueError('num_workers must be a positive integer')
     if type(chunk_size) is not int or chunk_size<1:raise ValueError('chunk_size must be a positive integer')
     if not groups:return {}
@@ -43,7 +48,8 @@ def build_prediction_cache(groups: dict[str,list[str]], prep_config: dict, *,
     items=list(groups.items())
     effective_chunk_size=min(chunk_size,max(1,len(items)//num_workers))
     results={}
-    with tempfile.TemporaryDirectory(prefix='clefts-predict-prepare-') as directory:
+    directory=tempfile.mkdtemp(prefix='clefts-predict-prepare-',dir=temp_dir)
+    try:
         commands=[]
         for offset in range(0,len(items),effective_chunk_size):
             chunk=dict(items[offset:offset+effective_chunk_size])
@@ -60,6 +66,11 @@ def build_prediction_cache(groups: dict[str,list[str]], prep_config: dict, *,
         env['PYTHONPATH']=os.pathsep.join(filter(None,[root,env.get('PYTHONPATH')]))
         run_parallel_subprocesses(commands,max_workers=min(num_workers,len(commands)),print_output=False,
                                   env=env,desc=desc,unit='chunk',on_complete=on_complete)
+    finally:
+        if keep_temp:
+            print(f"kept prepare task/result files: {directory}",file=sys.stderr)
+        else:
+            shutil.rmtree(directory,ignore_errors=True)
     return results
 
 
@@ -67,7 +78,10 @@ def predict_source_msdataset(dataset: object, generator: SourceAnchoredFragmentS
                              smiles_column: str, adduct_type_column: str, collision_energy_column: str,
                              precursor_mz_column: str, instrument_column: str | None,
                              include_formula_annotation: bool = True,
-                             num_workers: int = 1, chunk_size: int = 1) -> tuple[object,pd.DataFrame]:
+                             num_workers: int = 1, chunk_size: int = 1,
+                             keep_temp: bool = False, temp_dir: str | None = None,
+                             validate_desc: str = 'Validating records', prepare_desc: str = 'Preparing molecules',
+                             predict_desc: str = 'Predicting spectra') -> tuple[object,pd.DataFrame]:
     total = len(dataset)
     smiles_values = dataset[smiles_column].tolist()
     adduct_values = dataset[adduct_type_column].tolist()
@@ -81,7 +95,7 @@ def predict_source_msdataset(dataset: object, generator: SourceAnchoredFragmentS
     # per UNIQUE compound below, not once per row, since a real dataset
     # typically repeats the same compound across many adducts/energies.
     candidates,failures = [],[]
-    for i in tqdm(range(total),total=total,desc='Validating records'):
+    for i in tqdm(range(total),total=total,desc=validate_desc):
         try:
             adduct=Adduct.parse(str(adduct_values[i]))
             if str(adduct) not in generator.adduct_type_strs:
@@ -105,6 +119,7 @@ def predict_source_msdataset(dataset: object, generator: SourceAnchoredFragmentS
             failures.append({'index':i,'smiles':smiles_values[i],'error':f'{type(error).__name__}: {error}'})
             continue
         candidates.append((i,str(smiles_values[i]),adduct,float(ev)))
+    print(f"{validate_desc}: {len(candidates)}/{total} records valid, {len(failures)} failed",file=sys.stderr)
 
     # Phase 2: group by unique compound and precompute cleavage actions plus
     # candidate precursor sequences once per compound, optionally in
@@ -119,13 +134,19 @@ def predict_source_msdataset(dataset: object, generator: SourceAnchoredFragmentS
         'symbols':list(generator.mol_encoder.symbols),
         'adduct_type_strs':list(generator.adduct_type_strs),
     }
-    cache=build_prediction_cache(groups,prep_config,num_workers=num_workers,chunk_size=chunk_size)
+    cache=build_prediction_cache(groups,prep_config,num_workers=num_workers,chunk_size=chunk_size,
+                                 desc=prepare_desc,keep_temp=keep_temp,temp_dir=temp_dir)
 
-    # Phase 3: a compound RDKit could not fragment fails every row sharing
-    # it, instead of crashing generator.predict_batches() for the rest of
-    # the dataset. Compound.from_smiles is re-run once per unique compound
-    # here (already validated by the cache above) rather than pickling
-    # RDKit Mol objects back across the subprocess boundary.
+    # Phase 3: a compound RDKit could not fragment, or an adduct with no
+    # valid precursor action sequence for this source (an empty tuple --
+    # source_action_structure.prepare_source_actions raises
+    # UnresolvedPrecursorError on that, deep inside the batched prediction
+    # loop, taking every other sample sharing this compound down with it),
+    # fails only its own rows instead of crashing
+    # generator.predict_batches() for the rest of the dataset.
+    # Compound.from_smiles is re-run once per unique compound here (already
+    # validated by the cache above) rather than pickling RDKit Mol objects
+    # back across the subprocess boundary.
     sources,adducts,energies,valid_indices,precomputed = [],[],[],[],{}
     compound_cache: dict[str,Compound] = {}
     for i,smiles,adduct,ev in candidates:
@@ -133,6 +154,9 @@ def predict_source_msdataset(dataset: object, generator: SourceAnchoredFragmentS
         if result is None or not result.get('ok'):
             error=(result or {}).get('error','RDKit fragmentation produced no result for this compound')
             failures.append({'index':i,'smiles':smiles,'error':error})
+            continue
+        if not result['precursor_sequences'].get(str(adduct)):
+            failures.append({'index':i,'smiles':smiles,'error':f'No valid precursor action sequence found for adduct {adduct} on this compound'})
             continue
         if smiles not in compound_cache:
             try:
@@ -146,7 +170,7 @@ def predict_source_msdataset(dataset: object, generator: SourceAnchoredFragmentS
     spectra=[GeneratedMassSpectrum(k,[]) for k in range(len(sources))]
     threshold=generator.post_model.ion_prediction_threshold
     if sources:
-        progress=tqdm(total=len(sources),desc='Predicting spectra')
+        progress=tqdm(total=len(sources),desc=predict_desc)
         try:
             for output in generator.predict_batches(sources,adducts,energies,precomputed=precomputed):
                 prediction=output.spectra

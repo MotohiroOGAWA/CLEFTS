@@ -9,7 +9,7 @@ const defaults = {
   db: 'unspecified', smilesColumn: 'SMILES',
   precursorMzColumn: 'PrecursorMZ', adductTypeColumn: 'AdductType',
   collisionEnergyColumn: 'CollisionEnergy', instrumentColumn: '',
-  specIdColumn: 'SpecID', overwrite: false, maxSamples:128, numWorkers:1, chunkSize:1
+  specIdColumn: 'SpecID', overwrite: false, maxSamples:128, numWorkers:1, chunkSize:1, keepTemp:false
 };
 
 function buildBatchArgs(config) {
@@ -25,6 +25,7 @@ function buildBatchArgs(config) {
     '--num-workers', String(config.numWorkers??1), '--chunk-size', String(config.chunkSize??1)];
   if (String(config.instrumentColumn || '').trim()) args.push('--instrument-column', config.instrumentColumn.trim());
   if (config.overwrite) args.push('--overwrite');
+  if (config.keepTemp) args.push('--keep-temp');
   return args;
 }
 
@@ -122,6 +123,7 @@ function html() {
   return `<section id="predictConfiguration"><div class="section-title"><div><h2>Prediction Configuration</h2><p class="muted">Save or restore the model, single-spectrum conditions, and batch MSDataset settings.</p></div><div class="actions"><button type="button" id="predictLoadConfig">Load Configuration</button><button type="button" id="predictLoadConfigFile">Load From Run (.pft.json)</button><button type="button" id="predictSaveConfig">Save Configuration</button></div></div></section><section id="predictBatchSection" data-predict-mode="batch"><div class="section-title"><div><h2>Batch MSDataset prediction</h2><p class="muted">Predict in bounded batches and reuse molecular features across shared conditions.</p></div></div>
   <div class="grid"><label>Output directory *<div class="path"><input name="batchOutputDir" data-path-kind="folder"><button type="button" data-predict-batch-pick="outputDir">Browse</button></div></label><label>Input MSDataset *<div class="path"><input name="batchInput" data-path-kind="file"><button type="button" data-predict-batch-pick="input">Browse</button></div></label><label>Maximum simultaneous samples<input name="batchMaxSamples" type="number" min="1" step="1" value="128"></label><label>DB label<input name="batchDb" value="unspecified"></label><label>SpecID column<input name="batchSpecIdColumn" value="SpecID"></label><label>SMILES column<input name="batchSmilesColumn" value="SMILES"></label><label>Precursor m/z column<input name="batchPrecursorMzColumn" value="PrecursorMZ"></label><label>Adduct column<input name="batchAdductTypeColumn" value="AdductType"></label><label>Collision energy column<input name="batchCollisionEnergyColumn" value="CollisionEnergy"></label><label>Instrument column (optional)<input name="batchInstrumentColumn"></label><label>Parallel prepare workers<input name="batchNumWorkers" type="number" min="1" step="1" value="1"></label><label>Compounds per worker chunk<input name="batchChunkSize" type="number" min="1" step="1" value="1"></label></div>
   <label class="check"><input name="batchOverwrite" type="checkbox"><span>Overwrite existing output</span></label>
+  <label class="check"><input name="batchKeepTemp" type="checkbox"><span>Keep parallel prepare temp files</span></label>
   <div class="actions"><button type="button" id="predictBatchCopy">Copy CLI Command</button><button type="button" id="predictBatchStop" disabled>Stop</button><button type="button" id="predictBatchRun" class="primary">Predict MSDataset</button></div>
   <p id="predictBatchStatus" class="status idle">Ready</p><pre id="predictBatchCommand" style="white-space:pre-wrap;overflow-wrap:anywhere"></pre><pre id="predictBatchLog" style="max-height:280px;overflow:auto;white-space:pre-wrap"></pre></section>`;
 }
@@ -137,6 +139,7 @@ function client(defaults) {
     adductTypeColumn: value('batchAdductTypeColumn'), collisionEnergyColumn: value('batchCollisionEnergyColumn'),
     instrumentColumn: value('batchInstrumentColumn'), overwrite: !!predictForm.elements.batchOverwrite?.checked,
     numWorkers:Number(value('batchNumWorkers')||1), chunkSize:Number(value('batchChunkSize')||1),
+    keepTemp: !!predictForm.elements.batchKeepTemp?.checked,
     modelPath: value('modelPath'), device: value('device')
   });
   const fullConfig = () => ({ ...config(), smiles: value('smiles'), ce: value('ce'), adductType: value('adductType') });
@@ -164,6 +167,7 @@ function client(defaults) {
         numWorkers: 'batchNumWorkers', chunkSize: 'batchChunkSize' };
       for (const [key, name] of Object.entries(fields)) if (predictForm.elements[name]) predictForm.elements[name].value = loaded[key] ?? '';
       predictForm.elements.batchOverwrite.checked = !!loaded.overwrite;
+      predictForm.elements.batchKeepTemp.checked = !!loaded.keepTemp;
       for (const name of ['modelPath', 'device', 'smiles', 'ce']) if (predictForm.elements[name] && loaded[name] !== undefined) predictForm.elements[name].value = loaded[name];
       if (loaded.adductType) predictForm.elements.adductType.dataset.restoreValue = loaded.adductType;
       el('predictBatchStatus').textContent = 'Loaded configuration ' + message.path;

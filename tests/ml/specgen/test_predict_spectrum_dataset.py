@@ -127,6 +127,75 @@ def test_main_writes_msds_and_mssim_without_an_output_name_argument(tmp_path, mo
     assert pft["modelPath"] == str(model_path.resolve())
     assert pft["numWorkers"] == 1
     assert pft["chunkSize"] == 1
+    assert pft["keepTemp"] is False
+
+
+def test_main_keeps_prepare_temp_files_under_output_dir_only_with_keep_temp(tmp_path, monkeypatch) -> None:
+    # The parallel-prepare temp directory belongs under --output-dir (easy to
+    # find while a run is in progress, and afterward with --keep-temp), not
+    # the system temp directory; by default it leaves no trace once the run
+    # finishes.
+    model_config = config()
+    generator = create_spectrum_generator(model_config).eval()
+    model_path = tmp_path / "model.pt"
+    torch.save({"model_config": {"params": model_config}, "model_state_dict": generator.state_dict()}, model_path)
+
+    dataset = direct_input_dataset(smiles_values=["CCCO", "CCN"], collision_energy="20 eV", adduct_type="[M+H]+")
+    dataset["SpecID"] = ["orig-1", "orig-2"]
+    input_path = tmp_path / "input.msds"
+    dataset.save(str(input_path))
+
+    default_output_dir = tmp_path / "default-output"
+    monkeypatch.setattr("sys.argv", [
+        "predict_spectrum.py", "--input", str(input_path), "--output-dir", str(default_output_dir),
+        "--model", str(model_path), "--device", "cpu", "--spec-id-column", "SpecID",
+        "--num-workers", "2",
+    ])
+    predict_spectrum.main()
+    assert not (default_output_dir / "tmp").exists()
+
+    kept_output_dir = tmp_path / "kept-output"
+    monkeypatch.setattr("sys.argv", [
+        "predict_spectrum.py", "--input", str(input_path), "--output-dir", str(kept_output_dir),
+        "--model", str(model_path), "--device", "cpu", "--spec-id-column", "SpecID",
+        "--num-workers", "2", "--keep-temp",
+    ])
+    predict_spectrum.main()
+    kept_temp_dir = kept_output_dir / "tmp"
+    assert kept_temp_dir.exists()
+    assert any(kept_temp_dir.rglob("*.pkl"))
+
+
+def test_main_writes_pft_json_before_prediction_even_if_it_later_fails(tmp_path, monkeypatch) -> None:
+    # Settings should be visible/loadable (Workbench "Load From Run") even if
+    # the run fails or is interrupted partway through, not only on success.
+    model_config = config()
+    generator = create_spectrum_generator(model_config).eval()
+    model_path = tmp_path / "model.pt"
+    torch.save({"model_config": {"params": model_config}, "model_state_dict": generator.state_dict()}, model_path)
+
+    dataset = direct_input_dataset(smiles_values=["CCCO"], collision_energy="20 eV", adduct_type="[M+H]+")
+    dataset["SpecID"] = ["orig-1"]
+    input_path = tmp_path / "input.msds"
+    dataset.save(str(input_path))
+
+    output_dir = tmp_path / "prediction-output"
+    monkeypatch.setattr("sys.argv", [
+        "predict_spectrum.py", "--input", str(input_path), "--output-dir", str(output_dir),
+        "--model", str(model_path), "--device", "cpu", "--spec-id-column", "SpecID",
+    ])
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("simulated mid-run failure")
+    monkeypatch.setattr(predict_spectrum, "predict_msdataset", _boom)
+
+    with pytest.raises(RuntimeError, match="simulated mid-run failure"):
+        predict_spectrum.main()
+
+    import json
+    pft = json.loads((output_dir / "prediction.pft.json").read_text())
+    assert pft["application"] == "spectrum-prediction"
+    assert not (output_dir / "predicted.msds").exists()
 
 
 def test_prediction_input_rejects_duplicate_source_ids() -> None:

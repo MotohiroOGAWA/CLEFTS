@@ -20,10 +20,19 @@ from clefts.ml.data_preparation.fragment_tree.context import create_preparation_
 
 
 def prepare_compound_cache(smiles: str, adduct_strs, fragmenter) -> dict:
-    """Cleavage actions and, best-effort per requested adduct, the candidate
-    precursor action sequences -- both plain picklable dataclasses (no live
-    RDKit Mol references), reused verbatim (no RDKit call) by
-    SourceAnchoredFragmentSpectrumGenerator.prepare()."""
+    """Cleavage actions and, per requested adduct, the candidate precursor
+    action sequences -- both plain picklable dataclasses (no live RDKit Mol
+    references), reused verbatim (no RDKit call) by
+    SourceAnchoredFragmentSpectrumGenerator.prepare().
+
+    Every adduct in adduct_strs always gets an entry in precursor_sequences,
+    even an empty tuple: either this source has no valid pathway to that
+    adduct under the model's ion rules, or resolving it raised. Either way,
+    the caller (predict_source_msdataset) treats "no sequences" as a normal
+    per-record failure to skip -- not something to silently drop here and
+    let prepare_source_actions raise UnresolvedPrecursorError over later,
+    deep inside the batched prediction loop where it takes every other
+    sample sharing this compound down with it."""
     source = Compound.from_smiles(smiles)
     actions = fragmenter.fragment_ion_tree_builder.create_cleavage_actions(source)
     precursor_tree = None
@@ -41,10 +50,7 @@ def prepare_compound_cache(smiles: str, adduct_strs, fragmenter) -> dict:
             sequences = {pa.action_sequence for pa in fragmenter.resolve_precursor_actions(precursor_tree, adduct)}
             precursor_sequences[adduct_str] = tuple(sorted(sequences, key=lambda seq: (seq is not None, seq.key if seq else ())))
         except Exception:
-            # Left out of the cache: prepare() falls back to resolving this
-            # one adduct inline, so one bad adduct string never invalidates
-            # the whole compound's cache entry.
-            pass
+            precursor_sequences[adduct_str] = ()
     return {"actions": actions, "precursor_sequences": precursor_sequences}
 
 
