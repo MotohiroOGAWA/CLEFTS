@@ -40,7 +40,7 @@ function makePanel(){const listeners=[],disposers=[],posted=[];return {posted,we
    try{
     const run=predictionPanel.send({type:'predictBatchRun',config:{input:data,outputDir:path.join(a,'batch'),modelPath:'/model.pt'}});
     const child=children.at(-1);assert(child);child.stdout.emit('data',Buffer.from('partial prediction output\n'));child.emit('close',3,null);await run;
-    const batchConfig=store.read(a).configurations.find(item=>item.label==='predicted.msds');assert(batchConfig);
+    const batchConfig=store.read(a).configurations.find(item=>item.label==='Batch prediction');assert(batchConfig);
     const savedJob=JSON.parse(fs.readFileSync(path.join(a,'.clefts/jobs',batchConfig.jobId+'.json')));
     assert.equal(savedJob.type,'batch-prediction');assert.equal(savedJob.status,'completed');assert.equal(savedJob.exitCode,3);assert(savedJob.warning);assert(fs.readFileSync(savedJob.logPath,'utf8').includes('partial prediction output'));
    }finally{predictionPanel.dispose();}

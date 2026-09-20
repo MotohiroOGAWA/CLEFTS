@@ -6,7 +6,6 @@ from importlib.metadata import PackageNotFoundError, version
 import json
 import os
 from pathlib import Path
-import re
 import sys
 import time
 from typing import Any, Dict, List, Optional, Sequence
@@ -19,6 +18,7 @@ from torch import Tensor
 from clefts.libs.mmkit.mmkit import Adduct, Compound
 from clefts.libs.msentity.msentity import MSDataset
 from clefts.libs.msentity.msentity.core.PeakSeries import PeakSeries
+from clefts.libs.msentity.msentity.similarity import calculate_similarity
 from clefts.domain.mass.parse_ce import parse_ce_to_ev
 from clefts.ml.specgen.spectrum_generator import create_spectrum_generator
 from clefts.ml.specgen.source_anchored_spectrum_predictor import SourceAnchoredFragmentSpectrumGenerator
@@ -35,14 +35,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-dir",
         default="prediction-output",
-        help="Directory receiving predicted.msds and run information.",
+        help="Directory receiving predicted.msds, predicted.mssim and run information.",
     )
-    parser.add_argument(
-        "--output-name",
-        default="predicted.msds",
-        help="Final MSDataset filename inside --output-dir. Default: predicted.msds",
-    )
-    parser.add_argument("--output", default=None, help=argparse.SUPPRESS)
     parser.add_argument(
         "--model",
         required=True,
@@ -112,10 +106,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--max-samples',type=int,default=128,help='Maximum simultaneous prediction samples; larger inputs are split.')
     args = parser.parse_args()
     if args.max_samples<1:parser.error('--max-samples must be positive')
-    if Path(args.output_name).name != args.output_name:
-        parser.error("--output-name must be a filename, not a path")
-    if not args.output_name.endswith(".msds"):
-        args.output_name += ".msds"
     if args.input is None:
         missing = [
             name
@@ -278,11 +268,6 @@ def _tool_version() -> str:
         return "0.1.0"
 
 
-def _id_component(value: str) -> str:
-    token = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(value).strip()).strip("-.")
-    return token or "unspecified"
-
-
 def prediction_metadata(
     metadata: pd.DataFrame,
     *,
@@ -294,7 +279,6 @@ def prediction_metadata(
     collision_energy_column: str,
     precursor_mz_column: str,
     instrument_column: Optional[str],
-    first_sequence: int,
     timestamp: str,
 ) -> pd.DataFrame:
     """Apply the shared predicted-MSDataset provenance contract.
@@ -316,11 +300,11 @@ def prediction_metadata(
         result["SourceDB"] = result["DB"]
 
     db_label = str(db).strip() or "unspecified"
-    safe_db = _id_component(db_label)
-    result["SpecID"] = [
-        f"clefts-{safe_db}-{sequence:09d}"
-        for sequence in range(first_sequence, first_sequence + len(result))
-    ]
+    # CLEFTS_{original SpecID}, not a fresh sequence: SourceSpecID already
+    # carries the same value, but embedding it in SpecID lets any downstream
+    # tool that only keeps SpecID (for example a lightweight .mssim join)
+    # still trace a prediction back to what it was generated from.
+    result["SpecID"] = [f"CLEFTS_{value}" for value in immediate_source_ids]
     result["DB"] = db_label
     result["PredictionTool"] = "CLEFTS"
     result["PredictionToolVersion"] = _tool_version()
@@ -391,7 +375,7 @@ def predict_msdataset(
         predicted.metadata, db=db, model_path=model_path, spec_id_column=spec_id_column,
         smiles_column=smiles_column, adduct_type_column=adduct_type_column,
         collision_energy_column=collision_energy_column, precursor_mz_column=precursor_mz_column,
-        instrument_column=instrument_column, first_sequence=1, timestamp=timestamp)
+        instrument_column=instrument_column, timestamp=timestamp)
     tags = list(dict.fromkeys([*predicted.tags, "predicted", "CLEFTS"]))
     attributes = {
         **predicted.attributes,
@@ -424,17 +408,14 @@ def main() -> None:
     args = parse_args()
     device = torch.device(args.device)
 
-    if args.output:
-        legacy_output = Path(args.output).resolve()
-        output_dir = legacy_output.parent
-        output_path = legacy_output
-        print("warning: --output is deprecated; use --output-dir and --output-name.", file=sys.stderr)
-    else:
-        output_dir = Path(args.output_dir).resolve()
-        output_path = output_dir / args.output_name
-    if output_path.exists() and not args.overwrite:
-        raise FileExistsError(f"Output already exists; use --overwrite: {output_path}")
-    if args.input is not None and Path(args.input).resolve() == output_path:
+    output_dir = Path(args.output_dir).resolve()
+    output_path = output_dir / "predicted.msds"
+    similarity_path = output_dir / "predicted.mssim"
+    if not args.overwrite:
+        existing = [path for path in (output_path, similarity_path) if path.exists()]
+        if existing:
+            raise FileExistsError(f"Output already exists; use --overwrite: {existing}")
+    if args.input is not None and Path(args.input).resolve() in (output_path, similarity_path):
         raise ValueError("The input and final output MSDataset must be different paths.")
 
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -470,6 +451,7 @@ def main() -> None:
     print(f"model: {args.model}")
     print(f"output directory: {output_dir}")
     print(f"output MSDataset: {output_path.name}")
+    print(f"output similarity dataset: {similarity_path.name}")
     print(f"device: {device}")
     print(f"db: {args.db}")
     print(f"selected SMILES count: {len(smiles_values)}")
@@ -502,6 +484,21 @@ def main() -> None:
 
     _atomic_save(predicted, output_path)
 
+    # Full/embedded (not lightweight) similarity dataset: this .mssim carries
+    # its own copy of the matched peak data, so it stands on its own without
+    # needing the .msds files it was built from kept alongside it.
+    similarity = calculate_similarity(
+        predicted, dataset,
+        source1=str(output_path),
+        source2=str(Path(args.input).resolve()) if args.input else "direct arguments",
+        key1="SourceSpecID", key2=args.spec_id_column,
+        include_matched_data=True,
+    )
+    # SimilarityDataset.save() already writes via a same-directory tempfile
+    # and renames into place, unlike MSDataset.save(); reusing _atomic_save's
+    # ".name.tmp" wrapper here would break its own ".mssim"-suffix check.
+    similarity.save(str(similarity_path))
+
     run_dir = output_dir / "run"
     run_dir.mkdir(parents=True, exist_ok=True)
     failures.to_csv(run_dir / "failures.tsv", sep="\t", index=False)
@@ -511,6 +508,7 @@ def main() -> None:
         "model": str(Path(args.model).resolve()),
         "input": str(Path(args.input).resolve()) if args.input else None,
         "output": str(output_path),
+        "similarity_output": str(similarity_path),
         "output_directory": str(output_dir),
         "db": args.db,
         "device": str(device),
@@ -528,6 +526,7 @@ def main() -> None:
         f"n_peaks={predicted.n_peaks_total}"
     )
     print(f"saved: {output_path}")
+    print(f"saved similarity dataset: {similarity_path}")
     print(f"run information: {run_dir}")
     if len(failures):
         print(f"partial success: {len(failures)} record(s) failed", file=sys.stderr)

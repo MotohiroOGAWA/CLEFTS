@@ -9,7 +9,7 @@ Module._load = function(request, parent, main) {
 const feature = require('../src/features/spectrum-prediction/editor');
 
 const args = feature.buildBatchArgs({
-  input: '/data/source database.msds', outputDir: '/data/prediction output', outputName: 'result.msds',
+  input: '/data/source database.msds', outputDir: '/data/prediction output',
   modelPath: '/models/model.pt', device: 'cuda', db: 'MoNA', maxSamples: 16,
   specIdColumn: 'SpecID', smilesColumn: 'SMILES', precursorMzColumn: 'PrecursorMZ',
   adductTypeColumn: 'AdductType', collisionEnergyColumn: 'CollisionEnergy',
@@ -19,7 +19,7 @@ assert.deepEqual(args.slice(0, 2), ['-m', 'clefts.ml.specgen.predict_spectrum'])
 assert.deepEqual(args.slice(args.indexOf('--db'), args.indexOf('--db') + 2), ['--db', 'MoNA']);
 assert.deepEqual(args.slice(args.indexOf('--max-samples'), args.indexOf('--max-samples') + 2), ['--max-samples', '16']);
 assert.deepEqual(args.slice(args.indexOf('--output-dir'), args.indexOf('--output-dir') + 2), ['--output-dir', '/data/prediction output']);
-assert.deepEqual(args.slice(args.indexOf('--output-name'), args.indexOf('--output-name') + 2), ['--output-name', 'result.msds']);
+assert(!args.includes('--output-name'));
 assert(!args.includes('--precompute-workers'));
 assert(args.includes('--overwrite'));
 assert(!args.includes('--keep-temp'));

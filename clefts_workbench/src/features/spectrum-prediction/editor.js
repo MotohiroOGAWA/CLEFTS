@@ -9,13 +9,13 @@ const defaults = {
   db: 'unspecified', smilesColumn: 'SMILES',
   precursorMzColumn: 'PrecursorMZ', adductTypeColumn: 'AdductType',
   collisionEnergyColumn: 'CollisionEnergy', instrumentColumn: '',
-  specIdColumn: 'SpecID', outputName: 'predicted.msds', overwrite: false, maxSamples:128
+  specIdColumn: 'SpecID', overwrite: false, maxSamples:128
 };
 
 function buildBatchArgs(config) {
   const args = ['-m', 'clefts.ml.specgen.predict_spectrum',
     '--input', config.input, '--output-dir', config.outputDir,
-    '--output-name', config.outputName || 'predicted.msds', '--model', config.modelPath,
+    '--model', config.modelPath,
     '--device', config.device || 'cpu', '--max-samples',String(config.maxSamples??128), '--db', config.db || 'unspecified',
     '--smiles-column', config.smilesColumn || 'SMILES',
     '--precursor-mz-column', config.precursorMzColumn || 'PrecursorMZ',
@@ -77,7 +77,7 @@ function attach(panel, context, projectRoot, output) {
       post({ running: true, clear: true, text: 'Predicting MSDataset…', command });
       child = spawn(python, args, { cwd: root, env: { ...process.env, PYTHONUNBUFFERED: '1',
         PYTHONPATH: [root, process.env.PYTHONPATH].filter(Boolean).join(path.delimiter) } });
-      observed=jobs.observeJob(context,{type:'batch-prediction',workflow:'prediction',name:config.outputName||'Batch prediction',outputDir:config.outputDir,child,command:[python,...args],config,base:root});
+      observed=jobs.observeJob(context,{type:'batch-prediction',workflow:'prediction',name:'Batch prediction',outputDir:config.outputDir,child,command:[python,...args],config,base:root});
       child.stdin.on('error', () => {}); child.stdin.end();
       const stream = data => {
         observed.log(data.toString());
@@ -108,7 +108,7 @@ function attach(panel, context, projectRoot, output) {
 
 function html() {
   return `<section id="predictConfiguration"><div class="section-title"><div><h2>Prediction Configuration</h2><p class="muted">Save or restore the model, single-spectrum conditions, and batch MSDataset settings.</p></div><div class="actions"><button type="button" id="predictLoadConfig">Load Configuration</button><button type="button" id="predictSaveConfig">Save Configuration</button></div></div></section><section id="predictBatchSection" data-predict-mode="batch"><div class="section-title"><div><h2>Batch MSDataset prediction</h2><p class="muted">Predict in bounded batches and reuse molecular features across shared conditions.</p></div></div>
-  <div class="grid"><label>Output directory *<div class="path"><input name="batchOutputDir" data-path-kind="folder"><button type="button" data-predict-batch-pick="outputDir">Browse</button></div></label><label>Output MSDataset filename<input name="batchOutputName" value="predicted.msds"></label><label>Input MSDataset *<div class="path"><input name="batchInput" data-path-kind="file"><button type="button" data-predict-batch-pick="input">Browse</button></div></label><label>Maximum simultaneous samples<input name="batchMaxSamples" type="number" min="1" step="1" value="128"></label><label>DB label<input name="batchDb" value="unspecified"></label><label>SpecID column<input name="batchSpecIdColumn" value="SpecID"></label><label>SMILES column<input name="batchSmilesColumn" value="SMILES"></label><label>Precursor m/z column<input name="batchPrecursorMzColumn" value="PrecursorMZ"></label><label>Adduct column<input name="batchAdductTypeColumn" value="AdductType"></label><label>Collision energy column<input name="batchCollisionEnergyColumn" value="CollisionEnergy"></label><label>Instrument column (optional)<input name="batchInstrumentColumn"></label></div>
+  <div class="grid"><label>Output directory *<div class="path"><input name="batchOutputDir" data-path-kind="folder"><button type="button" data-predict-batch-pick="outputDir">Browse</button></div></label><label>Input MSDataset *<div class="path"><input name="batchInput" data-path-kind="file"><button type="button" data-predict-batch-pick="input">Browse</button></div></label><label>Maximum simultaneous samples<input name="batchMaxSamples" type="number" min="1" step="1" value="128"></label><label>DB label<input name="batchDb" value="unspecified"></label><label>SpecID column<input name="batchSpecIdColumn" value="SpecID"></label><label>SMILES column<input name="batchSmilesColumn" value="SMILES"></label><label>Precursor m/z column<input name="batchPrecursorMzColumn" value="PrecursorMZ"></label><label>Adduct column<input name="batchAdductTypeColumn" value="AdductType"></label><label>Collision energy column<input name="batchCollisionEnergyColumn" value="CollisionEnergy"></label><label>Instrument column (optional)<input name="batchInstrumentColumn"></label></div>
   <label class="check"><input name="batchOverwrite" type="checkbox"><span>Overwrite existing output</span></label>
   <div class="actions"><button type="button" id="predictBatchCopy">Copy CLI Command</button><button type="button" id="predictBatchStop" disabled>Stop</button><button type="button" id="predictBatchRun" class="primary">Predict MSDataset</button></div>
   <p id="predictBatchStatus" class="status idle">Ready</p><pre id="predictBatchCommand" style="white-space:pre-wrap;overflow-wrap:anywhere"></pre><pre id="predictBatchLog" style="max-height:280px;overflow:auto;white-space:pre-wrap"></pre></section>`;
@@ -119,7 +119,7 @@ function client(defaults) {
   const el = id => document.getElementById(id), predictForm = el('predictForm');
   const value = name => predictForm.elements[name]?.value || '';
   const config = () => ({
-    input: value('batchInput'), outputDir: value('batchOutputDir'), outputName: value('batchOutputName'), db: value('batchDb'),
+    input: value('batchInput'), outputDir: value('batchOutputDir'), db: value('batchDb'),
     maxSamples:Number(value('batchMaxSamples')), specIdColumn: value('batchSpecIdColumn'),
     smilesColumn: value('batchSmilesColumn'), precursorMzColumn: value('batchPrecursorMzColumn'),
     adductTypeColumn: value('batchAdductTypeColumn'), collisionEnergyColumn: value('batchCollisionEnergyColumn'),
@@ -144,7 +144,7 @@ function client(defaults) {
     if (message.type === 'predictConfigLoaded') {
       const loaded = { ...defaults, ...(message.config || {}) };
       if (!loaded.outputDir && loaded.output) loaded.outputDir = loaded.output.replace(/[\\/][^\\/]+$/, '');
-      const fields = { maxSamples:'batchMaxSamples',input: 'batchInput', outputDir: 'batchOutputDir', outputName: 'batchOutputName', db: 'batchDb',
+      const fields = { maxSamples:'batchMaxSamples',input: 'batchInput', outputDir: 'batchOutputDir', db: 'batchDb',
         specIdColumn: 'batchSpecIdColumn', smilesColumn: 'batchSmilesColumn', precursorMzColumn: 'batchPrecursorMzColumn',
         adductTypeColumn: 'batchAdductTypeColumn', collisionEnergyColumn: 'batchCollisionEnergyColumn', instrumentColumn: 'batchInstrumentColumn' };
       for (const [key, name] of Object.entries(fields)) if (predictForm.elements[name]) predictForm.elements[name].value = loaded[key] ?? '';
