@@ -22,7 +22,7 @@ function createParameterEditor(container, initial, kind = "training", editCleava
     hidden_dim:'Hidden representation dimension for this model component.',
     condition_dim:'Dimension of the encoded spectrum conditions.',
     node_dim:'Molecular encoder atom representation dimension.',graph_dim:'Molecular encoder graph representation dimension.',
-    dropout:'Fraction of activations dropped during training for this model component.',
+    dropout:'Fraction of molecular encoder activations dropped during training.',
     max_roles:'Maximum SMARTS query role embeddings; leave the override unset to infer a safe size from the patterns.',
     num_layers:'Number of transformer layers.',num_heads:'Number of attention heads. Must divide the corresponding hidden dimension.',
     max_degree:'Maximum degree represented in graph structural embeddings.',max_spatial_dist:'Maximum atom graph distance encoded by the molecular encoder.',max_edge_dist:'Maximum bond distance encoded by the molecular encoder.',
@@ -39,7 +39,7 @@ function createParameterEditor(container, initial, kind = "training", editCleava
     freeze_mol_encoder:'Freeze the molecular encoder during training.',
   };
   const templates={patterns:{name:'new_pattern',reactant_smarts:'[!#1:1]-[!#1:2]',products:[{name:'product',smarts:'[!#1:1]'}]},products:{name:'product',smarts:'[!#1:1]'},adduct_rules:{name:'new_rule',adduct_type:'[M+H]+',radical:false,unsaturation:0,ion_shifts:[]},ion_shifts:{ion_shift:'[M+H]+'},atoms:'C',symbols:'C',adduct_type_strs:'[M+H]+'};
-  const optional={action_model_params:{num_heads:4,max_roles:64,state_num_layers:2,state_dropout:0,prediction_threshold:0.5},mol_encoder_params:{dropout:0},post_model_params:{cosine_loss_weight:0.5,dropout:0.5}};
+  const optional={action_model_params:{num_heads:4,max_roles:64,state_num_layers:2,prediction_threshold:0.5},mol_encoder_params:{dropout:0},post_model_params:{cosine_loss_weight:0.5}};
   const basic=new Set(['fragmenter_params.fragment_ion_tree_builder.max_action_count','fragmenter_params.precursor_candidate_max_action_count','fragmenter_params.mass_tolerance']);
   const node=(tag,text)=>{const n=document.createElement(tag);if(text!==undefined)n.textContent=text;return n;};
   const button=(text,fn)=>{const b=node('button',text);b.type='button';b.onclick=fn;return b;};

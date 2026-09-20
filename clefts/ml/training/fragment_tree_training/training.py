@@ -360,12 +360,10 @@ MODEL_OPTIONS = {
     'beam-size': ('action_model_params', 'beam_size', int, 32),
     'max-decode-steps': ('action_model_params', 'max_decode_steps', int, 16),
     'action-state-layers': ('action_model_params', 'state_num_layers', int, 2),
-    'action-state-dropout': ('action_model_params', 'state_dropout', float, 0.0),
     'post-hidden-dim': ('post_model_params', 'hidden_dim', int, 128),
     'post-num-layers': ('post_model_params', 'num_layers', int, 2),
     'post-cosine-loss-weight': ('post_model_params', 'cosine_loss_weight', float, 0.5),
     'post-num-heads': ('post_model_params', 'num_heads', int, 4),
-    'post-dropout': ('post_model_params', 'dropout', float, 0.5),
 }
 
 
@@ -376,6 +374,9 @@ def training_model_config(args):
         value = getattr(args, flag.replace('-', '_'))
         if value is not None or default is not None:
             config[section][key] = value if value is not None else default
+    # A single shared dropout, not one knob per component.
+    config['action_model_params']['state_dropout'] = args.dropout
+    config['post_model_params']['dropout'] = args.dropout
     if args.mol_encoder_checkpoint:
         config['mol_encoder_checkpoint'] = args.mol_encoder_checkpoint
     return config
@@ -384,6 +385,8 @@ def training_model_config(args):
 def build_arg_parser() -> argparse.ArgumentParser:
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--mol-encoder-checkpoint', help='Pretrained Mol Encoder checkpoint; required for new training.')
+    parser.add_argument('--dropout', type=float, default=0.5,
+        help='Shared dropout applied to every trainable component (action state encoder, post-materialization tree encoder).')
     for flag, (_, _, kind, default) in MODEL_OPTIONS.items():
         parser.add_argument('--'+flag, type=kind, default=default)
     for name in ('train-dir','val-dir','output-dir'):parser.add_argument('--'+name,required=True)
