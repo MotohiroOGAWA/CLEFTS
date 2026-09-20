@@ -6,9 +6,21 @@ import math
 import tempfile
 from pathlib import Path
 import torch
+from tqdm.auto import tqdm
 from clefts.ml.input.source_action_structure import SourceActionStructure
 from clefts.ml.specgen.spectrum_generator import create_spectrum_generator
 from .model import ActionFragmentTreeTrainingModel
+
+
+PROGRESS_WIDTH = 100
+PROGRESS_FORMAT = '{desc:<18} {percentage:3.0f}%|{bar:36}| {n_fmt:>5}/{total_fmt:<5} [{elapsed}<{remaining}]'
+
+
+def progress_bar(*, total, description, position, leave):
+    """Create one of the three fixed-position training progress bars."""
+    return tqdm(total=total, desc=description, position=position, leave=leave,
+                ncols=PROGRESS_WIDTH, dynamic_ncols=False, bar_format=PROGRESS_FORMAT,
+                mininterval=0.1, maxinterval=1.0)
 
 
 def validation_subset(pieces, fraction: float, seed: int):
@@ -61,6 +73,8 @@ def train_actions(*, model_config: dict, train_dir: str | Path, val_dir: str | P
         'validation_interval_steps','validation_fraction')}
     settings={key:str(value) if isinstance(value,Path) else value for key,value in settings.items()}
     (output/'training_args.json').write_text(json.dumps(settings,indent=2))
+    from .report import write_training_report
+    write_training_report(output,status='initializing',settings=settings)
     if epochs<1 or batch_size<1 or max_samples<1 or not math.isfinite(lr) or lr<=0:
         raise ValueError('epochs, batch_size, max_samples and lr must be positive')
     if any(not math.isfinite(value) or value<0 for value in (weight_decay,gradient_clip,absolute_weight,next_weight,negative_weight,intensity_weight,absolute_intensity_weight,minimum_positive_weight,min_lr)):
@@ -147,6 +161,8 @@ def train_actions(*, model_config: dict, train_dir: str | Path, val_dir: str | P
         datasets.append(pieces)
         dataset_report[name]={'files':len(files),'samples':samples,'teacher_states':states,'formula_targets':formulas,'chunks':len(pieces)}
     (output/'dataset_summary.json').write_text(json.dumps(dataset_report,indent=2))
+    write_training_report(output,status='running',settings=settings,datasets=dataset_report,
+                          completed_epochs=len(history),global_step=global_step)
     intermediate_pieces=[]
     if validation_interval_steps:
         intermediate_pieces,subset_indices=validation_subset(datasets[1],validation_fraction,subset_seed)
@@ -158,36 +174,44 @@ def train_actions(*, model_config: dict, train_dir: str | Path, val_dir: str | P
     iteration_writer=SummaryWriter(str(output/'tensorboard'/'iterations'),purge_step=global_step+1 if resume else None)
     writer.add_text('configuration/model',json.dumps(model_config,indent=2));writer.add_text('configuration/training',json.dumps(settings,indent=2))
     started=time.perf_counter();stop_reason='epochs_completed'
-    def batches(pieces,shuffle):
+    def batch_groups(pieces,shuffle):
         order=list(range(len(pieces)))
         if shuffle:random.shuffle(order)
-        group=[];count=0
+        groups=[];group=[];count=0
         for index in order:
             piece=pieces[index]
             if group and (len(group)>=batch_size or count+piece.num_samples>max_samples):
-                yield SourceActionStructure.from_structures(group);group=[];count=0
-            group.append(piece);count+=piece.num_samples
-        if group:yield SourceActionStructure.from_structures(group)
+                groups.append(tuple(group));group=[];count=0
+            group.append(index);count+=piece.num_samples
+        if group:groups.append(tuple(group))
+        return groups
+    def grouped_batches(pieces,groups):
+        for group in groups:
+            yield SourceActionStructure.from_structures([pieces[index] for index in group])
     def metric_values(result):
         return {'loss':result.loss,'absolute_action_loss':result.absolute_loss,
                 'branching_action_loss':result.next_action_loss,'intensity_loss':result.downstream_output.loss,**result.metrics}
-    from .spectrum_validation import validate_spectra
+    from .spectrum_validation import validate_spectra, append_metric_distributions
     def intermediate_validation(epoch):
         was_training=model.training
-        totals={};sample_count=batch_count=0
+        totals={};sample_count=batch_count=0;batch_metrics={}
         validation_started=time.perf_counter()
+        groups=batch_groups(intermediate_pieces,False)
+        stage_progress.reset(total=len(groups)+len(intermediate_pieces));stage_progress.set_description_str('Stage check');stage_progress.set_postfix_str('validation loss',refresh=True)
         try:
             model.eval()
             with torch.no_grad():
-                for data in batches(intermediate_pieces,False):
+                for data in grouped_batches(intermediate_pieces,groups):
                     data=replace(data,downstream=deduplicate_molecular_graphs(data.downstream,data.source_smiles)).to(device)
                     result=model(data)
                     for key,value in metric_values(result).items():
                         scalar=float(value.detach())
                         if not math.isfinite(scalar):raise FloatingPointError(f'Non-finite intermediate validation metric {key}')
                         totals[key]=totals.get(key,0.)+scalar*data.num_samples
+                        batch_metrics.setdefault(key,[]).append(scalar)
                     sample_count+=data.num_samples;batch_count+=1
                     del result,data,value
+                    stage_progress.update(1)
         finally:
             model.train(was_training)
         row={'epoch':epoch,'global_step':global_step,'validation_samples':sample_count,
@@ -196,7 +220,10 @@ def train_actions(*, model_config: dict, train_dir: str | Path, val_dir: str | P
              'validation_seconds':time.perf_counter()-validation_started,
              'validation_loss':totals.pop('loss')/sample_count}
         row.update({'validation/'+key:value/sample_count for key,value in totals.items()})
-        row.update({'validation/'+k:v for k,v in validate_spectra(generator,intermediate_pieces,output,f'step_{global_step}',global_step=global_step).items()})
+        append_metric_distributions(output,global_step,'intermediate_validation',batch_metrics,epoch=epoch)
+        stage_progress.set_postfix_str('generate spectrum',refresh=True)
+        row.update({'validation/'+k:v for k,v in validate_spectra(generator,intermediate_pieces,output,f'step_{global_step}',global_step=global_step,
+            progress=lambda _,phase:stage_progress.update(1) if phase=='end' else None,epoch=epoch).items()})
         row['validation_seconds']=time.perf_counter()-validation_started
         intermediate_history.append(row)
         (output/'intermediate_validation.json').write_text(json.dumps({'history':intermediate_history},indent=2))
@@ -207,46 +234,68 @@ def train_actions(*, model_config: dict, train_dir: str | Path, val_dir: str | P
             if key not in ('epoch','global_step'):
                 iteration_writer.add_scalar('intermediate_validation/'+key,value,global_step)
         iteration_writer.flush()
-        print(json.dumps({'event':'intermediate_validation_end',**row}),flush=True)
     try:
+        epoch_progress=progress_bar(total=epochs,description='Epoch',position=0,leave=True)
         for epoch in range(start,start+epochs):
             epoch_start=time.perf_counter();torch.cuda.reset_peak_memory_stats(device)
             row={'epoch':epoch+1};gradient_values=[]
-            for name,pieces in zip(('train','validation'),datasets):
-                model.train(name=='train');totals={};sample_count=0;batch_count=0
+            epoch_groups=[batch_groups(datasets[0],True),batch_groups(datasets[1],False)]
+            iteration_progress=progress_bar(total=sum(map(len,epoch_groups))+len(datasets[1]),description='Iteration',position=1,leave=False)
+            stage_progress=progress_bar(total=1,description='Stage',position=2,leave=False)
+            for name,pieces,groups in zip(('train','validation'),datasets,epoch_groups):
+                model.train(name=='train');totals={};sample_count=0;batch_count=0;batch_metrics={}
                 with torch.set_grad_enabled(name=='train'):
-                    for data in batches(pieces,name=='train'):
+                    for data in grouped_batches(pieces,groups):
+                        stages=('prepare','forward','backward','optimizer','metrics') if name=='train' else ('prepare','forward','metrics')
+                        stage_progress.reset(total=len(stages));stage_progress.set_description_str(f'Stage {name}');stage_progress.set_postfix_str(stages[0],refresh=True)
                         # Repeated molecular graphs (including Source roots) are
                         # encoded once and gathered for each sample's tree.
                         source_keys=data.source_smiles
                         data=replace(data,downstream=deduplicate_molecular_graphs(data.downstream,source_keys)).to(device)
+                        stage_progress.update(1);stage_progress.set_postfix_str('forward',refresh=True)
                         if name=='train':
                             if global_step<warmup_steps:
                                 for group in optimizer.param_groups:group['lr']=lr*(global_step+1)/max(warmup_steps,1)
                             optimizer.zero_grad(set_to_none=True)
                         result=model(data)
+                        stage_progress.update(1)
                         if not torch.isfinite(result.loss):raise FloatingPointError(f'Non-finite {name} loss at epoch {epoch+1}')
                         if name=='train':
+                            stage_progress.set_postfix_str('backward',refresh=True)
                             result.loss.backward()
                             norm=torch.nn.utils.clip_grad_norm_((p for p in model.parameters() if p.requires_grad),gradient_clip if gradient_clip>0 else float('inf'),error_if_nonfinite=True)
+                            stage_progress.update(1);stage_progress.set_postfix_str('optimizer',refresh=True)
                             gradient_values.append(float(norm));optimizer.step();global_step+=1
+                            batch_metrics.setdefault('gradient_norm',[]).append(float(norm))
+                            batch_metrics.setdefault('learning_rate',[]).append(float(optimizer.param_groups[0]['lr']))
                             iteration_writer.add_scalar('batch/train_loss',float(result.loss.detach()),global_step)
                             iteration_writer.add_scalar('batch/gradient_norm',float(norm),global_step)
                             iteration_writer.add_scalar('batch/learning_rate',optimizer.param_groups[0]['lr'],global_step)
+                            stage_progress.update(1)
+                        stage_progress.set_postfix_str('metrics',refresh=True)
                         values=metric_values(result)
                         for key,value in values.items():
                             scalar=float(value.detach())
                             if not math.isfinite(scalar):raise FloatingPointError(f'Non-finite metric {name}/{key}')
                             totals[key]=totals.get(key,0.)+scalar*data.num_samples
+                            batch_metrics.setdefault(key,[]).append(scalar)
                         sample_count+=data.num_samples;batch_count+=1
                         # Release the training graph before evaluating a subset.
                         del values,result,data,value
+                        stage_progress.update(1);iteration_progress.update(1)
                         if name=='train' and validation_interval_steps and global_step%validation_interval_steps==0:
                             intermediate_validation(epoch+1)
                 row[name+'_loss']=totals.pop('loss')/max(sample_count,1)
                 row.update({name+'/'+key:value/max(sample_count,1) for key,value in totals.items()})
                 row[name+'/samples']=sample_count;row[name+'/batches']=batch_count
-            row.update({'validation/'+k:v for k,v in validate_spectra(generator,datasets[1],output,f'epoch_{epoch+1}',global_step=global_step).items()})
+                append_metric_distributions(output,global_step,name,batch_metrics,epoch=epoch+1)
+            def spectrum_progress(_,phase):
+                if phase=='start':
+                    stage_progress.reset(total=1);stage_progress.set_description_str('Stage inference');stage_progress.set_postfix_str('generate spectrum',refresh=True)
+                else:
+                    stage_progress.update(1);iteration_progress.update(1)
+            row.update({'validation/'+k:v for k,v in validate_spectra(generator,datasets[1],output,f'epoch_{epoch+1}',global_step=global_step,progress=spectrum_progress,epoch=epoch+1).items()})
+            stage_progress.close();iteration_progress.close()
             row['global_step']=global_step;row['learning_rate']=optimizer.param_groups[0]['lr']
             row['gradient_norm']=sum(gradient_values)/max(len(gradient_values),1)
             row['epoch_seconds']=time.perf_counter()-epoch_start;row['cuda_peak_memory_mb']=torch.cuda.max_memory_allocated(device)/2**20
@@ -265,12 +314,18 @@ def train_actions(*, model_config: dict, train_dir: str | Path, val_dir: str | P
             saved=dict(model_config=model_config,model_state_dict=model.state_dict(),optimizer_state_dict=optimizer.state_dict(),scheduler_state_dict=scheduler.state_dict(),epoch=epoch+1,global_step=global_step,intermediate_validation_history=intermediate_history,schema_version=6,fragmentation_schema=generator.architecture,history=history,training_settings=settings,best_validation_loss=best,bad_epochs=bad_epochs,torch_rng_state=torch.get_rng_state(),cuda_rng_state=torch.cuda.get_rng_state_all(),python_rng_state=random.getstate())
             torch.save(saved,output/'last.pt')
             if improved:torch.save(saved,output/'best.pt')
-            print(json.dumps({'event':'epoch_end','current':epoch-start+1,'total':epochs,**row}),flush=True)
+            write_training_report(output,status='running',settings=settings,datasets=dataset_report,
+                                  completed_epochs=len(history),global_step=global_step,
+                                  latest_validation=f'spectrum_validation/epoch_{epoch+1}.json')
+            epoch_progress.update(1)
             if early_stopping_patience and bad_epochs>=early_stopping_patience:
                 stop_reason='early_stopping';break
         (output/'training_failure.json').unlink(missing_ok=True)
         report['stop_reason']=stop_reason
         (output/'metrics.json').write_text(json.dumps(report,indent=2));(output/'training_report.json').write_text(json.dumps(report,indent=2))
+        write_training_report(output,status='completed',settings=settings,datasets=dataset_report,
+                              completed_epochs=len(history),global_step=global_step,
+                              latest_validation=f'spectrum_validation/epoch_{history[-1]["epoch"]}.json' if history else None)
         lines=['# Fragment Tree Training Report','',f"Device: {device}; trainable parameters: {parameters['trainable']:,}",f"Best validation loss: {best:.6g}",f"Stop reason: {stop_reason}",'','Validation generates spectra in inference mode and records original-peak cosine distributions in spectrum_validation/. Teacher-forced losses are recorded separately.','','| Epoch | Train loss | Validation loss | Filter intensity recall | Spectrum cosine | LR |','|---|---|---|---|---|---|']
         for item in history:lines.append(f"| {item['epoch']} | {item['train_loss']:.6g} | {item['validation_loss']:.6g} | {item.get('validation/intensity_recall_at_filter',0):.4f} | {item.get('validation/spectrum_cosine_similarity',0):.4f} | {item.get('learning_rate',0):.3g} |")
         if intermediate_history:
@@ -281,8 +336,14 @@ def train_actions(*, model_config: dict, train_dir: str | Path, val_dir: str | P
         return report
     except Exception as error:
         (output/'training_failure.json').write_text(json.dumps({'error':str(error),'global_step':global_step,'completed_epochs':len(history)},indent=2))
+        write_training_report(output,status='failed',settings=settings,datasets=dataset_report if 'dataset_report' in locals() else {},
+                              completed_epochs=len(history),global_step=global_step,
+                              latest_validation=f'spectrum_validation/epoch_{history[-1]["epoch"]}.json' if history else None,error=error)
         raise
     finally:
+        if 'stage_progress' in locals():stage_progress.close()
+        if 'iteration_progress' in locals():iteration_progress.close()
+        if 'epoch_progress' in locals():epoch_progress.close()
         writer.close();iteration_writer.close()
 
 
@@ -375,13 +436,12 @@ def main(argv: list[str] | None = None) -> None:
             model_config=prepare_model_config(checkpoint_path=args.fine_tune_checkpoint,
                 pattern_set_path=patterns_path,new_params_path=config_path,width=args.adapter_width)
             model_config['fine_tuning'].pop('pattern_set_path', None)
-    report=train_actions(model_config=model_config,train_dir=args.train_dir,val_dir=args.val_dir,
+    train_actions(model_config=model_config,train_dir=args.train_dir,val_dir=args.val_dir,
         output_dir=args.output_dir,epochs=args.epochs,batch_size=args.batch_size,lr=args.lr,device=args.device,resume=args.resume,
         weight_decay=args.weight_decay,gradient_clip=args.gradient_clip,
         absolute_weight=args.absolute_weight,next_weight=args.next_weight,
         negative_weight=args.negative_weight,intensity_weight=args.intensity_weight,absolute_intensity_weight=args.absolute_intensity_weight,max_samples=args.max_samples,
         seed=args.seed,warmup_steps=args.warmup_steps,lr_patience=args.lr_patience,early_stopping_patience=args.early_stopping_patience,min_lr=args.min_lr,train_mol_encoder=args.train_mol_encoder,initialize_from=args.initialize_from,
         minimum_positive_weight=args.minimum_positive_weight,validation_interval_steps=args.validation_interval_steps,validation_fraction=args.validation_fraction)
-    print(json.dumps(report))
 
 if __name__=='__main__':main()

@@ -229,8 +229,7 @@ class TestActionTrainingRevision(unittest.TestCase):
             self.assertEqual(sum(training for training,_,_ in calls),6)
             self.assertTrue(all(training==grad_enabled for training,grad_enabled,_ in calls))
             self.assertEqual(sum(not training for training,_,_ in calls),32)
-            events=[json.loads(line) for line in logs.getvalue().splitlines()]
-            self.assertEqual([event['global_step'] for event in events if event['event']=='intermediate_validation_end'],[3,6])
+            self.assertEqual(logs.getvalue(),'')
             for filename in ('intermediate_validation.json','intermediate_validation.tsv','intermediate_validation_subset.json'):
                 self.assertTrue((root/'run'/filename).is_file())
             self.assertEqual(len(json.loads((root/'run'/'intermediate_validation.json').read_text())['history']),2)

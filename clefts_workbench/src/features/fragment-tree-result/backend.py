@@ -73,7 +73,7 @@ def _node_view(structure, samples, source_smiles, file_path):
     mol=source.mapped_mol
     drawer=rdMolDraw2D.MolDraw2DSVG(620,360)
     drawer.DrawMolecule(mol);drawer.FinishDrawing()
-    registry=[];original_actions=[];params={}
+    registry=[];original_actions=[];params={};cleavage_patterns={}
     for parent in file_path.parents:
         config=parent/'preparation_config.json'
         if config.exists():
@@ -82,7 +82,10 @@ def _node_view(structure, samples, source_smiles, file_path):
     fragmenter_params=model.get('fragmenter_params',params.get('fragmenterParams'))
     if fragmenter_params:
         from clefts.domain.fragment.fragmenter import Fragmenter
-        original_actions=list(Fragmenter.from_dict(fragmenter_params).fragment_ion_tree_builder.create_cleavage_actions(source))
+        fragmenter=Fragmenter.from_dict(fragmenter_params)
+        builder=fragmenter.fragment_ion_tree_builder
+        original_actions=list(builder.create_cleavage_actions(source))
+        cleavage_patterns={pattern.pattern_id:pattern for pattern in builder.cleavage_pattern_set}
         if len(original_actions)!=len(structure.action_type): original_actions=[]
     atoms=list(mol.GetAtoms())
     if len(atoms)!=structure.source_graph.num_nodes:
@@ -90,10 +93,11 @@ def _node_view(structure, samples, source_smiles, file_path):
     ptr=structure.action_source_atom_ptr.tolist();index=structure.action_source_atom_index.tolist()
     for number,category in enumerate(structure.action_type.tolist()):
         original=original_actions[number] if original_actions else None
-        definitions=(fragmenter_params or {}).get('fragment_ion_tree_builder',{}).get('cleavage_pattern_set',{}).get('patterns',[])
-        definition=definitions[category[0]] if category[0]<len(definitions) else {}
+        pattern=cleavage_patterns.get(category[0])
+        reaction=next((item for item in pattern.cleavage_reactions if item.id==category[1]),None) if pattern else None
         registry.append(dict(id=number,cleavagePatternId=category[0],reactionId=category[1],reactantId=category[1],productMoleculeId=category[2],
-            cleavagePatternName=definition.get('name',''),reactantSmarts=definition.get('reactant_smarts',''),
+            cleavagePatternName=pattern.name if pattern else '',reactantSmarts=pattern.reactant_smarts if pattern else '',
+            reactionName=reaction.source_rule.name if reaction else '',reactionProductSmarts=reaction.source_rule.smarts if reaction else '',
             sourceAtomMaps=list(original.source_atom_maps) if original else [atoms[i].GetAtomMapNum() for i in index[ptr[number]:ptr[number+1]]],
             retainedAtomMaps=sorted(original.retained_atom_maps) if original else [],
             discardedAtomMaps=sorted(original.discarded_atom_maps) if original else [],

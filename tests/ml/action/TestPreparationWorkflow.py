@@ -245,6 +245,16 @@ class TestPreparationWorkflow(unittest.TestCase):
         registry={action['id'] for action in result['actions']}
         self.assertTrue(all(transition['addedAction'] in registry for edge in sample['edges'] for transition in edge['transitions']))
         self.assertTrue(all(action['sourceAtomMaps'] for action in result['actions']))
+        from clefts.domain.fragment.fragmenter import Fragmenter
+        patterns={pattern.pattern_id:pattern for pattern in Fragmenter.from_dict(model['fragmenter_params']).fragment_ion_tree_builder.cleavage_pattern_set}
+        for action in result['actions']:
+            pattern=patterns[action['cleavagePatternId']]
+            reaction=next(reaction for reaction in pattern.cleavage_reactions if reaction.id==action['reactionId'])
+            self.assertEqual(action['cleavagePatternName'],pattern.name)
+            self.assertEqual(action['reactantSmarts'],pattern.reactant_smarts)
+            self.assertEqual(action['reactionName'],reaction.source_rule.name)
+            self.assertEqual(action['reactionProductSmarts'],reaction.source_rule.smarts)
+            self.assertLess(action['productMoleculeId'],len(reaction.prod_temp))
         self.assertIn('<svg',result['sourceSvg'])
 
     def test_split_cli_creates_both_structure_directories(self):

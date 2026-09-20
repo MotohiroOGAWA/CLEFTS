@@ -68,18 +68,28 @@ It performs natural action filtering, branching decoding, materialization and
 post-model spectrum generation. Teacher-forced loss remains a separate diagnostic
 and controls scheduling/checkpoint selection.
 
+`training.pft.json` is a small live run manifest. Opening it in CLEFTS Workbench
+selects the training-result viewer by its internal `clefts.training-report`
+schema; the `.pft.json` extension is shared with the other CLEFTS result types.
+
 `spectrum_validation/epoch_N.json` and `step_N.json` contain every generated
-spectrum and original peak set, one-to-one mass-tolerance matched cosine per
-sample, histogram, mean, standard deviation and quantiles. Unassigned original
-peaks and unmatched predictions remain in the cosine norms. Empty predictions
-score zero and contribute to the nonempty-spectrum fraction. These small-run
-artifacts can be large for production validation sets.
+spectrum and original peak set, one-to-one mass-tolerance matched cosine and
+intensity-weighted assignment coverage per sample. Both scores are also saved
+without precursor peaks. Reports include q10/q25/median/q75/q90 representatives,
+empirical collision-energy tertiles, normalized main adducts, and MS2-depth
+breakdowns where the precursor is depth 0. Unassigned original peaks and
+unmatched predictions remain in the cosine norms. Empty predictions score zero
+and contribute to the nonempty-spectrum fraction. These detailed artifacts can
+be large for production validation sets; `training.pft.json` references them
+instead of duplicating them.
 
 Metrics include branching precision/recall, positive/valid/predicted actions per
 node, recall by MS2 depth, generated/unique fragment counts, natural prefilter
-recall, teacher-spectrum cosine, and free-running spectrum cosine. TensorBoard,
-JSON/TSV reports, last/best checkpoints and intermediate subset provenance are
-written to the training directory.
+recall, teacher-spectrum cosine, free-running spectrum cosine, and assignment
+coverage. Batch and spectrum distributions are written as q10/q25/median/q75/q90
+plus mean so Workbench can switch every series between mean, median, and
+distribution views. TensorBoard, JSON/TSV reports, last/best checkpoints and
+intermediate subset provenance are written to the training directory.
 
 Schema v5 structures are rejected with a regeneration message. Regenerate from
 original MSDataset files. Old autoregressive configuration names are accepted as

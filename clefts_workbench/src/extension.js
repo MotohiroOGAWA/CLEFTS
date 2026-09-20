@@ -15,6 +15,7 @@ const workbenchDefaults = require('./workbench/defaults');
 const parameterService = require('./workbench/parameter-service');
 const workbench = require('./workbench/panel');
 const trainingMetrics = require('./features/training-metrics/editor');
+const trainingReport = require('./features/training-report/view');
 const fineTune = require('./features/fragment-tree-finetune/editor');
 const smartsSearch = require('./features/smarts-search/editor');
 const evaluation = require('./features/evaluation/editor');
@@ -424,6 +425,9 @@ class ResultEditorProvider {
 
 async function resultHtml(manifestPath) {
   const manifest = JSON.parse(await fs.promises.readFile(manifestPath, 'utf8'));
+  if (manifest.schema === 'clefts.training-report') {
+    return trainingReport.html(await trainingReport.readTrainingReport(manifestPath), commonCss());
+  }
   const root = path.dirname(manifestPath);
   const files = await scan(root, root, 3, 500);
   const manifests = await readStructureManifests(root);
