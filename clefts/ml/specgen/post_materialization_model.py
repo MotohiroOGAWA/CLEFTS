@@ -128,7 +128,7 @@ class PostMaterializationFragmentTreeModel(nn.Module):
             pred_norm=intensity.new_zeros(s).scatter_add_(0,group,intensity.square())
             target_norm=intensity.new_zeros(s).scatter_add_(0,group,target.square())
             observed=target_norm>0
-            cosine=dot/(pred_norm*target_norm).sqrt().clamp_min(1e-8)
+            cosine=dot/(pred_norm*target_norm).clamp_min(1e-16).sqrt()
             if torch.any(observed):loss=loss+self.cosine_loss_weight*(1-cosine[observed]).mean()
         return PostMaterializationOutput(intensity,data.formula_sample_index,data.formula_tensor,data.formula_mz,loss)
 
@@ -138,7 +138,8 @@ def prepare_post_materialization(decoded: DecodedFragmentTreeBatch, fragmenter: 
     """Ion/formula preparation is outside all neural forwards."""
     graphs, node_ids, ion_features, formulas, formula_samples, mzs, formula_ids = [], [], [], [], [], [], []
     node_offset = 0
-    terminal = set(decoded.terminal_node_index.tolist())
+    # Every generated node can emit ions, including observed intermediates
+    # that also have positive outgoing branches. Terminal only stops expansion.
     for sample, tree in enumerate(decoded.trees):
         compounds = {i:decoded.compounds[node_offset+i] for i in range(tree.num_nodes)}
         builder = fragmenter.fragment_ion_tree_builder
@@ -158,7 +159,7 @@ def prepare_post_materialization(decoded: DecodedFragmentTreeBatch, fragmenter: 
             selected=[]
             for entry in range(group.indptr[formula_index],group.indptr[formula_index+1]):
                 node = int(group.node_indices[entry])
-                if node not in reachable or node_offset+node not in terminal:
+                if node not in reachable:
                     continue
                 adduct = group.candidate_adducts[group.candidate_adduct_indices[entry]]
                 if node == 0 and adduct.apply_to_formula(compounds[0].formula).normalized != precursor_types[sample].apply_to_formula(compounds[0].formula).normalized:

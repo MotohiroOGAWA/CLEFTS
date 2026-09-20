@@ -39,8 +39,8 @@ def train_actions(*, model_config: dict, train_dir: str | Path, val_dir: str | P
                   lr: float = 1e-4, device: str = "cuda", resume: str | Path | None = None,
                   weight_decay: float = 0.01, gradient_clip: float = 1.0,
                   absolute_weight: float = 1.0, next_weight: float = 1.0,
-                  negative_weight: float = 1.0, intensity_weight: float = 1.0,
-                  absolute_intensity_weight: float = 1.0, max_samples: int = 128,
+                  negative_weight: float = 0.2, intensity_weight: float = 1.0,
+                  absolute_intensity_weight: float = 1.0, minimum_positive_weight: float = 0.05, max_samples: int = 128,
                   seed: int = 42, warmup_steps: int = 100, lr_patience: int = 3,
                   early_stopping_patience: int = 10, min_lr: float = 1e-6,
                   validation_interval_steps: int = 0, validation_fraction: float = 0.1,
@@ -56,14 +56,14 @@ def train_actions(*, model_config: dict, train_dir: str | Path, val_dir: str | P
     output=Path(output_dir);output.mkdir(parents=True,exist_ok=True)
     settings={key:value for key,value in locals().copy().items() if key in (
         'train_dir','val_dir','epochs','batch_size','lr','device','resume','weight_decay','gradient_clip',
-        'absolute_weight','next_weight','negative_weight','intensity_weight','absolute_intensity_weight',
+        'absolute_weight','next_weight','negative_weight','intensity_weight','absolute_intensity_weight','minimum_positive_weight',
         'max_samples','seed','warmup_steps','lr_patience','early_stopping_patience','min_lr','train_mol_encoder','initialize_from',
         'validation_interval_steps','validation_fraction')}
     settings={key:str(value) if isinstance(value,Path) else value for key,value in settings.items()}
     (output/'training_args.json').write_text(json.dumps(settings,indent=2))
     if epochs<1 or batch_size<1 or max_samples<1 or not math.isfinite(lr) or lr<=0:
         raise ValueError('epochs, batch_size, max_samples and lr must be positive')
-    if any(not math.isfinite(value) or value<0 for value in (weight_decay,gradient_clip,absolute_weight,next_weight,negative_weight,intensity_weight,absolute_intensity_weight,min_lr)):
+    if any(not math.isfinite(value) or value<0 for value in (weight_decay,gradient_clip,absolute_weight,next_weight,negative_weight,intensity_weight,absolute_intensity_weight,minimum_positive_weight,min_lr)):
         raise ValueError('Optimizer and loss settings must be finite and non-negative')
     if absolute_weight+next_weight+intensity_weight<=0:raise ValueError('Enable at least one training loss')
     if min_lr>lr or min(warmup_steps,lr_patience,early_stopping_patience)<0:
@@ -87,11 +87,11 @@ def train_actions(*, model_config: dict, train_dir: str | Path, val_dir: str | P
         prior=checkpoint.get('training_settings',{})
         if not prior:settings['train_mol_encoder']=not bool(model_config.get('fine_tuning'))
         # Restoring optimizer and loss definitions makes a resumed curve comparable.
-        for key in ('absolute_weight','next_weight','negative_weight','intensity_weight','absolute_intensity_weight','train_mol_encoder','gradient_clip','warmup_steps','lr_patience','min_lr','lr'):
+        for key in ('absolute_weight','next_weight','negative_weight','intensity_weight','absolute_intensity_weight','minimum_positive_weight','train_mol_encoder','gradient_clip','warmup_steps','lr_patience','min_lr','lr'):
             if key in prior:settings[key]=prior[key]
         absolute_weight=settings['absolute_weight'];next_weight=settings['next_weight'];negative_weight=settings['negative_weight']
         intensity_weight=settings['intensity_weight'];absolute_intensity_weight=settings['absolute_intensity_weight'];train_mol_encoder=settings['train_mol_encoder']
-        gradient_clip=settings['gradient_clip'];warmup_steps=settings['warmup_steps'];lr_patience=settings['lr_patience'];min_lr=settings['min_lr'];lr=settings['lr']
+        minimum_positive_weight=settings['minimum_positive_weight'];gradient_clip=settings['gradient_clip'];warmup_steps=settings['warmup_steps'];lr_patience=settings['lr_patience'];min_lr=settings['min_lr'];lr=settings['lr']
     params=model_config.get('params',model_config)
     model_config=inherit_model_config(model_config,train_dir,val_dir,encoder_checkpoint=params.get('mol_encoder_checkpoint'),saved_model=model_config if resume or params.get('fine_tuning') else None)
     model_config['max_samples']=max_samples
@@ -103,7 +103,7 @@ def train_actions(*, model_config: dict, train_dir: str | Path, val_dir: str | P
         generator.mol_encoder.load_state_dict(pretrained['mol_encoder_state_dict'])
     if not train_mol_encoder:generator.feature_model.freeze_mol_encoder()
     model=ActionFragmentTreeTrainingModel(generator.feature_model,downstream_model=generator.post_model,
-        absolute_weight=absolute_weight,next_weight=next_weight,negative_weight=negative_weight,intensity_weight=intensity_weight,absolute_intensity_weight=absolute_intensity_weight).to(device)
+        absolute_weight=absolute_weight,next_weight=next_weight,negative_weight=negative_weight,intensity_weight=intensity_weight,absolute_intensity_weight=absolute_intensity_weight,minimum_positive_weight=minimum_positive_weight).to(device)
     model.set_checkpoint_model_config(model_config)
     legacy=checkpoint is not None and not checkpoint.get('training_settings')
     optimizer_parameters=list(model.parameters()) if legacy else [p for p in model.parameters() if p.requires_grad]
@@ -134,7 +134,7 @@ def train_actions(*, model_config: dict, train_dir: str | Path, val_dir: str | P
     datasets=[];dataset_report={}
     for name,directory in (('train',train_dir),('validation',val_dir)):
         files=sorted(Path(directory).rglob('*.preft.pt'))
-        if not files:raise ValueError(f'No schema-v5 .preft.pt files in {directory}')
+        if not files:raise ValueError(f'No schema-v6 .preft.pt files in {directory}')
         pieces=[];samples=0;states=0;formulas=0
         for file in files:
             data=SourceActionStructure.load(file,max_action_count=generator.feature_model.max_action_count)
@@ -142,7 +142,7 @@ def train_actions(*, model_config: dict, train_dir: str | Path, val_dir: str | P
             if data.downstream is None:raise ValueError('Full training requires stored target molecular graphs')
             if data.precursor_next_index.numel()==0 and data.action_type.numel() and data.precursor_row_action_ptr.numel()==1:
                 raise ValueError('Regenerate structures with recorded precursor alternatives')
-            samples+=data.num_samples;states+=data.teacher_state_sample_index.numel();formulas+=data.downstream.formula_tensor.shape[0]
+            samples+=data.num_samples;states+=data.teacher_node_sample_index.numel();formulas+=data.downstream.formula_tensor.shape[0]
             pieces.extend(select_samples(data,range(i,min(i+max_samples,data.num_samples))) for i in range(0,data.num_samples,max_samples))
         datasets.append(pieces)
         dataset_report[name]={'files':len(files),'samples':samples,'teacher_states':states,'formula_targets':formulas,'chunks':len(pieces)}
@@ -170,7 +170,8 @@ def train_actions(*, model_config: dict, train_dir: str | Path, val_dir: str | P
         if group:yield SourceActionStructure.from_structures(group)
     def metric_values(result):
         return {'loss':result.loss,'absolute_action_loss':result.absolute_loss,
-                'next_action_loss':result.next_action_loss,'intensity_loss':result.downstream_output.loss,**result.metrics}
+                'branching_action_loss':result.next_action_loss,'intensity_loss':result.downstream_output.loss,**result.metrics}
+    from .spectrum_validation import validate_spectra
     def intermediate_validation(epoch):
         was_training=model.training
         totals={};sample_count=batch_count=0
@@ -195,6 +196,8 @@ def train_actions(*, model_config: dict, train_dir: str | Path, val_dir: str | P
              'validation_seconds':time.perf_counter()-validation_started,
              'validation_loss':totals.pop('loss')/sample_count}
         row.update({'validation/'+key:value/sample_count for key,value in totals.items()})
+        row.update({'validation/'+k:v for k,v in validate_spectra(generator,intermediate_pieces,output,f'step_{global_step}',global_step=global_step).items()})
+        row['validation_seconds']=time.perf_counter()-validation_started
         intermediate_history.append(row)
         (output/'intermediate_validation.json').write_text(json.dumps({'history':intermediate_history},indent=2))
         headers=list(dict.fromkeys(key for item in intermediate_history for key in item))
@@ -243,6 +246,7 @@ def train_actions(*, model_config: dict, train_dir: str | Path, val_dir: str | P
                 row[name+'_loss']=totals.pop('loss')/max(sample_count,1)
                 row.update({name+'/'+key:value/max(sample_count,1) for key,value in totals.items()})
                 row[name+'/samples']=sample_count;row[name+'/batches']=batch_count
+            row.update({'validation/'+k:v for k,v in validate_spectra(generator,datasets[1],output,f'epoch_{epoch+1}',global_step=global_step).items()})
             row['global_step']=global_step;row['learning_rate']=optimizer.param_groups[0]['lr']
             row['gradient_norm']=sum(gradient_values)/max(len(gradient_values),1)
             row['epoch_seconds']=time.perf_counter()-epoch_start;row['cuda_peak_memory_mb']=torch.cuda.max_memory_allocated(device)/2**20
@@ -254,19 +258,20 @@ def train_actions(*, model_config: dict, train_dir: str | Path, val_dir: str | P
             for key,value in row.items():
                 if key!='epoch':writer.add_scalar(key,value,epoch+1)
             writer.flush();iteration_writer.flush()
-            report={'history':history,'intermediate_validation_history':intermediate_history,'schema_version':5,'fragmentation_schema':generator.architecture,'model_config':model_config,'training':settings,'datasets':dataset_report,'parameters':parameters,'best_validation_loss':best,
-                'elapsed_seconds':time.perf_counter()-started,'validation_mode':'teacher forcing on stored graphs; candidate recall measured before forced positives','stop_reason':'running'}
+            report={'history':history,'intermediate_validation_history':intermediate_history,'schema_version':6,'fragmentation_schema':generator.architecture,'model_config':model_config,'training':settings,'datasets':dataset_report,'parameters':parameters,'best_validation_loss':best,
+                'elapsed_seconds':time.perf_counter()-started,'validation_mode':'free-running spectrum generation plus teacher-forced loss; original-peak cosine distributions recorded','stop_reason':'running'}
             (output/'metrics.json').write_text(json.dumps(report,indent=2))
             headers=list(dict.fromkeys(key for item in history for key in item));(output/'metrics.tsv').write_text('\t'.join(key.replace('/','_') for key in headers)+'\n'+'\n'.join('\t'.join(str(item.get(key,'')) for key in headers) for item in history)+'\n')
-            saved=dict(model_config=model_config,model_state_dict=model.state_dict(),optimizer_state_dict=optimizer.state_dict(),scheduler_state_dict=scheduler.state_dict(),epoch=epoch+1,global_step=global_step,intermediate_validation_history=intermediate_history,schema_version=5,fragmentation_schema=generator.architecture,history=history,training_settings=settings,best_validation_loss=best,bad_epochs=bad_epochs,torch_rng_state=torch.get_rng_state(),cuda_rng_state=torch.cuda.get_rng_state_all(),python_rng_state=random.getstate())
+            saved=dict(model_config=model_config,model_state_dict=model.state_dict(),optimizer_state_dict=optimizer.state_dict(),scheduler_state_dict=scheduler.state_dict(),epoch=epoch+1,global_step=global_step,intermediate_validation_history=intermediate_history,schema_version=6,fragmentation_schema=generator.architecture,history=history,training_settings=settings,best_validation_loss=best,bad_epochs=bad_epochs,torch_rng_state=torch.get_rng_state(),cuda_rng_state=torch.cuda.get_rng_state_all(),python_rng_state=random.getstate())
             torch.save(saved,output/'last.pt')
             if improved:torch.save(saved,output/'best.pt')
             print(json.dumps({'event':'epoch_end','current':epoch-start+1,'total':epochs,**row}),flush=True)
             if early_stopping_patience and bad_epochs>=early_stopping_patience:
                 stop_reason='early_stopping';break
+        (output/'training_failure.json').unlink(missing_ok=True)
         report['stop_reason']=stop_reason
         (output/'metrics.json').write_text(json.dumps(report,indent=2));(output/'training_report.json').write_text(json.dumps(report,indent=2))
-        lines=['# Fragment Tree Training Report','',f"Device: {device}; trainable parameters: {parameters['trainable']:,}",f"Best validation loss: {best:.6g}",f"Stop reason: {stop_reason}",'','Validation uses teacher forcing and stored molecular graphs. Filter recall is evaluated before positive insertion; this is not a free-running spectrum benchmark.','','| Epoch | Train loss | Validation loss | Filter intensity recall | Spectrum cosine | LR |','|---|---|---|---|---|---|']
+        lines=['# Fragment Tree Training Report','',f"Device: {device}; trainable parameters: {parameters['trainable']:,}",f"Best validation loss: {best:.6g}",f"Stop reason: {stop_reason}",'','Validation generates spectra in inference mode and records original-peak cosine distributions in spectrum_validation/. Teacher-forced losses are recorded separately.','','| Epoch | Train loss | Validation loss | Filter intensity recall | Spectrum cosine | LR |','|---|---|---|---|---|---|']
         for item in history:lines.append(f"| {item['epoch']} | {item['train_loss']:.6g} | {item['validation_loss']:.6g} | {item.get('validation/intensity_recall_at_filter',0):.4f} | {item.get('validation/spectrum_cosine_similarity',0):.4f} | {item.get('learning_rate',0):.3g} |")
         if intermediate_history:
             lines.extend(['', '## Intermediate validation', '', 'These fixed-subset checks are observational; scheduling and best-checkpoint selection use full epoch validation.', '', '| Step | Epoch | Samples | Validation loss | Spectrum cosine |', '|---|---|---|---|---|'])
@@ -290,6 +295,7 @@ MODEL_OPTIONS = {
     'action-top-k': ('action_model_params', 'action_prefilter_top_k', int, 64),
     'action-max-k': ('action_model_params', 'action_prefilter_max_k', int, 128),
     'action-threshold': ('action_model_params', 'action_prefilter_threshold_logit', float, 1.0),
+    'branch-threshold': ('action_model_params', 'prediction_threshold', float, 0.5),
     'beam-size': ('action_model_params', 'beam_size', int, 32),
     'max-decode-steps': ('action_model_params', 'max_decode_steps', int, 16),
     'action-state-layers': ('action_model_params', 'state_num_layers', int, 2),
@@ -302,7 +308,7 @@ MODEL_OPTIONS = {
 
 
 def training_model_config(args):
-    config = {'max_samples':args.max_samples,'architecture': 'source-anchored-action-autoregressive-v1',
+    config = {'max_samples':args.max_samples,'architecture': 'source-anchored-branching-v1',
               'action_model_params': {}, 'post_model_params': {}}
     for flag, (section, key, _, default) in MODEL_OPTIONS.items():
         value = getattr(args, flag.replace('-', '_'))
@@ -326,7 +332,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument('--adapter-width',type=int,default=8,help='Extra low-rank nodes per linear/attention projection (default: 8).')
     for name, default in (("weight-decay",0.01),("gradient-clip",1.0),
                           ("absolute-weight",1.0),("next-weight",1.0),
-                          ("negative-weight",1.0),("intensity-weight",1.0),("absolute-intensity-weight",1.0),("min-lr",1e-6)):
+                          ("negative-weight",0.2),("minimum-positive-weight",0.05),("intensity-weight",1.0),("absolute-intensity-weight",1.0),("min-lr",1e-6)):
         parser.add_argument('--'+name,type=float,default=default)
     for name,default in (('max-samples',128),('seed',42),('warmup-steps',100),('lr-patience',3),('early-stopping-patience',10)):
         parser.add_argument('--'+name,type=int,default=default)
@@ -375,7 +381,7 @@ def main(argv: list[str] | None = None) -> None:
         absolute_weight=args.absolute_weight,next_weight=args.next_weight,
         negative_weight=args.negative_weight,intensity_weight=args.intensity_weight,absolute_intensity_weight=args.absolute_intensity_weight,max_samples=args.max_samples,
         seed=args.seed,warmup_steps=args.warmup_steps,lr_patience=args.lr_patience,early_stopping_patience=args.early_stopping_patience,min_lr=args.min_lr,train_mol_encoder=args.train_mol_encoder,initialize_from=args.initialize_from,
-        validation_interval_steps=args.validation_interval_steps,validation_fraction=args.validation_fraction)
+        minimum_positive_weight=args.minimum_positive_weight,validation_interval_steps=args.validation_interval_steps,validation_fraction=args.validation_fraction)
     print(json.dumps(report))
 
 if __name__=='__main__':main()

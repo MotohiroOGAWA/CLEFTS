@@ -13,27 +13,27 @@ from ..specgen.materialization import materialize_action_states
 from ..specgen.post_materialization_model import prepare_post_materialization
 
 
-def _walk_pathway(tree, fragmenter, pathway) -> set:
-    """Follow a domain FragmentPathway (always rooted at Source) through tree
-    edges/transitions, returning the resulting CleavageActionSequence set."""
-    states = {(0, None)}
+def _walk_pathway_chains(tree, fragmenter, pathway):
+    """Retain every supported transition history, including precursor provenance."""
+    states=[(0, None, ((None,None),))]
     for node in pathway.nodes[1:]:
-        next_states = set()
-        for index, state in states:
+        next_states=[]
+        for index,state,chain in states:
             for edge in tree.get_out_edges(index):
-                if tree.get_node(edge.target_index).smiles != node.smiles:
-                    continue
+                if tree.get_node(edge.target_index).smiles!=node.smiles:continue
                 for transition in edge.transitions:
-                    if transition.parent_action_sequence != state:
-                        continue
-                    if state is not None and transition.added_action is not None:
-                        action=transition.added_action
+                    if transition.parent_action_sequence!=state:continue
+                    action=transition.added_action
+                    if state is not None and action is not None:
                         if not set(action.source_atom_maps)<=state.retained_atom_maps or any(previous.changed_bond_maps & action.matched_bond_maps for previous in state.actions):continue
-                    if node.is_precursor and len(transition.action_sequence.actions) > fragmenter.precursor_candidate_max_action_count:
-                        continue
-                    next_states.add((edge.target_index, transition.action_sequence))
-        states = next_states
-    return {state for _, state in states}
+                    if node.is_precursor and len(transition.action_sequence.actions)>fragmenter.precursor_candidate_max_action_count:continue
+                    next_states.append((edge.target_index,transition.action_sequence,(*chain,(transition.action_sequence,action))))
+        states=next_states
+    return tuple(dict.fromkeys(chain for _,_,chain in states))
+
+
+def _walk_pathway(tree,fragmenter,pathway):
+    return {chain[-1][0] for chain in _walk_pathway_chains(tree,fragmenter,pathway)}
 
 
 class ActionStructureBuilder:
@@ -83,66 +83,34 @@ class ActionStructureBuilder:
         else:
             precursor_sequences=precursor_sequences_all
         assignments=fragmenter.assign_fragment_pathways_to_peak_sets(tree,zip(precursor_types,peaks_mz))
-        targets=[]
-        for _,groups in assignments:
-            sequences=set()
-            for group in groups:
+        teacher_paths=[]
+        for (_,groups),intensities in zip(assignments,peaks_intensity):
+            paths=[]
+            for group,intensity in zip(groups,intensities):
                 for pathway in group:
-                    sequences.update(_walk_pathway(tree,fragmenter,pathway))
-            targets.append(tuple(sorted(sequences,key=lambda seq:seq.key if seq else ())))
+                    paths.extend((chain,float(intensity)) for chain in _walk_pathway_chains(tree,fragmenter,pathway))
+            teacher_paths.append(paths)
         conditions=torch.tensor([[generator.adduct_type_strs.index(str(adduct)),ce]
                                  for adduct,ce in zip(precursor_types,collision_energy)],dtype=torch.float32)
         data=prepare_source_actions(source=source,actions=actions,graph_builder=generator.mol_encoder.graph_builder,
-            condition_features=conditions,max_action_count=fragmenter.tree_max_action_count,target_sequences=targets,
+            condition_features=conditions,max_action_count=fragmenter.tree_max_action_count,teacher_pathways=teacher_paths,
             precursor_sequences=precursor_sequences)
-        # Reconstruct a preparation-only DAG from all teacher states. Parent
-        # traversal includes all valid orders for supervision; materialization
-        # chooses a representative ancestor chain for graph presentation.
-        rows=[]
-        for start,stop in zip(data.teacher_state_action_ptr[:-1],data.teacher_state_action_ptr[1:]):
-            rows.append(tuple(data.teacher_state_action_index[start:stop].tolist()))
-        state_by_row=[CleavageActionSequence(actions[i] for i in row) if row else None for row in rows]
-        samples=data.teacher_state_sample_index.tolist()
-        dense_rows, dense_sample, parents, added, terminal=[],[],[],[],[]
+        # Materialization adds its own Source bookkeeping roots. Teacher roots
+        # are precursor seeds at MS2 depth zero, including nonempty seeds.
+        rows=[tuple(data.teacher_node_action_index[a:b].tolist()) for a,b in zip(data.teacher_node_action_ptr[:-1],data.teacher_node_action_ptr[1:])]
+        samples=data.teacher_node_sample_index.tolist()
+        dense_rows=[];dense_sample=[];parents=[];added=[];terminal=[];teacher_dense={}
+        width=fragmenter.tree_max_action_count
         for sample in range(len(precursor_types)):
-            known={state_by_row[i]:i for i,s in enumerate(samples) if s==sample}
-            if None not in known:
-                continue
-            queue=[(None,-1,-1)]
-            visited={None}
-            while queue:
-                state,parent,action=queue.pop(0)
-                row_index=len(dense_rows)
-                ids=tuple(actions.index(a) for a in state.actions) if state else ()
-                dense_rows.append((*ids,*([-1]*(fragmenter.tree_max_action_count-len(ids)))))
-                dense_sample.append(sample)
-                parents.append(parent)
-                added.append(action)
-                terminal.append(bool(data.teacher_positive_eos[known[state]]))
-                original=known[state]
-                if state is None and None not in precursor_sequences[sample]:
-                    # Match inference: deterministic precursor combinations are
-                    # whole seed edges, not learned fragmentation prefixes.
-                    for seed in sorted((seq for seq in precursor_sequences[sample] if seq in known),key=lambda seq:seq.key):
-                        if seed not in visited:
-                            visited.add(seed);queue.append((seed,row_index,-1))
-                    continue
-                start,stop=data.teacher_positive_action_ptr[original:original+2].tolist()
-                # prepare_source_actions already guarantees every teacher state
-                # here is precursor-consistent, so any traversal order yields a
-                # representative chain that passes through the precursor node.
-                for action_index in data.teacher_positive_action_index[start:stop].tolist():
-                    child=CleavageActionSequence((*(state.actions if state else ()),actions[action_index]))
-                    if child in known and child not in visited:
-                        visited.add(child)
-                        queue.append((child,row_index,action_index))
-        # Even records with no assignments have a Source graph, but no terminal
-        # targets. BOS is inserted solely as a materialization bookkeeping root.
-        present=set(dense_sample)
-        for sample in range(len(precursor_types)):
-            if sample not in present:
-                dense_rows.append(tuple([-1]*fragmenter.tree_max_action_count))
-                dense_sample.append(sample);parents.append(-1);added.append(-1);terminal.append(False)
+            source_row=len(dense_rows)
+            dense_rows.append(tuple([-1]*width));dense_sample.append(sample);parents.append(-1);added.append(-1);terminal.append(False)
+            for node,(owner,ids) in enumerate(zip(samples,rows)):
+                if owner!=sample:continue
+                parent=int(data.teacher_node_parent_index[node])
+                teacher_dense[node]=len(dense_rows)
+                dense_rows.append((*ids,*([-1]*(width-len(ids)))))
+                dense_sample.append(sample);parents.append(teacher_dense[parent] if parent>=0 else source_row)
+                added.append(int(data.teacher_node_added_action_index[node]));terminal.append(True)
         synthetic=ActionDecoderOutput(torch.tensor(dense_sample),torch.tensor(dense_rows,dtype=torch.long),
             torch.zeros(len(dense_rows)),torch.tensor(terminal),torch.tensor(parents),torch.tensor(added),
             SimpleNamespace(action_index=torch.arange(len(actions)).expand(len(precursor_types),-1)))

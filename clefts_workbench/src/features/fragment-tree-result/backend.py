@@ -1,4 +1,4 @@
-"""Backend for inspecting generated schema-v5 action training structures."""
+"""Backend for inspecting generated schema-v6 action training structures."""
 from __future__ import annotations
 
 import json
@@ -11,13 +11,13 @@ import torch
 
 def _teacher_states(structure) -> list[dict]:
     """One row per (sample, normalized action-set) teacher state, with its
-    valid next actions/EOS and, if materialized, the resulting fragment SMILES."""
-    state_action_ptr = structure.teacher_state_action_ptr.tolist()
-    state_action_index = structure.teacher_state_action_index.tolist()
+    positive branching actions and, if materialized, the resulting fragment SMILES."""
+    state_action_ptr = structure.teacher_node_action_ptr.tolist()
+    state_action_index = structure.teacher_node_action_index.tolist()
     positive_ptr = structure.teacher_positive_action_ptr.tolist()
     positive_index = structure.teacher_positive_action_index.tolist()
-    eos = structure.teacher_positive_eos.tolist()
-    sample_index = structure.teacher_state_sample_index.tolist()
+    eos = structure.teacher_node_observed.tolist()
+    sample_index = structure.teacher_node_sample_index.tolist()
     fragment_node_index = structure.state_fragment_node_index.tolist()
     compounds = structure.downstream.decoded.compounds if structure.downstream is not None else None
 
@@ -29,9 +29,13 @@ def _teacher_states(structure) -> list[dict]:
         rows.append({
             "sample": sample_index[row],
             "actions": actions,
-            "eos": bool(eos[row]),
+            "terminal": not next_actions,
+            "observed": bool(eos[row]),
+            "ms2Depth": int(structure.teacher_node_ms2_depth[row]),
+            "precursorRow": int(structure.teacher_node_precursor_row_index[row]),
+            "positiveWeights": structure.teacher_positive_action_weight[positive_ptr[row]:positive_ptr[row+1]].tolist(),
             "fragmentSmiles": str(compounds[node].smiles) if compounds is not None and node >= 0 else None,
-            "positiveNextActions": next_actions,
+            "positiveBranchActions": next_actions,
         })
     return rows
 
@@ -121,10 +125,10 @@ def _node_view(structure, samples, source_smiles, file_path):
                 histories=[];eos=False;next_actions=set()
                 for state in states_for_node.get(offset+node.index,[]):
                     if state['actions'] not in histories:histories.append(state['actions'])
-                    eos=eos or state['eos'];next_actions.update(state['positiveNextActions'])
+                    eos=eos or state['observed'];next_actions.update(state['positiveBranchActions'])
                 precursor=any(set(history)==set(alternative) for history in histories for alternative in sample['precursorAlternatives'])
                 if node.index==0 and (not sample['precursorAlternatives'] or [] in sample['precursorAlternatives']):precursor=True
-                nodes.append(dict(id=ids[node.index],smiles=node.smiles,actionSets=histories,precursor=precursor,eos=eos,positiveNextActions=sorted(next_actions)))
+                nodes.append(dict(id=ids[node.index],smiles=node.smiles,actionSets=histories,precursor=precursor,observed=eos,positiveBranchActions=sorted(next_actions)))
             edges=[]
             for edge in (tree.get_edge(index) for index in range(tree.num_edges)):
                 transitions=[]
@@ -149,9 +153,9 @@ def inspect_structure(file_path: Path) -> dict:
         raise TypeError("This .preft.pt file has no saved structure.")
     structure = payload["structure"]
     metadata = dict(payload.get("metadata") or {})
-    required = ("teacher_state_action_ptr", "sample_precursor_row_ptr", "action_type")
+    required = ("teacher_node_action_ptr", "sample_precursor_row_ptr", "action_type")
     if not all(hasattr(structure, name) for name in required):
-        raise TypeError("This .preft.pt file is not a schema-v5 Source/action training structure.")
+        raise TypeError("This .preft.pt file is not a schema-v6 Source/action training structure.")
 
     source_smiles = str(metadata.get("smiles", ""))
     conditions = structure.condition_features.tolist()
@@ -213,7 +217,10 @@ def inspect_structure(file_path: Path) -> dict:
             **totals,
             "samples": num_samples,
             "primitiveActions": int(structure.action_type.shape[0]),
-            "teacherStates": len(states),
+            "teacherNodes": len(states),
+            "positiveBranches": structure.transition_added_action_index.numel(),
+            "precursorCandidates": structure.precursor_row_action_ptr.numel()-1,
+            "maxMs2Depth": int(structure.teacher_node_ms2_depth.max()) if states else 0,
             "transitions": len(transitions),
         },
         "samples": samples,

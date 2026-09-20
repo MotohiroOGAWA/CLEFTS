@@ -6,7 +6,7 @@ from torch import Tensor, nn
 from .components.condition.condition_encoder import MS2ConditionEncoder
 from .components.action.action_encoder import ActionEncoder
 from .components.action.action_condition_scorer import ActionConditionScorer
-from .components.action.action_decoder import ActionPool, ActionSequenceDecoder, build_action_pool
+from .components.action.action_decoder import ActionPool, BranchingCleavageDecoder, build_action_pool
 
 
 @dataclass(frozen=True)
@@ -16,7 +16,6 @@ class SourceActionFeatures:
     absolute_logits: Tensor
     pool: ActionPool
     precursor_absolute_logits: Tensor | None = None
-    precursor_eos_logits: Tensor | None = None
     precursor_sample_index: Tensor | None = None
     source_embeddings: Tensor | None = None
 
@@ -28,7 +27,7 @@ class SourceActionFeatureModel(nn.Module):
                  action_prefilter_max_k: int = 128, action_prefilter_threshold_logit: float = 1.0,
                  beam_size: int = 32, num_heads: int = 4, max_decode_steps: int = 16,
                  state_num_layers: int = 2, state_dropout: float = 0.0,
-                 condition_encoder: nn.Module | None = None, max_roles: int = 64) -> None:
+                 condition_encoder: nn.Module | None = None, max_roles: int = 64, prediction_threshold: float = 0.5) -> None:
         super().__init__()
         if not 1 <= action_prefilter_top_k <= action_prefilter_max_k:
             raise ValueError("Require 1 <= action_prefilter_top_k <= action_prefilter_max_k")
@@ -36,7 +35,7 @@ class SourceActionFeatureModel(nn.Module):
         self.action_encoder = ActionEncoder(mol_encoder.node_dim, mol_encoder.graph_dim, hidden_dim, category_sizes, num_heads,max_roles)
         self.condition_encoder = condition_encoder or nn.Sequential(nn.Linear(condition_feature_dim, condition_dim), nn.GELU(), nn.Linear(condition_dim, condition_dim))
         self.scorer = ActionConditionScorer(hidden_dim, condition_dim, hidden_dim)
-        self.decoder = ActionSequenceDecoder(hidden_dim, condition_dim, max_action_count, beam_size, num_heads, max_decode_steps, state_num_layers, state_dropout)
+        self.decoder = BranchingCleavageDecoder(hidden_dim, condition_dim, max_action_count, beam_size, num_heads, max_decode_steps, state_num_layers, state_dropout, prediction_threshold)
         self.top_k, self.max_k, self.threshold = action_prefilter_top_k, action_prefilter_max_k, action_prefilter_threshold_logit
         self.max_action_count = max_action_count
 
@@ -88,11 +87,10 @@ class SourceActionFeatureModel(nn.Module):
         precursor_h=self.decoder.state_encoder(tokens,state,row_sample)
         row_absolute=self.scorer(action,condition[row_sample],precursor_h)
         mask=torch.zeros_like(row_absolute,dtype=torch.bool)
-        mask[data.precursor_next_index[0],data.precursor_next_index[1]]=True
+        mask = data.action_tree_index[None,:] == data.sample_tree_index[row_sample,None]
         row_absolute=row_absolute.masked_fill(~mask,-torch.inf)
         absolute=condition.new_full((data.num_samples,action.shape[0]),-torch.inf)
         absolute.scatter_reduce_(0,row_sample[:,None].expand_as(row_absolute),row_absolute,reduce='amax',include_self=True)
-        eos=self.scorer.base(precursor_h).squeeze(-1)+(self.scorer.condition_q(condition[row_sample])*self.scorer.action_q(precursor_h)).sum(-1)*self.scorer.scale
         # Mandatory precursor actions are not filtered by a learned score.
         owners=torch.repeat_interleave(row_sample,counts)
         mandatory=torch.zeros_like(absolute,dtype=torch.bool)
@@ -101,5 +99,4 @@ class SourceActionFeatureModel(nn.Module):
 
         pool = build_action_pool(action, absolute, data, top_k=self.top_k, max_k=self.max_k,
                                  threshold=self.threshold, training=training_pool, max_action_count=self.max_action_count)
-        pool=replace(pool,precursor_eos_logits=eos)
-        return SourceActionFeatures(action, condition, absolute, pool,row_absolute,eos,row_sample,source_embeddings)
+        return SourceActionFeatures(action, condition, absolute, pool,row_absolute,row_sample,source_embeddings)

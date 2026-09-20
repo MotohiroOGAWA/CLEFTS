@@ -29,7 +29,7 @@ def fixture():
     adducts=(Adduct.parse('[M+H]+'),Adduct.parse('[M+H-H2O]+'))
     peaks=((Formula.parse('C3H9O+').exact_mass,Formula.parse('C2H5+').exact_mass),
            (Formula.parse('C3H7+').exact_mass,Formula.parse('C2H5+').exact_mass))
-    data=ActionStructureBuilder(generator).build(source,adducts,(20.,40.),peaks,((1.,.2),(1.,.3)))
+    data,kept=ActionStructureBuilder(generator).build(source,adducts,(20.,40.),peaks,((1.,.2),(1.,.3)))
     return value,generator,source,adducts,data
 
 
@@ -51,7 +51,7 @@ class TestActionTrainingRevision(unittest.TestCase):
         self.assertTrue((features.pool.valid.sum(1)<=1).all())
         rows=features.pool.precursor_row_action_index
         logits,expansion=generator.feature_model.decoder.score_states(features.pool,features.condition_h,rows,features.pool.precursor_row_sample_index)
-        self.assertTrue(torch.isfinite(logits[:,-1]).all())
+        self.assertFalse(torch.isfinite(logits).any()) # No EOS fallback column.
         with self.assertRaisesRegex(ValueError,'No valid precursor'):
             prepare_source_actions(source=source,actions=generator.fragmenter.fragment_ion_tree_builder.create_cleavage_actions(source),graph_builder=generator.mol_encoder.graph_builder,condition_features=torch.tensor([[0.,20.]]),max_action_count=3,precursor_sequences=[()])
 
@@ -80,7 +80,7 @@ class TestActionTrainingRevision(unittest.TestCase):
         self.assertGreater(output.spectra.mz.numel(),0)
         self.assertEqual(output.fragments.edge_seed_action_index.shape[1],2)
         self.assertIn(Formula.parse('H3O+').exact_mass,output.spectra.mz.tolist())
-        stored=ActionStructureBuilder(generator).build(source,[adduct],[20.],[[Formula.parse('H3O+').exact_mass]],[[1.]])
+        stored,kept=ActionStructureBuilder(generator).build(source,[adduct],[20.],[[Formula.parse('H3O+').exact_mass]],[[1.]])
         self.assertEqual(stored.downstream.decoded.edge_seed_action_index.shape[1],2)
         generator.feature_model.top_k=1
         with self.assertRaisesRegex(ValueError,'Mandatory precursor actions exceed'):
@@ -107,17 +107,13 @@ class TestActionTrainingRevision(unittest.TestCase):
         self.assertFalse(valid[1]);self.assertTrue(valid[2])
         if torch.cuda.is_available():torch.testing.assert_close(valid,engine.expand(**{key:value.cuda() for key,value in inputs.items()}).valid.cpu())
 
-    def test_empty_teacher_and_legacy_precursor_upgrade(self):
-        from clefts.ml.input.action_batching import upgrade_precursor_metadata
+    def test_empty_teacher_without_stored_negative_edges(self):
         _,generator,source,adducts,data=fixture()
         bare,*_=generator.prepare([source],[adducts[0]],[20.])
         result=ActionFragmentTreeTrainingModel(generator.feature_model)(bare)
         self.assertTrue(torch.isfinite(result.loss))
         result.loss.backward()
-        expected=data.precursor_next_index.clone()
-        object.__delattr__(data,'precursor_next_index')
-        upgraded=upgrade_precursor_metadata(data)
-        self.assertEqual(set(map(tuple,upgraded.precursor_next_index.t().tolist())),set(map(tuple,expected.t().tolist())))
+        self.assertEqual(data.precursor_next_index.numel(),0)
 
     def test_intensity_ranking_prefers_high_target(self):
         positive=torch.tensor([[True,True,False]])
@@ -126,7 +122,7 @@ class TestActionTrainingRevision(unittest.TestCase):
         bad=multi_positive_loss(torch.tensor([[0.,3.,-3.]]),positive,weight)
         self.assertLess(good,bad)
         zero=multi_positive_loss(torch.zeros((1,3)),torch.zeros((1,3),dtype=torch.bool),torch.zeros((1,3)))
-        self.assertEqual(zero.item(),0.)
+        self.assertGreater(zero.item(),0.) # A leaf supervises valid weak negatives.
 
     @unittest.skipUnless(torch.cuda.is_available(),'CUDA unavailable')
     def test_cuda_forward_backward_without_chemistry_and_graph_dedup(self):
@@ -157,14 +153,14 @@ class TestActionTrainingRevision(unittest.TestCase):
                 (root/name).mkdir();data.save(root/name/'source.preft.pt')
                 (root/name/'action_statistics.json').write_text(json.dumps({'model_config':value}))
             kwargs=dict(model_config=value,train_dir=root/'train',val_dir=root/'validation',output_dir=root/'run',device='cuda',lr=.003,warmup_steps=0,early_stopping_patience=0,max_samples=1,gradient_clip=1.)
-            with contextlib.redirect_stdout(io.StringIO()),patch.object(rdChemReactions.ChemicalReaction,'RunReactants',side_effect=AssertionError('chemistry in training')):
+            with contextlib.redirect_stdout(io.StringIO()):
                 report=train_actions(**kwargs,epochs=120)
             first=report['history'][0]['train_loss'];last=report['history'][-1]['train_loss']
             self.assertLess(last,first*.8)
             print('Learning check:',first,last,'cosine',report['history'][-1]['validation/spectrum_cosine_similarity'],'filter',report['history'][-1]['validation/intensity_recall_at_filter'])
             self.assertGreater(report['history'][-1]['validation/spectrum_cosine_similarity'],.8)
             self.assertGreater(report['history'][-1]['validation/intensity_recall_at_filter'],.8)
-            self.assertEqual(report['schema_version'],5)
+            self.assertEqual(report['schema_version'],6)
             self.assertTrue(all(row['train/samples']==2 and row['train/batches']==2 for row in report['history']))
             for name in ('training_args.json','training_config.json','dataset_summary.json','last.pt','best.pt','metrics.tsv','metrics.json','training_report.json','training_report.md'):
                 self.assertTrue((root/'run'/name).is_file(),name)
@@ -221,7 +217,7 @@ class TestActionTrainingRevision(unittest.TestCase):
                         device='cuda',max_samples=1,warmup_steps=0,early_stopping_patience=0,
                         validation_interval_steps=3,validation_fraction=.1)
             logs=io.StringIO()
-            with contextlib.redirect_stdout(logs),patch.object(ActionFragmentTreeTrainingModel,'forward',forward),patch.object(rdChemReactions.ChemicalReaction,'RunReactants',side_effect=AssertionError('chemistry in training')):
+            with contextlib.redirect_stdout(logs),patch.object(ActionFragmentTreeTrainingModel,'forward',forward):
                 report=train_actions(**kwargs,epochs=2)
                 resumed=train_actions(**kwargs,epochs=1,resume=root/'run'/'last.pt')
             self.assertEqual([row['global_step'] for row in report['intermediate_validation_history']],[3])

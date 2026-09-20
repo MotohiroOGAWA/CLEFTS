@@ -1,151 +1,54 @@
-# Creating Fragment Tree Training Data
+# Creating branching teacher data
 
-`create_fragment_tree_training_data.py` groups an `MSDataset` by SMILES and creates one training `FragmentTreeStructure` (`.preft.pt`) file for each SMILES group. Executable dataset-building workflows and reporting helpers live in `clefts.ml.data_preparation`; reusable dataset and structure classes remain in `clefts.ml.input`.
-
-Run the commands below from the repository's `mnt/app` directory.
-
-## Basic example
+Run the existing Preparation CLI from `mnt/app`:
 
 ```bash
-python -m clefts.ml.data_preparation.fragment_tree.create_fragment_tree_training_data \
-  --train-input path/to/training_data.msds \
-  --params path/to/fragmenter_params.json \
-  --symbols C N O P S F Cl Br I \
-  --output-dir path/to/output_directory \
-  --num-workers 1
+python -m clefts.cli train create-fragment-tree-data \
+  --input train.msds --validation-input validation.msds \
+  --output-dir prepared --params model_config.json \
+  --num-workers 4 --chunk-size 4 \
+  --max-node 1000 --max-edge -1 \
+  --normalize-intensities 1 --overwrite 1
 ```
 
-Add `--overwrite --overwrite-model-config` to rebuild existing output:
+All Preparation argument names, defaults and choices are preserved. There are no
+new branching Preparation flags. The Workbench uses this same command.
 
-```bash
-python -m clefts.ml.data_preparation.fragment_tree.create_fragment_tree_training_data \
-  --train-input path/to/training_data.msds \
-  --validation-input path/to/validation_candidates.msds \
-  --validation-smiles-ratio 0.1 \
-  --params path/to/fragmenter_params.json \
-  --symbols C N O P S F Cl Br I \
-  --output-dir path/to/output_directory \
-  --num-workers 4 \
-  --chunk-size 32 \
-  --save-train-valid-records \
-  --overwrite \
-  --overwrite-model-config
-```
+Each Source SMILES produces a schema-v6 `SourceActionStructure` `.preft.pt`.
+`fragmentation_schema` is `source-anchored-branching-v1`. v5 structures require
+regeneration from the original spectra.
 
-Choose positive- or negative-mode fragmenter parameters explicitly. Neural-network
-dimensions, layer counts, and dropout are not preprocessing inputs.
+The chemistry tree assigns measured peaks to pathways. Each supported pathway
+retains its actual transition order and precursor seed. Only MS2 suffixes become
+teacher nodes and positive transitions, including their intermediate ancestors.
+Ambiguous pathways are retained. Multiple precursor candidates are independent
+rows; Source itself has an empty row. Teacher MS2 depth starts at zero.
 
-Both `--train-input` and `--output-dir` are required. Reusing the same output directory without `--overwrite` resumes training: existing SMILES structure files are skipped and missing ones are built. Validation sampling starts only after this training pass has completed, and its maximum Tanimoto values are calculated against the SMILES in the completed files under `train_structures/data`.
+The action generator deterministically deduplicates exact actions and removes
+unsupported chemistry, empty fragments and true no-ops. Preparation never uses
+neural scores or random rankings to remove teachers. Every positive action must
+remain in the Source action universe.
 
-The immutable preprocessing settings are saved in
-`config/preprocessing_config.pftprep.json`. They contain `symbols`, normalized
-`fragmenter_params`, `max_node`, and `max_edge`; they do not contain neural-network
-dimensions, layer counts, or dropout. Training validates the model's symbols and
-fragmenter definitions against this file before constructing the model.
+Stored fields include:
 
-The `.pftprep.json` double extension is CLEFTS's dedicated marker for this file
-kind (matching `.pft.json`/`.pfttrain.json`/`.clevageset.json` elsewhere in the
-Workbench), not just a plain `.json`. Structure directories created before this
-convention was introduced still load correctly: every reader
-(`find_previous_preprocessing_config`, `load_and_validate_split_preprocessing`,
-`validate_preprocessing_compatibility`, and the Workbench's fragment-tree-result
-inspector) falls back to the legacy plain `preprocessing_config.json` name when
-the dedicated one is absent. New runs always write the dedicated name.
+- `teacher_node_sample_index`, `teacher_node_precursor_row_index`,
+  `teacher_node_parent_index`, `teacher_node_added_action_index`,
+  `teacher_node_ms2_depth` and CSR `teacher_node_action_ptr/index`.
+- CSR `teacher_positive_action_ptr/index/weight`; weights are maximum descendant
+  observed intensities. `teacher_node_observed` is observation metadata, not EOS.
+- CSR `sample_positive_action_ptr/index` containing only learned MS2 branch actions.
+- CSR `sample_precursor_row_ptr`, `precursor_row_action_ptr/index` for seed alternatives.
+- Positive transition tensors, teacher-to-materialized-node mapping, prepared
+  post-model graphs, formula intensities, and original peak annotations.
 
-## Main output files
+Full possible action states, negative transitions and dense node/action labels
+are not stored. Valid candidates and weak negatives are generated during forward
+through the same chemistry compatibility component used at inference.
 
-```text
-OUTPUT_DIR/
-├── config/preprocessing_config.pftprep.json
-├── statistics/
-│   ├── train_assigned_cleavage_events.tsv
-│   ├── train_assigned_cleavage_events_by_sample.tsv
-│   ├── train_assigned_cleavage_events_by_pattern.tsv
-│   ├── train_assigned_cleavage_events_by_pattern_reaction.tsv
-│   └── train_assigned_cleavage_events_by_pattern_reaction_product.tsv
-├── train_structures/
-│   ├── fragmenter.json
-│   ├── data/*.preft.pt
-│   ├── manifest.tsv
-│   └── assignment_scores.tsv
-└── validation_structures/
-    ├── fragmenter.json
-    └── ...
-```
+Manifests and statistics report teacher node count, positive transitions,
+precursor candidates and maximum MS2 depth in addition to the existing fields.
+The result viewer displays schema-v6 summaries and branching action targets.
+Collation offsets sample, action, precursor, teacher and materialized node indexes.
 
-When `--validation-input` is supplied, the corresponding `statistics/validation_*` files are also generated.
-Each generated structure split contains a `fragmenter.json` in the native
-`Fragmenter` format. It can be loaded directly with
-`Fragmenter.from_json(".../train_structures/fragmenter.json")` (or the validation
-equivalent) and used to reproduce fragmentation with the split's settings.
-
-By default, `--validation-smiles-ratio` is `0.1`: the number of selected validation SMILES is 10% of the number of unique training SMILES (rounded up and capped by the available validation SMILES). Candidates are divided into ten bins by their maximum Morgan-fingerprint Tanimoto similarity to training data, then selected round-robin across non-empty bins. Thus similarity 1.0 (also present in training) through structurally dissimilar candidates near 0.0 are represented as evenly as the candidate pool allows. The selection is deterministic by default; use `--validation-sampling-seed` to change it. `validation_structures/max_tanimoto_index.tsv` records the selected SMILES and similarities.
-
-With `--num-workers 2` or greater, each worker writes
-`part_*_assigned_cleavage_events.tsv` and
-`part_*_assigned_cleavage_events_by_sample.tsv` under the split's parallel
-temporary directory immediately after building its chunk. The parent process
-only sums the chunk aggregates and concatenates the per-sample rows. It does
-not rescan every final `.preft.pt` file after all structure workers finish. The part
-files are removed with the other parallel temporary files unless
-`--keep-parallel-temp` is specified.
-
-## Assigned cleavage-event statistics
-
-These statistics count cleavage events in `FragmentPathway` objects that were actually assigned to observed spectrum peaks. They do not count every SMARTS match in the root compound or every event available in the shared fragment-tree structure.
-
-A structure can contain many spectrum samples for the same SMILES. Each target assignment is traced separately through:
-
-```text
-sample -> observed peak -> assigned FragmentPathway -> pathway edges -> cleavage events
-```
-
-This ensures that samples sharing one structure are counted separately. If the same pathway is assigned in multiple samples, its events contribute once for each assignment in each sample. Shared pathway prefixes are therefore counted according to their actual use by assigned pathways.
-
-- `*_assigned_cleavage_events.tsv`: Aggregate counts sorted by `assigned_cleavage_event_count` in descending order. `reactant_smarts` identifies the cleavage pattern, while `matched_substructure` describes the actual matched atoms, such as `C-C`, `C-N`, or `C-O`. `assigned_pathway_count` is the number of assigned pathways containing that type, and `sample_count` is the number of distinct samples in which it occurs.
-- `*_assigned_cleavage_events_by_sample.tsv`: Per-sample detail used to produce the aggregate table. It includes the source record index, `SpecID` when the input dataset provides it, structure filename, structure-local sample index, SMARTS, matched substructure, and event count.
-- `*_assigned_cleavage_events_by_pattern.tsv`: Counts grouped by `pattern_id`.
-- `*_assigned_cleavage_events_by_pattern_reaction.tsv`: Counts grouped by `(pattern_id, reaction_id)`.
-- `*_assigned_cleavage_events_by_pattern_reaction_product.tsv`: Counts grouped by `(pattern_id, reaction_id, product_molecule_id)`.
-
-For example:
-
-```text
-reactant_smarts       matched_substructure  assigned_cleavage_event_count
-[!#1:1]-[!#1:2]      C-O                   1000
-```
-
-The compact label uses the actual atom and bond types at the matched reactant atom indexes. Single, double, triple, and aromatic bonds are represented by `-`, `=`, `#`, and `:`, respectively.
-
-## Common options
-
-- `--max-node`, `--max-edge`: Fragment tree size limits. Use `-1` for no limit.
-- `--num-workers`: Use two or more subprocess workers to process SMILES groups in parallel. SMARTS statistics are calculated once per split by the parent process.
-- `--chunk-size`: Number of SMILES groups assigned to each parallel chunk. When `num_workers * chunk_size` exceeds the split's unique SMILES count, it is automatically reduced to `max(1, unique_smiles_count // num_workers)`. Training and validation are adjusted independently.
-- `--smiles-column`: Name of the SMILES metadata column. The default is `SMILES`.
-- `--symbols`: Element symbols that define the atom-feature columns. This is required and immutable for generated data.
-- `--validation-smiles-ratio`: Target validation count divided by unique training SMILES count. The unit is SMILES, not spectrum records.
-- `--tanimoto-num-bins`: Number of intervals used to balance maximum Tanimoto similarity (default: 10).
-- `--save-train-valid-records`: Save training records for which structures were successfully generated as an `.msds` file.
-- `--no-save-validation-valid-records`: Disable saving valid validation records.
-- `--overwrite`: Remove and rebuild existing structure output.
-
-Display all available options with:
-
-```bash
-python -m clefts.ml.data_preparation.fragment_tree.create_fragment_tree_training_data --help
-```
-
-## Restoring settings and inline Fragmenter parameters
-
-Every parent CLI run writes `fragment-tree.pft.json` containing input/output options
-and the complete `fragmenterParams` object. Load it with Workbench's Load Configuration.
-The immutable `config/preprocessing_config.pftprep.json` continues to describe only
-the structure preprocessing settings.
-
-Use `--params-json '{"fragment_ion_tree_builder": ...}'` to pass Fragmenter values
-directly (the value must be a complete valid JSON object). `--params PATH` remains
-available for existing scripts; the two options are mutually exclusive. Parallel
-workers receive the same embedded values via `--params-json`. The
-`clefts train create-fragment-tree-data` command also accepts an inline JSON object
-in its `MODEL_CONFIG` positional argument.
+Training details and validation outputs are described in
+[`fragment_tree_training/README.md`](../../training/fragment_tree_training/README.md).

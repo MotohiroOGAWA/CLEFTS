@@ -36,7 +36,7 @@ class SourceAnchoredSpectrumOutput:
 
 
 class SourceAnchoredFragmentSpectrumGenerator(nn.Module):
-    architecture = "source-anchored-action-autoregressive-v1"
+    architecture = "source-anchored-branching-v1"
 
     def __init__(self, fragmenter_params: dict, mol_encoder_params: dict,
                  action_model_params: dict | None = None, post_model_params: dict | None = None,

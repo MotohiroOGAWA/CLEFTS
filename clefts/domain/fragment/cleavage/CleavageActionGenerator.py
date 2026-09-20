@@ -158,6 +158,8 @@ def create_cleavage_actions(
                     updates.add((*edge, order))
                 if unsupported:
                     continue
+                if not retained or (retained == universe and not cuts and not updates):
+                    continue # Deterministic empty/true-no-op hard pruning.
                 matched = frozenset(bond_key(roles[u], roles[v]) for u, v in template.query_bond_roles)
                 changed = frozenset(edge for edge in source_orders if not set(edge) <= retained)
                 actions.add(CleavageAction(template.cleavage_pattern_id, template.reaction_id,

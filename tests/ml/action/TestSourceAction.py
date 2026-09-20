@@ -21,10 +21,10 @@ def model_and_data() -> tuple[SourceActionFeatureModel, SourceActionStructure, t
     fragmenter = Fragmenter.from_json('clefts/domain/fragment/presets/fragmenter_single_bond_pos.json')
     source = Compound.from_smiles('CC(O)N')
     actions = fragmenter.fragment_ion_tree_builder.create_cleavage_actions(source)
-    targets = [result.action_sequence for result in fragmenter.fragment_ion_tree_builder.cleave_all(source, max_action_count=2)]
+    paths = [(((None,None),(CleavageActionSequence((action,)),action)),1.) for action in actions]
     mol = MolEncoder(symbols=('C','O','N','H'), node_dim=16, graph_dim=16, num_layers=1, num_heads=4, dropout=0.)
     data = prepare_source_actions(source=source, actions=actions, graph_builder=mol.graph_builder,
-        condition_features=torch.tensor([[20.,1.],[40.,1.]]), max_action_count=2, target_sequences=(targets, targets))
+        condition_features=torch.tensor([[20.,1.],[40.,1.]]), max_action_count=2, teacher_pathways=(paths, paths))
     model = SourceActionFeatureModel(mol, (1,1,2), 2, hidden_dim=16, condition_dim=16, max_action_count=2,
         action_prefilter_top_k=8, action_prefilter_max_k=16, beam_size=4, max_decode_steps=4)
     return model, data, actions, source
@@ -82,7 +82,7 @@ class TestSourceAction(unittest.TestCase):
     def test_multi_positive_likelihood(self) -> None:
         logits = torch.tensor([[1.,2.,3.,4.]], requires_grad=True)
         positive = torch.tensor([[True,True,False,True]])
-        expected = -torch.log(torch.softmax(logits,dim=1)[positive].sum())
+        expected = torch.nn.functional.softplus(-logits[positive]).mean()+.2*torch.nn.functional.softplus(logits[~positive]).mean()
         torch.testing.assert_close(multi_positive_loss(logits, positive), expected)
         multi_positive_loss(logits,positive).backward()
         self.assertTrue(torch.isfinite(logits.grad).all())

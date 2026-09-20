@@ -64,6 +64,6 @@ def create_spectrum_generator(params: Dict):
     # Training initialization metadata is not a generator constructor argument.
     config.pop("mol_encoder_checkpoint", None)
     architecture = config.pop("architecture", None)
-    if architecture not in (None, SourceAnchoredFragmentSpectrumGenerator.architecture):
+    if architecture not in (None, "source-anchored-action-autoregressive-v1", SourceAnchoredFragmentSpectrumGenerator.architecture):
         raise ValueError(f"Unknown spectrum generator architecture: {architecture}")
     return SourceAnchoredFragmentSpectrumGenerator(**config)

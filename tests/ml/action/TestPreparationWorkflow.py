@@ -187,7 +187,7 @@ class TestPreparationWorkflow(unittest.TestCase):
         builder=ActionStructureBuilder(create_preparation_context(model))
         source=Compound.from_smiles('CCO');adduct=Adduct.parse('[M+H]+')
         mz=Formula.parse('C2H7O+').exact_mass
-        data=builder.build(source,[adduct,adduct],[20.,20.],[[mz],[mz]],[[1.],[0.]])
+        data,kept=builder.build(source,[adduct,adduct],[20.,20.],[[mz],[mz]],[[1.],[0.]])
         first,second=data.sample_annotations
         self.assertEqual(first['assignmentScore'],1.)
         self.assertIsNone(first['assignmentScoreWithoutPrecursor'])

@@ -29,16 +29,17 @@ function createParameterEditor(container, initial, kind = "training", editCleava
     action_prefilter_top_k:'Number of primitive source actions retained by the absolute action scorer.',
     action_prefilter_max_k:'Maximum action pool size during teacher-forced training, including forced positive actions.',
     action_prefilter_threshold_logit:'Absolute scorer logit threshold used before top-K action selection.',
+    prediction_threshold:'Independent sigmoid probability required to generate a branch (0 < value < 1).',
     beam_size:'Maximum candidate normalized action states retained at each decoding step.',
     state_num_layers:'Number of Set Transformer layers encoding the current action set.',state_dropout:'Dropout in the action state Set Transformer.',cosine_loss_weight:'Spectrum cosine loss weight, added to log intensity MSE.',
-    max_decode_steps:'Maximum autoregressive action decoding steps per spectrum.',
+    max_decode_steps:'Maximum MS2 branch expansion depth from each precursor seed.',
     adduct_type_strs:'Supported precursor adduct types, in model embedding order.',
     name:'Human-readable name stored in this configuration.',
     mol_encoder_checkpoint:'Pretrained molecular encoder checkpoint path.',
     freeze_mol_encoder:'Freeze the molecular encoder during training.',
   };
   const templates={patterns:{name:'new_pattern',reactant_smarts:'[!#1:1]-[!#1:2]',products:[{name:'product',smarts:'[!#1:1]'}]},products:{name:'product',smarts:'[!#1:1]'},adduct_rules:{name:'new_rule',adduct_type:'[M+H]+',radical:false,unsaturation:0,ion_shifts:[]},ion_shifts:{ion_shift:'[M+H]+'},atoms:'C',symbols:'C',adduct_type_strs:'[M+H]+'};
-  const optional={action_model_params:{num_heads:4,max_roles:64,state_num_layers:2,state_dropout:0},mol_encoder_params:{dropout:0},post_model_params:{cosine_loss_weight:0.5}};
+  const optional={action_model_params:{num_heads:4,max_roles:64,state_num_layers:2,state_dropout:0,prediction_threshold:0.5},mol_encoder_params:{dropout:0},post_model_params:{cosine_loss_weight:0.5}};
   const basic=new Set(['fragmenter_params.fragment_ion_tree_builder.max_action_count','fragmenter_params.precursor_candidate_max_action_count','fragmenter_params.mass_tolerance']);
   const node=(tag,text)=>{const n=document.createElement(tag);if(text!==undefined)n.textContent=text;return n;};
   const button=(text,fn)=>{const b=node('button',text);b.type='button';b.onclick=fn;return b;};
