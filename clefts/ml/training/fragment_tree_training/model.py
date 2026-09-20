@@ -143,7 +143,10 @@ class ActionFragmentTreeTrainingModel(nn.Module):
             mean_positive_actions_per_node=next_positive.sum().float()/max(p,1),
             mean_valid_actions_per_node=torch.isfinite(logits).sum().float()/max(p,1),
             mean_predicted_actions_per_node=predicted.sum().float()/max(p,1))
-        for depth in range(self.feature_model.decoder.max_decode_steps+1):
+        # The decode safety limit is often much larger than the fragmenter's
+        # configured tree depth and must not create meaningless empty charts.
+        maximum_reported_depth=min(self.feature_model.decoder.max_decode_steps,self.feature_model.max_action_count)
+        for depth in range(maximum_reported_depth+1):
             mask=data.teacher_node_ms2_depth==depth
             metrics[f'recall_depth_{depth}']=(predicted[mask]&next_positive[mask]).sum()/next_positive[mask].sum().clamp_min(1)
         for k in (16, 32, 64, 128):
