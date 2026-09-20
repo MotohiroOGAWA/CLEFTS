@@ -13,10 +13,10 @@ const { readTrainingReport, reportCharts, html } = require('../src/features/trai
     { name:'distributions/validation/cosine_similarity@main_adduct:[M+H]+_median', points:[[10,.6]] },
     { name:'distributions/validation/cosine_similarity@main_adduct:[M+H]+_q90', points:[[10,.9]] },
   ]);
-  assert.deepEqual(grouped.find(chart => chart.metric === 'loss').lanes.map(lane => lane.split), ['train','validation']);
+  assert.deepEqual(grouped.find(chart => chart.metric === 'loss').variants.withPrecursor.map(lane => lane.split), ['train','validation']);
   const facet = grouped.find(chart => chart.dimension === 'main_adduct');
-  assert.equal(facet.lanes[0].category, '[M+H]+');
-  assert.deepEqual(Object.keys(facet.lanes[0].stats), ['q10','median','q90']);
+  assert.equal(facet.variants.withPrecursor[0].category, '[M+H]+');
+  assert.deepEqual(Object.keys(facet.variants.withPrecursor[0].stats), ['q10','median','q90']);
 
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'clefts-training-report-'));
   try {

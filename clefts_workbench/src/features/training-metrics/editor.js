@@ -169,16 +169,21 @@ function client(groupSeries) {
       const allLanes = chart.variants[settings.withoutPrecursor?'withoutPrecursor':'withPrecursor'];
       const lanes = allLanes.filter(lane => !hidden.has(lane.label));
       const splitColors={train:'#e76f51',train_window:'#f4a261',validation:'#3a86ff',intermediate_validation:'#2a9d8f',all:'#8b8f98'};
-      const categoryDashes=['','8 3','3 3','10 3 2 3','2 5'];
+      const splitDashes={train:'',train_window:'4 2',validation:'',intermediate_validation:'6 3',all:''};
+      const categoryColors=['#e76f51','#2a9d8f','#e9c46a','#264653','#8ab17d','#f4a261','#577590','#b56576','#6d597a','#ee6c4d'];
       const categories=[...new Set(allLanes.map(lane=>lane.category))];
-      const color = lane => splitColors[lane.split] || splitColors.all;
-      const dash = lane => categoryDashes[categories.indexOf(lane.category)%categoryDashes.length];
-      const legend = document.createElement('div'); legend.style.cssText = 'display:flex;flex-wrap:wrap;gap:8px;margin:12px 0';
+      const faceted = !!chart.dimension && categories.length>1;
+      const color = lane => faceted ? categoryColors[categories.indexOf(lane.category)%categoryColors.length] : (splitColors[lane.split] || splitColors.all);
+      const dash = lane => faceted ? (splitDashes[lane.split] || '') : '';
+      const legend = document.createElement('div'); legend.style.cssText = 'display:flex;flex-wrap:wrap;gap:10px;margin:12px 0';
       for (const lane of allLanes) {
-        const label = document.createElement('label'); label.style.color = color(lane);
+        const label = document.createElement('label'); label.style.cssText = 'display:inline-flex;align-items:center;gap:6px;cursor:pointer';
         const toggle = document.createElement('input'); toggle.type = 'checkbox'; toggle.checked = !hidden.has(lane.label);
         toggle.onchange = () => { if (toggle.checked) hidden.delete(lane.label); else hidden.add(lane.label); render(); };
-        label.append(toggle, document.createTextNode(lane.label)); legend.append(label);
+        const swatch = document.createElementNS('http://www.w3.org/2000/svg','svg'); swatch.setAttribute('viewBox','0 0 28 10'); swatch.style.cssText='width:26px;height:10px;flex:0 0 auto';
+        const swatchLine = document.createElementNS('http://www.w3.org/2000/svg','line'); swatchLine.setAttribute('x1',1); swatchLine.setAttribute('x2',27); swatchLine.setAttribute('y1',5); swatchLine.setAttribute('y2',5);
+        swatchLine.setAttribute('stroke',color(lane)); swatchLine.setAttribute('stroke-width',3); swatchLine.setAttribute('stroke-dasharray',dash(lane)); swatchLine.setAttribute('stroke-linecap','round'); swatch.append(swatchLine);
+        label.append(toggle, swatch, document.createTextNode(lane.label)); legend.append(label);
       }
       card.append(legend);
       if (settings.mode === 'distribution') { const hint = document.createElement('p'); hint.className = 'muted'; hint.textContent = 'Light band: q10–q90 · Dark band: q25–q75 · Line: median'; card.append(hint); }
@@ -220,7 +225,7 @@ function client(groupSeries) {
         }
         node('text', { x:75, y:240, fill:'currentColor', 'font-size':12 }, String(first));
         node('text', { x:575, y:240, fill:'currentColor', 'font-size':12, 'text-anchor':'end' }, String(last));
-        const info = document.createElement('p'); info.className = 'muted'; info.style.whiteSpace = 'pre-line'; info.textContent = 'Solid: train · Dotted: train_window · Dashed: validation · Hover to inspect';
+        const info = document.createElement('p'); info.className = 'muted'; info.style.whiteSpace = 'pre-line'; info.textContent = (faceted ? 'Color: category · Dashed: intermediate validation' : 'Color: split') + ' · Hover to inspect';
         svg.onmousemove = event => {
           const rect = svg.getBoundingClientRect(); const step = first + ((event.clientX-rect.left)/rect.width*600-75)/500*(last-first);
           info.textContent = lanes.map(lane => {

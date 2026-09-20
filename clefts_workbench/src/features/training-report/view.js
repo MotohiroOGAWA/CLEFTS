@@ -23,11 +23,13 @@ function reportCharts(series, maxDepth = null) {
     const base = facet ? facet[1] : metric, dimension = facet ? facet[2] : '', category = facet ? facet[3] : 'all';
     const depth = dimension === 'depth' ? Number(category) : Number(base.match(/(?:^|_)depth_(\d+)$/)?.[1]);
     if (maxDepth !== null && Number.isFinite(depth) && depth > maxDepth) continue;
-    const key = base + '@@' + dimension;
-    if (!charts.has(key)) charts.set(key, { metric: base, dimension, lanes: [] });
-    const chart = charts.get(key);
-    let lane = chart.lanes.find(item => item.split === split && item.category === category);
-    if (!lane) { lane = { split, category, stats: {} }; chart.lanes.push(lane); }
+    const withoutPrecursor = base.endsWith('_without_precursor');
+    const metricName = withoutPrecursor ? base.replace(/_without_precursor$/, '') : base;
+    const key = metricName + '@@' + dimension;
+    if (!charts.has(key)) charts.set(key, { metric: metricName, dimension, variants: { withPrecursor: [], withoutPrecursor: [] } });
+    const lanes = charts.get(key).variants[withoutPrecursor ? 'withoutPrecursor' : 'withPrecursor'];
+    let lane = lanes.find(item => item.split === split && item.category === category);
+    if (!lane) { lane = { split, category, stats: {} }; lanes.push(lane); }
     lane.stats[statistic] = source.points;
   }
   return [...charts.values()].sort((a,b) => (a.dimension+a.metric).localeCompare(b.dimension+b.metric));
@@ -88,35 +90,62 @@ function client() {
     ['Performance & resources',/seconds|memory/],
   ];
   const GROUP_ORDER=METRIC_GROUPS.map(item=>item[0]).concat('Other');
-  const metricGroup=metric=>{const base=metric.replace(/_without_precursor$/,'');for(const [label,pattern] of METRIC_GROUPS)if(pattern.test(base))return label;return 'Other';};
-  const without = metric => metric.endsWith('_without_precursor');
-  const labelMetric = metric => metric.replace(/_without_precursor$/, '') + (without(metric) ? ' (without precursor)' : '');
+  const metricGroup=metric=>{for(const [label,pattern] of METRIC_GROUPS)if(pattern.test(metric))return label;return 'Other';};
+  const chartKey=chart=>chart.dimension+'@@'+chart.metric;
+  const cardSettings=new Map(Object.entries(saved.cardSettings||{}));
+  const hiddenLanes=new Map();
   const dimensions = [...new Set(data.charts.map(chart => chart.dimension))];
   for (const dimension of dimensions) { const option=document.createElement('option'); option.value=dimension; option.textContent=dimension ? dimension.replaceAll('_',' ') : 'Overall'; el('reportFacet').append(option); }
-  if (['mean','median','distribution'].includes(saved.mode)) el('reportMode').value=saved.mode;
   if (dimensions.includes(saved.facet)) el('reportFacet').value=saved.facet;
-  if (typeof saved.includePrecursor==='boolean') el('reportPrecursor').checked=saved.includePrecursor;
   if (typeof saved.filter==='string') el('reportFilter').value=saved.filter;
+  if (['grid','vertical'].includes(saved.layout)) el('reportLayout').value=saved.layout;
   if (['cosine_similarity','assignment_score'].includes(saved.representativeMetric)) el('representativeMetric').value=saved.representativeMetric;
+  if (typeof saved.representativePrecursor==='boolean') el('representativePrecursor').checked=saved.representativePrecursor;
   el('reportAuto').checked=typeof saved.auto==='boolean'?saved.auto:data.manifest.status==='running';
-  const save=()=>vscode.setState({mode:el('reportMode').value,facet:el('reportFacet').value,includePrecursor:el('reportPrecursor').checked,filter:el('reportFilter').value,representativeMetric:el('representativeMetric').value,representativeQuantile:el('representativeLevel')?.value||saved.representativeQuantile,auto:el('reportAuto').checked});
+  const save=()=>vscode.setState({facet:el('reportFacet').value,filter:el('reportFilter').value,layout:el('reportLayout').value,cardSettings:Object.fromEntries(cardSettings),representativeMetric:el('representativeMetric').value,representativePrecursor:el('representativePrecursor').checked,representativeQuantile:el('representativeLevel')?.value||saved.representativeQuantile,auto:el('reportAuto').checked});
   function svgNode(svg, tag, attributes, text) { const node=document.createElementNS('http://www.w3.org/2000/svg',tag); for(const [key,value] of Object.entries(attributes))node.setAttribute(key,value); if(text!==undefined)node.textContent=text; svg.append(node); return node; }
+  function legendSwatch(color,dash){const swatch=document.createElementNS('http://www.w3.org/2000/svg','svg');swatch.setAttribute('viewBox','0 0 28 10');swatch.setAttribute('class','legend-swatch');const ln=document.createElementNS('http://www.w3.org/2000/svg','line');ln.setAttribute('x1',1);ln.setAttribute('x2',27);ln.setAttribute('y1',5);ln.setAttribute('y2',5);ln.setAttribute('stroke',color);ln.setAttribute('stroke-width',3);ln.setAttribute('stroke-dasharray',dash);ln.setAttribute('stroke-linecap','round');swatch.append(ln);return swatch;}
+  function applyLayout(){el('reportCharts').style.gridTemplateColumns=el('reportLayout').value==='vertical'?'minmax(0,1fr)':'';}
   function renderChart(chart) {
-    const card=document.createElement('section'), title=document.createElement('h3'); title.textContent=labelMetric(chart.metric)+(chart.dimension?' · '+chart.dimension.replaceAll('_',' '):''); card.append(title);
-    const lanes=chart.lanes, categories=[...new Set(lanes.map(lane=>lane.category))], legend=document.createElement('div'); legend.className='report-legend';
+    const key=chartKey(chart);
+    const availableWith=chart.variants.withPrecursor.length>0, availableWithout=chart.variants.withoutPrecursor.length>0;
+    const settings={mode:'mean', excludePrecursor:!availableWith&&availableWithout, ...(cardSettings.get(key)||{})};
+    if(settings.excludePrecursor&&!availableWithout)settings.excludePrecursor=false;
+    if(!settings.excludePrecursor&&!availableWith)settings.excludePrecursor=true;
+    cardSettings.set(key,settings);
+    const card=document.createElement('section'), title=document.createElement('h3');
+    title.textContent=chart.metric+(chart.dimension?' · '+chart.dimension.replaceAll('_',' '):'');
+    card.append(title);
+    const controls=document.createElement('div'); controls.className='card-controls';
+    const modeLabel=document.createElement('label'); modeLabel.append(document.createTextNode('Display '));
+    const modeSelect=document.createElement('select');
+    for(const [value,text] of [['mean','Mean'],['median','Median'],['distribution','Distribution']]){const option=document.createElement('option');option.value=value;option.textContent=text;modeSelect.append(option);}
+    modeSelect.value=settings.mode;
+    modeSelect.onchange=()=>{settings.mode=modeSelect.value;save();renderCharts();};
+    modeLabel.append(modeSelect); controls.append(modeLabel);
+    const precursorLabel=document.createElement('label'), precursorCheckbox=document.createElement('input');
+    precursorCheckbox.type='checkbox'; precursorCheckbox.checked=settings.excludePrecursor; precursorCheckbox.disabled=!availableWith||!availableWithout;
+    precursorCheckbox.onchange=()=>{settings.excludePrecursor=precursorCheckbox.checked;save();renderCharts();};
+    precursorLabel.append(precursorCheckbox,document.createTextNode(' Exclude precursor')); controls.append(precursorLabel);
+    card.append(controls);
+    const allLanes=chart.variants[settings.excludePrecursor?'withoutPrecursor':'withPrecursor'];
+    const hidden=hiddenLanes.get(key)||new Set(); hiddenLanes.set(key,hidden);
+    const categories=[...new Set(allLanes.map(lane=>lane.category))];
     const faceted=!!chart.dimension&&categories.length>1;
     const color=lane=>faceted?categoryColors[categories.indexOf(lane.category)%categoryColors.length]:(splitColors[lane.split]||splitColors.all);
     const dash=lane=>faceted?(splitDashes[lane.split]||''):'';
-    for(const lane of lanes){
-      const item=document.createElement('span');item.className='report-legend-item';
-      const swatch=document.createElementNS('http://www.w3.org/2000/svg','svg');swatch.setAttribute('viewBox','0 0 28 10');swatch.setAttribute('class','legend-swatch');
-      const ln=document.createElementNS('http://www.w3.org/2000/svg','line');ln.setAttribute('x1',1);ln.setAttribute('x2',27);ln.setAttribute('y1',5);ln.setAttribute('y2',5);
-      ln.setAttribute('stroke',color(lane));ln.setAttribute('stroke-width',3);ln.setAttribute('stroke-dasharray',dash(lane));ln.setAttribute('stroke-linecap','round');swatch.append(ln);
+    const legend=document.createElement('div'); legend.className='report-legend';
+    for(const lane of allLanes){
+      const laneKey=lane.split+'@@'+lane.category;
+      const item=document.createElement('label');item.className='report-legend-item';
+      const toggle=document.createElement('input');toggle.type='checkbox';toggle.checked=!hidden.has(laneKey);
+      toggle.onchange=()=>{if(toggle.checked)hidden.delete(laneKey);else hidden.add(laneKey);renderCharts();};
       const label=document.createElement('span');label.textContent=(chart.dimension?lane.category+' · ':'')+lane.split;
-      item.append(swatch,label);legend.append(item);
+      item.append(toggle,legendSwatch(color(lane),dash(lane)),label);legend.append(item);
     }
     card.append(legend);
-    const mode=el('reportMode').value;
+    const lanes=allLanes.filter(lane=>!hidden.has(lane.split+'@@'+lane.category));
+    const mode=settings.mode;
     const visibleStats=lane=>mode==='distribution'?['q10','q25','median','q75','q90']:mode==='median'?['median','value']:['mean','value'];
     const points=lanes.flatMap(lane=>visibleStats(lane).flatMap(stat=>lane.stats[stat]||[]));
     if(!points.length){const p=document.createElement('p');p.className='muted';p.textContent='No '+mode+' measurements are available.';card.append(p);return card;}
@@ -129,14 +158,12 @@ function client() {
     svgNode(svg,'text',{x:68,y:243,fill:'currentColor','font-size':11},String(first));svgNode(svg,'text',{x:578,y:243,fill:'currentColor','font-size':11,'text-anchor':'end'},String(last));card.append(svg);return card;
   }
   function renderCharts(){
-    const query=el('reportFilter').value.trim().toLowerCase(),facet=el('reportFacet').value,include=el('reportPrecursor').checked,names=new Set(data.charts.filter(chart=>chart.dimension===facet).map(chart=>chart.metric));
-    const visible=data.charts.filter(chart=>{
-      const paired=without(chart.metric)?names.has(chart.metric.replace(/_without_precursor$/,'')):names.has(chart.metric+'_without_precursor');
-      return chart.dimension===facet&&!(paired&&without(chart.metric)===include)&&labelMetric(chart.metric).toLowerCase().includes(query);
-    }).sort((a,b)=>{
-      const ga=GROUP_ORDER.indexOf(metricGroup(a.metric)),gb=GROUP_ORDER.indexOf(metricGroup(b.metric));
-      return ga!==gb?ga-gb:labelMetric(a.metric).localeCompare(labelMetric(b.metric));
-    });
+    const query=el('reportFilter').value.trim().toLowerCase(),facet=el('reportFacet').value;
+    const visible=data.charts.filter(chart=>chart.dimension===facet&&chart.metric.toLowerCase().includes(query))
+      .sort((a,b)=>{
+        const ga=GROUP_ORDER.indexOf(metricGroup(a.metric)),gb=GROUP_ORDER.indexOf(metricGroup(b.metric));
+        return ga!==gb?ga-gb:a.metric.localeCompare(b.metric);
+      });
     el('reportCharts').replaceChildren();
     const showGroups=new Set(visible.map(chart=>metricGroup(chart.metric))).size>1;
     let lastGroup=null;
@@ -151,15 +178,22 @@ function client() {
     el('chartCount').textContent=visible.length+' metric cards';
   }
   function peaks(record, kind){const values=record[kind+'_peaks'];if(values)return values;return (record[kind+'_mz']||[]).map((mz,index)=>({mz,intensity:record[kind+'_intensity'][index],precursor:false}));}
-  function renderSpectra(){const metric=el('representativeMetric').value+(el('reportPrecursor').checked?'':'_without_precursor'),entries=data.validation?.representatives?.[metric]||{},levels=['q10','q25','median','q75','q90'].filter(level=>entries[level]);el('representativeSpectra').replaceChildren();if(levels.length){const card=document.createElement('article'),heading=document.createElement('h4'),level=document.createElement('select');level.id='representativeLevel';for(const value of levels){const option=document.createElement('option');option.value=value;option.textContent=value;level.append(option);}if(levels.includes(saved.representativeQuantile))level.value=saved.representativeQuantile;const control=document.createElement('label');control.append(document.createTextNode('Representative level '),level);card.append(heading,control);const plot=document.createElement('div'),meta=document.createElement('p');meta.className='muted';card.append(plot,meta);const draw=()=>{saved.representativeQuantile=level.value;save();const quantile=level.value,item=entries[quantile],record=item.spectrum,include=el('reportPrecursor').checked,generated=peaks(record,'generated').filter(p=>include||!p.precursor),original=(record.original_peaks||[]).filter(p=>include||!p.precursor),all=[...generated,...original],maximum=Math.max(...all.map(p=>Number(p.mz)),1),gmax=Math.max(...generated.map(p=>Number(p.intensity)),1e-8),omax=Math.max(...original.map(p=>Number(p.intensity)),1e-8),x=mz=>42+Number(mz)/maximum*516;heading.innerHTML='';const levelLabel=document.createElement('span');levelLabel.className='rep-level-label';levelLabel.textContent=quantile+' representative';const badge=document.createElement('span');badge.className='similarity-badge';badge.textContent=el('representativeMetric').selectedOptions[0].textContent+' '+Number(item.value).toFixed(4);heading.append(levelLabel,badge);const svg=document.createElementNS('http://www.w3.org/2000/svg','svg');svg.setAttribute('viewBox','0 0 570 270');svg.setAttribute('role','img');svg.setAttribute('aria-label',quantile+' representative mirror spectrum');svgNode(svg,'line',{x1:42,x2:558,y1:130,y2:130,stroke:'currentColor'});for(const peak of generated)svgNode(svg,'line',{x1:x(peak.mz),x2:x(peak.mz),y1:130,y2:130-105*peak.intensity/gmax,stroke:peak.precursor?'#f0883e':'#58a6ff','stroke-width':2});for(const peak of original)svgNode(svg,'line',{x1:x(peak.mz),x2:x(peak.mz),y1:130,y2:130+105*peak.intensity/omax,stroke:peak.precursor?'#f0883e':'#3fb950','stroke-width':2});svgNode(svg,'text',{x:45,y:18,fill:'#58a6ff','font-size':11},'Generated');svgNode(svg,'text',{x:45,y:258,fill:'#3fb950','font-size':11},'Observed');svgNode(svg,'text',{x:558,y:148,fill:'currentColor','font-size':10,'text-anchor':'end'},maximum.toFixed(2)+' m/z');plot.replaceChildren(svg);meta.textContent=record.main_adduct+' · '+record.collision_energy+' eV · '+generated.length+' / '+original.length+' peaks';};level.onchange=draw;draw();el('representativeSpectra').append(card);}el('representativeStatus').textContent=data.validation?data.validation.file+' · '+(data.validation.summary.samples||0)+' spectra':'No validation spectrum artifact is available yet.';}
-  for(const id of ['reportMode','reportFacet','reportPrecursor','representativeMetric'])el(id).addEventListener('change',()=>{save();renderCharts();renderSpectra();});el('reportAuto').onchange=save;el('reportFilter').oninput=()=>{save();renderCharts();};el('reportRefresh').onclick=()=>vscode.postMessage({type:'refresh'});setInterval(()=>{if(el('reportAuto').checked)vscode.postMessage({type:'refresh'});},15000);renderCharts();renderSpectra();
+  function renderSpectra(){const metric=el('representativeMetric').value+(el('representativePrecursor').checked?'':'_without_precursor'),entries=data.validation?.representatives?.[metric]||{},levels=['q10','q25','median','q75','q90'].filter(level=>entries[level]);el('representativeSpectra').replaceChildren();if(levels.length){const card=document.createElement('article'),heading=document.createElement('h4'),level=document.createElement('select');level.id='representativeLevel';for(const value of levels){const option=document.createElement('option');option.value=value;option.textContent=value;level.append(option);}if(levels.includes(saved.representativeQuantile))level.value=saved.representativeQuantile;const control=document.createElement('label');control.append(document.createTextNode('Representative level '),level);card.append(heading,control);const plot=document.createElement('div'),meta=document.createElement('p');meta.className='muted';card.append(plot,meta);const draw=()=>{saved.representativeQuantile=level.value;save();const quantile=level.value,item=entries[quantile],record=item.spectrum,include=el('representativePrecursor').checked,generated=peaks(record,'generated').filter(p=>include||!p.precursor),original=(record.original_peaks||[]).filter(p=>include||!p.precursor),all=[...generated,...original],maximum=Math.max(...all.map(p=>Number(p.mz)),1),gmax=Math.max(...generated.map(p=>Number(p.intensity)),1e-8),omax=Math.max(...original.map(p=>Number(p.intensity)),1e-8),x=mz=>42+Number(mz)/maximum*516;heading.innerHTML='';const levelLabel=document.createElement('span');levelLabel.className='rep-level-label';levelLabel.textContent=quantile+' representative';const badge=document.createElement('span');badge.className='similarity-badge';badge.textContent=el('representativeMetric').selectedOptions[0].textContent+' '+Number(item.value).toFixed(4);heading.append(levelLabel,badge);const svg=document.createElementNS('http://www.w3.org/2000/svg','svg');svg.setAttribute('viewBox','0 0 570 270');svg.setAttribute('role','img');svg.setAttribute('aria-label',quantile+' representative mirror spectrum');svgNode(svg,'line',{x1:42,x2:558,y1:130,y2:130,stroke:'currentColor'});for(const peak of generated)svgNode(svg,'line',{x1:x(peak.mz),x2:x(peak.mz),y1:130,y2:130-105*peak.intensity/gmax,stroke:peak.precursor?'#f0883e':'#58a6ff','stroke-width':2});for(const peak of original)svgNode(svg,'line',{x1:x(peak.mz),x2:x(peak.mz),y1:130,y2:130+105*peak.intensity/omax,stroke:peak.precursor?'#f0883e':'#3fb950','stroke-width':2});svgNode(svg,'text',{x:45,y:18,fill:'#58a6ff','font-size':11},'Generated');svgNode(svg,'text',{x:45,y:258,fill:'#3fb950','font-size':11},'Observed');svgNode(svg,'text',{x:558,y:148,fill:'currentColor','font-size':10,'text-anchor':'end'},maximum.toFixed(2)+' m/z');plot.replaceChildren(svg);meta.textContent=record.main_adduct+' · '+record.collision_energy+' eV · '+generated.length+' / '+original.length+' peaks';};level.onchange=draw;draw();el('representativeSpectra').append(card);}el('representativeStatus').textContent=data.validation?data.validation.file+' · '+(data.validation.summary.samples||0)+' spectra':'No validation spectrum artifact is available yet.';}
+  el('reportFacet').addEventListener('change',()=>{save();renderCharts();});
+  el('reportFilter').oninput=()=>{save();renderCharts();};
+  el('reportLayout').addEventListener('change',()=>{applyLayout();save();});
+  for(const id of ['representativeMetric','representativePrecursor'])el(id).addEventListener('change',()=>{save();renderSpectra();});
+  el('reportAuto').onchange=save;
+  el('reportRefresh').onclick=()=>vscode.postMessage({type:'refresh'});
+  setInterval(()=>{if(el('reportAuto').checked)vscode.postMessage({type:'refresh'});},15000);
+  applyLayout();renderCharts();renderSpectra();
 }
 
 function html(data, commonCss) {
   const manifest=data.manifest, training=manifest.datasets?.train?.samples??'—', validation=manifest.datasets?.validation?.samples??'—';
   const serialized=JSON.stringify(data).replace(/</g,'\\u003c');
   return `<!doctype html><html><head><meta charset="UTF-8"><style>${commonCss}
-  body{margin:0;background:var(--vscode-editor-background);color:var(--vscode-foreground)}.report-main{padding:24px 28px}.report-toolbar{display:flex;gap:12px;align-items:center;padding:14px 24px;border-bottom:1px solid var(--border);background:var(--vscode-input-background)}.report-toolbar strong{margin-right:auto}.report-controls,.report-legend{display:flex;gap:12px;align-items:center;flex-wrap:wrap}.report-controls input[type=search]{min-width:250px}.report-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,460px),1fr));gap:16px;margin-top:16px;align-items:start}.report-grid section{margin:0;content-visibility:auto;contain-intrinsic-size:auto 360px}.report-grid svg,.spectrum-grid svg{display:block;width:100%}.report-group-header{grid-column:1/-1;font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;opacity:.7;margin:18px 0 -4px;padding-top:14px;border-top:1px solid var(--border)}.report-group-header:first-child{margin-top:0;padding-top:0;border-top:0}.report-legend{font-size:12px;margin:8px 0;row-gap:6px}.report-legend-item{display:inline-flex;align-items:center;gap:6px}.legend-swatch{width:26px;height:10px;flex:0 0 auto}.spectrum-grid{display:grid;grid-template-columns:minmax(min(100%,760px),1fr);gap:12px}.spectrum-grid article{border:1px solid var(--border);border-radius:9px;padding:12px}.spectrum-grid h4{display:flex;align-items:center;flex-wrap:wrap;gap:8px;margin:0 0 6px}.rep-level-label{font-weight:600}.similarity-badge{background:color-mix(in srgb,var(--accent) 22%,transparent);color:var(--accent);padding:2px 10px;border-radius:999px;font-weight:700;font-size:12px}.status-${escapeHtml(manifest.status)}{color:var(--accent)}</style></head><body><div class="report-toolbar"><strong>CLEFTS Workbench <small>/ Training Result</small></strong><span class="status-${escapeHtml(manifest.status)}">${escapeHtml(manifest.status)}</span><label><input id="reportAuto" type="checkbox"> Auto refresh (15s)</label><button id="reportRefresh">Refresh</button></div><main class="report-main"><header><div><span class="eyebrow">${escapeHtml(manifest.project)} / ${escapeHtml(manifest.run)}</span><h1>Fragment Tree Training Report</h1><p class="muted">${escapeHtml(data.root)} · updated ${escapeHtml(manifest.updatedAt)}</p></div></header><section class="cards"><article><b>${manifest.completedEpochs||0}</b><span>Completed epochs</span></article><article><b>${manifest.globalStep||0}</b><span>Global step</span></article><article><b>${training}</b><span>Train samples</span></article><article><b>${validation}</b><span>Validation samples</span></article></section>${manifest.error?`<section><h2>Training failed</h2><pre>${escapeHtml(manifest.error)}</pre></section>`:''}<section><h2>Learning curves</h2><div class="report-controls"><label>Display <select id="reportMode"><option value="mean">Mean only</option><option value="median">Median only</option><option value="distribution">Distribution (q10–q90)</option></select></label><label>Breakdown <select id="reportFacet"></select></label><label><input id="reportPrecursor" type="checkbox" checked> Include precursor</label><input id="reportFilter" type="search" placeholder="Filter metrics"><span id="chartCount" class="muted"></span></div><p class="muted">Train and validation share each card. Distribution shows q10–q90 and q25–q75 bands with the median line.</p><div id="reportCharts" class="report-grid"></div></section><section><h2>Representative validation spectra</h2><div class="report-controls"><label>Rank by <select id="representativeMetric"><option value="cosine_similarity">Cosine similarity</option><option value="assignment_score">Assignment score (m/z coverage)</option></select></label><span id="representativeStatus" class="muted"></span></div><p class="muted">Compare the generated and observed spectrum in one card, switching its representative level between q10, q25, median, q75, and q90.</p><div id="representativeSpectra" class="spectrum-grid"></div></section><script type="application/json" id="trainingReportData">${serialized}</script><script>const vscode=acquireVsCodeApi();(${client.toString()})();</script></main></body></html>`;
+  body{margin:0;background:var(--vscode-editor-background);color:var(--vscode-foreground)}.report-main{padding:24px 28px;max-width:none;width:100%}.report-toolbar{display:flex;gap:12px;align-items:center;padding:14px 24px;border-bottom:1px solid var(--border);background:var(--vscode-input-background)}.report-toolbar strong{margin-right:auto}.report-controls,.report-legend{display:flex;gap:12px;align-items:center;flex-wrap:wrap}.report-controls input[type=search]{min-width:250px}.card-controls{display:flex;gap:14px;align-items:center;flex-wrap:wrap;margin:8px 0 4px;font-size:12px}.card-controls label{display:flex;align-items:center;gap:6px}.card-controls input[type=checkbox]{width:auto;margin:0}.report-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,460px),1fr));gap:16px;margin-top:16px;align-items:start}.report-grid section{margin:0;content-visibility:auto;contain-intrinsic-size:auto 360px}.report-grid svg,.spectrum-grid svg{display:block;width:100%}.report-group-header{grid-column:1/-1;font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;opacity:.7;margin:18px 0 -4px;padding-top:14px;border-top:1px solid var(--border)}.report-group-header:first-child{margin-top:0;padding-top:0;border-top:0}.report-legend{font-size:12px;margin:8px 0;row-gap:6px}.report-legend-item{display:inline-flex;align-items:center;gap:6px;cursor:pointer}.report-legend-item input[type=checkbox]{width:auto;margin:0}.legend-swatch{width:26px;height:10px;flex:0 0 auto}.spectrum-grid{display:grid;grid-template-columns:minmax(min(100%,760px),1fr);gap:12px}.spectrum-grid article{border:1px solid var(--border);border-radius:9px;padding:12px}.spectrum-grid h4{display:flex;align-items:center;flex-wrap:wrap;gap:8px;margin:0 0 6px}.rep-level-label{font-weight:600}.similarity-badge{background:color-mix(in srgb,var(--accent) 22%,transparent);color:var(--accent);padding:2px 10px;border-radius:999px;font-weight:700;font-size:12px}.status-${escapeHtml(manifest.status)}{color:var(--accent)}</style></head><body><div class="report-toolbar"><strong>CLEFTS Workbench <small>/ Training Result</small></strong><span class="status-${escapeHtml(manifest.status)}">${escapeHtml(manifest.status)}</span><label><input id="reportAuto" type="checkbox"> Auto refresh (15s)</label><button id="reportRefresh">Refresh</button></div><main class="report-main"><header><div><span class="eyebrow">${escapeHtml(manifest.project)} / ${escapeHtml(manifest.run)}</span><h1>Fragment Tree Training Report</h1><p class="muted">${escapeHtml(data.root)} · updated ${escapeHtml(manifest.updatedAt)}</p></div></header><section class="cards"><article><b>${manifest.completedEpochs||0}</b><span>Completed epochs</span></article><article><b>${manifest.globalStep||0}</b><span>Global step</span></article><article><b>${training}</b><span>Train samples</span></article><article><b>${validation}</b><span>Validation samples</span></article></section>${manifest.error?`<section><h2>Training failed</h2><pre>${escapeHtml(manifest.error)}</pre></section>`:''}<section><h2>Learning curves</h2><div class="report-controls"><label>Breakdown <select id="reportFacet"></select></label><label>Layout <select id="reportLayout"><option value="grid">Grid</option><option value="vertical">Vertical</option></select></label><input id="reportFilter" type="search" placeholder="Filter metrics"><span id="chartCount" class="muted"></span></div><p class="muted">Each card has its own display mode and precursor toggle, plus checkboxes to hide a train/validation line. Distribution shows q10–q90 and q25–q75 bands with the median line.</p><div id="reportCharts" class="report-grid"></div></section><section><h2>Representative validation spectra</h2><div class="report-controls"><label>Rank by <select id="representativeMetric"><option value="cosine_similarity">Cosine similarity</option><option value="assignment_score">Assignment score (m/z coverage)</option></select></label><label><input id="representativePrecursor" type="checkbox" checked> Include precursor</label><span id="representativeStatus" class="muted"></span></div><p class="muted">Compare the generated and observed spectrum in one card, switching its representative level between q10, q25, median, q75, and q90.</p><div id="representativeSpectra" class="spectrum-grid"></div></section><script type="application/json" id="trainingReportData">${serialized}</script><script>const vscode=acquireVsCodeApi();(${client.toString()})();</script></main></body></html>`;
 }
 
 module.exports = { readTrainingReport, reportCharts, html, STATS };
