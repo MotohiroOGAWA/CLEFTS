@@ -31,6 +31,9 @@ class PostMaterializationBatch:
     # inference). Multiple mass-degenerate candidates at the same node can
     # be positive together: they are indistinguishable from MS data alone.
     ion_is_positive: Tensor | None = None
+    # str(Adduct) for each candidate ion, parallel to ion_node_index/ion_features;
+    # display-only (e.g. the fragment-tree node inspector), never read by the model.
+    ion_adduct: tuple[str,...] = ()
     unique_node_graph: Batch | None = None
     node_graph_inverse: Tensor | None = None
     unique_source_index: Tensor | None = None
@@ -49,6 +52,14 @@ class PostMaterializationOutput:
     formula_tensor: Tensor
     mz: Tensor
     loss: Tensor
+    # Highest ion-score sigmoid confidence among the candidates explaining this
+    # formula. Never used to gate the loss or the intensity itself (so training
+    # dynamics/metrics stay unaffected); callers producing a spectrum for
+    # display can drop low-confidence peaks with it instead.
+    confidence: Tensor
+    # sigmoid(ion_logit) per candidate ion, parallel to the input batch's
+    # ion_node_index/ion_adduct; display-only, same reasoning as confidence.
+    ion_probability: Tensor
 
 
 class PostMaterializationFragmentTreeModel(nn.Module):
@@ -57,13 +68,16 @@ class PostMaterializationFragmentTreeModel(nn.Module):
     def __init__(self, mol_encoder: nn.Module, action_dim: int, condition_dim: int,
                  formula_dim: int, hidden_dim: int = 128, num_heads: int = 4,
                  num_layers: int = 2, max_action_count: int = 3,
-                 cosine_loss_weight: float = 0.5, ion_loss_weight: float = 0.5, dropout: float = 0.) -> None:
+                 cosine_loss_weight: float = 0.5, ion_loss_weight: float = 0.5,
+                 ion_prediction_threshold: float = 0.5, dropout: float = 0.) -> None:
         super().__init__()
         if not 0<=cosine_loss_weight or not torch.isfinite(torch.tensor(cosine_loss_weight)):raise ValueError("cosine_loss_weight must be non-negative and finite")
         if not 0<=ion_loss_weight or not torch.isfinite(torch.tensor(ion_loss_weight)):raise ValueError("ion_loss_weight must be non-negative and finite")
+        if not 0<ion_prediction_threshold<1:raise ValueError("ion_prediction_threshold must be between zero and one")
         if not 0<=dropout<1:raise ValueError("dropout must be in [0,1)")
         self.cosine_loss_weight=cosine_loss_weight
         self.ion_loss_weight=ion_loss_weight
+        self.ion_prediction_threshold=ion_prediction_threshold
         self.mol_encoder = mol_encoder
         self.edge_encoder = nn.Sequential(nn.Linear(action_dim + mol_encoder.graph_dim * 2, hidden_dim), nn.GELU(), nn.Linear(hidden_dim,hidden_dim))
         self.tree_encoder = GraphormerEncoder(node_dim=mol_encoder.graph_dim,hidden_dim=hidden_dim,edge_dim=hidden_dim,
@@ -118,6 +132,12 @@ class PostMaterializationFragmentTreeModel(nn.Module):
         ion_score = F.softplus(ion_logit)
         score = ion_score.new_zeros(data.formula_tensor.shape[0]).scatter_add_(0,data.ion_formula_index,ion_score)
         count = ion_score.new_zeros(data.formula_tensor.shape[0]).scatter_add_(0,data.ion_formula_index,torch.ones_like(ion_score))
+        # The most confident candidate ion explaining each formula. Kept out of
+        # the loss/intensity path entirely (that stays exactly as trained) so a
+        # caller building a spectrum for display can drop unconfident peaks
+        # (e.g. below self.ion_prediction_threshold) without changing what the
+        # model was actually optimized and validated against.
+        confidence = ion_logit.new_zeros(data.formula_tensor.shape[0]).scatter_reduce_(0,data.ion_formula_index,ion_logit.sigmoid(),reduce='amax',include_self=True)
         intensity = self.formula_intensity(data.formula_tensor,score,count)
         # Relative spectra are invariant to overall scale. Normalize each sample
         # before fitting so reducing every peak cannot hide a wrong spectral shape.
@@ -150,7 +170,7 @@ class PostMaterializationFragmentTreeModel(nn.Module):
             ion_loss = (positive_loss.mean() if positive_loss.numel() else ion_logit.sum()*0) \
                 + (negative_loss.mean() if negative_loss.numel() else ion_logit.sum()*0)
             loss = loss + self.ion_loss_weight*ion_loss
-        return PostMaterializationOutput(intensity,data.formula_sample_index,data.formula_tensor,data.formula_mz,loss)
+        return PostMaterializationOutput(intensity,data.formula_sample_index,data.formula_tensor,data.formula_mz,loss,confidence,ion_logit.sigmoid())
 
 
 def prepare_post_materialization(decoded: DecodedFragmentTreeBatch, fragmenter: Fragmenter,
@@ -164,7 +184,7 @@ def prepare_post_materialization(decoded: DecodedFragmentTreeBatch, fragmenter: 
     (node, net adduct) is in that set; nothing is asserted for inference callers,
     which omit this argument entirely.
     """
-    graphs, node_ids, ion_features, formulas, formula_samples, mzs, formula_ids = [], [], [], [], [], [], []
+    graphs, node_ids, ion_features, formulas, formula_samples, mzs, formula_ids, ion_adduct = [], [], [], [], [], [], [], []
     ion_is_positive = [] if ion_positive_sets is not None else None
     node_offset = 0
     # Every generated node can emit ions, including observed intermediates
@@ -204,6 +224,7 @@ def prepare_post_materialization(decoded: DecodedFragmentTreeBatch, fragmenter: 
                 node_ids.append(node_offset+node)
                 ion_features.append((hydrogen,shift,charge))
                 formula_ids.append(new_index)
+                ion_adduct.append(str(adduct))
                 if ion_is_positive is not None:
                     ion_is_positive.append((node,str(adduct)) in ion_positive_sets[sample])
         node_offset += tree.num_nodes
@@ -211,12 +232,13 @@ def prepare_post_materialization(decoded: DecodedFragmentTreeBatch, fragmenter: 
         torch.tensor(ion_features,dtype=torch.float32).reshape(-1,3),torch.tensor(formula_samples,dtype=torch.long),
         tensorizer.formulas_to_tensor(formulas),torch.tensor(mzs,dtype=torch.float64),torch.tensor(formula_ids,dtype=torch.long),
         ion_is_positive=torch.tensor(ion_is_positive,dtype=torch.bool) if ion_is_positive is not None else None,
+        ion_adduct=tuple(ion_adduct),
         node_smiles=tuple(compound.smiles for compound in decoded.compounds))
 
 
 def collate_post_materialization(items: Sequence[PostMaterializationBatch], action_offsets: Sequence[int]) -> PostMaterializationBatch:
     molecules=[];trees=[];compounds=[];metadata_trees=[];edges=[];samples=[];actions=[];terminals=[];scores=[]
-    ion_nodes=[];ion_features=[];formula_samples=[];formulas=[];mzs=[];formula_ids=[];targets=[];ion_positives=[]
+    ion_nodes=[];ion_features=[];formula_samples=[];formulas=[];mzs=[];formula_ids=[];targets=[];ion_positives=[];ion_adducts=[]
     node_offset=sample_offset=formula_offset=0
     node_smiles=[]
     seed_actions=[];edge_offset=0
@@ -233,6 +255,7 @@ def collate_post_materialization(items: Sequence[PostMaterializationBatch], acti
         formulas.append(item.formula_tensor);mzs.append(item.formula_mz);formula_ids.append(item.ion_formula_index+formula_offset)
         if item.target_intensity is not None: targets.append(item.target_intensity)
         if item.ion_is_positive is not None: ion_positives.append(item.ion_is_positive)
+        ion_adducts.append(item.ion_adduct)
         node_offset+=len(decoded.compounds);sample_offset+=len(decoded.trees);formula_offset+=item.formula_tensor.shape[0]
     if targets and len(targets)!=len(items):
         raise ValueError("Cannot mix supervised and inference downstream batches")
@@ -242,7 +265,7 @@ def collate_post_materialization(items: Sequence[PostMaterializationBatch], acti
         torch.cat(terminals),torch.cat(scores),tuple(metadata_trees),tuple(compounds),sum(i.decoded.rdkit_run_count for i in items),sum(i.decoded.failed_effect_count for i in items),edge_seed_action_index=torch.cat(seed_actions,dim=1))
     return PostMaterializationBatch(decoded,Batch.from_data_list(trees),torch.cat(ion_nodes),torch.cat(ion_features),
         torch.cat(formula_samples),torch.cat(formulas),torch.cat(mzs),torch.cat(formula_ids),torch.cat(targets) if targets else None,
-        ion_is_positive=torch.cat(ion_positives) if ion_positives else None,node_smiles=tuple(node_smiles))
+        ion_is_positive=torch.cat(ion_positives) if ion_positives else None,ion_adduct=sum(ion_adducts,()),node_smiles=tuple(node_smiles))
 
 
 def deduplicate_molecular_graphs(data: PostMaterializationBatch, source_smiles=()):

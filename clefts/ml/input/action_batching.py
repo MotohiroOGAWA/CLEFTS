@@ -57,6 +57,7 @@ def select_samples(data, indices):
             formula_tensor=downstream.formula_tensor[formula_ids],formula_mz=downstream.formula_mz[formula_ids],ion_formula_index=formula_map[downstream.ion_formula_index[ions]],
             target_intensity=downstream.target_intensity[formula_ids] if downstream.target_intensity is not None else None,
             ion_is_positive=downstream.ion_is_positive[ions] if downstream.ion_is_positive is not None else None,
+            ion_adduct=tuple(adduct for adduct,keep in zip(downstream.ion_adduct,ions.tolist()) if keep) if downstream.ion_adduct else (),
             unique_node_graph=None,node_graph_inverse=None,unique_source_index=None,node_smiles=tuple(downstream.node_smiles[i] for i in node_ids.tolist()))
         if state_nodes.numel():state_nodes=torch.where(state_nodes>=0,node_map[state_nodes.clamp_min(0)],state_nodes)
         annotations=tuple({**sample,'peaks':[{**peak,'matches':[

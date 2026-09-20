@@ -364,6 +364,7 @@ MODEL_OPTIONS = {
     'post-num-layers': ('post_model_params', 'num_layers', int, 2),
     'post-cosine-loss-weight': ('post_model_params', 'cosine_loss_weight', float, 0.5),
     'post-ion-loss-weight': ('post_model_params', 'ion_loss_weight', float, 0.5),
+    'post-ion-threshold': ('post_model_params', 'ion_prediction_threshold', float, 0.5),
     'post-num-heads': ('post_model_params', 'num_heads', int, 4),
 }
 

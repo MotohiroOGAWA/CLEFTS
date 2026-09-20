@@ -33,6 +33,7 @@ function createParameterEditor(container, initial, kind = "training", editCleava
     beam_size:'Maximum candidate normalized action states retained at each decoding step.',
     state_num_layers:'Number of Set Transformer layers encoding the current action set.',state_dropout:'Dropout in the action state Set Transformer.',cosine_loss_weight:'Spectrum cosine loss weight, added to log intensity MSE.',
     ion_loss_weight:'Weight of the balanced ion score loss: pushes each candidate ion (node, hydrogen shift, radical, adduct) toward the observed peak match or toward zero, independent of the aggregated intensity loss.',
+    ion_prediction_threshold:'Minimum ion confidence (sigmoid probability) kept when generating a spectrum. Below this, a candidate adduct/hydrogen-shift is suppressed instead of appearing as a small peak. Does not affect training loss.',
     max_decode_steps:'Maximum MS2 branch expansion depth from each precursor seed.',
     adduct_type_strs:'Supported precursor adduct types, in model embedding order.',
     name:'Human-readable name stored in this configuration.',
@@ -40,7 +41,7 @@ function createParameterEditor(container, initial, kind = "training", editCleava
     freeze_mol_encoder:'Freeze the molecular encoder during training.',
   };
   const templates={patterns:{name:'new_pattern',reactant_smarts:'[!#1:1]-[!#1:2]',products:[{name:'product',smarts:'[!#1:1]'}]},products:{name:'product',smarts:'[!#1:1]'},adduct_rules:{name:'new_rule',adduct_type:'[M+H]+',radical:false,unsaturation:0,ion_shifts:[]},ion_shifts:{ion_shift:'[M+H]+'},atoms:'C',symbols:'C',adduct_type_strs:'[M+H]+'};
-  const optional={action_model_params:{num_heads:4,max_roles:64,state_num_layers:2,prediction_threshold:0.5},mol_encoder_params:{dropout:0},post_model_params:{cosine_loss_weight:0.5,ion_loss_weight:0.5}};
+  const optional={action_model_params:{num_heads:4,max_roles:64,state_num_layers:2,prediction_threshold:0.5},mol_encoder_params:{dropout:0},post_model_params:{cosine_loss_weight:0.5,ion_loss_weight:0.5,ion_prediction_threshold:0.5}};
   const basic=new Set(['fragmenter_params.fragment_ion_tree_builder.max_action_count','fragmenter_params.precursor_candidate_max_action_count','fragmenter_params.mass_tolerance']);
   const node=(tag,text)=>{const n=document.createElement(tag);if(text!==undefined)n.textContent=text;return n;};
   const button=(text,fn)=>{const b=node('button',text);b.type='button';b.onclick=fn;return b;};

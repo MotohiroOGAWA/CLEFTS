@@ -200,6 +200,7 @@ def validate_spectra(generator, pieces, output_dir, label, *, global_step=None, 
                     formula_rows = torch.nonzero(output.downstream.formula_sample_index == sample, as_tuple=False).flatten().tolist()
                     mz = [float(output.downstream.formula_mz[row]) for row in formula_rows]
                     intensity = [float(output.spectra.intensity[row]) for row in formula_rows]
+                    confidence = [float(output.spectra.confidence[row]) for row in formula_rows]
                     if not np.isfinite(intensity).all():
                         raise FloatingPointError('Non-finite generated spectrum')
                     observed = [dict(mz=float(p['mz']), intensity=float(p['intensity']), precursor=bool(p.get('precursor')))
@@ -207,9 +208,12 @@ def validate_spectra(generator, pieces, output_dir, label, *, global_step=None, 
                     precursor_mz = float(annotation['precursorMz'])
                     node_depths = _node_depths(output.downstream, sample, precursor_mz, tolerance)
                     formula_depth = _formula_depths(output.downstream, sample, node_depths, precursor_mz, tolerance)
-                    generated = [dict(mz=mass, intensity=value, depth=formula_depth.get(row),
+                    # confidence never changes which peaks are scored (matched_cosine/
+                    # assignment_score below still see every candidate), it only lets a
+                    # renderer dim or hide an unconfident adduct/hydrogen-shift guess.
+                    generated = [dict(mz=mass, intensity=value, confidence=conf, depth=formula_depth.get(row),
                                       precursor=bool(tolerance.within(mass, precursor_mz)))
-                                 for row, mass, value in zip(formula_rows, mz, intensity)]
+                                 for row, mass, value, conf in zip(formula_rows, mz, intensity, confidence)]
                     original_depth = _original_depths(data, input_index, annotation, tolerance)
                     for peak, depth in zip(observed, original_depth): peak['depth'] = depth
                     generated_np = [peak for peak in generated if not peak['precursor']]
