@@ -2,6 +2,34 @@ const fs = require('fs');
 const path = require('path');
 const readline = require('readline');
 
+function safeResolve(root, relative) {
+  if (!relative) return null;
+  const target = path.resolve(root, relative), prefix = root.endsWith(path.sep) ? root : root + path.sep;
+  return target === root || target.startsWith(prefix) ? target : null;
+}
+
+async function validationResult(root, manifest) {
+  let target = safeResolve(root, manifest.latestValidation);
+  if (!target || !fs.existsSync(target)) {
+    const directory = path.join(root, manifest.artifacts?.validationDirectory || 'spectrum_validation');
+    let files = [];
+    try { files = (await fs.promises.readdir(directory)).filter(file => /^(epoch|step)_\d+\.json$/.test(file)); } catch {}
+    files.sort((a,b) => (Number(a.match(/\d+/)?.[0]) || 0) - (Number(b.match(/\d+/)?.[0]) || 0));
+    target = files.length ? path.join(directory, files.at(-1)) : null;
+  }
+  if (!target) return null;
+  const value = JSON.parse(await fs.promises.readFile(target, 'utf8'));
+  const spectra = value.spectra || [], representatives = {};
+  for (const [metric, entries] of Object.entries(value.representatives || {})) {
+    representatives[metric] = {};
+    for (const [quantile, item] of Object.entries(entries)) {
+      const spectrum = spectra[item.spectrum_index];
+      if (spectrum) representatives[metric][quantile] = { ...item, spectrum };
+    }
+  }
+  return { file: path.relative(root, target), summary: value.summary || {}, representatives };
+}
+
 async function readRun(directory) {
   let report;
   if (directory.endsWith('.pft.json')) {
@@ -44,7 +72,8 @@ async function readRun(directory) {
     const value = config.model_config?.fragmenter_params?.fragment_ion_tree_builder?.max_action_count;
     if (Number.isInteger(value) && value >= 0) maxDepth = value;
   } catch {}
-  return { directory, report, files, maxDepth, series: [...series].sort(([a], [b]) => a.localeCompare(b)).map(([name, values]) => ({ name, points: [...values].sort((a, b) => a[0] - b[0]) })) };
+  const validation = report ? await validationResult(directory, report) : null;
+  return { directory, report, validation, files, maxDepth, series: [...series].sort(([a], [b]) => a.localeCompare(b)).map(([name, values]) => ({ name, points: [...values].sort((a, b) => a[0] - b[0]) })) };
 }
 // Keep grouping independent of the webview so recorded naming conventions are testable.
 function groupSeries(series, maxDepth = null) {
@@ -101,20 +130,37 @@ function attach(panel) {
     } catch (error) { panel.webview.postMessage({ type: 'metricsData', request: message.request, error: error.message }); }
   });
 }
-function html() {
-  return `<div id="metricsApp" hidden><section><h2>Training Report</h2><label>Run directory or training.pft.json<input id="metricsDirectory" type="text" data-path-kind="folder" placeholder="/path/to/run/training.pft.json" style="width:100%"></label><div class="actions"><button id="metricsBrowse">Browse…</button><button id="metricsLoad">Load / Refresh</button><label><input id="metricsAuto" type="checkbox"> Auto refresh (15s)</label></div><p id="metricsStatus" role="status"></p><p class="muted">Each metric appears once. After adding it, switch that card between mean, median, and q10–q90 distribution views, or exclude precursor peaks. Train uses warm colors and validation uses cool colors.</p><div class="actions"><input id="metricsFilter" type="search" placeholder="Filter charts" aria-label="Filter charts"><select id="metricsChoice" aria-label="Chart metric" style="max-width:80%"></select><button id="metricsAdd" disabled>＋ Add chart</button><button id="metricsAddAll" disabled>Add all charts</button><button id="metricsClear">Clear charts</button><label>Layout <select id="metricsLayout"><option value="grid">Grid</option><option value="vertical">Vertical</option></select></label></div></section><div id="metricsCharts" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,440px),1fr));gap:16px"></div></div>`;
+function html({ hidden = true } = {}) {
+  return `<div id="metricsApp"${hidden ? ' hidden' : ''}><section><h2>Training Report</h2><label>Run directory or training.pft.json<input id="metricsDirectory" type="text" data-path-kind="folder" placeholder="/path/to/run/training.pft.json" style="width:100%"></label><div class="actions"><button id="metricsBrowse">Browse…</button><button id="metricsLoad">Load / Refresh</button><label><input id="metricsAuto" type="checkbox"> Auto refresh (15s)</label></div><p id="metricsStatus" role="status"></p><p class="muted">Each metric appears once. After adding it, switch that card between mean, median, and q10–q90 distribution views, or exclude precursor peaks. Train uses warm colors and validation uses cool colors; a breakdown (collision energy, adduct, depth) colors each category instead.</p><div class="actions"><input id="metricsFilter" type="search" placeholder="Filter charts" aria-label="Filter charts"><select id="metricsChoice" aria-label="Chart metric" style="max-width:80%"></select><button id="metricsAdd" disabled>＋ Add chart</button><button id="metricsAddAll" disabled>Add all charts</button><button id="metricsClear">Clear charts</button><label>Layout <select id="metricsLayout"><option value="grid">Grid</option><option value="vertical">Vertical</option></select></label></div></section><div id="metricsCharts" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,440px),1fr));gap:16px"></div><section><h2>Representative validation spectra</h2><div class="actions"><label>Rank by <select id="representativeMetric"><option value="cosine_similarity">Cosine similarity</option><option value="assignment_score">Assignment score (m/z coverage)</option></select></label><label><input id="representativePrecursor" type="checkbox" checked> Include precursor</label><span id="representativeStatus" class="muted"></span></div><p class="muted">Compare the generated (top) and observed (bottom) spectrum in one card, switching its representative level between q10, q25, median, q75, and q90. Available once a training.pft.json report with spectrum validation is loaded.</p><div id="representativeSpectra" style="display:grid;grid-template-columns:minmax(min(100%,760px),1fr);gap:12px"></div></section></div>`;
 }
 function client(groupSeries) {
   const el = id => document.getElementById(id);
   const state = vscode.getState() || {};
-  let selected = state.metricsSelected || [], data = [], request = 0, busy = false;
+  let selected = state.metricsSelected || [], data = [], report = null, validation = null, request = 0, busy = false;
   const cardSettings = new Map(Object.entries(state.metricsCardSettings || {}));
   const hiddenLanes = new Map();
+  const splitColors={train:'#e76f51',train_window:'#f4a261',validation:'#3a86ff',intermediate_validation:'#2a9d8f',all:'#8b8f98'};
+  const splitDashes={train:'',train_window:'4 2',validation:'',intermediate_validation:'6 3',all:''};
+  const categoryColors=['#e76f51','#2a9d8f','#e9c46a','#264653','#8ab17d','#f4a261','#577590','#b56576','#6d597a','#ee6c4d'];
+  const METRIC_GROUPS=[
+    ['Spectrum similarity',/cosine_similarity|assignment_score|spectrum_nonempty_fraction|teacher_spectrum/],
+    ['Loss',/loss/],
+    ['Action recall & precision',/recall|precision|positive_action|branch_positive|positive_fraction|negative_fraction|valid_candidate_count|normalized_replacement_rate|actions_(before|after)_filter|training_pool_actions/],
+    ['Optimization',/^(learning_rate|gradient_norm)$/],
+    ['Dataset & throughput',/samples|batches|fragment_nodes|validation_fraction/],
+    ['Performance & resources',/seconds|memory/],
+  ];
+  const GROUP_ORDER=METRIC_GROUPS.map(item=>item[0]).concat('Other');
+  const metricGroup=metric=>{for(const [label,pattern] of METRIC_GROUPS)if(pattern.test(metric))return label;return 'Other';};
+  const border='var(--border,rgba(128,128,128,.35))', accent='var(--accent,#36c5a2)';
   el('metricsDirectory').value = state.metricsDirectory || '';
   el('metricsLayout').value = state.metricsLayout === 'vertical' ? 'vertical' : 'grid';
+  if (['cosine_similarity','assignment_score'].includes(state.representativeMetric)) el('representativeMetric').value = state.representativeMetric;
+  if (typeof state.representativePrecursor === 'boolean') el('representativePrecursor').checked = state.representativePrecursor;
   const applyLayout = () => { el('metricsCharts').style.gridTemplateColumns = el('metricsLayout').value === 'vertical' ? 'minmax(0, 1fr)' : 'repeat(auto-fit,minmax(min(100%,440px),1fr))'; };
   applyLayout();
-  const save = () => vscode.setState({ ...(vscode.getState() || {}), metricsSelected: selected, metricsCardSettings:Object.fromEntries(cardSettings), metricsLayout: el('metricsLayout').value, metricsDirectory: el('metricsDirectory').value });
+  const save = () => vscode.setState({ ...(vscode.getState() || {}), metricsSelected: selected, metricsCardSettings:Object.fromEntries(cardSettings), metricsLayout: el('metricsLayout').value, metricsDirectory: el('metricsDirectory').value, representativeMetric: el('representativeMetric').value, representativePrecursor: el('representativePrecursor').checked, representativeQuantile: el('representativeLevel')?.value || state.representativeQuantile });
+  function svgNode(svg, tag, attributes, text) { const node=document.createElementNS('http://www.w3.org/2000/svg',tag); for(const [key,value] of Object.entries(attributes))node.setAttribute(key,value); if(text!==undefined)node.textContent=text; svg.append(node); return node; }
   function load() {
     if (busy) return;
     busy = true; el('metricsLoad').disabled = true; el('metricsStatus').textContent = 'Loading…'; save();
@@ -128,9 +174,14 @@ function client(groupSeries) {
     const previous = el('metricsChoice').value;
     const matching = matchingCharts();
     el('metricsChoice').replaceChildren();
-    for (const chart of matching) {
-      const option = document.createElement('option'); option.value = option.textContent = chart.name;
-      el('metricsChoice').append(option);
+    const byGroup = new Map();
+    for (const chart of matching) { const group = metricGroup(chart.metric); if (!byGroup.has(group)) byGroup.set(group, []); byGroup.get(group).push(chart); }
+    for (const group of GROUP_ORDER) {
+      const charts = byGroup.get(group);
+      if (!charts?.length) continue;
+      const optgroup = document.createElement('optgroup'); optgroup.label = group;
+      for (const chart of charts) { const option = document.createElement('option'); option.value = option.textContent = chart.name; optgroup.append(option); }
+      el('metricsChoice').append(optgroup);
     }
     if (matching.some(chart => chart.name === previous)) el('metricsChoice').value = previous;
     el('metricsAdd').disabled = !matching.length;
@@ -143,18 +194,34 @@ function client(groupSeries) {
     let rendered = 0;
     el('metricsCharts').replaceChildren();
     const chartsByName = new Map(data.map(chart => [chart.name, chart]));
-    for (const name of [...selected]) {
+    const orderedSelected = [...selected].sort((a,b) => {
+      const ca=chartsByName.get(a), cb=chartsByName.get(b);
+      const ga = ca ? GROUP_ORDER.indexOf(metricGroup(ca.metric)) : GROUP_ORDER.length;
+      const gb = cb ? GROUP_ORDER.indexOf(metricGroup(cb.metric)) : GROUP_ORDER.length;
+      return ga !== gb ? ga - gb : a.localeCompare(b);
+    });
+    const showGroups = new Set(orderedSelected.filter(name => chartsByName.has(name)).map(name => metricGroup(chartsByName.get(name).metric))).size > 1;
+    let lastGroup = null;
+    for (const name of orderedSelected) {
       if (rendered > 0 && rendered % 8 === 0) {
         await new Promise(resolve => setTimeout(resolve, 0));
         if (version !== renderVersion) return;
+      }
+      const chart = chartsByName.get(name);
+      if (!chart) continue;
+      const group = metricGroup(chart.metric);
+      if (showGroups && group !== lastGroup) {
+        const header = document.createElement('div');
+        header.style.cssText = 'grid-column:1/-1;font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;opacity:.7;margin:18px 0 -4px;padding-top:14px;border-top:1px solid '+border+(lastGroup===null?';margin-top:0;padding-top:0;border-top:0':'');
+        header.textContent = group;
+        el('metricsCharts').append(header);
+        lastGroup = group;
       }
       const card = document.createElement('section'); card.style.cssText = 'display:block;content-visibility:auto;contain-intrinsic-size:auto 380px';
       const title = document.createElement('strong'); title.textContent = name;
       const remove = document.createElement('button'); remove.textContent = '×'; remove.title = 'Remove chart'; remove.style.float = 'right';
       remove.onclick = () => { selected = selected.filter(n => n !== name); save(); render(); };
       card.append(remove, title);
-      const chart = chartsByName.get(name);
-      if (!chart) continue;
       const availableWith = chart.variants.withPrecursor.length > 0, availableWithout = chart.variants.withoutPrecursor.length > 0;
       const settings = { mode:'mean', withoutPrecursor:!availableWith && availableWithout, ...(cardSettings.get(name) || {}) };
       if (settings.withoutPrecursor && !availableWithout) settings.withoutPrecursor=false;
@@ -168,9 +235,6 @@ function client(groupSeries) {
       hiddenLanes.set(name, hidden);
       const allLanes = chart.variants[settings.withoutPrecursor?'withoutPrecursor':'withPrecursor'];
       const lanes = allLanes.filter(lane => !hidden.has(lane.label));
-      const splitColors={train:'#e76f51',train_window:'#f4a261',validation:'#3a86ff',intermediate_validation:'#2a9d8f',all:'#8b8f98'};
-      const splitDashes={train:'',train_window:'4 2',validation:'',intermediate_validation:'6 3',all:''};
-      const categoryColors=['#e76f51','#2a9d8f','#e9c46a','#264653','#8ab17d','#f4a261','#577590','#b56576','#6d597a','#ee6c4d'];
       const categories=[...new Set(allLanes.map(lane=>lane.category))];
       const faceted = !!chart.dimension && categories.length>1;
       const color = lane => faceted ? categoryColors[categories.indexOf(lane.category)%categoryColors.length] : (splitColors[lane.split] || splitColors.all);
@@ -242,6 +306,51 @@ function client(groupSeries) {
       rendered++;
     }
   }
+  function peaks(record, kind) { const values=record[kind+'_peaks']; if(values) return values; return (record[kind+'_mz']||[]).map((mz,index)=>({mz,intensity:record[kind+'_intensity'][index],precursor:false})); }
+  function renderSpectra() {
+    const metric = el('representativeMetric').value + (el('representativePrecursor').checked ? '' : '_without_precursor');
+    const entries = validation?.representatives?.[metric] || {};
+    const levels = ['q10','q25','median','q75','q90'].filter(level => entries[level]);
+    el('representativeSpectra').replaceChildren();
+    if (levels.length) {
+      const card = document.createElement('article'); card.style.cssText = 'border:1px solid '+border+';border-radius:9px;padding:12px';
+      const heading = document.createElement('h4'); heading.style.cssText = 'display:flex;align-items:center;flex-wrap:wrap;gap:8px;margin:0 0 6px';
+      const level = document.createElement('select'); level.id = 'representativeLevel';
+      for (const value of levels) { const option = document.createElement('option'); option.value = value; option.textContent = value; level.append(option); }
+      if (levels.includes(state.representativeQuantile)) level.value = state.representativeQuantile;
+      const control = document.createElement('label'); control.append(document.createTextNode('Representative level '), level);
+      card.append(heading, control);
+      const plot = document.createElement('div'), meta = document.createElement('p'); meta.className = 'muted'; card.append(plot, meta);
+      const draw = () => {
+        save();
+        const quantile = level.value, item = entries[quantile], record = item.spectrum, include = el('representativePrecursor').checked,
+              generated = peaks(record,'generated').filter(p=>include||!p.precursor),
+              original = (record.original_peaks||[]).filter(p=>include||!p.precursor),
+              all = [...generated,...original],
+              maximum = Math.max(...all.map(p=>Number(p.mz)),1),
+              gmax = Math.max(...generated.map(p=>Number(p.intensity)),1e-8),
+              omax = Math.max(...original.map(p=>Number(p.intensity)),1e-8),
+              x = mz => 42+Number(mz)/maximum*516;
+        heading.innerHTML = '';
+        const levelLabel = document.createElement('span'); levelLabel.style.fontWeight = '600'; levelLabel.textContent = quantile+' representative';
+        const badge = document.createElement('span'); badge.style.cssText = 'background:color-mix(in srgb,'+accent+' 22%,transparent);color:'+accent+';padding:2px 10px;border-radius:999px;font-weight:700;font-size:12px';
+        badge.textContent = el('representativeMetric').selectedOptions[0].textContent+' '+Number(item.value).toFixed(4);
+        heading.append(levelLabel, badge);
+        const svg = document.createElementNS('http://www.w3.org/2000/svg','svg'); svg.setAttribute('viewBox','0 0 570 270'); svg.style.display='block'; svg.style.width='100%'; svg.setAttribute('role','img'); svg.setAttribute('aria-label',quantile+' representative mirror spectrum');
+        svgNode(svg,'line',{x1:42,x2:558,y1:130,y2:130,stroke:'currentColor'});
+        for (const peak of generated) svgNode(svg,'line',{x1:x(peak.mz),x2:x(peak.mz),y1:130,y2:130-105*peak.intensity/gmax,stroke:peak.precursor?'#f0883e':'#58a6ff','stroke-width':2});
+        for (const peak of original) svgNode(svg,'line',{x1:x(peak.mz),x2:x(peak.mz),y1:130,y2:130+105*peak.intensity/omax,stroke:peak.precursor?'#f0883e':'#3fb950','stroke-width':2});
+        svgNode(svg,'text',{x:45,y:18,fill:'#58a6ff','font-size':11},'Generated');
+        svgNode(svg,'text',{x:45,y:258,fill:'#3fb950','font-size':11},'Observed');
+        svgNode(svg,'text',{x:558,y:148,fill:'currentColor','font-size':10,'text-anchor':'end'},maximum.toFixed(2)+' m/z');
+        plot.replaceChildren(svg);
+        meta.textContent = record.main_adduct+' · '+record.collision_energy+' eV · '+generated.length+' / '+original.length+' peaks';
+      };
+      level.onchange = draw; draw();
+      el('representativeSpectra').append(card);
+    }
+    el('representativeStatus').textContent = validation ? validation.file+' · '+(validation.summary.samples||0)+' spectra' : (report ? 'No validation spectrum artifact is available yet.' : 'Load a training.pft.json report to see representative spectra.');
+  }
   el('metricsFilter').oninput = updateChoices;
   el('metricsAddAll').onclick = () => {
     selected = [...new Set([...selected, ...matchingCharts().map(chart => chart.name)])];
@@ -252,11 +361,15 @@ function client(groupSeries) {
   el('metricsLoad').onclick = load;
   el('metricsBrowse').onclick = () => vscode.postMessage({ type:'metricsPick' });
   el('metricsAdd').onclick = () => { const name = el('metricsChoice').value; if (name && !selected.includes(name)) { selected.push(name); save(); render(); } };
+  el('representativeMetric').addEventListener('change', () => { save(); renderSpectra(); });
+  el('representativePrecursor').addEventListener('change', () => { save(); renderSpectra(); });
   window.addEventListener('message', ({ data: message }) => {
     if (message.type === 'metricsPicked') { el('metricsDirectory').value = message.directory; save(); }
     if (message.type !== 'metricsData' || message.request !== request) return;
     busy = false; el('metricsLoad').disabled = false;
     data = groupSeries(message.data?.series || [],message.data?.maxDepth ?? null);
+    report = message.data?.report || null;
+    validation = message.data?.validation || null;
     if (!message.error) {
       selected = [...new Set(selected.map(name => data.find(chart => chart.name===name||chart.sources.includes(name))?.name || name.replace(/^(mean|distribution|metrics)\//,'')))].filter(name=>data.some(chart=>chart.name===name));
       save();
@@ -264,9 +377,11 @@ function client(groupSeries) {
     el('metricsStatus').textContent = message.error || message.data.directory+' · '+data.length+' charts · '+new Date().toLocaleTimeString();
     updateChoices();
     render();
+    renderSpectra();
   });
   setInterval(() => { if (el('metricsAuto').checked && !el('metricsApp').hidden && el('metricsDirectory').value.trim()) load(); }, 15000);
   render();
+  renderSpectra();
 }
 function script() { return '(' + client.toString() + ')(' + groupSeries.toString() + ');'; }
 module.exports = { readRun, groupSeries, attach, html, script };

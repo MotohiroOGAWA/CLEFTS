@@ -384,6 +384,7 @@ class ResultEditorProvider {
   async openCustomDocument(uri) { return { uri, dispose() {} }; }
   async resolveCustomEditor(document, panel) {
     panel.webview.options = { enableScripts: true };
+    trainingMetrics.attach(panel);
     const refresh = async () => {
       try { panel.webview.html = await resultHtml(document.uri.fsPath); }
       catch (e) { panel.webview.html = errorHtml(e.message); }
@@ -426,7 +427,7 @@ class ResultEditorProvider {
 async function resultHtml(manifestPath) {
   const manifest = JSON.parse(await fs.promises.readFile(manifestPath, 'utf8'));
   if (manifest.schema === 'clefts.training-report') {
-    return trainingReport.html(await trainingReport.readTrainingReport(manifestPath), commonCss());
+    return trainingReport.html({ manifest, root: path.dirname(manifestPath), reportPath: manifestPath }, commonCss());
   }
   const root = path.dirname(manifestPath);
   const files = await scan(root, root, 3, 500);
