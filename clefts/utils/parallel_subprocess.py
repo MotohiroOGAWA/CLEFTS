@@ -108,6 +108,7 @@ def run_parallel_subprocesses(
     desc: str = "Parallel tasks",
     unit: str = "it",
     on_complete: Optional[Callable[[List[str]], None]] = None,
+    progress: Optional[tqdm] = None,
 ) -> None:
     """Run multiple subprocesses in parallel.
 
@@ -125,6 +126,12 @@ def run_parallel_subprocesses(
     on_complete:
         Optional callback receiving the command after each successful subprocess,
         invoked in the calling thread in completion order.
+    progress:
+        Optional externally-owned tqdm bar to advance (one update per
+        completed command) instead of creating a new one. Lets a caller that
+        invokes this function repeatedly, in bounded waves of commands_list,
+        show one continuous bar across every wave rather than a bar that
+        resets to 0 each call.
     """
 
 
@@ -140,12 +147,15 @@ def run_parallel_subprocesses(
             for commands in commands_list
         }
 
-        for future in tqdm(
+        completed = as_completed(futures) if progress is not None else tqdm(
             as_completed(futures),
             total=len(futures),
             desc=desc,
             unit=unit,
-        ):
+        )
+        for future in completed:
             future.result()
+            if progress is not None:
+                progress.update(1)
             if on_complete is not None:
                 on_complete(futures[future])

@@ -1,6 +1,8 @@
 """Shared metadata checks for inspection and exclusion during preparation."""
 import math
+import sys
 from rdkit import Chem
+from tqdm import tqdm
 from clefts.libs.mmkit.mmkit import Adduct
 from clefts.domain.mass.parse_ce import parse_ce_to_ev
 
@@ -30,7 +32,7 @@ def inspect_records(dataset, fragmenter, mapping=None):
                'precursorMzColumn': 'Cannot parse precursor m/z to a finite positive number'}
     values = {key: dataset[name].tolist() for key, name in mapping.items()}
     ids = dataset['SpecID'].astype(str).tolist() if 'SpecID' in dataset.columns else None
-    for index in range(len(dataset)):
+    for index in tqdm(range(len(dataset)), total=len(dataset), desc='Inspecting records', file=sys.stderr):
         failures = []
         for key, item in validation.items():
             value = values[key][index]

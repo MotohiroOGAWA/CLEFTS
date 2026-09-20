@@ -116,17 +116,18 @@ def create_action_training_data(*, dataset: MSDataset, model_config: dict, outpu
     def collect_result(result):
         nonlocal prepared_records,completed_sources
         completed_sources+=1
+        # No per-source printing: the tqdm bar's own postfix (below) already
+        # shows prepared/skipped counts live without competing with its
+        # redraws, and skipped_sources.json / manifest.tsv already report
+        # every skip and completion once the run finishes.
         if 'skipped' in result:
             source=result['skipped']
             manifest_rows.append(dict(file='',smiles=source['smiles'],record_indexes=json.dumps(source['record_indexes']),num_input_records=len(source['record_indexes']),num_valid_samples=0,rejected_sample_count=len(source['record_indexes']),rejection_log='skipped_sources.json',num_nodes=0,num_edges=0,assignment_score=None,assignment_score_without_precursor=None,status='skipped',reason=source['reason']))
             skipped.append(result['skipped'])
-            print(json.dumps(dict(event='source_skipped',split=split,**result['skipped'])),flush=True)
         else:
             files.append(Path(result['path']));prepared_records+=result['record_count']
             score_rows.extend(result['assignment_scores'])
             manifest_rows.append(dict(file=Path(result['path']).name,smiles=result['smiles'],record_indexes=json.dumps(result['record_indexes']),num_input_records=result['input_record_count'],num_valid_samples=result['record_count'],rejected_sample_count=result['rejected_record_count'],rejection_log='',**result['summary'],status='completed',reason=result['reason']))
-        print(json.dumps(dict(event='progress',split=split,current=completed_sources,total=len(grouped),
-                              prepared=len(files),skipped=len(skipped))),flush=True)
 
     if num_workers==1 or len(grouped)<2:
         with tqdm(total=len(grouped),desc=f'Fragment trees ({split})',unit='tree',file=sys.stderr) as progress:
@@ -136,29 +137,53 @@ def create_action_training_data(*, dataset: MSDataset, model_config: dict, outpu
                 progress.set_postfix(prepared=len(files),skipped=len(skipped),refresh=False)
                 progress.update(1)
     else:
-        # Use the shared subprocess runner; only temporary task files cross the boundary.
-        # Placed under output_dir (not the system temp dir) since task files can be very
-        # large and output_dir is where the caller has already provisioned enough space.
+        # Use the shared subprocess runner, but only ever materialize up to
+        # num_workers chunks' worth of task files at once (deleting each as
+        # soon as its result is consumed), instead of writing every chunk
+        # for the whole dataset upfront and keeping them all until the run
+        # finishes. Each task file duplicates real per-record data (SMILES,
+        # every kept peak) from the in-memory dataset, so writing all of
+        # them at once for a NIST-scale dataset can need disk space on the
+        # order of the whole dataset's size, in --output-dir, before a
+        # single subprocess even starts -- on top of the growing .preft.pt
+        # outputs, which is what actually exhausted disk on a large run.
+        # Task files still live under output_dir (not the system temp dir):
+        # output_dir is where the caller has already provisioned space for
+        # this run's outputs, and bounding the window keeps that assumption
+        # reasonable instead of needing the whole dataset duplicated there.
         with tempfile.TemporaryDirectory(prefix='clefts-preparation-',dir=str(output)) as directory:
-            commands=[]
             effective_chunk_size=min(chunk_size,max(1,len(grouped)//num_workers))
-            while True:
-                chunk=list(islice(tasks,effective_chunk_size))
-                if not chunk: break
-                task_file=Path(directory)/f'task-{len(commands)}.pkl'
-                result_file=task_file.with_suffix('.json')
-                with task_file.open('wb') as stream:
-                    pickle.dump(dict(tasks=chunk,model_config=model_config,observed_adducts=generator.adduct_type_strs,
-                                     options=options),stream,pickle.HIGHEST_PROTOCOL)
-                commands.append([sys.executable,'-m','clefts.ml.data_preparation.fragment_tree.subprocess_worker',
-                                 '--task',str(task_file),'--result',str(result_file)])
-            def on_complete(command):
-                for result in json.loads(Path(command[-1]).read_text()): collect_result(result)
+            total_chunks=math.ceil(len(grouped)/effective_chunk_size)
+            wave_size=max(1,num_workers)
             env={**os.environ,'PYTHONUNBUFFERED':'1'}
             root=str(Path(__file__).resolve().parents[4])
             env['PYTHONPATH']=os.pathsep.join(filter(None,[root,env.get('PYTHONPATH')]))
-            run_parallel_subprocesses(commands,max_workers=min(num_workers,len(commands)),print_output=False,
-                                      env=env,desc=f'Fragment trees ({split})',unit='chunk',on_complete=on_complete)
+            with tqdm(total=total_chunks,desc=f'Fragment trees ({split})',unit='chunk',file=sys.stderr) as progress:
+                def on_complete(command):
+                    result_file=Path(command[command.index('--result')+1])
+                    task_file=Path(command[command.index('--task')+1])
+                    try:
+                        for result in json.loads(result_file.read_text()): collect_result(result)
+                    finally:
+                        result_file.unlink(missing_ok=True)
+                        task_file.unlink(missing_ok=True)
+                    progress.set_postfix(prepared=len(files),skipped=len(skipped),refresh=False)
+                task_id=0
+                while True:
+                    commands=[]
+                    for _ in range(wave_size):
+                        chunk=list(islice(tasks,effective_chunk_size))
+                        if not chunk: break
+                        task_file=Path(directory)/f'task-{task_id}.pkl';task_id+=1
+                        result_file=task_file.with_suffix('.json')
+                        with task_file.open('wb') as stream:
+                            pickle.dump(dict(tasks=chunk,model_config=model_config,observed_adducts=generator.adduct_type_strs,
+                                             options=options),stream,pickle.HIGHEST_PROTOCOL)
+                        commands.append([sys.executable,'-m','clefts.ml.data_preparation.fragment_tree.subprocess_worker',
+                                         '--task',str(task_file),'--result',str(result_file)])
+                    if not commands: break
+                    run_parallel_subprocesses(commands,max_workers=min(num_workers,len(commands)),print_output=False,
+                                              env=env,on_complete=on_complete,progress=progress)
     with (output/'manifest.tsv').open('w',newline='') as stream:
         writer=csv.DictWriter(stream,fieldnames=['file','smiles','record_indexes','num_input_records','num_valid_samples','rejected_sample_count','rejection_log','num_teacher_nodes','num_positive_transitions','num_precursor_candidates','max_ms2_depth','num_nodes','num_edges','assignment_score','assignment_score_without_precursor','status','reason'],delimiter='\t')
         writer.writeheader();writer.writerows(sorted(manifest_rows,key=lambda row:row['smiles']))

@@ -5,6 +5,7 @@ import io
 import json
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -278,7 +279,13 @@ class TestPreparationWorkflow(unittest.TestCase):
                 rows=pd.read_csv(folder/'manifest.tsv',sep='\t')
                 self.assertEqual(len(rows),2)
                 self.assertTrue(all((folder/'data'/file).exists() for file in rows['file']))
-            self.assertIn('"event": "progress"',log.getvalue())
+            # No per-source "progress"/"source_skipped" events on stdout: a
+            # plain print there breaks a live tqdm bar's in-place redraw on
+            # a large dataset (thousands of sources). tqdm's own postfix
+            # already shows prepared/skipped live, and skipped_sources.json
+            # / manifest.tsv already report the same data once the run ends.
+            self.assertNotIn('"event": "progress"',log.getvalue())
+            self.assertNotIn('"event": "source_skipped"',log.getvalue())
             with self.assertRaises(FileExistsError),contextlib.redirect_stdout(io.StringIO()):
                 main(['--input',str(file),'--output-dir',str(root/'out'),'--validation-ratio','0.5',
                       '--params-json',json.dumps(model),'--overwrite','0'])
@@ -343,3 +350,26 @@ class TestPreparationWorkflow(unittest.TestCase):
             stats=json.loads((root/'parallel/action_statistics.json').read_text())
             self.assertEqual(stats['num_workers'],2)
             self.assertTrue(stats['normalize_intensities'])
+
+    def test_parallel_preparation_bounds_temp_files_to_num_workers_at_a_time(self):
+        # Every chunk's task file used to be written to --output-dir upfront,
+        # for the whole dataset, before a single subprocess started -- on a
+        # NIST-scale run this can duplicate close to the full dataset's size
+        # on disk before any of it is freed. Dispatch now happens in waves
+        # of at most num_workers chunks, each wave's files deleted once
+        # consumed, so no single run_parallel_subprocesses call (and thus no
+        # single on-disk moment) ever holds more than num_workers chunks.
+        import clefts.ml.data_preparation.fragment_tree.create_training_data as create_training_data_module
+        from clefts.ml.data_preparation.fragment_tree.create_training_data import create_action_training_data
+        max_seen=0
+        real_run_parallel_subprocesses=create_training_data_module.run_parallel_subprocesses
+        def spy(commands_list,*args,**kwargs):
+            nonlocal max_seen
+            max_seen=max(max_seen,len(commands_list))
+            return real_run_parallel_subprocesses(commands_list,*args,**kwargs)
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);model=config();model['fragmenter_params']['fragment_ion_tree_builder']['max_action_count']=1
+            with unittest.mock.patch.object(create_training_data_module,'run_parallel_subprocesses',spy):
+                create_action_training_data(dataset=self.dataset(),model_config=model,output_dir=root/'parallel',num_workers=2,chunk_size=1)
+        self.assertGreater(max_seen,0)
+        self.assertLessEqual(max_seen,2)
