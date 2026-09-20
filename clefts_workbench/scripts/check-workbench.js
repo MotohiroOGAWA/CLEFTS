@@ -35,7 +35,8 @@ const layoutSource=require('fs').readFileSync(require.resolve('../src/workbench/
 assert(!layoutSource.includes('initializeFrom'));
 console.log('Training settings visibility, execution placement and resume command checks passed.');
 
-const inheritedArgs=extension.buildTrainingArgs({modelConfig:{fragmenter_params:{ignored:true},mol_encoder_params:{node_dim:999},adduct_type_strs:['ignored'],action_model_params:{hidden_dim:64}},molEncoderCheckpoint:'encoder.pt'});
+const inheritedArgs=extension.buildTrainingArgs({modelConfig:{fragmenter_params:{ignored:true},mol_encoder_params:{node_dim:999},adduct_type_strs:['ignored'],action_model_params:{hidden_dim:64},post_model_params:{dropout:0.5}},molEncoderCheckpoint:'encoder.pt'});
 assert(!inheritedArgs.includes('--params-json'));assert(!inheritedArgs.includes('--fragmenter-params-json'));
 assert.equal(inheritedArgs[inheritedArgs.indexOf('--action-hidden-dim')+1],'64');
+assert.equal(inheritedArgs[inheritedArgs.indexOf('--post-dropout')+1],'0.5');
 assert(!html.match(/<form id="trainingForm"[\s\S]*?<\/form>/)[0].includes('name="fineTunePatternSet"'));

@@ -52,15 +52,16 @@ class PostMaterializationFragmentTreeModel(nn.Module):
     def __init__(self, mol_encoder: nn.Module, action_dim: int, condition_dim: int,
                  formula_dim: int, hidden_dim: int = 128, num_heads: int = 4,
                  num_layers: int = 2, max_action_count: int = 3,
-                 cosine_loss_weight: float = 0.5) -> None:
+                 cosine_loss_weight: float = 0.5, dropout: float = 0.) -> None:
         super().__init__()
         if not 0<=cosine_loss_weight or not torch.isfinite(torch.tensor(cosine_loss_weight)):raise ValueError("cosine_loss_weight must be non-negative and finite")
+        if not 0<=dropout<1:raise ValueError("dropout must be in [0,1)")
         self.cosine_loss_weight=cosine_loss_weight
         self.mol_encoder = mol_encoder
         self.edge_encoder = nn.Sequential(nn.Linear(action_dim + mol_encoder.graph_dim * 2, hidden_dim), nn.GELU(), nn.Linear(hidden_dim,hidden_dim))
         self.tree_encoder = GraphormerEncoder(node_dim=mol_encoder.graph_dim,hidden_dim=hidden_dim,edge_dim=hidden_dim,
             condition_dim=condition_dim,condition_token_count=1,num_heads=num_heads,num_layers=num_layers,
-            max_spatial_dist=max_action_count+1,max_edge_dist=max_action_count+1,undirected_for_spd=False,undirected_for_path=False,dropout=0.)
+            max_spatial_dist=max_action_count+1,max_edge_dist=max_action_count+1,undirected_for_spd=False,undirected_for_path=False,dropout=dropout)
         self.ion_encoder = nn.Linear(3,hidden_dim)
         self.ion_score = nn.Linear(hidden_dim,1)
         self.formula_intensity = FragmentTreeFormulaIntensityPredictor(formula_dim=formula_dim,hidden_dim=hidden_dim)
