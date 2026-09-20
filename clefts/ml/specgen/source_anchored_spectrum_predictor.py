@@ -36,7 +36,7 @@ class SourceAnchoredSpectrumOutput:
 
 
 class SourceAnchoredFragmentSpectrumGenerator(nn.Module):
-    architecture = "source-anchored-action-autoregressive-v1"
+    architecture = "source-anchored-branching-v1"
 
     def __init__(self, fragmenter_params: dict, mol_encoder_params: dict,
                  action_model_params: dict | None = None, post_model_params: dict | None = None,
@@ -75,7 +75,8 @@ class SourceAnchoredFragmentSpectrumGenerator(nn.Module):
         features=self.feature_model(data)
         return SourceAnchoredSelectionOutput(features,self.feature_model.decoder(features.pool,features.condition_h))
 
-    def prepare(self, sources: Sequence[Compound], precursor_types: Sequence[Adduct], collision_energy: Sequence[float]) -> tuple[SourceActionStructure, tuple[Compound,...], tuple[tuple,...], tuple[Adduct,...], tuple[int,...]]:
+    def prepare(self, sources: Sequence[Compound], precursor_types: Sequence[Adduct], collision_energy: Sequence[float], *,
+                precomputed: dict[str,dict] | None = None) -> tuple[SourceActionStructure, tuple[Compound,...], tuple[tuple,...], tuple[Adduct,...], tuple[int,...]]:
         if not sources or not len(sources)==len(precursor_types)==len(collision_energy):
             raise ValueError("sources, precursor_types and collision_energy need equal nonzero lengths")
         grouped: dict[str,list[int]]={}
@@ -84,17 +85,29 @@ class SourceAnchoredFragmentSpectrumGenerator(nn.Module):
         structures,unique_sources,universes,ordered_adducts,input_indices=[],[],[],[],[]
         for rows in grouped.values():
             source=sources[rows[0]]
-            actions=self.fragmenter.fragment_ion_tree_builder.create_cleavage_actions(source)
+            cached=precomputed.get(source.smiles) if precomputed else None
+            if cached is not None:
+                # Cleavage actions and, for adducts already resolved, the
+                # candidate precursor sequences came from a prior (possibly
+                # parallel, subprocess-isolated) precompute pass -- reused
+                # verbatim, with no RDKit call here for a fully cached group.
+                actions=cached["actions"]
+                precursor_cache=dict(cached["precursor_sequences"])
+            else:
+                actions=self.fragmenter.fragment_ion_tree_builder.create_cleavage_actions(source)
+                precursor_cache={}
             conditions=torch.tensor([[self.adduct_type_strs.index(str(precursor_types[i])),collision_energy[i]] for i in rows],dtype=torch.float32)
             # Bounded by precursor_candidate_max_action_count (not the full
             # tree_max_action_count), so resolving a given precursor stays a
             # small, fixed-cost preparation step, never an exhaustive search.
-            precursor_tree=self.fragmenter.build_fragment_ion_tree(source,
-                max_action_count=self.fragmenter.precursor_candidate_max_action_count,_include_fragment_compound_cache=True)
-            precursor_cache={}
+            # Built lazily: with a fully cached group, this never runs.
+            precursor_tree=None
             for i in rows:
                 key=str(precursor_types[i])
                 if key not in precursor_cache:
+                    if precursor_tree is None:
+                        precursor_tree=self.fragmenter.build_fragment_ion_tree(source,
+                            max_action_count=self.fragmenter.precursor_candidate_max_action_count,_include_fragment_compound_cache=True)
                     sequences={pa.action_sequence for pa in self.fragmenter.resolve_precursor_actions(precursor_tree,precursor_types[i])}
                     precursor_cache[key]=tuple(sorted(sequences,key=lambda seq:(seq is not None,seq.key if seq else ())))
             precursor_sequences=[precursor_cache[str(precursor_types[i])] for i in rows]
@@ -109,7 +122,7 @@ class SourceAnchoredFragmentSpectrumGenerator(nn.Module):
         return data,tuple(unique_sources),tuple(universes),tuple(ordered_adducts),tuple(input_indices)
 
     @torch.no_grad()
-    def predict_batches(self,sources,precursor_types,collision_energy,*,max_samples=None):
+    def predict_batches(self,sources,precursor_types,collision_energy,*,max_samples=None,precomputed=None):
         limit=self.max_samples if max_samples is None else max_samples
         if self.training:raise ValueError('Call eval() before predict_batches()')
         if type(limit) is not int or limit<1:raise ValueError('max_samples must be positive')
@@ -125,16 +138,16 @@ class SourceAnchoredFragmentSpectrumGenerator(nn.Module):
             if len(current)>=limit:packs.append(current);current=[]
         if current:packs.append(current)
         for rows in packs:
-            for output in self._predict_group_batches([sources[i] for i in rows],[precursor_types[i] for i in rows],[collision_energy[i] for i in rows],max_samples=limit):
+            for output in self._predict_group_batches([sources[i] for i in rows],[precursor_types[i] for i in rows],[collision_energy[i] for i in rows],max_samples=limit,precomputed=precomputed):
                 yield replace(output,sample_input_index=tuple(rows[i] for i in output.sample_input_index))
 
     @torch.no_grad()
-    def _predict_group_batches(self, sources, precursor_types, collision_energy, *, max_samples=None):
+    def _predict_group_batches(self, sources, precursor_types, collision_energy, *, max_samples=None, precomputed=None):
         """Yield bounded outputs, with global input indices and shared static tokens."""
         if self.training:raise ValueError("Call eval() before predict_batches()")
         limit=self.max_samples if max_samples is None else max_samples
         if type(limit) is not int or limit<1:raise ValueError("max_samples must be positive")
-        data,unique_sources,actions,adducts,indices=self.prepare(sources,precursor_types,collision_energy)
+        data,unique_sources,actions,adducts,indices=self.prepare(sources,precursor_types,collision_energy,precomputed=precomputed)
         from ..input.action_batching import select_samples
         from .post_materialization_model import deduplicate_molecular_graphs
         device=next(self.parameters()).device
@@ -165,7 +178,7 @@ class SourceAnchoredFragmentSpectrumGenerator(nn.Module):
             yield SourceAnchoredSpectrumOutput(selection,decoded,spectra,downstream,indices[start:stop])
 
     @torch.no_grad()
-    def predict(self, sources, precursor_types, collision_energy):
+    def predict(self, sources, precursor_types, collision_energy, *, precomputed=None):
         if len(sources)>self.max_samples:
             raise ValueError("Use predict_batches() for inputs exceeding max_samples")
-        return next(self.predict_batches(sources,precursor_types,collision_energy))
+        return next(self.predict_batches(sources,precursor_types,collision_energy,precomputed=precomputed))

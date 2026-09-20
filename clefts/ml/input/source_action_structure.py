@@ -1,4 +1,4 @@
-"""Schema v4 Source/action tensors. RDKit is confined to preparation."""
+"""Schema v6 Source/action tensors. RDKit is confined to preparation."""
 from __future__ import annotations
 import hashlib
 from dataclasses import dataclass, field, fields, replace
@@ -9,13 +9,12 @@ from torch import Tensor
 from torch_geometric.data import Batch
 from clefts.domain.fragment.cleavage import CleavageAction, CleavageActionSequence
 from clefts.domain.fragment.cleavage.CleavageActionRelations import CleavageActionRelations
-from clefts.domain.fragment.cleavage.CleavageActionSearch import CleavageActionSearch
 from clefts.libs.mmkit.mmkit import Compound
 from ..mol.graph_builder import MolGraphBuilder
 
 SCHEMA = "clefts.fragment-tree-training"
-SCHEMA_VERSION = 5
-FRAGMENTATION_SCHEMA = "source-anchored-action-autoregressive-v1"
+SCHEMA_VERSION = 6
+FRAGMENTATION_SCHEMA = "source-anchored-branching-v1"
 
 
 class UnresolvedPrecursorError(ValueError):
@@ -52,12 +51,12 @@ class SourceActionStructure:
     action_retained_index: Tensor
     sample_tree_index: Tensor
     condition_features: Tensor
-    teacher_state_sample_index: Tensor
-    teacher_state_action_ptr: Tensor
-    teacher_state_action_index: Tensor
+    teacher_node_sample_index: Tensor
+    teacher_node_action_ptr: Tensor
+    teacher_node_action_index: Tensor
     teacher_positive_action_ptr: Tensor
     teacher_positive_action_index: Tensor
-    teacher_positive_eos: Tensor
+    teacher_node_observed: Tensor
     sample_positive_action_ptr: Tensor
     sample_positive_action_index: Tensor
     # Every alternative PrecursorAction.action_sequence for this sample's
@@ -81,6 +80,12 @@ class SourceActionStructure:
     transition_added_action_index: Tensor = field(default_factory=lambda: torch.empty(0,dtype=torch.long),kw_only=True)
     state_fragment_node_index: Tensor = field(default_factory=lambda: torch.empty(0,dtype=torch.long),kw_only=True)
 
+    teacher_node_precursor_row_index: Tensor = field(default_factory=lambda: torch.empty(0,dtype=torch.long),kw_only=True)
+    teacher_node_parent_index: Tensor = field(default_factory=lambda: torch.empty(0,dtype=torch.long),kw_only=True)
+    teacher_node_added_action_index: Tensor = field(default_factory=lambda: torch.empty(0,dtype=torch.long),kw_only=True)
+    teacher_node_ms2_depth: Tensor = field(default_factory=lambda: torch.empty(0,dtype=torch.long),kw_only=True)
+    teacher_positive_action_weight: Tensor = field(default_factory=lambda: torch.empty(0),kw_only=True)
+
     @property
     def num_samples(self) -> int:
         return self.sample_tree_index.numel()
@@ -101,10 +106,10 @@ class SourceActionStructure:
     def load(cls, path: str | Path, device: str | torch.device = "cpu", *, max_action_count: int = 3) -> SourceActionStructure:
         payload = torch.load(path, map_location="cpu",weights_only=False)
         if not isinstance(payload, dict) or (payload.get("schema"), payload.get("schema_version"), payload.get("fragmentation_schema")) != (SCHEMA, SCHEMA_VERSION, FRAGMENTATION_SCHEMA):
-            raise ValueError("Action training requires schema v5; regenerate from original MSDataset")
+            raise ValueError("Action training requires schema v6; regenerate from original MSDataset")
         result = payload["structure"]
         if not isinstance(result, cls):
-            raise TypeError("schema v5 structure must be SourceActionStructure")
+            raise TypeError("schema v6 structure must be SourceActionStructure")
         if result.downstream is not None and not hasattr(result.downstream.decoded,"edge_seed_action_index"):
             object.__setattr__(result.downstream.decoded,"edge_seed_action_index",torch.empty((2,0),dtype=torch.long))
         if result.downstream is not None and not result.downstream.node_smiles:
@@ -115,8 +120,7 @@ class SourceActionStructure:
                 node=int((result.downstream.decoded.node_sample_index==sample).nonzero()[0])
                 keys[tree]=result.downstream.node_smiles[node]
             result=replace(result,source_smiles=tuple(keys[i] for i in range(result.source_graph.num_graphs)))
-        from .action_batching import upgrade_precursor_metadata
-        return upgrade_precursor_metadata(result,max_action_count=max_action_count).to(device)
+        return result.to(device)
 
     @classmethod
     def from_structures(cls, structures: Sequence[SourceActionStructure]) -> SourceActionStructure:
@@ -130,8 +134,12 @@ class SourceActionStructure:
         atom_offset = action_offset = tree_offset = sample_offset = state_offset = node_offset = 0
         downstream_items, action_offsets, parents, children, added_actions, state_nodes = [], [], [], [], [], []
         annotations=[]
+        seed_owners=[]; node_parents=[]; node_added=[]
         for item in structures:
             action_offsets.append(action_offset)
+            seed_owners.append(item.teacher_node_precursor_row_index+precursor_offset)
+            node_parents.append(torch.where(item.teacher_node_parent_index>=0,item.teacher_node_parent_index+state_offset,item.teacher_node_parent_index))
+            node_added.append(torch.where(item.teacher_node_added_action_index>=0,item.teacher_node_added_action_index+action_offset,item.teacher_node_added_action_index))
             parents.append(item.transition_parent_state_index+state_offset)
             children.append(item.transition_child_state_index+state_offset)
             added_actions.append(item.transition_added_action_index+action_offset)
@@ -140,7 +148,7 @@ class SourceActionStructure:
                 annotations.append({**sample,'peaks':[{**peak,'matches':[
                     {**match,'nodeIndices':[index+node_offset for index in match['nodeIndices']]}
                     for match in peak['matches']]} for peak in sample['peaks']]})
-            state_offset+=item.teacher_state_sample_index.numel()
+            state_offset+=item.teacher_node_sample_index.numel()
             if item.downstream is not None:
                 downstream_items.append(item.downstream)
                 node_offset+=len(item.downstream.decoded.compounds)
@@ -155,8 +163,8 @@ class SourceActionStructure:
                 relations[name].append(getattr(item, name) + action_offset)
             sample_trees.append(item.sample_tree_index + tree_offset)
             conditions.append(item.condition_features)
-            state_samples.append(item.teacher_state_sample_index + sample_offset)
-            for ptr, data, dest in ((item.teacher_state_action_ptr, item.teacher_state_action_index, state_rows),
+            state_samples.append(item.teacher_node_sample_index + sample_offset)
+            for ptr, data, dest in ((item.teacher_node_action_ptr, item.teacher_node_action_index, state_rows),
                                     (item.teacher_positive_action_ptr, item.teacher_positive_action_index, next_rows),
                                     (item.sample_positive_action_ptr, item.sample_positive_action_index, positives)):
                 for start, stop in zip(ptr[:-1], ptr[1:]):
@@ -166,7 +174,7 @@ class SourceActionStructure:
             precursor_next.append(item.precursor_next_index + torch.tensor([[precursor_offset],[action_offset]]))
             precursor_offset += item.precursor_row_action_ptr.numel()-1
             sample_precursor_row_counts.extend((item.sample_precursor_row_ptr[1:] - item.sample_precursor_row_ptr[:-1]).tolist())
-            eos.append(item.teacher_positive_eos)
+            eos.append(item.teacher_node_observed)
             atom_offset += item.source_graph.num_nodes
             action_offset += item.action_type.shape[0]
             tree_offset += item.source_graph.num_graphs
@@ -193,6 +201,9 @@ class SourceActionStructure:
                    downstream,source_smiles=tuple(key for item in structures for key in item.source_smiles),precursor_next_index=torch.cat(precursor_next,dim=1),transition_parent_state_index=torch.cat(parents),
                    transition_child_state_index=torch.cat(children),transition_added_action_index=torch.cat(added_actions),
                    state_fragment_node_index=torch.cat(state_nodes),
+                   teacher_node_precursor_row_index=torch.cat(seed_owners),teacher_node_parent_index=torch.cat(node_parents),
+                   teacher_node_added_action_index=torch.cat(node_added),teacher_node_ms2_depth=torch.cat([i.teacher_node_ms2_depth for i in structures]),
+                   teacher_positive_action_weight=torch.cat([i.teacher_positive_action_weight for i in structures]),
                    sample_annotations=tuple(annotations) if len(annotations)==sum(item.num_samples for item in structures) else (),
                    max_action_role_count=max(item.max_action_role_count for item in structures),
                    source_atom_capacity=max(item.source_atom_capacity for item in structures),
@@ -202,15 +213,14 @@ class SourceActionStructure:
 def prepare_source_actions(*, source: Compound, actions: tuple[CleavageAction, ...],
                            graph_builder: MolGraphBuilder, condition_features: Tensor,
                            max_action_count: int, target_sequences: Sequence[Sequence[CleavageActionSequence | None]] | None = None,
-                           precursor_sequences: Sequence[Iterable[CleavageActionSequence | None]] | None = None) -> SourceActionStructure:
-    """Inference prepares primitives only; teacher enumeration is preparation-only.
+                           precursor_sequences: Sequence[Iterable[CleavageActionSequence | None]] | None = None,
+                           teacher_pathways=None) -> SourceActionStructure:
+    """Pack Source primitives and observed positive pathways as sparse tensors.
 
-    precursor_sequences records, per sample, every PrecursorAction.action_sequence
-    alternative for that sample's precursor type (Fragmenter.resolve_precursor_actions,
-    computed once against the same exhaustively built fragment tree). Real MS2
-    fragmentation always happens on the selected precursor ion, never on the
-    bare Source, so every teacher state other than the empty <BOS> prefix must
-    itself be a subset or superset of one of these alternatives.
+    Precursor alternatives remain independent rows. Teacher nodes are keyed by
+    (sample, precursor row, normalized state); their parent is representative,
+    while transition tensors retain every pathway-supported positive edge.
+    Inference passes no pathways and receives no teacher nodes.
     """
     relations = CleavageActionRelations.from_actions(actions)
     maps = {atom.GetAtomMapNum(): index for index, atom in enumerate(graph_builder.graph_atoms(source))}
@@ -235,96 +245,62 @@ def prepare_source_actions(*, source: Compound, actions: tuple[CleavageAction, .
     sample_precursor_row_counts = [len(rows) for rows in alternatives]
     # Chemistry relations are prepared once. Neural filtering applies this sparse
     # table on the device; there is no RDKit or Python chemistry in forward.
-    precursor_next = []
-    next_cache={}
-    for row, previous in enumerate(precursor_rows):
-        if previous not in next_cache:
-            candidates=[]
-            if len(previous)<max_action_count:
-                for candidate, action in enumerate(actions):
-                    if candidate in previous or relations.rejection((*previous,candidate)) or any(relations.must_precede_mask[candidate] & (1<<i) for i in previous):continue
-                    child=CleavageActionSequence((*(actions[i] for i in previous),action))
-                    ids=frozenset(index[a] for a in child.actions)
-                    if child.retained_atom_maps and len(ids)<=max_action_count and frozenset(previous)<ids:candidates.append(candidate)
-            next_cache[previous]=candidates
-        precursor_next.extend((row,candidate) for candidate in next_cache[previous])
-    if target_sequences is not None:
-        if len(target_sequences) != condition_features.shape[0]:
-            raise ValueError("target_sequences must have one row per condition")
-        search = CleavageActionSearch(actions, max_action_count=max_action_count)
-        candidates = search.enumerate()
-        known = {None, *(c.action_sequence for c in candidates)}
-        transitions: set[tuple[CleavageActionSequence | None, CleavageActionSequence, CleavageAction]] = set()
-        # Enumerate every valid outgoing transition, including replacement, not
-        # just one arbitrary permutation of a target set.
-        for parent in known:
-            if parent is not None and len(parent.actions) >= max_action_count:
-                continue
-            for action in actions:
-                if parent is not None and action in parent.actions:
-                    continue
-                raw = (*(parent.actions if parent else ()), action)
-                if any(relations.must_precede_mask[index[action]] & (1<<index[a]) for a in (parent.actions if parent else ())):continue
-                if relations.rejection(tuple(index[a] for a in raw)):
-                    continue
-                child = CleavageActionSequence(raw)
-                if child != parent and child.retained_atom_maps and len(child.actions) <= max_action_count and child in known:
-                    transitions.add((parent, child, action))
-        for sample, targets in enumerate(target_sequences):
-            terminal = set(targets)
-            if not terminal <= known:
-                raise ValueError("Teacher target is not a valid searchable Source action state")
-            required = frozenset(alternatives[sample]) if precursor_sequences is not None else frozenset((None,))
-            if not required <= known:
-                raise ValueError("Precursor action sequence is not a valid searchable Source action state")
-            root_is_precursor = None in required
-            required_sets = frozenset(frozenset(index[a] for a in req.actions) for req in required if req is not None)
-            if root_is_precursor:
-                # Source itself is a valid precursor selection: the empty
-                # action set trivially satisfies (is a subset of) every state.
-                required_sets = required_sets | frozenset({frozenset()})
-
-            def contains_a_precursor(state: CleavageActionSequence | None) -> bool:
-                """state already fully applied one recorded precursor action set."""
-                if state is None:
-                    return root_is_precursor
-                actions_set = frozenset(index[a] for a in state.actions)
-                return any(required_set <= actions_set for required_set in required_sets)
-
-            if not all(contains_a_precursor(target) for target in terminal):
-                raise ValueError("Teacher target does not contain a recorded precursor action set")
-            ancestors = set(terminal)
-            while True:
-                updated = ancestors | {parent for parent, child, _ in transitions if child in ancestors}
-                if updated == ancestors:
-                    break
-                ancestors = updated
-            if not root_is_precursor:
-                # Real MS2 fragmentation happens on the selected precursor ion:
-                # keep only <BOS> (the DAG's entry point) and states already on
-                # a path toward, through, or beyond a recorded precursor set.
-                def on_precursor_path(state: CleavageActionSequence | None) -> bool:
-                    if state is None:
-                        return True
-                    actions_set = frozenset(index[a] for a in state.actions)
-                    return contains_a_precursor(state) or any(actions_set <= required_set for required_set in required_sets)
-                ancestors = {state for state in ancestors if on_precursor_path(state)}
-            ordered = sorted(ancestors, key=lambda seq: (len(seq.actions), seq.key) if seq else (0, ()))
-            row_by_state={state:len(states)+i for i,state in enumerate(ordered)}
-            for parent,child,action in sorted(transitions,key=lambda t: ((t[0].key if t[0] else ()),t[1].key,t[2].key)):
-                if parent in ancestors and child in ancestors:
-                    transition_parents.append(row_by_state[parent]);transition_children.append(row_by_state[child]);transition_actions.append(index[action])
-            positive_actions = set()
-            for state in ordered:
-                next_actions = sorted({index[action] for parent, child, action in transitions if parent == state and child in ancestors})
-                positive_actions.update(next_actions)
-                if state:
-                    positive_actions.update(index[a] for a in state.actions)
-                samples.append(sample)
-                states.append(tuple(sorted(index[a] for a in state.actions)) if state else ())
-                positive_next.append(next_actions)
-                eos.append(state in terminal)
-            sample_positive.append(sorted(positive_actions))
+    precursor_next = [] # No valid/negative outgoing edges are stored.
+    node_seeds=[]; node_parents=[]; node_added=[]; depths=[]; weights=[]
+    # Path records contain actual chemistry transitions, never permutations of
+    # a terminal action set. Each precursor alternative has independent nodes.
+    if target_sequences is not None and teacher_pathways is None:
+        raise ValueError("Branching teachers require observed teacher_pathways, not terminal action sets")
+    if teacher_pathways is not None:
+        if len(teacher_pathways)!=condition_features.shape[0]:
+            raise ValueError("teacher_pathways must have one list per condition")
+        seed_offset=0
+        for sample, paths in enumerate(teacher_pathways):
+            positive_actions=set()
+            for chain,_ in paths:
+                if not any(state==seed for state,_ in chain for seed in alternatives[sample]):
+                    raise ValueError("Observed teacher pathway has no resolved precursor seed")
+            for seed_local, seed in enumerate(alternatives[sample]):
+                known={}; outgoing={}; salience={}
+                def add(state, parent=-1, action=-1):
+                    if state in known:return known[state]
+                    row=len(states);known[state]=row
+                    samples.append(sample);states.append(tuple(sorted(index[a] for a in state.actions)) if state else ())
+                    positive_next.append([]);eos.append(False)
+                    node_seeds.append(seed_offset+seed_local);node_parents.append(parent);node_added.append(action)
+                    depths.append(0 if parent<0 else depths[parent]+1)
+                    outgoing[row]={};salience[row]=0.
+                    return row
+                add(seed)
+                edges=set()
+                for chain, intensity in paths:
+                    # chain: (state, added_action) rooted at Source. Only the
+                    # suffix starting at this exact precursor belongs to MS2.
+                    starts=[i for i,(state,_) in enumerate(chain) if state==seed]
+                    for start in starts:
+                        parent=add(seed)
+                        for child, action in chain[start+1:]:
+                            if action is None:continue
+                            assert action in index, "All teacher-positive actions must be retained"
+                            child_row=add(child,parent,index[action])
+                            if child_row==parent:continue
+                            edges.add((parent,child_row,index[action]))
+                            outgoing[parent].setdefault(index[action],set()).add(child_row)
+                            positive_actions.add(index[action]);parent=child_row
+                        salience[parent]=max(salience[parent],float(intensity));eos[parent]=True
+                # Monotone max propagation also supports a normalized DAG.
+                for _ in range(len(known)):
+                    changed=False
+                    for parent,child,action in sorted(edges,reverse=True):
+                        value=max(salience[parent],salience[child])
+                        changed |= value!=salience[parent];salience[parent]=value
+                    if not changed:break
+                for row in known.values():
+                    positive_next[row]=sorted(outgoing[row])
+                    weights.extend(max(salience[c] for c in outgoing[row][a]) for a in positive_next[row])
+                for parent,child,action in sorted(edges):
+                    transition_parents.append(parent);transition_children.append(child);transition_actions.append(action)
+            sample_positive.append(sorted(positive_actions));seed_offset+=len(alternatives[sample])
     else:
         sample_positive = [() for _ in range(condition_features.shape[0])]
     state_ptr, state_index = csr(states)
@@ -343,6 +319,9 @@ def prepare_source_actions(*, source: Compound, actions: tuple[CleavageAction, .
         torch.tensor(samples, dtype=torch.long), state_ptr, state_index, next_ptr, next_index,
         torch.tensor(eos, dtype=torch.bool), positive_ptr, positive_index,
         sample_precursor_row_ptr, precursor_row_action_ptr, precursor_row_action_index,
+        teacher_node_precursor_row_index=torch.tensor(node_seeds,dtype=torch.long),
+        teacher_node_parent_index=torch.tensor(node_parents,dtype=torch.long),teacher_node_added_action_index=torch.tensor(node_added,dtype=torch.long),
+        teacher_node_ms2_depth=torch.tensor(depths,dtype=torch.long),teacher_positive_action_weight=torch.tensor(weights,dtype=torch.float32),
         source_smiles=(source.smiles,),precursor_next_index=coo(precursor_next),transition_parent_state_index=torch.tensor(transition_parents,dtype=torch.long),
         transition_child_state_index=torch.tensor(transition_children,dtype=torch.long),
         transition_added_action_index=torch.tensor(transition_actions,dtype=torch.long),

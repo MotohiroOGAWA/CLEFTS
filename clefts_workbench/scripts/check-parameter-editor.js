@@ -33,6 +33,27 @@ const app=path.resolve(__dirname,'../..'),preset=service.defaults(app);
  const current=editor.getValue(),args=buildArgs({input:'input.msds',outputDir:'output',modelConfig:current,params:'ignored.json'});assert(!args.includes('--params'));assert.deepEqual(JSON.parse(args[args.indexOf('--params-json')+1]),current);
  const dataArgs=buildArgs({input:'input.msds',outputDir:'out',fragmenterParams:current.fragmenter_params,symbols:current.symbols,maxNode:500,maxEdge:1000});assert(dataArgs.includes('--symbols-json'));assert.equal(dataArgs[dataArgs.indexOf('--max-edge')+1],'1000');
  const trainingArgs=buildTrainingArgs({trainDir:'train',valDir:'val',outputDir:'out',modelConfig:current});assert(!trainingArgs.includes('--params'));assert(!trainingArgs.includes('--params-json'));
+ // A resumed config always carries action_model_params.state_dropout and
+ // post_model_params.dropout (training_model_config writes both from the one
+ // shared --dropout), but only that one shared field may ever be edited.
+ const dropoutConfigRoot=new Element('div');
+ createParameterEditor(dropoutConfigRoot,{action_model_params:{state_dropout:0.3},post_model_params:{dropout:0.3}},'training');
+ assert(!walk(dropoutConfigRoot).some(node=>node.dataset.parameterPath==='action_model_params.state_dropout'));
+ assert(!walk(dropoutConfigRoot).some(node=>node.dataset.parameterPath==='post_model_params.dropout'));
+ // The balanced ion-score loss weight is a per-component model_config field, like
+ // cosine_loss_weight, and (like every other optional field) is filled in with
+ // its default immediately -- no "Override" button to click first.
+ const ionRoot=new Element('div'),ionEditor=createParameterEditor(ionRoot,{post_model_params:{}},'training');
+ assert(!walk(ionRoot).some(node=>node.tag==='button'&&node.textContent.startsWith('Override ')));
+ assert.equal(walk(ionRoot).find(node=>node.dataset.parameterPath==='post_model_params.ion_loss_weight').value,0.5);
+ assert(walk(ionRoot).some(node=>node.className==='parameter-group-heading'&&node.textContent==='Loss weights'));
+ const ionArgs=buildTrainingArgs({trainDir:'train',valDir:'val',outputDir:'out',modelConfig:ionEditor.getValue()});
+ assert.equal(ionArgs[ionArgs.indexOf('--post-ion-loss-weight')+1],'0.5');
+ // Dropout is one shared training-level flag, not a per-component model_config override.
+ const dropoutArgs=buildTrainingArgs({trainDir:'train',valDir:'val',outputDir:'out',dropout:0.3});
+ assert.equal(dropoutArgs[dropoutArgs.indexOf('--dropout')+1],'0.3');
+ const legacyConfigArgs=buildTrainingArgs({trainDir:'train',valDir:'val',outputDir:'out',modelConfig:{action_model_params:{state_dropout:0.1},post_model_params:{dropout:0.1}},molEncoderCheckpoint:'encoder.pt'});
+ assert(!legacyConfigArgs.includes('--action-state-dropout'));assert(!legacyConfigArgs.includes('--post-dropout'));
  const temp=fs.mkdtempSync(path.join(os.tmpdir(),'clefts-parameter-import-'));try{
  const file=path.join(temp,'fragmenter config.json');fs.writeFileSync(file,JSON.stringify({fragment_ion_tree_builder:{max_action_count:2},mass_tolerance:'0.04Da'}));let handler;const messages=[];service.attach({webview:{onDidReceiveMessage:fn=>handler=fn,postMessage:data=>messages.push(data)}},{},()=>app);
  await handler({type:'parameters/load',target:'data',path:file});assert.equal(messages.at(-1).type,'parameters/loaded');assert.equal(messages.at(-1).modelConfig.fragmenter_params.mass_tolerance,'0.04Da');assert.equal(messages.at(-1).modelConfig.fragmenter_params.fragment_ion_tree_builder.max_action_count,2);assert(messages.at(-1).modelConfig.fragmenter_params.fragment_ion_tree_builder.cleavage_pattern_set);

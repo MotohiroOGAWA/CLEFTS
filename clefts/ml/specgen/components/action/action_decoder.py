@@ -27,7 +27,6 @@ class ActionPool:
     # when Source itself is a valid precursor.
     precursor_row_sample_index: Tensor
     precursor_row_action_index: Tensor
-    precursor_eos_logits: Tensor | None = field(default=None,kw_only=True)
 
 
 def positive_mask(ptr: Tensor, index: Tensor, rows: int, columns: int) -> Tensor:
@@ -158,10 +157,10 @@ class ActionDecoderOutput:
     pool: ActionPool
 
 
-class ActionSequenceDecoder(nn.Module):
+class BranchingCleavageDecoder(nn.Module):
     def __init__(self, hidden_dim: int, condition_dim: int, max_action_count: int,
                  beam_size: int = 32, num_heads: int = 4, max_decode_steps: int = 16,
-                 state_num_layers: int = 2, state_dropout: float = 0.0) -> None:
+                 state_num_layers: int = 2, state_dropout: float = 0.0, prediction_threshold: float = 0.5) -> None:
         super().__init__()
         if beam_size < 1 or max_decode_steps < 1:
             raise ValueError("beam_size and max_decode_steps must be positive")
@@ -169,7 +168,8 @@ class ActionSequenceDecoder(nn.Module):
         self.compatibility = ActionCompatibilityEngine(max_action_count,enforce_reactant_order=True)
         self.query = nn.Linear(hidden_dim + condition_dim, hidden_dim)
         self.key = nn.Linear(hidden_dim, hidden_dim, bias=False)
-        self.eos_head = nn.Linear(hidden_dim + condition_dim, 1)
+        if not 0 < prediction_threshold < 1:raise ValueError("prediction_threshold must be between zero and one")
+        self.prediction_threshold=prediction_threshold
         self.scale = hidden_dim ** -0.5
         self.max_action_count = max_action_count
         self.beam_size = beam_size
@@ -195,16 +195,7 @@ class ActionSequenceDecoder(nn.Module):
             preserved |= (matches & (sample[:,None,None]==rows[None,None,start:start+32])).any(dim=-1)
         if seeds.shape[0]:
             valid &= preserved
-        eos=self.eos_head(context).squeeze(-1)
-        if pool.precursor_eos_logits is not None:
-            # Initial no-cleavage score participates in precursor termination.
-            prior=eos.new_full(eos.shape,-torch.inf)
-            for start in range(0,seeds.shape[0],32):
-                match=(state[:,None,:]==seeds[None,start:start+32,:]).all(-1) & (sample[:,None]==rows[None,start:start+32])
-                values=pool.precursor_eos_logits[None,start:start+32].expand_as(match).masked_fill(~match,-torch.inf)
-                prior=torch.maximum(prior,values.max(-1).values)
-            eos=eos+torch.where(torch.isfinite(prior),prior,torch.zeros_like(prior))
-        logits = torch.cat((action.masked_fill(~valid, -torch.inf), eos[:,None]), dim=1)
+        logits = action.masked_fill(~valid, -torch.inf)
         return logits, expansion
 
     def forward(self, pool: ActionPool, conditions: Tensor) -> ActionDecoderOutput:
@@ -233,10 +224,10 @@ class ActionSequenceDecoder(nn.Module):
             row = torch.arange(sample.numel(), device=device) + offset
             raw_history_score.append(score)
             logits, expansion = self.score_states(pool, conditions, state, sample)
-            probabilities = F.log_softmax(logits, dim=1)
+            probabilities = F.logsigmoid(logits)
             all_sample.append(sample)
             all_state.append(state)
-            all_score.append(score + probabilities[:, -1])
+            all_score.append(score)
             all_parent.append(global_parent)
             all_added.append(added)
             all_terminal.append(torch.ones_like(sample, dtype=torch.bool))
@@ -246,7 +237,7 @@ class ActionSequenceDecoder(nn.Module):
             parent = expansion.parent_state_index
             candidate = expansion.candidate_action_index
             candidate_score = score[parent] + probabilities[parent, candidate]
-            valid = expansion.valid & torch.isfinite(candidate_score)
+            valid = expansion.valid & torch.isfinite(candidate_score) & (logits[parent,candidate].sigmoid() >= self.prediction_threshold)
             parent, candidate, candidate_score = parent[valid], candidate[valid], candidate_score[valid]
             child_sample, child, child_score, representative = deduplicate(sample[parent], expansion.child_action_index[valid], candidate_score)
             old_keys = torch.cat((torch.cat(all_sample)[:, None], torch.cat(all_state)), dim=1)
@@ -262,10 +253,12 @@ class ActionSequenceDecoder(nn.Module):
             sample, state, score = child_sample[selected], child[selected], child_score[selected]
             global_parent, added = parents[selected], actions[selected]
         samples, states, scores = torch.cat(all_sample), torch.cat(all_state), torch.cat(all_score)
-        terminal_sample, terminal_state, terminal_score, representative = deduplicate(samples, states, scores)
-        chosen = grouped_topk(terminal_score, terminal_sample, self.beam_size, s)
-        terminal = torch.zeros_like(samples, dtype=torch.bool)
-        terminal[representative[chosen]] = True
-        # All generated states form a bounded superset of terminal ancestor
-        # closure; materialization computes the actual closure outside Torch.
+        # Leaves stop at the threshold or a generation limit. Materialization
+        # recovers all accepted ancestors from these leaves.
+        terminal = torch.ones_like(samples,dtype=torch.bool)
+        parent_rows=torch.cat(all_parent)
+        terminal[parent_rows[parent_rows>=0]]=False
         return ActionDecoderOutput(samples, states, scores, terminal, torch.cat(all_parent), torch.cat(all_added), pool)
+
+# Import compatibility for callers; semantics are branching in schema v6.
+ActionSequenceDecoder = BranchingCleavageDecoder

@@ -130,8 +130,8 @@ class TestActionPipeline(unittest.TestCase):
         source = Compound.from_smiles('CCCO')
         adducts = (Adduct.parse('[M+H]+'), Adduct.parse('[M+H-H2O]+'))
         mzs = [[Formula.parse('C3H9O+').exact_mass], [Formula.parse('C3H7+').exact_mass, Formula.parse('C2H5+').exact_mass]]
-        data = ActionStructureBuilder(generator).build(source, adducts, (20.,40.), mzs, ((1.,), (1.,.5)))
-        self.assertTrue(data.teacher_positive_eos.any())
+        data,kept = ActionStructureBuilder(generator).build(source, adducts, (20.,40.), mzs, ((1.,), (1.,.5)))
+        self.assertTrue(data.teacher_node_observed.any())
         self.assertTrue((data.state_fragment_node_index >= 0).any())
         self.assertTrue(any(compound.smiles == 'CCC' for compound in data.downstream.decoded.compounds))
         for sample, peaks in enumerate(mzs):
@@ -151,7 +151,7 @@ class TestActionPipeline(unittest.TestCase):
                 (root/name).mkdir()
                 data.save(root/name/'source.preft.pt')
             report = train_actions(model_config=config(), train_dir=root/'train', val_dir=root/'val', output_dir=root/'run', epochs=1)
-            self.assertEqual(report['schema_version'], 5)
+            self.assertEqual(report['schema_version'], 6)
             self.assertTrue((root/'run'/'last.pt').is_file())
             resumed = train_actions(model_config=config(), train_dir=root/'train', val_dir=root/'val', output_dir=root/'run', epochs=1, resume=root/'run'/'last.pt')
             self.assertEqual(resumed['history'][-1]['epoch'], 2)
@@ -195,7 +195,7 @@ class TestActionPipeline(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            base_data = ActionStructureBuilder(base_generator).build(source, adducts, (20.,), mzs, ((1.,),))
+            base_data,kept = ActionStructureBuilder(base_generator).build(source, adducts, (20.,), mzs, ((1.,),))
             for name in ('base_train', 'base_val'):
                 (root/name).mkdir()
                 base_data.save(root/name/'source.preft.pt')
@@ -224,7 +224,7 @@ class TestActionPipeline(unittest.TestCase):
 
             # Regenerate training data with the expanded action universe.
             expanded_generator = create_spectrum_generator(deepcopy(new_config)).eval()
-            expanded_data = ActionStructureBuilder(expanded_generator).build(source, adducts, (20.,), mzs, ((1.,),))
+            expanded_data,kept = ActionStructureBuilder(expanded_generator).build(source, adducts, (20.,), mzs, ((1.,),))
             for name in ('ft_train', 'ft_val'):
                 (root/name).mkdir()
                 expanded_data.save(root/name/'source.preft.pt')

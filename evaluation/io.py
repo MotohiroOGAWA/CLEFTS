@@ -51,7 +51,10 @@ def _similarity_table(path: Path) -> pd.DataFrame:
             file_format = file_format.decode("utf-8")
         if file_format != "msentity.similarity":
             raise ValueError("Not an msentity similarity file.")
-        if int(handle.attrs.get("schema_version", -1)) != 1:
+        # msentity.SimilarityDataset.load() itself accepts schema versions 1 and 2
+        # (2 only adds an optional embedded-matched-data group; table.parquet's
+        # own columns are unchanged), so this reader must too.
+        if int(handle.attrs.get("schema_version", -1)) not in (1, 2):
             raise ValueError("Unsupported msentity similarity schema version.")
         if "table.parquet" not in handle:
             raise ValueError("Similarity file does not contain table.parquet.")

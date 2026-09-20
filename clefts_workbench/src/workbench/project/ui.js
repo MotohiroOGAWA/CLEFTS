@@ -22,7 +22,7 @@ function client(){
     if(workflow==='molTraining')dispatch({type:'mol/config',config});
     if(workflow==='cleavage'){dispatch({type:'cleavagePatternSet',value:config.value||config,path:config.path||''});resetVisualBuilder();el('visualBuilder').hidden=true;}
     if(workflow==='prediction'){
-      const fields={input:'batchInput',outputDir:'batchOutputDir',outputName:'batchOutputName',db:'batchDb',maxSamples:'batchMaxSamples',specIdColumn:'batchSpecIdColumn',smilesColumn:'batchSmilesColumn',precursorMzColumn:'batchPrecursorMzColumn',adductTypeColumn:'batchAdductTypeColumn',collisionEnergyColumn:'batchCollisionEnergyColumn',instrumentColumn:'batchInstrumentColumn',overwrite:'batchOverwrite'};
+      const fields={input:'batchInput',outputDir:'batchOutputDir',db:'batchDb',maxSamples:'batchMaxSamples',specIdColumn:'batchSpecIdColumn',smilesColumn:'batchSmilesColumn',precursorMzColumn:'batchPrecursorMzColumn',adductTypeColumn:'batchAdductTypeColumn',collisionEnergyColumn:'batchCollisionEnergyColumn',instrumentColumn:'batchInstrumentColumn',overwrite:'batchOverwrite',numWorkers:'batchNumWorkers',chunkSize:'batchChunkSize',keepTemp:'batchKeepTemp'};
       const values={...config};for(const [key,field]of Object.entries(fields))if(key in config)values[field]=config[key];
       setFormConfig(el('predictForm'),values);resetPredictModelState();
       if(config.adductType)el('predictForm').elements.adductType.dataset.restoreValue=config.adductType;

@@ -26,6 +26,14 @@ class PostMaterializationBatch:
     formula_mz: Tensor
     ion_formula_index: Tensor
     target_intensity: Tensor | None = None
+    # True for a candidate ion whose (node, net adduct) was matched to an
+    # observed peak during dataset preparation; None when unavailable (e.g.
+    # inference). Multiple mass-degenerate candidates at the same node can
+    # be positive together: they are indistinguishable from MS data alone.
+    ion_is_positive: Tensor | None = None
+    # str(Adduct) for each candidate ion, parallel to ion_node_index/ion_features;
+    # display-only (e.g. the fragment-tree node inspector), never read by the model.
+    ion_adduct: tuple[str,...] = ()
     unique_node_graph: Batch | None = None
     node_graph_inverse: Tensor | None = None
     unique_source_index: Tensor | None = None
@@ -34,7 +42,7 @@ class PostMaterializationBatch:
 
     def to(self, device: str | torch.device) -> PostMaterializationBatch:
         return replace(self, decoded=self.decoded.to(device), tree_graph=self.tree_graph.to(device),unique_node_graph=self.unique_node_graph.to(device) if self.unique_node_graph is not None else None,
-            **{name: getattr(self,name).to(device) for name in ("ion_node_index","ion_features","formula_sample_index","formula_tensor","formula_mz","ion_formula_index","target_intensity","node_graph_inverse","unique_source_index") if getattr(self,name) is not None})
+            **{name: getattr(self,name).to(device) for name in ("ion_node_index","ion_features","formula_sample_index","formula_tensor","formula_mz","ion_formula_index","target_intensity","ion_is_positive","node_graph_inverse","unique_source_index") if getattr(self,name) is not None})
 
 
 @dataclass(frozen=True)
@@ -44,6 +52,14 @@ class PostMaterializationOutput:
     formula_tensor: Tensor
     mz: Tensor
     loss: Tensor
+    # Highest ion-score sigmoid confidence among the candidates explaining this
+    # formula. Never used to gate the loss or the intensity itself (so training
+    # dynamics/metrics stay unaffected); callers producing a spectrum for
+    # display can drop low-confidence peaks with it instead.
+    confidence: Tensor
+    # sigmoid(ion_logit) per candidate ion, parallel to the input batch's
+    # ion_node_index/ion_adduct; display-only, same reasoning as confidence.
+    ion_probability: Tensor
 
 
 class PostMaterializationFragmentTreeModel(nn.Module):
@@ -52,15 +68,26 @@ class PostMaterializationFragmentTreeModel(nn.Module):
     def __init__(self, mol_encoder: nn.Module, action_dim: int, condition_dim: int,
                  formula_dim: int, hidden_dim: int = 128, num_heads: int = 4,
                  num_layers: int = 2, max_action_count: int = 3,
-                 cosine_loss_weight: float = 0.5) -> None:
+                 cosine_loss_weight: float = 0.5, ion_loss_weight: float = 0.5,
+                 ion_prediction_threshold: float = 0.5, intensity_power: float = 0.5,
+                 precursor_free_loss_weight: float = 0.5, dropout: float = 0.) -> None:
         super().__init__()
         if not 0<=cosine_loss_weight or not torch.isfinite(torch.tensor(cosine_loss_weight)):raise ValueError("cosine_loss_weight must be non-negative and finite")
+        if not 0<=ion_loss_weight or not torch.isfinite(torch.tensor(ion_loss_weight)):raise ValueError("ion_loss_weight must be non-negative and finite")
+        if not 0<ion_prediction_threshold<1:raise ValueError("ion_prediction_threshold must be between zero and one")
+        if not 0<intensity_power or not torch.isfinite(torch.tensor(intensity_power)):raise ValueError("intensity_power must be positive and finite")
+        if not 0<=precursor_free_loss_weight or not torch.isfinite(torch.tensor(precursor_free_loss_weight)):raise ValueError("precursor_free_loss_weight must be non-negative and finite")
+        if not 0<=dropout<1:raise ValueError("dropout must be in [0,1)")
+        self.intensity_power=intensity_power
+        self.precursor_free_loss_weight=precursor_free_loss_weight
         self.cosine_loss_weight=cosine_loss_weight
+        self.ion_loss_weight=ion_loss_weight
+        self.ion_prediction_threshold=ion_prediction_threshold
         self.mol_encoder = mol_encoder
         self.edge_encoder = nn.Sequential(nn.Linear(action_dim + mol_encoder.graph_dim * 2, hidden_dim), nn.GELU(), nn.Linear(hidden_dim,hidden_dim))
         self.tree_encoder = GraphormerEncoder(node_dim=mol_encoder.graph_dim,hidden_dim=hidden_dim,edge_dim=hidden_dim,
             condition_dim=condition_dim,condition_token_count=1,num_heads=num_heads,num_layers=num_layers,
-            max_spatial_dist=max_action_count+1,max_edge_dist=max_action_count+1,undirected_for_spd=False,undirected_for_path=False,dropout=0.)
+            max_spatial_dist=max_action_count+1,max_edge_dist=max_action_count+1,undirected_for_spd=False,undirected_for_path=False,dropout=dropout)
         self.ion_encoder = nn.Linear(3,hidden_dim)
         self.ion_score = nn.Linear(hidden_dim,1)
         self.formula_intensity = FragmentTreeFormulaIntensityPredictor(formula_dim=formula_dim,hidden_dim=hidden_dim)
@@ -106,39 +133,103 @@ class PostMaterializationFragmentTreeModel(nn.Module):
         tree.edge_attr = edge_h
         node_h, _ = self.tree_encoder(tree,condition_repr=condition_h)
         ion_h = node_h[data.ion_node_index] + self.ion_encoder(data.ion_features)
-        ion_score = F.softplus(self.ion_score(F.gelu(ion_h)).squeeze(-1))
-        score = ion_score.new_zeros(data.formula_tensor.shape[0]).scatter_add_(0,data.ion_formula_index,ion_score)
-        count = ion_score.new_zeros(data.formula_tensor.shape[0]).scatter_add_(0,data.ion_formula_index,torch.ones_like(ion_score))
+        ion_logit = self.ion_score(F.gelu(ion_h)).squeeze(-1)
+        ion_score = F.softplus(ion_logit)
+        num_formulas = data.formula_tensor.shape[0]
+        score = ion_score.new_zeros(num_formulas).scatter_add_(0,data.ion_formula_index,ion_score)
+        count = ion_score.new_zeros(num_formulas).scatter_add_(0,data.ion_formula_index,torch.ones_like(ion_score))
+        # The most confident candidate ion explaining each formula. Kept out of
+        # the loss/intensity path entirely (that stays exactly as trained) so a
+        # caller building a spectrum for display can drop unconfident peaks
+        # (e.g. below self.ion_prediction_threshold) without changing what the
+        # model was actually optimized and validated against.
+        confidence = ion_logit.new_zeros(num_formulas).scatter_reduce_(0,data.ion_formula_index,ion_logit.sigmoid(),reduce='amax',include_self=True)
         intensity = self.formula_intensity(data.formula_tensor,score,count)
-        # Relative spectra are invariant to overall scale. Normalize each sample
-        # before fitting so reducing every peak cannot hide a wrong spectral shape.
         sample_count=data.tree_graph.num_graphs
+        # Displayed/predicted spectrum always includes the precursor peak and is
+        # never power-transformed; only the training losses below are.
         maximum=intensity.new_zeros(sample_count).scatter_reduce_(0,data.formula_sample_index,intensity,reduce='amax',include_self=True)
-        intensity=intensity/maximum[data.formula_sample_index].clamp_min(1e-8)
-        target=None
-        if data.target_intensity is not None:
-            target=data.target_intensity.clamp_min(0)
-            target_max=target.new_zeros(sample_count).scatter_reduce_(0,data.formula_sample_index,target,reduce='amax',include_self=True)
-            target=target/target_max[data.formula_sample_index].clamp_min(1e-8)
-        loss = intensity.sum()*0 if data.target_intensity is None or intensity.numel()==0 else F.mse_loss(torch.log1p(intensity),torch.log1p(target))
-        if data.target_intensity is not None and intensity.numel():
-            group=data.formula_sample_index
-            s=data.tree_graph.num_graphs
-            dot=intensity.new_zeros(s).scatter_add_(0,group,intensity*target)
-            pred_norm=intensity.new_zeros(s).scatter_add_(0,group,intensity.square())
-            target_norm=intensity.new_zeros(s).scatter_add_(0,group,target.square())
-            observed=target_norm>0
-            cosine=dot/(pred_norm*target_norm).sqrt().clamp_min(1e-8)
-            if torch.any(observed):loss=loss+self.cosine_loss_weight*(1-cosine[observed]).mean()
-        return PostMaterializationOutput(intensity,data.formula_sample_index,data.formula_tensor,data.formula_mz,loss)
+        normalized_intensity=intensity/maximum[data.formula_sample_index].clamp_min(1e-8)
+
+        # Root (source/precursor) node per sample: the first node materialized
+        # for that sample. A formula is "the precursor formula" if one of its
+        # candidate ions sits on that node (prepare_post_materialization already
+        # only keeps a node-0 candidate there when it matches the true precursor).
+        node_sample = data.decoded.node_sample_index
+        root_node = node_sample.new_full((sample_count,), node_sample.numel())
+        root_node.scatter_reduce_(0,node_sample,torch.arange(node_sample.numel(),device=node_sample.device),reduce='amin',include_self=True)
+        ion_is_root = data.ion_node_index==root_node[node_sample[data.ion_node_index]]
+        formula_is_precursor = ion_score.new_zeros(num_formulas).scatter_add_(0,data.ion_formula_index,ion_is_root.to(ion_score.dtype))>0
+
+        def spectrum_loss(keep_formula,keep_ion):
+            """Every loss term recomputed over only keep_formula/keep_ion, each
+            re-normalized to its own max=1. Used once over everything, and once
+            with the precursor excluded so its usually-dominant magnitude cannot
+            starve gradient for the rest of the spectrum; the model itself is
+            never asked to predict anything but the full, precursor-included
+            spectrum (see normalized_intensity above)."""
+            total = intensity.sum()*0
+            if data.target_intensity is not None and intensity.numel() and torch.any(keep_formula):
+                masked=intensity*keep_formula
+                peak_max=masked.new_zeros(sample_count).scatter_reduce_(0,data.formula_sample_index,masked,reduce='amax',include_self=True)
+                pred=(masked/peak_max[data.formula_sample_index].clamp_min(1e-8))[keep_formula]
+                masked_target=data.target_intensity.clamp_min(0)*keep_formula
+                target_max=masked_target.new_zeros(sample_count).scatter_reduce_(0,data.formula_sample_index,masked_target,reduce='amax',include_self=True)
+                target=(masked_target/target_max[data.formula_sample_index].clamp_min(1e-8))[keep_formula]
+                # A square-root-like power transform is standard in spectral
+                # similarity: it keeps the model outputting ordinary intensities,
+                # but the loss itself weighs small peaks much more relative to
+                # the base peak than a raw linear/log1p comparison would.
+                pred=pred.clamp_min(0).pow(self.intensity_power);target=target.pow(self.intensity_power)
+                total=total+F.mse_loss(pred,target)
+                group=data.formula_sample_index[keep_formula]
+                dot=pred.new_zeros(sample_count).scatter_add_(0,group,pred*target)
+                pred_norm=pred.new_zeros(sample_count).scatter_add_(0,group,pred.square())
+                target_norm=pred.new_zeros(sample_count).scatter_add_(0,group,target.square())
+                observed=target_norm>0
+                cosine=dot/(pred_norm*target_norm).clamp_min(1e-16).sqrt()
+                if torch.any(observed):total=total+self.cosine_loss_weight*(1-cosine[observed]).mean()
+            if data.ion_is_positive is not None and ion_logit.numel():
+                # Positive and negative candidate ions are mean-normalized
+                # separately (like multi_positive_loss in
+                # fragment_tree_training/model.py) so an imbalanced count on
+                # either side cannot let the model coast by scoring every
+                # candidate the same way.
+                positive=data.ion_is_positive & keep_ion
+                negative=(~data.ion_is_positive) & keep_ion
+                positive_loss=F.softplus(-ion_logit[positive])
+                negative_loss=F.softplus(ion_logit[negative])
+                ion_loss=(positive_loss.mean() if positive_loss.numel() else ion_logit.sum()*0) \
+                    + (negative_loss.mean() if negative_loss.numel() else ion_logit.sum()*0)
+                total=total+self.ion_loss_weight*ion_loss
+            return total
+
+        keep_all_formula=formula_is_precursor.new_ones(num_formulas)
+        keep_all_ion=ion_logit.new_ones(ion_logit.shape[0],dtype=torch.bool)
+        loss=spectrum_loss(keep_all_formula,keep_all_ion)
+        if self.precursor_free_loss_weight>0 and num_formulas:
+            keep_formula=~formula_is_precursor
+            keep_ion=~formula_is_precursor[data.ion_formula_index] if data.ion_formula_index.numel() else keep_all_ion
+            loss=loss+self.precursor_free_loss_weight*spectrum_loss(keep_formula,keep_ion)
+        return PostMaterializationOutput(normalized_intensity,data.formula_sample_index,data.formula_tensor,data.formula_mz,loss,confidence,ion_logit.sigmoid())
 
 
 def prepare_post_materialization(decoded: DecodedFragmentTreeBatch, fragmenter: Fragmenter,
-                                 precursor_types: Sequence[Adduct], tensorizer: FormulaTensorizer) -> PostMaterializationBatch:
-    """Ion/formula preparation is outside all neural forwards."""
-    graphs, node_ids, ion_features, formulas, formula_samples, mzs, formula_ids = [], [], [], [], [], [], []
+                                 precursor_types: Sequence[Adduct], tensorizer: FormulaTensorizer,
+                                 ion_positive_sets: Sequence[set[tuple[int, str]]] | None = None) -> PostMaterializationBatch:
+    """Ion/formula preparation is outside all neural forwards.
+
+    ion_positive_sets, when given, has one set per sample of (node_index, str(adduct))
+    pairs already confirmed by an observed peak during dataset preparation (see
+    ActionStructureBuilder.build). A candidate ion is positive when its own
+    (node, net adduct) is in that set; nothing is asserted for inference callers,
+    which omit this argument entirely.
+    """
+    graphs, node_ids, ion_features, formulas, formula_samples, mzs, formula_ids, ion_adduct = [], [], [], [], [], [], [], []
+    ion_is_positive = [] if ion_positive_sets is not None else None
     node_offset = 0
-    terminal = set(decoded.terminal_node_index.tolist())
+    # Every generated node can emit ions, including observed intermediates
+    # that also have positive outgoing branches. Terminal only stops expansion.
     for sample, tree in enumerate(decoded.trees):
         compounds = {i:decoded.compounds[node_offset+i] for i in range(tree.num_nodes)}
         builder = fragmenter.fragment_ion_tree_builder
@@ -158,31 +249,37 @@ def prepare_post_materialization(decoded: DecodedFragmentTreeBatch, fragmenter: 
             selected=[]
             for entry in range(group.indptr[formula_index],group.indptr[formula_index+1]):
                 node = int(group.node_indices[entry])
-                if node not in reachable or node_offset+node not in terminal:
+                if node not in reachable:
                     continue
                 adduct = group.candidate_adducts[group.candidate_adduct_indices[entry]]
                 if node == 0 and adduct.apply_to_formula(compounds[0].formula).normalized != precursor_types[sample].apply_to_formula(compounds[0].formula).normalized:
                     continue
-                selected.append((node,float(group.hydrogen_candidate_indices[entry]),float(group.shift_rule_indices[entry]),float(adduct.charge)))
+                selected.append((node,float(group.hydrogen_candidate_indices[entry]),float(group.shift_rule_indices[entry]),float(adduct.charge),adduct))
             if not selected:
                 continue
             new_index=len(formulas)
             formulas.append(formula)
             formula_samples.append(sample)
             mzs.append(formula.exact_mass)
-            for node,hydrogen,shift,charge in selected:
+            for node,hydrogen,shift,charge,adduct in selected:
                 node_ids.append(node_offset+node)
                 ion_features.append((hydrogen,shift,charge))
                 formula_ids.append(new_index)
+                ion_adduct.append(str(adduct))
+                if ion_is_positive is not None:
+                    ion_is_positive.append((node,str(adduct)) in ion_positive_sets[sample])
         node_offset += tree.num_nodes
     return PostMaterializationBatch(decoded,Batch.from_data_list(graphs),torch.tensor(node_ids,dtype=torch.long),
         torch.tensor(ion_features,dtype=torch.float32).reshape(-1,3),torch.tensor(formula_samples,dtype=torch.long),
-        tensorizer.formulas_to_tensor(formulas),torch.tensor(mzs,dtype=torch.float64),torch.tensor(formula_ids,dtype=torch.long),node_smiles=tuple(compound.smiles for compound in decoded.compounds))
+        tensorizer.formulas_to_tensor(formulas),torch.tensor(mzs,dtype=torch.float64),torch.tensor(formula_ids,dtype=torch.long),
+        ion_is_positive=torch.tensor(ion_is_positive,dtype=torch.bool) if ion_is_positive is not None else None,
+        ion_adduct=tuple(ion_adduct),
+        node_smiles=tuple(compound.smiles for compound in decoded.compounds))
 
 
 def collate_post_materialization(items: Sequence[PostMaterializationBatch], action_offsets: Sequence[int]) -> PostMaterializationBatch:
     molecules=[];trees=[];compounds=[];metadata_trees=[];edges=[];samples=[];actions=[];terminals=[];scores=[]
-    ion_nodes=[];ion_features=[];formula_samples=[];formulas=[];mzs=[];formula_ids=[];targets=[]
+    ion_nodes=[];ion_features=[];formula_samples=[];formulas=[];mzs=[];formula_ids=[];targets=[];ion_positives=[];ion_adducts=[]
     node_offset=sample_offset=formula_offset=0
     node_smiles=[]
     seed_actions=[];edge_offset=0
@@ -198,13 +295,18 @@ def collate_post_materialization(items: Sequence[PostMaterializationBatch], acti
         ion_features.append(item.ion_features);formula_samples.append(item.formula_sample_index+sample_offset)
         formulas.append(item.formula_tensor);mzs.append(item.formula_mz);formula_ids.append(item.ion_formula_index+formula_offset)
         if item.target_intensity is not None: targets.append(item.target_intensity)
+        if item.ion_is_positive is not None: ion_positives.append(item.ion_is_positive)
+        ion_adducts.append(item.ion_adduct)
         node_offset+=len(decoded.compounds);sample_offset+=len(decoded.trees);formula_offset+=item.formula_tensor.shape[0]
     if targets and len(targets)!=len(items):
         raise ValueError("Cannot mix supervised and inference downstream batches")
+    if ion_positives and len(ion_positives)!=len(items):
+        raise ValueError("Cannot mix downstream batches with and without ion positive/negative labels")
     decoded=DecodedFragmentTreeBatch(Batch.from_data_list(molecules),torch.cat(edges,dim=1),torch.cat(samples),torch.cat(actions),
         torch.cat(terminals),torch.cat(scores),tuple(metadata_trees),tuple(compounds),sum(i.decoded.rdkit_run_count for i in items),sum(i.decoded.failed_effect_count for i in items),edge_seed_action_index=torch.cat(seed_actions,dim=1))
     return PostMaterializationBatch(decoded,Batch.from_data_list(trees),torch.cat(ion_nodes),torch.cat(ion_features),
-        torch.cat(formula_samples),torch.cat(formulas),torch.cat(mzs),torch.cat(formula_ids),torch.cat(targets) if targets else None,node_smiles=tuple(node_smiles))
+        torch.cat(formula_samples),torch.cat(formulas),torch.cat(mzs),torch.cat(formula_ids),torch.cat(targets) if targets else None,
+        ion_is_positive=torch.cat(ion_positives) if ion_positives else None,ion_adduct=sum(ion_adducts,()),node_smiles=tuple(node_smiles))
 
 
 def deduplicate_molecular_graphs(data: PostMaterializationBatch, source_smiles=()):

@@ -1,4 +1,4 @@
-"""Backend for inspecting generated schema-v5 action training structures."""
+"""Backend for inspecting generated schema-v6 action training structures."""
 from __future__ import annotations
 
 import json
@@ -11,13 +11,13 @@ import torch
 
 def _teacher_states(structure) -> list[dict]:
     """One row per (sample, normalized action-set) teacher state, with its
-    valid next actions/EOS and, if materialized, the resulting fragment SMILES."""
-    state_action_ptr = structure.teacher_state_action_ptr.tolist()
-    state_action_index = structure.teacher_state_action_index.tolist()
+    positive branching actions and, if materialized, the resulting fragment SMILES."""
+    state_action_ptr = structure.teacher_node_action_ptr.tolist()
+    state_action_index = structure.teacher_node_action_index.tolist()
     positive_ptr = structure.teacher_positive_action_ptr.tolist()
     positive_index = structure.teacher_positive_action_index.tolist()
-    eos = structure.teacher_positive_eos.tolist()
-    sample_index = structure.teacher_state_sample_index.tolist()
+    eos = structure.teacher_node_observed.tolist()
+    sample_index = structure.teacher_node_sample_index.tolist()
     fragment_node_index = structure.state_fragment_node_index.tolist()
     compounds = structure.downstream.decoded.compounds if structure.downstream is not None else None
 
@@ -29,9 +29,13 @@ def _teacher_states(structure) -> list[dict]:
         rows.append({
             "sample": sample_index[row],
             "actions": actions,
-            "eos": bool(eos[row]),
+            "terminal": not next_actions,
+            "observed": bool(eos[row]),
+            "ms2Depth": int(structure.teacher_node_ms2_depth[row]),
+            "precursorRow": int(structure.teacher_node_precursor_row_index[row]),
+            "positiveWeights": structure.teacher_positive_action_weight[positive_ptr[row]:positive_ptr[row+1]].tolist(),
             "fragmentSmiles": str(compounds[node].smiles) if compounds is not None and node >= 0 else None,
-            "positiveNextActions": next_actions,
+            "positiveBranchActions": next_actions,
         })
     return rows
 
@@ -69,7 +73,7 @@ def _node_view(structure, samples, source_smiles, file_path):
     mol=source.mapped_mol
     drawer=rdMolDraw2D.MolDraw2DSVG(620,360)
     drawer.DrawMolecule(mol);drawer.FinishDrawing()
-    registry=[];original_actions=[];params={}
+    registry=[];original_actions=[];params={};cleavage_patterns={}
     for parent in file_path.parents:
         config=parent/'preparation_config.json'
         if config.exists():
@@ -78,7 +82,10 @@ def _node_view(structure, samples, source_smiles, file_path):
     fragmenter_params=model.get('fragmenter_params',params.get('fragmenterParams'))
     if fragmenter_params:
         from clefts.domain.fragment.fragmenter import Fragmenter
-        original_actions=list(Fragmenter.from_dict(fragmenter_params).fragment_ion_tree_builder.create_cleavage_actions(source))
+        fragmenter=Fragmenter.from_dict(fragmenter_params)
+        builder=fragmenter.fragment_ion_tree_builder
+        original_actions=list(builder.create_cleavage_actions(source))
+        cleavage_patterns={pattern.pattern_id:pattern for pattern in builder.cleavage_pattern_set}
         if len(original_actions)!=len(structure.action_type): original_actions=[]
     atoms=list(mol.GetAtoms())
     if len(atoms)!=structure.source_graph.num_nodes:
@@ -86,10 +93,11 @@ def _node_view(structure, samples, source_smiles, file_path):
     ptr=structure.action_source_atom_ptr.tolist();index=structure.action_source_atom_index.tolist()
     for number,category in enumerate(structure.action_type.tolist()):
         original=original_actions[number] if original_actions else None
-        definitions=(fragmenter_params or {}).get('fragment_ion_tree_builder',{}).get('cleavage_pattern_set',{}).get('patterns',[])
-        definition=definitions[category[0]] if category[0]<len(definitions) else {}
+        pattern=cleavage_patterns.get(category[0])
+        reaction=next((item for item in pattern.cleavage_reactions if item.id==category[1]),None) if pattern else None
         registry.append(dict(id=number,cleavagePatternId=category[0],reactionId=category[1],reactantId=category[1],productMoleculeId=category[2],
-            cleavagePatternName=definition.get('name',''),reactantSmarts=definition.get('reactant_smarts',''),
+            cleavagePatternName=pattern.name if pattern else '',reactantSmarts=pattern.reactant_smarts if pattern else '',
+            reactionName=reaction.source_rule.name if reaction else '',reactionProductSmarts=reaction.source_rule.smarts if reaction else '',
             sourceAtomMaps=list(original.source_atom_maps) if original else [atoms[i].GetAtomMapNum() for i in index[ptr[number]:ptr[number+1]]],
             retainedAtomMaps=sorted(original.retained_atom_maps) if original else [],
             discardedAtomMaps=sorted(original.discarded_atom_maps) if original else [],
@@ -121,10 +129,10 @@ def _node_view(structure, samples, source_smiles, file_path):
                 histories=[];eos=False;next_actions=set()
                 for state in states_for_node.get(offset+node.index,[]):
                     if state['actions'] not in histories:histories.append(state['actions'])
-                    eos=eos or state['eos'];next_actions.update(state['positiveNextActions'])
+                    eos=eos or state['observed'];next_actions.update(state['positiveBranchActions'])
                 precursor=any(set(history)==set(alternative) for history in histories for alternative in sample['precursorAlternatives'])
                 if node.index==0 and (not sample['precursorAlternatives'] or [] in sample['precursorAlternatives']):precursor=True
-                nodes.append(dict(id=ids[node.index],smiles=node.smiles,actionSets=histories,precursor=precursor,eos=eos,positiveNextActions=sorted(next_actions)))
+                nodes.append(dict(id=ids[node.index],smiles=node.smiles,actionSets=histories,precursor=precursor,observed=eos,positiveBranchActions=sorted(next_actions)))
             edges=[]
             for edge in (tree.get_edge(index) for index in range(tree.num_edges)):
                 transitions=[]
@@ -149,9 +157,9 @@ def inspect_structure(file_path: Path) -> dict:
         raise TypeError("This .preft.pt file has no saved structure.")
     structure = payload["structure"]
     metadata = dict(payload.get("metadata") or {})
-    required = ("teacher_state_action_ptr", "sample_precursor_row_ptr", "action_type")
+    required = ("teacher_node_action_ptr", "sample_precursor_row_ptr", "action_type")
     if not all(hasattr(structure, name) for name in required):
-        raise TypeError("This .preft.pt file is not a schema-v5 Source/action training structure.")
+        raise TypeError("This .preft.pt file is not a schema-v6 Source/action training structure.")
 
     source_smiles = str(metadata.get("smiles", ""))
     conditions = structure.condition_features.tolist()
@@ -213,7 +221,10 @@ def inspect_structure(file_path: Path) -> dict:
             **totals,
             "samples": num_samples,
             "primitiveActions": int(structure.action_type.shape[0]),
-            "teacherStates": len(states),
+            "teacherNodes": len(states),
+            "positiveBranches": structure.transition_added_action_index.numel(),
+            "precursorCandidates": structure.precursor_row_action_ptr.numel()-1,
+            "maxMs2Depth": int(structure.teacher_node_ms2_depth.max()) if states else 0,
             "transitions": len(transitions),
         },
         "samples": samples,

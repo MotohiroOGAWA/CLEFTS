@@ -19,7 +19,7 @@ from clefts.domain.mass.parse_ce import parse_ce_to_ev
 from clefts.ml.specgen.predict_spectrum import load_generator
 
 
-def _build_tree(result, sample: int) -> dict[str, Any]:
+def _build_tree(result, sample: int, tensorizer, threshold: float) -> dict[str, Any]:
     """Fragment-tree nodes/edges explored for this prediction, annotated with
     per-node neutral formula/exact mass plus any predicted-peak ion states."""
     fragments = result.fragments
@@ -54,26 +54,32 @@ def _build_tree(result, sample: int) -> dict[str, Any]:
     spectra = result.spectra
     ion_node_index = downstream.ion_node_index.detach().cpu().tolist()
     ion_formula_index = downstream.ion_formula_index.detach().cpu().tolist()
+    ion_probability = spectra.ion_probability.detach().cpu().tolist()
+    ion_adduct = downstream.ion_adduct
     formula_sample_index = downstream.formula_sample_index.detach().cpu().tolist()
     formula_mz = downstream.formula_mz.detach().cpu().tolist()
+    formula_tensor = downstream.formula_tensor
     intensity = spectra.intensity.detach().cpu().tolist()
 
+    # Candidate ions below the trained confidence threshold are the same
+    # unrelated adduct/hydrogen-shift guesses excluded from the peak list
+    # below; keep the node inspector consistent with what the spectrum shows.
     annotations_by_node: dict[int, list[dict[str, Any]]] = {}
-    for formula_index, formula_sample in enumerate(formula_sample_index):
-        if formula_sample != sample:
+    for entry, (node, node_ion_formula) in enumerate(zip(ion_node_index, ion_formula_index)):
+        if node not in local_index or formula_sample_index[node_ion_formula] != sample:
             continue
-        for entry, node_ion_formula in enumerate(ion_formula_index):
-            if node_ion_formula != formula_index:
-                continue
-            node = ion_node_index[entry]
-            if node not in local_index:
-                continue
-            annotations_by_node.setdefault(local_index[node], []).append(
-                {
-                    "peakMz": float(formula_mz[formula_index]),
-                    "peakIntensity": float(intensity[formula_index]),
-                }
-            )
+        probability = float(ion_probability[entry])
+        if probability < threshold:
+            continue
+        annotations_by_node.setdefault(local_index[node], []).append(
+            {
+                "peakMz": float(formula_mz[node_ion_formula]),
+                "peakIntensity": float(intensity[node_ion_formula]),
+                "adduct": ion_adduct[entry] if entry < len(ion_adduct) else "",
+                "ionFormula": str(tensorizer.tensor_to_formula(formula_tensor[node_ion_formula])),
+                "probability": probability,
+            }
+        )
 
     nodes = []
     for global_index in node_offsets:
@@ -85,6 +91,7 @@ def _build_tree(result, sample: int) -> dict[str, Any]:
                 "id": local,
                 "smiles": compound.smiles,
                 "depth": depth[local],
+                "precursor": depth[local] == 0,
                 "formula": str(neutral_formula),
                 "exactMass": neutral_formula.exact_mass,
                 "annotations": annotations_by_node.get(local, []),
@@ -150,17 +157,31 @@ def predict(request: dict[str, Any]) -> dict[str, Any]:
 
     if not result.spectra.mz.numel():
         raise ValueError("The model did not produce any peaks for this input.")
+    threshold = generator.post_model.ion_prediction_threshold
     peaks = sorted(
         (
-            {"mz": float(mz), "intensity": float(intensity)}
-            for mz, intensity in zip(
+            {
+                "mz": float(mz),
+                "intensity": float(intensity),
+                "formula": str(generator.tensorizer.tensor_to_formula(formula_row)),
+                "confidence": float(confidence),
+            }
+            for mz, intensity, formula_row, confidence in zip(
                 result.spectra.mz.detach().cpu().tolist(),
                 result.spectra.intensity.detach().cpu().tolist(),
+                result.spectra.formula_tensor,
+                result.spectra.confidence.detach().cpu().tolist(),
             )
+            # Below the trained ion confidence threshold: the same unrelated
+            # adduct/hydrogen-shift candidate this model now learns to push
+            # toward zero, kept out of the predicted spectrum shown here.
+            if confidence >= threshold
         ),
         key=lambda peak: peak["mz"],
     )
-    tree = _build_tree(result, sample=0)
+    if not peaks:
+        raise ValueError("Every candidate peak was below the model's ion confidence threshold.")
+    tree = _build_tree(result, sample=0, tensorizer=generator.tensorizer, threshold=threshold)
 
     rdDepictor.Compute2DCoords(mol)
     drawer = rdMolDraw2D.MolDraw2DSVG(420, 300)
