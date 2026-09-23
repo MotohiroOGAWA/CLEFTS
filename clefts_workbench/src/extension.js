@@ -281,6 +281,7 @@ function normalizeTrainingConfig(config) {
   const result=JSON.parse(JSON.stringify(config||{}));
   const model=result.modelConfig?.params||result.modelConfig;
   if(model&&typeof model==='object'&&!Array.isArray(model)){
+    if(!result.molEncoderCheckpoint&&typeof model.mol_encoder_checkpoint==='string')result.molEncoderCheckpoint=model.mol_encoder_checkpoint;
     result.modelConfig={};
     for(const key of ['action_model_params','post_model_params'])if(model[key]&&typeof model[key]==='object'&&!Array.isArray(model[key]))result.modelConfig[key]=model[key];
     if(!Object.keys(result.modelConfig).length)delete result.modelConfig;
@@ -296,7 +297,7 @@ async function runTraining(context, output, config, panel) {
   for (const key of ['trainDir', 'valDir', 'outputDir']) {
     if (!config[key]) throw new Error(`${key} is required.`);
   }
-  if (!config.resume && !config.fineTuneCheckpoint && !String(config.molEncoderCheckpoint || config.modelConfig?.mol_encoder_checkpoint || '').trim()) throw new Error('Mol encoder checkpoint is required for new training.');
+  if (!config.resume && !config.fineTuneCheckpoint && !String(config.molEncoderCheckpoint || '').trim()) throw new Error('Mol encoder checkpoint is required for new training.');
   if (config.initializeFrom && (config.resume || config.fineTuneCheckpoint)) throw new Error('Use pretrained weight initialization, resume, or frozen-base expansion separately.');
   const root = projectRoot(context);
   const python = vscode.workspace.getConfiguration('clefts').get('pythonPath', 'python');
@@ -369,7 +370,7 @@ function buildTrainingArgs(c) {
     '--train-dir', c.trainDir, '--val-dir', c.valDir, '--output-dir', c.outputDir,
     '--epochs', String(c.epochs || 1), '--batch-size', String(c.batchSize || 4),
     '--device', c.device || 'cuda', '--lr', String(c.lr ?? 0.0001)];
-  const encoder=c.molEncoderCheckpoint||c.modelConfig?.mol_encoder_checkpoint;
+  const encoder=c.molEncoderCheckpoint;
   if(encoder&&!c.resume&&!c.fineTuneCheckpoint)a.push('--mol-encoder-checkpoint',encoder);
   if(!c.resume&&!c.fineTuneCheckpoint){
     const sections={action_model_params:{hidden_dim:'action-hidden-dim',branch_main_adduct_dim:'action-main-adduct-dim',num_heads:'action-num-heads',max_roles:'action-max-roles',branch_path_threshold:'branch-path-threshold',max_fragment_nodes:'max-fragment-nodes',state_num_layers:'action-state-layers'},post_model_params:{hidden_dim:'post-hidden-dim',num_layers:'post-num-layers',num_heads:'post-num-heads',ion_embedding_dim:'ion-embedding-dim',unsaturation_embedding_dim:'unsaturation-embedding-dim',radical_embedding_dim:'radical-embedding-dim',state_hidden_dim:'ion-state-hidden-dim',main_adduct_dim:'main-adduct-embedding-dim',collision_energy_dim:'collision-energy-feature-dim',cosine_loss_weight:'post-cosine-loss-weight',ion_loss_weight:'post-ion-loss-weight',ion_prediction_threshold:'post-ion-threshold',peak_intensity_threshold:'post-peak-intensity-threshold',intensity_power:'post-intensity-power',precursor_free_loss_weight:'post-precursor-free-weight'}};
