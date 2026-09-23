@@ -43,3 +43,5 @@ assert.equal(inheritedArgs[inheritedArgs.indexOf('--action-hidden-dim')+1],'64')
 assert.equal(inheritedArgs[inheritedArgs.indexOf('--dropout')+1],'0.3');
 assert(!inheritedArgs.includes('--action-state-dropout'));assert(!inheritedArgs.includes('--post-dropout'));
 assert(!html.match(/<form id="trainingForm"[\s\S]*?<\/form>/)[0].includes('name="fineTunePatternSet"'));
+const savedTraining=extension.normalizeTrainingConfig({adduct_type_strs:['top'],symbols:['C'],modelConfig:{architecture:'x',fragmenter_params:{x:1},mol_encoder_params:{node_dim:9},adduct_type_strs:['nested'],action_model_params:{hidden_dim:64},post_model_params:{hidden_dim:32}}});
+assert(!('adduct_type_strs' in savedTraining));assert(!('adduct_type_strs' in savedTraining.modelConfig));assert(!('fragmenter_params' in savedTraining.modelConfig));assert(!('mol_encoder_params' in savedTraining.modelConfig));assert.deepEqual(Object.keys(savedTraining.modelConfig).sort(),['action_model_params','post_model_params']);

@@ -30,7 +30,7 @@ The `Training` tab follows the same workflow: select the generated training and 
 python -m clefts.ml.training.fragment_tree_training.training_model ...
 ```
 
-Training configurations use the dedicated `*.pfttrain.json` suffix. Every CLI run writes `fragment_tree.pfttrain.json` into its output directory, and the same file can be loaded from the Training tab. The Workbench only passes arguments to the CLI and displays its output; training, configuration output, checkpoints, and model artifacts remain owned by the Python implementation.
+Training configurations use the dedicated `*.pfttrain.json` suffix. Load, drop, or save them from the top-right of the Fragment Tree Training page. They contain run settings and trainable Branch / Fragment Transformer / Ion-State / Intensity parameters only. Fragmenter settings, Cleavage Patterns, ion-adduct rules, Symbols, molecular-encoder parameters, and adduct ordering are inherited from prepared datasets and checkpoints, checked for compatibility, and displayed read-only. The Workbench only passes supported training arguments to the CLI; resolved model metadata remains owned by the Python implementation and its checkpoints.
 
 Set `clefts.pythonPath` when the required Python environment is not available as `python`. The CLEFTS project directory defaults to the parent directory of this extension and can be overridden with `clefts.applicationRoot`.
 

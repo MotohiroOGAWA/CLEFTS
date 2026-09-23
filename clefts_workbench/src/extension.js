@@ -134,13 +134,16 @@ function openWorkbench(context, output, initialPage = "home") {
         }
       } else if (message.type === 'saveTrainingConfig') {
         const target = await vscode.window.showSaveDialog({ filters: { 'CLEFTS training configuration': ['pfttrain.json'] }, defaultUri: vscode.Uri.file('fragment_tree.pfttrain.json') });
-        if (target) {await fs.promises.writeFile(target.fsPath, JSON.stringify(normalizeTrainingConfig(message.config), null, 2) + '\n');projects.record(context,'training',message.config,{label:path.basename(target.fsPath),reason:'exported',sourcePath:target.fsPath,base:projectRoot(context)});}
-      } else if (message.type === 'loadTrainingConfig') {
-        const picked = await vscode.window.showOpenDialog({ filters: { 'CLEFTS training configuration': ['pfttrain.json'] }, canSelectMany: false });
+        if (target) {const config=normalizeTrainingConfig(message.config);await fs.promises.writeFile(target.fsPath, JSON.stringify(config, null, 2) + '\n');projects.record(context,'training',config,{label:path.basename(target.fsPath),reason:'exported',sourcePath:target.fsPath,base:projectRoot(context)});}
+      } else if (['loadTrainingConfig','loadTrainingConfigFile','loadTrainingConfigJSON'].includes(message.type)) {
+        if(message.type==='loadTrainingConfigJSON'&&(typeof message.json!=='string'||message.json.length>2000000))throw new Error('Training configuration is too large or invalid.');
+        if(message.type==='loadTrainingConfigFile'&&(typeof message.path!=='string'||!message.path.trim()))throw new Error('Select a training configuration file.');
+        const picked = message.type==='loadTrainingConfigFile'?[vscode.Uri.file(message.path)]:message.type==='loadTrainingConfigJSON'?[{fsPath:message.name||'fragment_tree.pfttrain.json'}]:await vscode.window.showOpenDialog({ filters: { 'CLEFTS training configuration': ['pfttrain.json'] }, canSelectMany: false });
         if (picked && picked[0]) {
-          const config = JSON.parse(await fs.promises.readFile(picked[0].fsPath, 'utf8'));
-          if(!config.modelConfig && config.params)config.modelConfig=parameterService.merge(parameterService.defaults(projectRoot(context)),parameterService.unpack(JSON.parse(await fs.promises.readFile(path.resolve(path.dirname(picked[0].fsPath),config.params),'utf8'))));
-          panel.webview.postMessage({ type: 'trainingConfig', path: picked[0].fsPath, config: { ...defaultTrainingConfig(context), ...config } });
+          const raw=JSON.parse(message.type==='loadTrainingConfigJSON'?message.json:await fs.promises.readFile(picked[0].fsPath, 'utf8'));
+          if(!raw.modelConfig&&raw.params){if(message.type==='loadTrainingConfigJSON')throw new Error('Dropped training configurations must contain their model settings.');raw.modelConfig=parameterService.merge(parameterService.defaults(projectRoot(context)),parameterService.unpack(JSON.parse(await fs.promises.readFile(path.resolve(path.dirname(picked[0].fsPath),raw.params),'utf8'))));}
+          const config=normalizeTrainingConfig(raw);
+          panel.webview.postMessage({ type: 'trainingConfig', path: message.type==='loadTrainingConfigJSON'?undefined:picked[0].fsPath, config: { ...defaultTrainingConfig(context), ...config } });
         }
       } else if (message.type === 'openResult') {
         await openResultPicker();
@@ -220,7 +223,7 @@ function openWorkbench(context, output, initialPage = "home") {
     } catch (error) {
       if (/^(load|save)Cleavage/.test(message.type)) panel.webview.postMessage({ type: 'cleavagePatternError', message: String(error.message || error) });
       if (message.type === 'chemistry') panel.webview.postMessage({ type: 'chemistryError', requestId: message.requestId, message: String(error.message || error) });
-      const trainingMessage = ['runTraining', 'copyTrainingCommand', 'saveTrainingConfig', 'loadTrainingConfig'].includes(message.type);
+      const trainingMessage = ['runTraining', 'copyTrainingCommand', 'saveTrainingConfig', 'loadTrainingConfig', 'loadTrainingConfigFile', 'loadTrainingConfigJSON'].includes(message.type);
       panel.webview.postMessage({ type: trainingMessage ? 'trainingStatus' : 'status', status: 'error', text: String(error.message || error) });
       vscode.window.showErrorMessage(`CLEFTS: ${error.message || error}`);
     }
@@ -275,7 +278,17 @@ function normalizeConfig(config) {
 }
 
 function normalizeTrainingConfig(config) {
-  return { ...config };
+  const result=JSON.parse(JSON.stringify(config||{}));
+  const model=result.modelConfig?.params||result.modelConfig;
+  if(model&&typeof model==='object'&&!Array.isArray(model)){
+    result.modelConfig={};
+    for(const key of ['action_model_params','post_model_params'])if(model[key]&&typeof model[key]==='object'&&!Array.isArray(model[key]))result.modelConfig[key]=model[key];
+    if(!Object.keys(result.modelConfig).length)delete result.modelConfig;
+  }
+  for(const key of ['adduct_type_strs','fragmenter_params','mol_encoder_params','symbols'])delete result[key];
+  delete result.params;
+  delete result.initializeFrom;
+  return result;
 }
 
 async function runTraining(context, output, config, panel) {

@@ -22,6 +22,13 @@ class TestConfigOptions(unittest.TestCase):
         configure_model_options(parser)
         return parser
 
+    def test_adduct_embedding_order_is_not_a_cli_parameter(self):
+        parser = self.parser()
+        self.assertNotIn('--adduct-types-json', parser._option_string_actions)
+        resolved = resolve_model_options(parser.parse_args([
+            '--params-json', '{"adduct_type_strs":["[M+K]+"]}']))
+        self.assertNotIn('adduct_type_strs', resolved)
+
     def test_file_inline_named_and_individual_precedence(self):
         with tempfile.TemporaryDirectory() as directory:
             file=Path(directory)/'config.json'

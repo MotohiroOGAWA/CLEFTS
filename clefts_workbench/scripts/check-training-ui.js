@@ -10,6 +10,12 @@ const event=()=>new w.Event('change',{bubbles:true});
 const post=data=>w.dispatchEvent(new w.MessageEvent('message',{data}));
 assert.deepEqual(errors,[]);
 d.querySelector('#legacyNavigation [data-app=training]').click();
+assert(d.querySelector('#loadTraining').closest('.training-heading'));
+assert(d.querySelector('#saveTraining').closest('.training-heading'));
+assert(!form.querySelector('section:nth-last-of-type(1) #loadTraining'));
+assert(!d.getElementById('trainingParameterDrop'),'Training uses the complete configuration loader instead of a second parameter importer');
+d.getElementById('loadTraining').click();assert.equal(messages.at(-1).type,'loadTrainingConfig');
+const drop=new w.Event('drop',{bubbles:true,cancelable:true});Object.defineProperty(drop,'dataTransfer',{value:{files:[],getData:type=>type==='text/uri-list'?'file:///tmp/training.pfttrain.json':''}});d.getElementById('loadTraining').ondrop(drop);assert.equal(messages.at(-1).type,'loadTrainingConfigFile');assert.equal(messages.at(-1).path,'/tmp/training.pfttrain.json');
 for(const button of form.querySelectorAll('[data-model-component]')){button.click();const section=d.querySelector('#trainingParameterEditor [data-model-block="'+button.dataset.modelComponent+'"]');assert(section);assert(!section.querySelector('[data-advanced]')?.hidden);}
 for(const key of ['mol_encoder_params','fragmenter_params','adduct_type_strs'])assert(!form.querySelector('[data-model-block="'+key+'"]'));
 const dimension=form.querySelector('[data-parameter-path="action_model_params.hidden_dim"]');dimension.value='64';dimension.dispatchEvent(new w.Event('input',{bubbles:true}));assert.equal(w.eval('getTrainingConfig()').modelConfig.action_model_params.hidden_dim,64);
@@ -41,6 +47,8 @@ form.elements.valDir.value='/fixtures/validation_structures';form.elements.molEn
 const sourceRequest=messages.filter(m=>m.type==='training/sources').at(-1);assert(sourceRequest);
 post({type:'training/sources',requestId:sourceRequest.requestId,modelConfig:{fragmenter_params:preset.fragmenter_params,mol_encoder_params:{...preset.mol_encoder_params,node_dim:48},adduct_type_strs:preset.adduct_type_strs}});
 assert.equal(w.eval('getTrainingConfig()').modelConfig.mol_encoder_params.node_dim,48);assert.equal(w.eval('getTrainingConfig()').modelConfig.action_model_params.hidden_dim,64);assert(!form.querySelector('[data-model-block=mol_encoder_params]'));
+const inherited=d.getElementById('trainingInheritedConfig');assert(inherited.textContent.includes('Cleavage Pattern Set'));assert(inherited.textContent.includes('Ion Adduct Rule Set'));assert(inherited.textContent.includes('Molecular Encoder Parameters'));assert(inherited.querySelectorAll('details details').length>1,'patterns and adduct rules must be independently collapsible');assert.equal(inherited.querySelectorAll('input,select,textarea,button').length,0,'inherited settings must be read-only');assert(inherited.querySelector('.training-symbols'));assert.equal(inherited.querySelectorAll('.training-symbols span').length,preset.mol_encoder_params.symbols.length);
+form.querySelector('[data-model-checkpoint]').click();assert(inherited.querySelector('[data-inherited-model=mol]').open);
 assert(!form.elements.fineTunePatternSet);
 function mode(value){const radio=form.querySelector('input[name=trainingMode][value='+value+']');radio.checked=true;radio.dispatchEvent(event());}
 mode('resume');form.elements.resume.value='/model/resume.pt';form.elements.resume.dispatchEvent(event());assert(messages.some(m=>m.type==='training/checkpoint'&&m.path==='/model/resume.pt'));

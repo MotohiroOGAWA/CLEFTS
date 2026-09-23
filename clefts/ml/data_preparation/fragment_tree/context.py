@@ -21,7 +21,9 @@ def create_preparation_context(config, *, observed_adducts=()):
     if not symbols: raise ValueError('Select at least one element symbol.')
     if not isinstance(symbols,(list,tuple)) or any(not isinstance(value,str) or value not in {Chem.GetPeriodicTable().GetElementSymbol(i) for i in range(1,119)} for value in symbols):
         raise ValueError('Symbols must be a list of valid element symbols.')
-    types=list(dict.fromkeys(str(Adduct.parse(str(value))) for value in config.get('adduct_type_strs',fragmenter.adduct_types)))
+    # The embedding order is resolved from chemistry and the actual datasets;
+    # it is not a user-configurable preparation or training parameter.
+    types=list(dict.fromkeys(str(value) for value in fragmenter.adduct_types))
     for value in observed_adducts:
         adduct=Adduct.parse(str(value))
         fragmenter.get_index_by_adduct_type(adduct)

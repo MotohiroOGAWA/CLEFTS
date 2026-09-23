@@ -56,6 +56,19 @@ class TestTrainingSources(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'different elements'):
                 dataset_sources(train, validation)
 
+    def test_molecular_encoder_symbols_must_match_prepared_data(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            train = self._dataset(root, 'train', ['C', 'N', 'O'])
+            validation = self._dataset(root, 'validation', ['O', 'N', 'C'])
+            checkpoint = root / 'encoder.pt'
+            torch.save({
+                'mol_encoder_params': {'symbols': ('C', 'N', 'S')},
+                'mol_encoder_state_dict': {},
+            }, checkpoint)
+            with self.assertRaisesRegex(ValueError, 'molecular encoder checkpoint'):
+                inherit_model_config({}, train, validation, encoder_checkpoint=checkpoint)
+
 
 if __name__ == '__main__':
     unittest.main()
