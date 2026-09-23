@@ -124,7 +124,7 @@ Opening a `*.clevageset.json` file directly in Explorer also uses the dedicated 
 
 ## Single-SMILES cleavage viewer
 
-Open `Visualization → Cleavage Viewer`, load a pattern set, and select either the complete set or one pattern. `Stepwise actions` highlights the currently compatible Source locations, previews the resulting fragment before an action is added, and masks actions invalidated by the selected simultaneous action set. `Exhaustive candidates` enumerates valid unordered action sets up to `Max actions` and shows each fragment and SMIRKS. This page reuses the exact Reaction Preview UI instance from the Cleavage Pattern editor.
+Open `Visualization → Cleavage Viewer`, load a pattern set, and select either the complete set or one pattern. In `Stepwise actions`, first choose a reaction center from `Matched reactions`; this filters `Matched reactants` to the reactant matches associated with that center. Selecting a reactant keeps every related reactant visible and opens its product choices, so comparisons only require switching the active reactant or product. Clicking a bond displays every reaction associated with that bond. Each selected action can be removed independently. `Exhaustive candidates` enumerates valid unordered action sets up to `Max actions` and shows each fragment and SMIRKS. This page reuses the exact Reaction Preview UI instance from the Cleavage Pattern editor.
 
 ## Package
 

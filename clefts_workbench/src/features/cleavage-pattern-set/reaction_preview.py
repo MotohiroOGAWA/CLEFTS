@@ -216,6 +216,8 @@ def _action_summary(action, action_id: int, patterns: CleavagePatternSet,
         "sourceAtomMaps": list(action.source_atom_maps),
         "retainedAtomMaps": sorted(action.retained_atom_maps),
         "changedBondMaps": [list(edge) for edge in sorted(action.changed_bond_maps)],
+        "reactionBondMaps": [list(edge) for edge in sorted(
+            action.cut_bond_maps | frozenset((u, v) for u, v, _ in action.bond_updates))],
     }
 
 
@@ -247,6 +249,8 @@ def cleavage_explore(payload: dict[str, Any]) -> dict[str, Any]:
     for action_id, action in enumerate(actions):
         item = _action_summary(action, action_id, patterns, map_to_index)
         item["bonds"] = sorted(edge_to_bond[edge] for edge in action.matched_bond_maps)
+        item["reactionBonds"] = sorted(edge_to_bond[tuple(edge)]
+                                       for edge in item["reactionBondMaps"])
         summaries.append(item)
 
     requested_ids = tuple(int(value) for value in payload.get("selectedActionIds", []))

@@ -28,7 +28,7 @@ To update a preparation run, open **Training Data → Fragmentation → Cleavage
 
 Open **Visualization → Cleavage Viewer** to inspect cleavage of one SMILES with the pattern set currently loaded in **Cleavage Patterns**. Select the full set or one pattern and choose either mode:
 
-- **Stepwise actions** highlights only actions that can still join the selected simultaneous action set. Clicking a location previews its retained fragment; **Add action** confirms it. Selected actions can be removed.
+- **Stepwise actions** first presents **Matched reactions** as reaction centers only, without product-level rows. Select a reaction center to filter **Matched reactants** to its related reactant matches. Selecting one reactant changes only the active reactant—the other related reactants remain visible—and then displays that reactant's product choices. Clicking a highlighted bond selects its reaction center, including every currently valid reaction associated with that bond. Every selected action has its own **Remove** button.
 - **Exhaustive candidates** generates all valid unordered action sets up to **Max actions** and displays their fragments and reaction SMIRKS.
 
 The viewer and **Cleavage Patterns → Reaction Preview** are the same UI instance. The stepwise mask uses the production fragment-tree rules: every action retains every other action's Source match, no two actions change the same Source bond, duplicate/redundant actions are excluded, the retained atom intersection is nonempty, and the action limit is respected. Candidate sets must also produce an RDKit-valid fragment.

@@ -115,6 +115,10 @@ assert len(exploration['actions']) == 8
 assert exploration['availableActionIds'] == list(range(8))
 assert any(action['sourceAtomMaps'] == [2, 1] and action['atoms'] == [1, 0]
            for action in exploration['actions']), 'query-role order must not be sorted'
+assert all(action['reactionBondMaps'] and action['reactionBonds']
+           for action in exploration['actions']), 'reaction centers must be explicit'
+assert len({tuple(map(tuple, action['reactionBondMaps']))
+            for action in exploration['actions']}) == 4
 selected_id = next(action_id for action_id in exploration['availableActionIds']
                    if preview.cleavage_explore({**request, 'selectedActionIds':[action_id]})['availableActionIds'])
 selected = preview.cleavage_explore({**request, 'selectedActionIds':[selected_id]})
