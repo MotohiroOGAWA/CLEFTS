@@ -88,7 +88,7 @@ function defaultTrainingConfig(context) {
   return workbenchDefaults.workflowDefaults('training',{
     application: 'fragment-tree-training', modelConfig: parameterService.defaults(root), params: defaultParams, trainDir: '', valDir: '',
     outputDir: '',
-    experimentName: 'exp_main', molEncoderCheckpoint: '', epochs: 1, batchSize: 4, device: 'cuda', maxSamples:128, seed:42, warmupSteps:100, validationIntervalSteps:0, validationFraction:0.1, lrPatience:3, earlyStoppingPatience:10, minLr:0.000001, branchWeight:1, negativeWeight:0.2, branchMilTemperature:0.1, intensityWeight:1, gradientClip:1, lr: 0.0001, dropout: 0.5, resume: '',
+    experimentName: 'exp_main', molEncoderCheckpoint: '', epochs: 1, batchSize: 4, device: 'cuda', maxSamples:128, seed:42, warmupSteps:100, validationIntervalSteps:0, validationFraction:0.1, lrPatience:3, earlyStoppingPatience:10, minLr:0.000001, branchWeight:1, negativeWeight:0.2, branchMilTemperature:0.1, intensityWeight:1, gradientClip:1, lr: 0.0001, dropout: 0.5, resume: '', minimumAssignmentScore:0, minimumAssignmentScoreWithoutPrecursor:0,
     fineTuneCheckpoint: '', adapterWidth: 8
   },root);
 }
@@ -658,6 +658,8 @@ const HELP = {
   dropout: 'Dropout shared by the constructed fragment-tree model.',
   assignmentScoreThreshold: 'Minimum assignment score accepted for training and the filtered validation view. Reads assignment_scores.tsv from each split. Default: 0.8. Validation also evaluates all samples by combining disjoint above- and below-threshold results without repeating inference.',
   maxSamples: 'Maximum spectra packed into one loaded compound batch.',
+  minimumAssignmentScore: 'Drop a prepared sample at training load time if its assignment score (fraction of matched peak intensity, all peaks) is below this value. Data preparation keeps every sample; this only affects what training actually loads. Use 0 to keep every sample.',
+  minimumAssignmentScoreWithoutPrecursor: 'Drop a prepared sample at training load time if its assignment score excluding the precursor peak is below this value. Use 0 to keep every sample.',
   experimentName: 'Checkpoint experiment directory name.', ckptId: 'Optional checkpoint identifier to resume.',
   batchSize: 'Number of prepared compound batches per optimizer step.', device: 'PyTorch execution device.',
   epochs: 'Number of complete training epochs.', validationIntervalSteps: 'Run validation after this many optimizer steps; use 0 to disable step validation.',

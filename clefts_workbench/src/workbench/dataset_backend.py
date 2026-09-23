@@ -175,6 +175,29 @@ def training_sources(payload):
         encoder_checkpoint=payload.get('molEncoderCheckpoint'), saved_model=saved)
     return {'modelConfig': config}
 
+def training_assignment_score_counts(payload):
+    import torch
+    minimum=float(payload.get('minimumAssignmentScore',0))
+    minimum_without_precursor=float(payload.get('minimumAssignmentScoreWithoutPrecursor',0))
+    for value,label in ((minimum,'Minimum assignment score'),(minimum_without_precursor,'Minimum assignment score without precursor')):
+        if not math.isfinite(value) or not 0<=value<=1: raise ValueError(f'{label} must be between 0 and 1.')
+    def passes(sample):
+        full=sample['assignmentScore'];without=sample['assignmentScoreWithoutPrecursor']
+        return (full is None or full>=minimum) and (without is None or without>=minimum_without_precursor)
+    result={}
+    for field,directory in (('train',payload.get('trainDir')),('validation',payload.get('valDir'))):
+        if not directory: continue
+        directory=Path(directory)
+        try: stats=json.loads((directory/'action_statistics.json').read_text())
+        except (OSError,json.JSONDecodeError): stats={}
+        samples=filtered=0
+        for file in sorted(directory.rglob('*.preft.pt')):
+            annotations=torch.load(file,map_location='cpu',weights_only=False)['structure'].sample_annotations
+            samples+=len(annotations)
+            filtered+=sum(1 for sample in annotations if passes(sample))
+        result[field]=dict(rawRecords=stats.get('num_metadata_valid_records'),samples=samples,filteredSamples=filtered)
+    return result
+
 def mol_smiles(payload):
     from rdkit import Chem, rdBase
     from rdkit.Chem.Draw import rdMolDraw2D
@@ -257,7 +280,7 @@ def main():
     request=json.loads(sys.stdin.read())
     try:
         with contextlib.redirect_stdout(sys.stderr):
-            result={'mol-smiles':mol_smiles,'mol-preflight':mol_preflight,'training-sources':training_sources,'training-checkpoint':training_checkpoint,'structure-manifest':structure_manifest,'columns':columns,'preview':preview,'validate':validate,'validate-config':lambda payload:validate(payload,check_datasets=False),'model':model}[request['command']](request['payload'])
+            result={'mol-smiles':mol_smiles,'mol-preflight':mol_preflight,'training-sources':training_sources,'training-checkpoint':training_checkpoint,'training-assignment-score-counts':training_assignment_score_counts,'structure-manifest':structure_manifest,'columns':columns,'preview':preview,'validate':validate,'validate-config':lambda payload:validate(payload,check_datasets=False),'model':model}[request['command']](request['payload'])
         print(json.dumps({'ok':True,'result':result},allow_nan=False))
     except Exception as error:
         import traceback

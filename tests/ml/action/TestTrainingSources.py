@@ -6,8 +6,13 @@ from unittest.mock import patch
 
 import torch
 
+from clefts.libs.mmkit.mmkit import Adduct, Compound, Formula
+from clefts.ml.data_preparation.fragment_tree.context import create_preparation_context
+from clefts.ml.input.action_batching import select_samples
+from clefts.ml.input.structure_builder import ActionStructureBuilder
 from clefts.ml.training.fragment_tree_training.sources import dataset_sources, inherit_model_config
 from clefts.ml.training.fragment_tree_training import training
+from .TestActionPipeline import config
 
 
 class TestTrainingSources(unittest.TestCase):
@@ -68,6 +73,34 @@ class TestTrainingSources(unittest.TestCase):
             }, checkpoint)
             with self.assertRaisesRegex(ValueError, 'molecular encoder checkpoint'):
                 inherit_model_config({}, train, validation, encoder_checkpoint=checkpoint)
+
+    def test_sample_meets_assignment_score_treats_missing_scores_as_passing(self):
+        self.assertTrue(training._sample_meets_assignment_score({'assignmentScore': None, 'assignmentScoreWithoutPrecursor': None}, 0.9, 0.9))
+        self.assertTrue(training._sample_meets_assignment_score({'assignmentScore': 0.9, 'assignmentScoreWithoutPrecursor': None}, 0.5, 0.9))
+        self.assertFalse(training._sample_meets_assignment_score({'assignmentScore': 0.4, 'assignmentScoreWithoutPrecursor': None}, 0.5, 0))
+        self.assertFalse(training._sample_meets_assignment_score({'assignmentScore': 1.0, 'assignmentScoreWithoutPrecursor': 0.2}, 0, 0.5))
+
+    def test_assignment_score_filter_drops_low_scoring_samples_via_select_samples(self):
+        # Data preparation always keeps every sample; training-time loading is
+        # where a below-threshold sample now gets dropped, via select_samples.
+        model = config(); model['fragmenter_params']['fragment_ion_tree_builder']['max_action_count'] = 1
+        builder = ActionStructureBuilder(create_preparation_context(model))
+        source = Compound.from_smiles('CCO'); adduct = Adduct.parse('[M+H]+')
+        precursor_mz = Formula.parse('C2H7O+').exact_mass
+        # Sample 0 is a lone matched precursor peak (assignmentScore 1.0). Sample 1 adds
+        # a large unmatched peak alongside the matched precursor, dragging its score down.
+        data, kept = builder.build(source, [adduct, adduct], [20., 20.],
+            [[precursor_mz], [precursor_mz, 1000.]], [[1.], [1., 100.]])
+        self.assertEqual(len(data.sample_annotations), 2)
+        full_scores = [sample['assignmentScore'] for sample in data.sample_annotations]
+        self.assertAlmostEqual(full_scores[0], 1.0)
+        self.assertLess(full_scores[1], 0.5)
+        surviving = [index for index, sample in enumerate(data.sample_annotations)
+                     if training._sample_meets_assignment_score(sample, 0.5, 0)]
+        self.assertEqual(surviving, [0])
+        filtered = select_samples(data, surviving)
+        self.assertEqual(filtered.num_samples, 1)
+        self.assertAlmostEqual(filtered.sample_annotations[0]['assignmentScore'], 1.0)
 
 
 if __name__ == '__main__':

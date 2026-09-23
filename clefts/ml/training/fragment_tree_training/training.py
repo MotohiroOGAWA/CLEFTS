@@ -31,6 +31,13 @@ def confirm_output_overwrite(output: Path, *, overwrite: bool, resume) -> None:
     )
 
 
+def _sample_meets_assignment_score(sample, minimum_assignment_score, minimum_assignment_score_without_precursor):
+    """A score of None means it could not be computed for that sample (e.g. zero
+    total intensity), so it never fails a threshold it can't be checked against."""
+    full=sample['assignmentScore'];without=sample['assignmentScoreWithoutPrecursor']
+    return (full is None or full>=minimum_assignment_score) and (without is None or without>=minimum_assignment_score_without_precursor)
+
+
 PROGRESS_WIDTH = 100
 PROGRESS_FORMAT = '{desc:<18} {percentage:3.0f}%|{bar:36}| {n_fmt:>5}/{total_fmt:<5} [{elapsed}<{remaining}]'
 
@@ -75,6 +82,7 @@ def train_actions(*, model_config: dict, train_dir: str | Path, val_dir: str | P
                   early_stopping_patience: int = 10, min_lr: float = 1e-6,
                   validation_interval_steps: int = 0, validation_fraction: float = 0.1,
                   train_mol_encoder: bool = False,
+                  minimum_assignment_score: float = 0.0, minimum_assignment_score_without_precursor: float = 0.0,
                   initialize_from: str | Path | None = None) -> dict:
     from dataclasses import replace
     import random
@@ -88,7 +96,7 @@ def train_actions(*, model_config: dict, train_dir: str | Path, val_dir: str | P
         'train_dir','val_dir','epochs','batch_size','lr','device','resume','weight_decay','gradient_clip',
         'branch_weight','negative_weight','branch_mil_temperature','intensity_weight',
         'max_samples','seed','warmup_steps','lr_patience','early_stopping_patience','min_lr','train_mol_encoder','initialize_from',
-        'validation_interval_steps','validation_fraction')}
+        'validation_interval_steps','validation_fraction','minimum_assignment_score','minimum_assignment_score_without_precursor')}
     settings={key:str(value) if isinstance(value,Path) else value for key,value in settings.items()}
     (output/'training_args.json').write_text(json.dumps(settings,indent=2))
     from .report import write_training_report
@@ -104,6 +112,8 @@ def train_actions(*, model_config: dict, train_dir: str | Path, val_dir: str | P
         raise ValueError('validation_interval_steps must be a non-negative integer')
     if not math.isfinite(validation_fraction) or not 0 < validation_fraction <= 1:
         raise ValueError('validation_fraction must be greater than 0 and at most 1')
+    if any(not math.isfinite(value) or not 0<=value<=1 for value in (minimum_assignment_score,minimum_assignment_score_without_precursor)):
+        raise ValueError('Assignment score thresholds must be between 0 and 1')
     if initialize_from is not None and resume is not None:raise ValueError('Use initialize_from or resume, not both.')
     device=torch.device(device)
     if device.type!='cuda' or not torch.cuda.is_available():
@@ -164,19 +174,31 @@ def train_actions(*, model_config: dict, train_dir: str | Path, val_dir: str | P
         initialize_from_base(model,params)
     # Chemistry ends here; CPU tensor collation can continue per batch.
     # Forward/backward, validation and compatibility masks use CUDA tensors.
+    filtering_assignment_score=minimum_assignment_score>0 or minimum_assignment_score_without_precursor>0
     datasets=[];dataset_report={}
     for name,directory in (('train',train_dir),('validation',val_dir)):
         files=sorted(Path(directory).rglob('*.preft.pt'))
         if not files:raise ValueError(f'No prepared .preft.pt files in {directory}')
-        pieces=[];samples=0;states=0;formulas=0
+        try:raw_records=json.loads((Path(directory)/'action_statistics.json').read_text()).get('num_metadata_valid_records')
+        except (OSError,json.JSONDecodeError):raw_records=None
+        pieces=[];samples=0;filtered_samples=0;states=0;formulas=0
         for file in files:
             data=SourceActionStructure.load(file,max_action_count=generator.feature_model.max_action_count)
             if data.num_samples<1:raise ValueError(f"Structure contains no samples: {file}")
             if data.downstream is None:raise ValueError('Full training requires stored target molecular graphs')
-            samples+=data.num_samples;states+=data.teacher_node_branch_group_index.numel();formulas+=data.downstream.formula_tensor.shape[0]
+            samples+=data.num_samples
+            if filtering_assignment_score:
+                surviving=[index for index,sample in enumerate(data.sample_annotations)
+                          if _sample_meets_assignment_score(sample,minimum_assignment_score,minimum_assignment_score_without_precursor)]
+                if not surviving:continue
+                if len(surviving)<data.num_samples:data=select_samples(data,surviving)
+            filtered_samples+=data.num_samples
+            states+=data.teacher_node_branch_group_index.numel();formulas+=data.downstream.formula_tensor.shape[0]
             pieces.extend(select_samples(data,range(i,min(i+max_samples,data.num_samples))) for i in range(0,data.num_samples,max_samples))
+        if not pieces:raise ValueError(f'No samples in {directory} meet the configured assignment score thresholds')
         datasets.append(pieces)
-        dataset_report[name]={'files':len(files),'samples':samples,'teacher_states':states,'formula_targets':formulas,'chunks':len(pieces)}
+        dataset_report[name]={'files':len(files),'raw_records':raw_records,'samples':samples,'filtered_samples':filtered_samples,
+                              'teacher_states':states,'formula_targets':formulas,'chunks':len(pieces)}
     (output/'dataset_summary.json').write_text(json.dumps(dataset_report,indent=2))
     write_training_report(output,status='running',settings=settings,datasets=dataset_report,
                           completed_epochs=len(history),global_step=global_step)
@@ -420,7 +442,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument('--adapter-width',type=int,default=8,help='Extra low-rank nodes per linear/attention projection (default: 8).')
     parser.add_argument('--overwrite',action='store_true',help='Reuse an existing, non-empty output directory without asking for confirmation.')
     for name, default in (("weight-decay",0.01),("gradient-clip",1.0),("branch-weight",1.0),
-                          ("negative-weight",0.2),("branch-mil-temperature",0.1),("intensity-weight",1.0),("min-lr",1e-6)):
+                          ("negative-weight",0.2),("branch-mil-temperature",0.1),("intensity-weight",1.0),("min-lr",1e-6),
+                          ("minimum-assignment-score",0.0),("minimum-assignment-score-without-precursor",0.0)):
         parser.add_argument('--'+name,type=float,default=default)
     for name,default in (('max-samples',128),('seed',42),('warmup-steps',100),('lr-patience',3),('early-stopping-patience',10)):
         parser.add_argument('--'+name,type=int,default=default)
@@ -470,6 +493,7 @@ def main(argv: list[str] | None = None) -> None:
         weight_decay=args.weight_decay,gradient_clip=args.gradient_clip,
         branch_weight=args.branch_weight,negative_weight=args.negative_weight,branch_mil_temperature=args.branch_mil_temperature,
         intensity_weight=args.intensity_weight,max_samples=args.max_samples,
+        minimum_assignment_score=args.minimum_assignment_score,minimum_assignment_score_without_precursor=args.minimum_assignment_score_without_precursor,
         seed=args.seed,warmup_steps=args.warmup_steps,lr_patience=args.lr_patience,early_stopping_patience=args.early_stopping_patience,min_lr=args.min_lr,train_mol_encoder=args.train_mol_encoder,initialize_from=args.initialize_from,
         validation_interval_steps=args.validation_interval_steps,validation_fraction=args.validation_fraction)
 

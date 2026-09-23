@@ -6,7 +6,7 @@ const path = require('path');
 const crypto = require('crypto');
 const { spawn } = require('child_process');
 const sessions = new Map();
-const trainingFlags = { weightDecay:'--weight-decay', gradientClip:'--gradient-clip',branchWeight:'--branch-weight',negativeWeight:'--negative-weight',branchMilTemperature:'--branch-mil-temperature',intensityWeight:'--intensity-weight',maxSamples:'--max-samples',seed:'--seed',warmupSteps:'--warmup-steps',validationIntervalSteps:'--validation-interval-steps',validationFraction:'--validation-fraction',lrPatience:'--lr-patience',earlyStoppingPatience:'--early-stopping-patience',minLr:'--min-lr',dropout:'--dropout' };
+const trainingFlags = { weightDecay:'--weight-decay', gradientClip:'--gradient-clip',branchWeight:'--branch-weight',negativeWeight:'--negative-weight',branchMilTemperature:'--branch-mil-temperature',intensityWeight:'--intensity-weight',maxSamples:'--max-samples',seed:'--seed',warmupSteps:'--warmup-steps',validationIntervalSteps:'--validation-interval-steps',validationFraction:'--validation-fraction',lrPatience:'--lr-patience',earlyStoppingPatience:'--early-stopping-patience',minLr:'--min-lr',dropout:'--dropout',minimumAssignmentScore:'--minimum-assignment-score',minimumAssignmentScoreWithoutPrecursor:'--minimum-assignment-score-without-precursor' };
 const pages = [['HOME','home','Overview'],['DATA','data','Training Data'],['DATA','cleavage','Cleavage Patterns'],['TRAINING','molTraining','Mol Training'],['TRAINING','training','Fragment Tree Training'],['TRAINING','jobs','Training Jobs'],['TRAINING','models','Models'],['TRAINING','metrics','Metrics'],['PREDICTION','predictSingle','Single Prediction'],['PREDICTION','predictBatch','Batch Prediction'],['VISUALIZATION','viewer','Spectrum / Fragment Viewer'],['VISUALIZATION','cleavageViewer','Cleavage Viewer'],['VISUALIZATION','smarts','Structure / SMARTS Search'],['SETTINGS','environment','Environment']];
 function session(context) {
   const dir=path.join(projects.root(context)?projects.store.metadata(projects.root(context)):(context.storageUri || context.globalStorageUri).fsPath,'jobs');
@@ -43,6 +43,7 @@ async function startTraining(context,panel,output,root,python,config,buildArgs){
   for(const key of ['epochs','batchSize'])if(!Number.isInteger(Number(config[key]))||Number(config[key])<1)throw new Error(key+' must be a positive integer.');
   if(config.validationIntervalSteps!==undefined&&(!Number.isInteger(Number(config.validationIntervalSteps))||Number(config.validationIntervalSteps)<0))throw new Error('Validation interval must be a non-negative integer.');
   if(config.validationFraction!==undefined&&(!(Number(config.validationFraction)>0)||Number(config.validationFraction)>1))throw new Error('Validation fraction must be greater than 0 and at most 1.');
+  for(const key of ['minimumAssignmentScore','minimumAssignmentScoreWithoutPrecursor'])if(config[key]!==undefined&&Number(config[key])>1)throw new Error(key+' must be at most 1.');
   if(!(Number(config.lr)>0))throw new Error('Learning rate must be positive.');
   const s=session(context);if(s.jobs.some(j=>j.status==='running'))throw new Error('A training job is already running.');
   const args=buildArgs(config),id=crypto.randomUUID(),logPath=path.join(s.dir,id+'.log');

@@ -125,7 +125,7 @@ function createParameterEditor(container, initial, kind = "training", editCleava
       if(kind==='data'&&key==='fragmenter_params'){renderValue(model,'max_node',section,'');renderValue(model,'max_edge',section,'');}
       if(key==='fragmenter_params')for(const path of basic){const parts=path.split('.');let parent=model;for(const part of parts.slice(0,-1))parent=parent?.[part];if(parent&&parts.at(-1) in parent)renderValue(parent,parts.at(-1),section,parts.slice(0,-1).join('.'));}
       const advanced=node('div');advanced.dataset.advanced=key;advanced.hidden=!expanded.has(key);
-      if(key==='fragmenter_params'||['mol_encoder_params','post_model_params'].includes(key)||(kind==='data'&&key!=='architecture')){const toggle=button('Advanced '+title(key),()=>{advanced.hidden=!advanced.hidden;toggle.setAttribute('aria-expanded',String(!advanced.hidden));});toggle.dataset.parameterToggle=key;toggle.setAttribute('aria-expanded',String(!advanced.hidden));section.append(toggle);renderValue(model,key,advanced,'',true);section.append(advanced);}
+      if(key==='fragmenter_params'||['mol_encoder_params','action_model_params','post_model_params'].includes(key)||(kind==='data'&&key!=='architecture')){const toggle=button('Advanced '+title(key),()=>{advanced.hidden=!advanced.hidden;toggle.setAttribute('aria-expanded',String(!advanced.hidden));});toggle.dataset.parameterToggle=key;toggle.setAttribute('aria-expanded',String(!advanced.hidden));section.append(toggle);renderValue(model,key,advanced,'',true);section.append(advanced);}
       else renderValue(model,key,section,'');container.append(section);
     }
   }
