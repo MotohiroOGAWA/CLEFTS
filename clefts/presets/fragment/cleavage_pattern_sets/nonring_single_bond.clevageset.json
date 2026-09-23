@@ -79,10 +79,6 @@
           {
             "name": "fragment_1",
             "smarts": "[*:1]"
-          },
-          {
-            "name": "fragment_2",
-            "smarts": "[*:2]"
           }
         ]
       }
