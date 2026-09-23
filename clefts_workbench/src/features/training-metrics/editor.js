@@ -145,7 +145,7 @@ function client(groupSeries) {
   const METRIC_GROUPS=[
     ['Spectrum similarity',/cosine_similarity|assignment_score|spectrum_nonempty_fraction|teacher_spectrum/],
     ['Loss',/loss/],
-    ['Action recall & precision',/recall|precision|positive_action|branch_positive|positive_fraction|negative_fraction|valid_candidate_count|normalized_replacement_rate|actions_(before|after)_filter|training_pool_actions/],
+    ['Branch supervision',/branch_(positive|negative|recall)|num_training_states_depth/],
     ['Optimization',/^(learning_rate|gradient_norm)$/],
     ['Dataset & throughput',/samples|batches|fragment_nodes|validation_fraction/],
     ['Performance & resources',/seconds|memory/],

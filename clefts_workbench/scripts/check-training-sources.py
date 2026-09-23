@@ -46,7 +46,7 @@ with tempfile.TemporaryDirectory() as directory:
     rejects(lambda: module.dataset_sources(train, validation))
     model['adduct_type_strs'].reverse()
     (validation / 'action_statistics.json').write_text(json.dumps({'model_config': model}))
-    encoder['symbols'] = ('O', 'C')
+    encoder['symbols'] = ('N', 'C')
     torch.save({'mol_encoder_params': encoder, 'mol_encoder_state_dict': {}}, checkpoint)
     rejects(lambda: module.inherit_model_config({}, train, validation, encoder_checkpoint=checkpoint))
 print('Dataset inheritance, encoder checkpoint metadata, resume compatibility and mismatch checks passed.')
