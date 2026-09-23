@@ -40,6 +40,57 @@ def csr(rows: Sequence[Sequence[int]]) -> tuple[Tensor, Tensor]:
     return torch.cat((counts.new_zeros(1), counts.cumsum(0))), torch.tensor([v for row in rows for v in row], dtype=torch.long)
 
 
+MAX_NEIGHBORHOOD_HOP = 3
+
+
+def exact_hop_shells(adjacency: Sequence[set[int]], center: int, max_hop: int = MAX_NEIGHBORHOOD_HOP) -> list[set[int]]:
+    """BFS shells at exact graph distance 1..max_hop from center, over the full source graph.
+
+    Each shell is disjoint from every other (exact distance, not "at most"); a
+    shell may include atoms that are internal to some reactant SMARTS match --
+    the caller subtracts that per-match exclusion afterward, since traversal
+    itself must be free to pass through SMARTS atoms (see module docstring of
+    prepare_source_actions' neighborhood computation).
+    """
+    visited = {center}
+    frontier = {center}
+    shells = []
+    for _ in range(max_hop):
+        next_frontier: set[int] = set()
+        for atom in frontier:
+            next_frontier.update(adjacency[atom])
+        next_frontier -= visited
+        visited |= next_frontier
+        shells.append(next_frontier)
+        frontier = next_frontier
+    return shells
+
+
+def hop_neighborhood_csr(adjacency: Sequence[set[int]], atom_ptr: Tensor, atom_index: Tensor,
+                         max_hop: int = MAX_NEIGHBORHOOD_HOP) -> tuple[tuple[Tensor, Tensor], ...]:
+    """Per-token (not per-action) external hop-1..hop-N neighborhoods, as CSR pairs.
+
+    One output row per entry of the flattened ``atom_index`` (i.e. per reactant
+    role atom of a specific action), excluding every atom that belongs to that
+    same action's own reactant match. Atom indices within a row are sorted for
+    determinism. Shells are cached per center atom since they only depend on
+    the source graph, not on which action's reactant match is being excluded.
+    """
+    cache: dict[int, list[set[int]]] = {}
+    rows: list[list[list[int]]] = [[] for _ in range(max_hop)]
+    for start, stop in zip(atom_ptr[:-1].tolist(), atom_ptr[1:].tolist()):
+        row_atoms = atom_index[start:stop].tolist()
+        internal = set(row_atoms)
+        for atom in row_atoms:
+            shells = cache.get(atom)
+            if shells is None:
+                shells = exact_hop_shells(adjacency, atom, max_hop)
+                cache[atom] = shells
+            for hop in range(max_hop):
+                rows[hop].append(sorted(shells[hop] - internal))
+    return tuple(csr(rows[hop]) for hop in range(max_hop))
+
+
 @dataclass(frozen=True)
 class SourceActionStructure:
     source_graph: Batch
@@ -66,6 +117,16 @@ class SourceActionStructure:
     max_action_role_count: int = field(default=0,kw_only=True)
     source_atom_capacity: int = field(default=0,kw_only=True)
     action_source_atom_features: Tensor | None = field(default=None,kw_only=True)
+    # External source-graph neighborhood of each reactant role atom, at exact
+    # 1/2/3-hop distance, excluding every atom internal to that action's own
+    # reactant match. One CSR row per action_source_atom_index entry (not per
+    # action): row t's neighbors are for token t = action_source_atom_index[t].
+    action_source_atom_hop1_ptr: Tensor = field(default_factory=lambda: torch.zeros(1,dtype=torch.long),kw_only=True)
+    action_source_atom_hop1_index: Tensor = field(default_factory=lambda: torch.empty(0,dtype=torch.long),kw_only=True)
+    action_source_atom_hop2_ptr: Tensor = field(default_factory=lambda: torch.zeros(1,dtype=torch.long),kw_only=True)
+    action_source_atom_hop2_index: Tensor = field(default_factory=lambda: torch.empty(0,dtype=torch.long),kw_only=True)
+    action_source_atom_hop3_ptr: Tensor = field(default_factory=lambda: torch.zeros(1,dtype=torch.long),kw_only=True)
+    action_source_atom_hop3_index: Tensor = field(default_factory=lambda: torch.empty(0,dtype=torch.long),kw_only=True)
     sample_annotations: tuple[dict, ...] = field(default=(),kw_only=True)
     downstream: object | None = None
     transition_parent_state_index: Tensor = field(default_factory=lambda: torch.empty(0,dtype=torch.long),kw_only=True)
@@ -135,6 +196,7 @@ class SourceActionStructure:
         if not structures:
             raise ValueError("Cannot collate an empty batch")
         graphs, action_types, atom_rows, retained, sample_trees, conditions = [], [], [], [], [], []
+        hop_rows = ([], [], [])
         relations = {name: [] for name in ("action_conflict_index", "action_invalidation_index", "action_dominance_index")}
         state_samples, state_rows, next_rows, eos, static, tree_indices = [], [], [], [], [], []
         atom_offset = action_offset = tree_offset = sample_offset = group_offset = state_offset = node_offset = 0
@@ -167,6 +229,15 @@ class SourceActionStructure:
             tree_indices.append(item.action_tree_index + tree_offset)
             for start, stop in zip(item.action_source_atom_ptr[:-1], item.action_source_atom_ptr[1:]):
                 atom_rows.append((item.action_source_atom_index[start:stop] + atom_offset).tolist())
+            # One CSR row per action_source_atom_index entry (a token), not per
+            # action, so this loop mirrors the atom_rows loop above but walks
+            # each hop's own ptr/index pair (equally many rows: len(atom_index)).
+            for dest, ptr_name, index_name in zip(hop_rows,
+                    ('action_source_atom_hop1_ptr', 'action_source_atom_hop2_ptr', 'action_source_atom_hop3_ptr'),
+                    ('action_source_atom_hop1_index', 'action_source_atom_hop2_index', 'action_source_atom_hop3_index')):
+                hop_ptr, hop_index = getattr(item, ptr_name), getattr(item, index_name)
+                for start, stop in zip(hop_ptr[:-1], hop_ptr[1:]):
+                    dest.append((hop_index[start:stop] + atom_offset).tolist())
             retained.append(item.action_retained_index + torch.tensor([[action_offset], [atom_offset]], device=item.action_retained_index.device))
             for name in relations:
                 relations[name].append(getattr(item, name) + action_offset)
@@ -203,6 +274,7 @@ class SourceActionStructure:
             group_offset += item.num_branch_groups
         graph = Batch.from_data_list(graphs)
         atom_ptr, atom_index = csr(atom_rows)
+        (hop1_ptr, hop1_index), (hop2_ptr, hop2_index), (hop3_ptr, hop3_index) = (csr(rows) for rows in hop_rows)
         state_ptr, state_index = csr(state_rows)
         next_ptr, next_index = csr(next_rows)
         valid_ptr,valid_actions=csr(valid_rows);negative_ptr,negative_actions=csr(negative_rows)
@@ -235,7 +307,10 @@ class SourceActionStructure:
                    sample_annotations=tuple(annotations) if len(annotations)==sum(item.num_samples for item in structures) else (),
                    max_action_role_count=max(item.max_action_role_count for item in structures),
                    source_atom_capacity=max(item.source_atom_capacity for item in structures),
-                   action_source_atom_features=torch.cat([item.action_source_atom_features for item in structures]))
+                   action_source_atom_features=torch.cat([item.action_source_atom_features for item in structures]),
+                   action_source_atom_hop1_ptr=hop1_ptr,action_source_atom_hop1_index=hop1_index,
+                   action_source_atom_hop2_ptr=hop2_ptr,action_source_atom_hop2_index=hop2_index,
+                   action_source_atom_hop3_ptr=hop3_ptr,action_source_atom_hop3_index=hop3_index)
 
 
 def prepare_source_actions(*, source: Compound, actions: tuple[CleavageAction, ...],
@@ -253,7 +328,15 @@ def prepare_source_actions(*, source: Compound, actions: tuple[CleavageAction, .
     relations=CleavageActionRelations.from_actions(actions)
     action_index={action:i for i,action in enumerate(actions)}
     maps={atom.GetAtomMapNum():i for i,atom in enumerate(graph_builder.graph_atoms(source))}
+    raw_graph=graph_builder.build(source)
+    # Undirected adjacency over the whole source graph: hop-context traversal
+    # is always allowed to pass through reactant SMARTS atoms (only the final
+    # pooled output excludes them), so this is built once, unfiltered by R.
+    adjacency=[set() for _ in range(raw_graph.num_nodes)]
+    for u,v in zip(raw_graph.edge_index[0].tolist(),raw_graph.edge_index[1].tolist()):
+        adjacency[u].add(v)
     atom_ptr,atom_index=csr([tuple(maps[v] for v in action.source_atom_maps if v in maps) for action in actions])
+    (hop1_ptr,hop1_index),(hop2_ptr,hop2_index),(hop3_ptr,hop3_index)=hop_neighborhood_csr(adjacency,atom_ptr,atom_index)
     role_features=torch.tensor([[float(v in action.retained_atom_maps),float(v in action.discarded_atom_maps),
         sum(v in edge for edge in action.matched_bond_maps),sum(v in edge for edge in action.cut_bond_maps),
         sum(v in edge for edge in action.changed_bond_maps),sum(v in (u,w) for u,w,_ in action.bond_updates)]
@@ -352,7 +435,7 @@ def prepare_source_actions(*, source: Compound, actions: tuple[CleavageAction, .
     transition_child=torch.tensor([b for _,b,_ in positive_edges],dtype=torch.long)
     transition_action=torch.tensor([c for _,_,c in positive_edges],dtype=torch.long)
 
-    graph=Batch.from_data_list([graph_builder.build(source)])
+    graph=Batch.from_data_list([raw_graph])
     static=torch.tensor([[len(a.matched_bond_maps),len(a.cut_bond_maps),len(a.changed_bond_maps),len(a.bond_updates),
                           len(a.retained_atom_maps),len(a.discarded_atom_maps)] for a in actions],dtype=torch.float32).reshape(-1,6).log1p()
     return SourceActionStructure(graph,graph.ptr,torch.zeros(len(actions),dtype=torch.long),
@@ -374,7 +457,10 @@ def prepare_source_actions(*, source: Compound, actions: tuple[CleavageAction, .
         teacher_peak_branch_group_index=torch.tensor(peak_groups,dtype=torch.long),teacher_path_step_ptr=path_step_ptr,
         teacher_path_step_state_index=path_step_state_index,teacher_path_step_action_index=path_step_action_index,
         source_atom_capacity=len(maps),action_source_atom_features=role_features,
-        max_action_role_count=max((len(a.source_atom_maps) for a in actions),default=0))
+        max_action_role_count=max((len(a.source_atom_maps) for a in actions),default=0),
+        action_source_atom_hop1_ptr=hop1_ptr,action_source_atom_hop1_index=hop1_index,
+        action_source_atom_hop2_ptr=hop2_ptr,action_source_atom_hop2_index=hop2_index,
+        action_source_atom_hop3_ptr=hop3_ptr,action_source_atom_hop3_index=hop3_index)
 
 
 def make_structure_file_stem(smiles: str, *, index: int) -> str:

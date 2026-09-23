@@ -29,10 +29,12 @@ class SourceActionFeatureModel(nn.Module):
                  max_roles: int = 64,
                  branch_path_threshold: float = 0.0, max_fragment_nodes: int = 100,
                  intensity_main_adduct_dim: int | None = None,
+                 action_neighborhood_mode: str = "hop_pooling",
                  ) -> None:
         super().__init__()
         self.mol_encoder = mol_encoder
-        self.action_encoder = ActionEncoder(mol_encoder.node_dim, mol_encoder.graph_dim, hidden_dim, category_sizes, num_heads,max_roles)
+        self.action_encoder = ActionEncoder(mol_encoder.node_dim, mol_encoder.graph_dim, hidden_dim, category_sizes, num_heads,
+            max_roles, action_neighborhood_mode=action_neighborhood_mode)
         if not isinstance(adduct_encoder,AdductEmbeddingLayer):
             raise TypeError("Branching requires an explicit main-adduct encoder")
         if not isinstance(collision_energy_encoder,CollisionEnergyFeatureLayer):
@@ -68,7 +70,8 @@ class SourceActionFeatureModel(nn.Module):
             encoded=self.mol_encoder(Batch.from_data_list(graphs[start:start+max_graphs]).to(device))
             atoms.append(encoded.x);molecules.append(encoded.embeddings)
         source_x=torch.cat(atoms);source_h=torch.cat(molecules)
-        kwargs={name:getattr(data,name).to(device) for name in ('action_type','action_tree_index','action_source_atom_ptr','action_source_atom_index','action_static_features','action_source_atom_features')}
+        kwargs={name:getattr(data,name).to(device) for name in ('action_type','action_tree_index','action_source_atom_ptr','action_source_atom_index','action_static_features','action_source_atom_features',
+            'action_source_atom_hop1_ptr','action_source_atom_hop1_index','action_source_atom_hop2_ptr','action_source_atom_hop2_index','action_source_atom_hop3_ptr','action_source_atom_hop3_index')}
         actions=self.action_encoder(source_atom_h=source_x,source_mol_h=source_h,**kwargs)
         return actions,source_h
 
@@ -79,7 +82,10 @@ class SourceActionFeatureModel(nn.Module):
         action = self.action_encoder(source_atom_h=source.x, source_mol_h=source.embeddings,
             action_type=data.action_type, action_tree_index=data.action_tree_index,
             action_source_atom_ptr=data.action_source_atom_ptr, action_source_atom_index=data.action_source_atom_index,
-            action_static_features=data.action_static_features,action_source_atom_features=data.action_source_atom_features) if static_features is None else static_features[0]
+            action_static_features=data.action_static_features,action_source_atom_features=data.action_source_atom_features,
+            action_source_atom_hop1_ptr=data.action_source_atom_hop1_ptr,action_source_atom_hop1_index=data.action_source_atom_hop1_index,
+            action_source_atom_hop2_ptr=data.action_source_atom_hop2_ptr,action_source_atom_hop2_index=data.action_source_atom_hop2_index,
+            action_source_atom_hop3_ptr=data.action_source_atom_hop3_ptr,action_source_atom_hop3_index=data.action_source_atom_hop3_index) if static_features is None else static_features[0]
         source_embeddings = source.embeddings if source is not None else static_features[1]
         sample_adduct=self.intensity_main_adduct_projection(self.adduct_encoder(data.condition_features[:,0].long()))
         collision_energy=self.collision_energy_encoder(data.condition_features[:,1])

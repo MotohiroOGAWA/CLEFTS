@@ -129,6 +129,15 @@ def initialize_from_base(model, model_config):
             continue  # adapter/row values and new-row index buffer
         original_key = re.sub(r'\.parametrizations\.([^.]+)\.original$', r'.\1', key)
         if original_key not in source:
+            # The only base-checkpoint gap this method tolerates: a base
+            # checkpoint predating hop-wise neighborhood context has no
+            # neighborhood_projections at all. They stay at their fresh
+            # zero initialization (see ActionEncoder), so fine-tuning starts
+            # from the same output as the base model and only the new
+            # LowRankExpansion adapter (already trainable) can move it.
+            # Every other missing tensor is still a hard error.
+            if re.search(r'action_encoder\.neighborhood_projections\.\d+\.weight$', original_key):
+                continue
             raise ValueError(f'Base checkpoint is missing {original_key}')
         old_value = source[original_key]
         used.add(original_key)
