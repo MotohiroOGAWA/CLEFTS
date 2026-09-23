@@ -381,7 +381,7 @@ function client(groupSeries) {
   el('metricsAdd').onclick = () => { const name = el('metricsChoice').value; if (name && !selected.includes(name)) { selected.push(name); save(); render(); } };
   el('representativeMetric').addEventListener('change', () => { save(); renderSpectra(); });
   el('representativePrecursor').addEventListener('change', () => { save(); renderSpectra(); });
-  window.addEventListener('message', ({ data: message }) => {
+  window.addEventListener('message', async ({ data: message }) => {
     if (message.type === 'metricsPicked') { el('metricsDirectory').value = message.directory; save(); }
     if (message.type !== 'metricsData' || message.request !== request) return;
     busy = false; el('metricsLoad').disabled = false;
@@ -394,8 +394,9 @@ function client(groupSeries) {
     }
     el('metricsStatus').textContent = message.error || message.data.directory+' · '+data.length+' charts · '+new Date().toLocaleTimeString();
     updateChoices();
-    render();
+    await render();
     renderSpectra();
+    window.dispatchEvent(new CustomEvent('trainingMetricsRendered'));
   });
   setInterval(() => { if (el('metricsAuto').checked && !el('metricsApp').hidden && el('metricsDirectory').value.trim()) load(); }, 15000);
   render();
