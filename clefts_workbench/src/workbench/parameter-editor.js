@@ -61,6 +61,11 @@ function createParameterEditor(container, initial, kind = "training", editCleava
   // them from the single shared --dropout), but they must never be editable
   // here independently of it -- only one dropout value can ever be specified.
   const linkedToSharedDropout=new Set(['action_model_params.state_dropout','post_model_params.dropout']);
+  // Keep closed-choice architecture settings out of free-form text inputs.
+  // The model currently supports only normalized attention, but defining the
+  // choices here makes future aggregation strategies appear automatically as
+  // explicit options instead of asking users to know their string values.
+  const choices={equivalent_state_aggregation:['attention']};
   const basic=new Set(['fragmenter_params.fragment_ion_tree_builder.max_action_count','fragmenter_params.precursor_candidate_max_action_count','fragmenter_params.mass_tolerance']);
   const badge=full=>full.endsWith('.max_action_count')?'Dataset inherited':full.endsWith('.branch_path_threshold')||full.endsWith('.max_fragment_nodes')?'Search':/(ion_prediction_threshold|peak_intensity_threshold)$/.test(full)?'Inference only':/(loss_weight|intensity_power)$/.test(full)?'Training only':/(hidden_dim|embedding_dim|main_adduct_dim|collision_energy_dim|branch_main_adduct_dim|num_layers|num_heads|state_num_layers|equivalent_state_aggregation)$/.test(full)?'Architecture':'';
   const node=(tag,text)=>{const n=document.createElement(tag);if(text!==undefined)n.textContent=text;return n;};
@@ -99,7 +104,8 @@ function createParameterEditor(container, initial, kind = "training", editCleava
       host.append(group);return;
     }
     const fieldKey=typeof key==='number'?path.split('.').at(-1):key;
-    const wrapper=node('label'),label=node('span',typeof key==='number'?title(fieldKey)+' '+(key+1):title(key));label.dataset.help=help(fieldKey,full);const mark=badge(full);if(mark){const tag=node('small',mark);tag.className='parameter-badge';label.append(' ',tag);}const input=node('input');input.dataset.parameterPath=full;input.type=typeof value==='boolean'?'checkbox':typeof value==='number'?'number':'text';
+    const wrapper=node('label'),label=node('span',typeof key==='number'?title(fieldKey)+' '+(key+1):title(key));label.dataset.help=help(fieldKey,full);const mark=badge(full);if(mark){const tag=node('small',mark);tag.className='parameter-badge';label.append(' ',tag);}const options=choices[fieldKey];if(options&&!options.includes(value))parent[key]=options[0];const input=node(options?'select':'input');input.dataset.parameterPath=full;if(options){for(const choice of options){const option=node('option',title(choice));option.value=choice;input.append(option);}input.value=parent[key];input.onchange=()=>{parent[key]=input.value;};}else input.type=typeof value==='boolean'?'checkbox':typeof value==='number'?'number':'text';
+    if(options){wrapper.append(label,input);if(optional[path]?.[key]!==undefined)wrapper.append(button('Use Default',()=>{delete parent[key];render();}));host.append(wrapper);return;}
     if(input.type==='number')input.step='any';if(input.type==='checkbox'){input.checked=value;wrapper.className='check';}else input.value=value??'';
     input.oninput=()=>{if(input.type==='number'&&(!input.value.trim()||!Number.isFinite(Number(input.value)))){input.setCustomValidity('Enter a finite number.');return;}input.setCustomValidity('');parent[key]=input.type==='checkbox'?input.checked:input.type==='number'?Number(input.value):input.value;};
     wrapper.append(label,input);if(optional[path]?.[key]!==undefined)wrapper.append(button('Use Default',()=>{delete parent[key];render();}));host.append(wrapper);

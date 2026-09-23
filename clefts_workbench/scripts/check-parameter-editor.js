@@ -46,6 +46,8 @@ const app=path.resolve(__dirname,'../..'),preset=service.defaults(app);
  const ionRoot=new Element('div'),ionEditor=createParameterEditor(ionRoot,{post_model_params:{}},'training');
  assert(!walk(ionRoot).some(node=>node.tag==='button'&&node.textContent.startsWith('Override ')));
  assert.equal(walk(ionRoot).find(node=>node.dataset.parameterPath==='post_model_params.ion_loss_weight').value,0.5);
+ const aggregation=walk(ionRoot).find(node=>node.dataset.parameterPath==='post_model_params.equivalent_state_aggregation');
+ assert.equal(aggregation.tag,'select');assert.deepEqual(aggregation.children.map(option=>option.value),['attention']);assert.equal(aggregation.value,'attention');
  assert(walk(ionRoot).some(node=>node.className==='parameter-group-heading'&&node.textContent==='Loss weights'));
  const ionArgs=buildTrainingArgs({trainDir:'train',valDir:'val',outputDir:'out',modelConfig:ionEditor.getValue()});
  assert.equal(ionArgs[ionArgs.indexOf('--post-ion-loss-weight')+1],'0.5');
