@@ -208,7 +208,9 @@ def _action_summary(action, action_id: int, patterns: CleavagePatternSet,
         "id": action_id, "patternIndex": action.cleavage_pattern_id,
         "patternName": pattern.name, "name": name,
         "productMoleculeId": action.product_molecule_id,
-        "atoms": sorted(map_to_index[m] for m in action.source_atom_maps),
+        # Keep query-role order. Symmetric matches at the same physical site can
+        # produce different actions, so sorting would erase the visible distinction.
+        "atoms": [map_to_index[m] for m in action.source_atom_maps],
         # Filled below after Source-map edges are converted to SVG bond indexes.
         "bonds": [],
         "sourceAtomMaps": list(action.source_atom_maps),

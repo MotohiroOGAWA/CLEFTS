@@ -17,13 +17,17 @@ const dom=new JSDOM(extension.workbenchHtml({},{}),{runScripts:'dangerously',vir
   document.getElementById('reactionPreviewSmiles').value='CCCCC';
   await document.getElementById('runReactionPreview').onclick();
   assert.equal(root.querySelectorAll('.rp-sites button').length,8);
-  await root.querySelector('.rp-sites button').onclick();
+  assert([...root.querySelectorAll('.rp-sites button')].some(button=>button.textContent.includes('atoms 2,1')));
+  const firstSite=root.querySelector('.rp-sites button'),firstBond=firstSite.dataset.previewMatch;
+  await firstSite.onclick();
   assert(root.querySelector('[data-rp-add-action]'));
   assert(root.querySelectorAll('.rp-products svg').length>=1,'candidate fragment must be previewed before selection');
   await root.querySelector('[data-rp-add-action]').onclick();
   assert(root.querySelector('.rp-patterns').textContent.includes('Remove'));
   assert(root.querySelector('.rp-products svg'));
   assert(root.querySelectorAll('.rp-sites button').length<8,'incompatible actions must be masked');
+  assert(!root.querySelector('[data-preview-match="'+firstBond+'"]'),'the selected action must not remain in candidate highlights');
+  assert.equal(root.querySelectorAll('[data-preview-bond]').length,0,'selected bonds must not remain in the clickable candidate overlay');
   document.getElementById('reactionPreviewMode').value='exhaustive';
   document.getElementById('reactionPreviewMode').onchange();
   document.getElementById('reactionPreviewMaxActions').value='2';

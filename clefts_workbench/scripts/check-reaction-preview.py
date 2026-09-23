@@ -113,6 +113,8 @@ request = {'smiles':'CCCCC', 'patterns':[chain_cut], 'maxActionCount':2, 'mode':
 exploration = preview.cleavage_explore(request)
 assert len(exploration['actions']) == 8
 assert exploration['availableActionIds'] == list(range(8))
+assert any(action['sourceAtomMaps'] == [2, 1] and action['atoms'] == [1, 0]
+           for action in exploration['actions']), 'query-role order must not be sorted'
 selected_id = next(action_id for action_id in exploration['availableActionIds']
                    if preview.cleavage_explore({**request, 'selectedActionIds':[action_id]})['availableActionIds'])
 selected = preview.cleavage_explore({**request, 'selectedActionIds':[selected_id]})
@@ -126,4 +128,21 @@ for candidate_id in selected['availableActionIds']:
 generated = preview.cleavage_explore({**request, 'mode':'exhaustive'})
 assert generated['results'] and all(1 <= item['actionCount'] <= 2 for item in generated['results'])
 assert all('<svg' in item['molecule']['drawing']['svg'] for item in generated['results'])
+
+# C-S-P-O regression: after cutting S-P and retaining P-O, S-P is invalid for
+# both reasons (changed-bond overlap and a Source match outside retained atoms).
+both_sides = {'name':'Any single cut', 'reactant_smarts':'[!#1:1]-[!#1:2]',
+              'products':[{'name':'Role 1','smarts':'[!#1:1]'},
+                          {'name':'Role 2','smarts':'[!#1:2]'}]}
+chain_request = {'smiles':'CSPO', 'patterns':[both_sides], 'maxActionCount':3,
+                 'mode':'stepwise'}
+chain = preview.cleavage_explore(chain_request)
+sp = next(action for action in chain['actions']
+          if action['sourceAtomMaps'] == [3, 2] and action['retainedAtomMaps'] == [3, 4])
+after_sp = preview.cleavage_explore({**chain_request, 'selectedActionIds':[sp['id']]})
+remaining_sources = [after_sp['actions'][index]['sourceAtomMaps']
+                     for index in after_sp['availableActionIds']]
+assert remaining_sources == [[3, 4], [4, 3]]
+assert all([2, 3] not in after_sp['actions'][index]['changedBondMaps']
+           for index in after_sp['availableActionIds'])
 print('Direct reaction preview: exact source locations, omitted maps, symmetric assignments, multiple rules, dot-separated products, new bonds, RDKit SVG, validation and limits passed.')
