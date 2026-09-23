@@ -47,7 +47,7 @@ function runChemistryBackend(context, command, payload, owner = context) {
     try { root = projectRoot(context); }
     catch (error) { reject(error); return; }
     if (!isCleftsRoot(root)) { reject(new Error('The detected working directory is not a CLEFTS application.')); return; }
-    if (command === 'reactionPreview' || command === 'reactionPreviewProducts') {
+    if (command === 'reactionPreview' || command === 'reactionPreviewProducts' || command === 'cleavageExplore') {
       cleavageReactionService.forOwner(owner, { python, script, root }, context).request(command, payload).then(resolve, reject);
       return;
     }

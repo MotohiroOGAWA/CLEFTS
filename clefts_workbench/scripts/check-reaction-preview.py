@@ -103,4 +103,27 @@ for smiles, patterns in [('not smiles',[split]), ('',[split]), ('CC',[])]:
 
 preview.LIMIT = 2
 assert preview.reaction_preview({'smiles':'CCCC','patterns':[symmetric]})['truncated']
+
+# The Workbench cleavage viewer uses the production Source-anchored action
+# generator and the same unordered compatibility rules as FragmentTreeBuilder.
+preview.LIMIT = 512
+chain_cut = {'name':'Chain cut', 'reactant_smarts':'[#6:1]-[#6:2]',
+             'products':[{'name':'Retain role 1','smarts':'[#6:1]'}]}
+request = {'smiles':'CCCCC', 'patterns':[chain_cut], 'maxActionCount':2, 'mode':'stepwise'}
+exploration = preview.cleavage_explore(request)
+assert len(exploration['actions']) == 8
+assert exploration['availableActionIds'] == list(range(8))
+selected_id = next(action_id for action_id in exploration['availableActionIds']
+                   if preview.cleavage_explore({**request, 'selectedActionIds':[action_id]})['availableActionIds'])
+selected = preview.cleavage_explore({**request, 'selectedActionIds':[selected_id]})
+assert selected['selectedProduct'] and '<svg' in selected['selectedProduct']['drawing']['svg']
+a = selected['actions'][selected_id]
+for candidate_id in selected['availableActionIds']:
+    b = selected['actions'][candidate_id]
+    assert set(b['sourceAtomMaps']) <= set(a['retainedAtomMaps'])
+    assert set(a['sourceAtomMaps']) <= set(b['retainedAtomMaps'])
+    assert not {tuple(edge) for edge in a['changedBondMaps']} & {tuple(edge) for edge in b['changedBondMaps']}
+generated = preview.cleavage_explore({**request, 'mode':'exhaustive'})
+assert generated['results'] and all(1 <= item['actionCount'] <= 2 for item in generated['results'])
+assert all('<svg' in item['molecule']['drawing']['svg'] for item in generated['results'])
 print('Direct reaction preview: exact source locations, omitted maps, symmetric assignments, multiple rules, dot-separated products, new bonds, RDKit SVG, validation and limits passed.')

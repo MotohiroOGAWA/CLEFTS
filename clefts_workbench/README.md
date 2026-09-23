@@ -122,6 +122,10 @@ The editor reads and writes this JSON shape:
 
 Opening a `*.clevageset.json` file directly in Explorer also uses the dedicated structured editor. Directly opened documents support VS Code save, undo, and redo. Use `Reopen Editor With... > Text Editor` when raw JSON editing is preferred.
 
+## Single-SMILES cleavage viewer
+
+Open `Visualization → Cleavage Viewer`, load a pattern set, and select either the complete set or one pattern. `Stepwise actions` highlights the currently compatible Source locations, previews the resulting fragment before an action is added, and masks actions invalidated by the selected simultaneous action set. `Exhaustive candidates` enumerates valid unordered action sets up to `Max actions` and shows each fragment and SMIRKS. This page reuses the exact Reaction Preview UI instance from the Cleavage Pattern editor.
+
 ## Package
 
 ```bash

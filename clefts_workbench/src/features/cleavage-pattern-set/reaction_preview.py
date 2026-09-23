@@ -7,6 +7,11 @@ from functools import lru_cache
 import json
 from rdkit.Chem.Draw import rdMolDraw2D
 
+from clefts.domain.fragment.cleavage import CleavageActionSequence, CleavagePatternSet
+from clefts.domain.fragment.cleavage.CleavageActionGenerator import create_cleavage_actions
+from clefts.domain.fragment.tree import FragmentTreeBuilder
+from clefts.libs.mmkit.mmkit import Compound
+
 LIMIT = 512
 
 
@@ -175,4 +180,131 @@ def reaction_preview_products(payload: dict[str, Any]) -> dict[str, Any]:
                     message = f"{name or 'Product'}: {exc}"
                     if message not in result["errors"]:
                         result["errors"].append(message)
+    return result
+
+
+def _pattern_set(payload: dict[str, Any]) -> CleavagePatternSet:
+    definitions = payload.get("patterns", [])
+    if not isinstance(definitions, list) or not definitions:
+        raise ValueError("Select at least one Cleavage Pattern.")
+    return CleavagePatternSet.from_dict({"name": str(payload.get("name", "Preview")),
+                                         "patterns": definitions})
+
+
+def _molecule_summary(compound: Compound) -> dict[str, Any]:
+    mol = compound.mol
+    smiles = compound.smiles
+    return {"smiles": smiles, "formula": rdMolDescriptors.CalcMolFormula(mol),
+            "exactMass": rdMolDescriptors.CalcExactMolWt(mol),
+            "drawing": product_drawing(smiles)}
+
+
+def _action_summary(action, action_id: int, patterns: CleavagePatternSet,
+                    map_to_index: dict[int, int]) -> dict[str, Any]:
+    pattern = patterns.get_pattern(action.cleavage_pattern_id)
+    reaction = next(r for r in pattern.cleavage_reactions if r.id == action.reaction_id)
+    name = reaction.source_rule.name or f"Product {action.product_molecule_id + 1}"
+    return {
+        "id": action_id, "patternIndex": action.cleavage_pattern_id,
+        "patternName": pattern.name, "name": name,
+        "productMoleculeId": action.product_molecule_id,
+        "atoms": sorted(map_to_index[m] for m in action.source_atom_maps),
+        # Filled below after Source-map edges are converted to SVG bond indexes.
+        "bonds": [],
+        "sourceAtomMaps": list(action.source_atom_maps),
+        "retainedAtomMaps": sorted(action.retained_atom_maps),
+        "changedBondMaps": [list(edge) for edge in sorted(action.changed_bond_maps)],
+    }
+
+
+def _run_sequence(source: Compound, sequence: CleavageActionSequence) -> Compound | None:
+    try:
+        products = sequence.compile(source).run(source)
+        return Compound(products[0]) if len(products) == 1 else None
+    except (Chem.rdchem.MolSanitizeException, ValueError):
+        return None
+
+
+def cleavage_explore(payload: dict[str, Any]) -> dict[str, Any]:
+    """Explore Source-anchored primitive actions and unordered action sets."""
+    source = Compound.from_smiles(str(payload.get("smiles", "")).strip())
+    patterns = _pattern_set(payload)
+    raw_maximum = payload.get("maxActionCount", 1)
+    if isinstance(raw_maximum, bool) or not isinstance(raw_maximum, int):
+        raise ValueError("Max actions must be a positive integer.")
+    maximum = raw_maximum
+    if maximum < 1:
+        raise ValueError("Max actions must be a positive integer.")
+    actions = create_cleavage_actions(source, patterns)
+    mapped = source.mapped_mol
+    map_to_index = {atom.GetAtomMapNum(): atom.GetIdx() for atom in mapped.GetAtoms()}
+    edge_to_bond = {tuple(sorted((bond.GetBeginAtom().GetAtomMapNum(),
+                                  bond.GetEndAtom().GetAtomMapNum()))): bond.GetIdx()
+                    for bond in mapped.GetBonds()}
+    summaries = []
+    for action_id, action in enumerate(actions):
+        item = _action_summary(action, action_id, patterns, map_to_index)
+        item["bonds"] = sorted(edge_to_bond[edge] for edge in action.matched_bond_maps)
+        summaries.append(item)
+
+    requested_ids = tuple(int(value) for value in payload.get("selectedActionIds", []))
+    if len(set(requested_ids)) != len(requested_ids):
+        raise ValueError("The same action cannot be selected more than once.")
+    chosen_ids = requested_ids
+    if any(value < 0 or value >= len(actions) for value in chosen_ids):
+        raise ValueError("A selected action no longer exists. Run the viewer again.")
+    selected = tuple(actions[value] for value in chosen_ids)
+    if len(selected) > maximum:
+        raise ValueError("The selected actions exceed Max actions.")
+    selected_sequence = CleavageActionSequence(selected) if selected else None
+    if selected_sequence is not None and len(selected_sequence.actions) != len(selected):
+        raise ValueError("The selected action is redundant with the current action set.")
+
+    available = []
+    candidate_sequences = {}
+    if len(selected) < maximum:
+        for action_id, action in enumerate(actions):
+            if action_id in chosen_ids:
+                continue
+            try:
+                sequence = CleavageActionSequence((*selected, action))
+                if (len(sequence.actions) == len(selected) + 1 and sequence.retained_atom_maps
+                        and len(sequence.actions) <= maximum):
+                    if _run_sequence(source, sequence) is not None:
+                        available.append(action_id)
+                        candidate_sequences[action_id] = sequence
+            except ValueError:
+                pass
+
+    selected_product = None
+    if selected_sequence is not None:
+        product = _run_sequence(source, selected_sequence)
+        if product is None:
+            raise ValueError("The selected action set did not produce a valid fragment.")
+        selected_product = _molecule_summary(product)
+
+    candidate_product = None
+    inspect_id = payload.get("inspectActionId")
+    if inspect_id is not None:
+        inspect_id = int(inspect_id)
+        if inspect_id not in candidate_sequences:
+            raise ValueError("The inspected action is not valid for the current action set.")
+        candidate_product = _run_sequence(source, candidate_sequences[inspect_id])
+        candidate_product = _molecule_summary(candidate_product) if candidate_product else None
+
+    result = {"smiles": source.smiles, "drawing": drawing(source.mol),
+              "actions": summaries, "availableActionIds": available,
+              "selectedActionIds": list(chosen_ids), "selectedProduct": selected_product,
+              "candidateProduct": candidate_product, "inspectedActionId": inspect_id,
+              "maxActionCount": maximum, "results": [], "truncated": False}
+    if str(payload.get("mode", "stepwise")) == "exhaustive":
+        builder = FragmentTreeBuilder(maximum, patterns, only_add_min_action_count=False)
+        search, candidates = builder._search(source, seed_action_sequences=None,
+                                             max_action_count=maximum)
+        action_ids = {action: index for index, action in enumerate(actions)}
+        for _, item in builder._materialize_iter(source, search, candidates):
+            ids = [action_ids[action] for action in item.action_sequence.actions]
+            result["results"].append({"actionIds": ids, "actionCount": len(ids),
+                                      "smirks": item.smirks,
+                                      "molecule": _molecule_summary(item.compound)})
     return result

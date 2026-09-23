@@ -24,6 +24,15 @@ Import a pattern set or an individual pattern by dropping its JSON file onto the
 
 To update a preparation run, open **Training Data → Fragmentation → Cleavage Patterns** and choose **Edit Cleavage Patterns** or **Add Pattern Visually**. The editor starts with that run's current pattern set. After adding, editing or importing patterns, click **Apply Patterns to Parameters** to return to Data Preparation and include the edited set in the preparation configuration. Saving a standalone pattern set does not apply it to a preparation run.
 
+## Cleavage viewer
+
+Open **Visualization → Cleavage Viewer** to inspect cleavage of one SMILES with the pattern set currently loaded in **Cleavage Patterns**. Select the full set or one pattern and choose either mode:
+
+- **Stepwise actions** highlights only actions that can still join the selected simultaneous action set. Clicking a location previews its retained fragment; **Add action** confirms it. Selected actions can be removed.
+- **Exhaustive candidates** generates all valid unordered action sets up to **Max actions** and displays their fragments and reaction SMIRKS.
+
+The viewer and **Cleavage Patterns → Reaction Preview** are the same UI instance. The stepwise mask uses the production fragment-tree rules: every action retains every other action's Source match, no two actions change the same Source bond, duplicate/redundant actions are excluded, the retained atom intersection is nonempty, and the action limit is respected. Candidate sets must also produce an RDKit-valid fragment.
+
 ## Mol Training descriptor targets
 
 In **Mol Training → Training Tasks & Loss Weights → Descriptor Regression**, select individual descriptor targets using the checkboxes. The standard 14 training descriptors are all checked by default. Each target includes a short description. **Select All** and **Clear All** update the selection together.
