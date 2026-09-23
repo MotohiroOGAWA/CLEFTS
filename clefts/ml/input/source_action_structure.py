@@ -50,7 +50,7 @@ class SourceActionStructure:
     action_source_atom_index: Tensor
     action_static_features: Tensor
     action_conflict_index: Tensor
-    action_precedence_index: Tensor
+    action_invalidation_index: Tensor
     action_dominance_index: Tensor
     action_retained_index: Tensor
     sample_tree_index: Tensor
@@ -135,7 +135,7 @@ class SourceActionStructure:
         if not structures:
             raise ValueError("Cannot collate an empty batch")
         graphs, action_types, atom_rows, retained, sample_trees, conditions = [], [], [], [], [], []
-        relations = {name: [] for name in ("action_conflict_index", "action_precedence_index", "action_dominance_index")}
+        relations = {name: [] for name in ("action_conflict_index", "action_invalidation_index", "action_dominance_index")}
         state_samples, state_rows, next_rows, eos, static, tree_indices = [], [], [], [], [], []
         atom_offset = action_offset = tree_offset = sample_offset = group_offset = state_offset = node_offset = 0
         downstream_items, action_offsets, parents, children, added_actions, state_nodes = [], [], [], [], [], []
@@ -357,7 +357,7 @@ def prepare_source_actions(*, source: Compound, actions: tuple[CleavageAction, .
                           len(a.retained_atom_maps),len(a.discarded_atom_maps)] for a in actions],dtype=torch.float32).reshape(-1,6).log1p()
     return SourceActionStructure(graph,graph.ptr,torch.zeros(len(actions),dtype=torch.long),
         torch.tensor([(a.cleavage_pattern_id,a.reaction_id,a.product_molecule_id) for a in actions],dtype=torch.long).reshape(-1,3),
-        atom_ptr,atom_index,static,coo(relations.conflict_pairs),coo(relations.precedence_pairs),coo(relations.dominance_pairs),retained,
+        atom_ptr,atom_index,static,coo(relations.conflict_pairs),coo(relations.invalidation_pairs),coo(relations.dominance_pairs),retained,
         torch.zeros(sample_count,dtype=torch.long),condition_features,torch.tensor(owners),state_ptr,state_index,positive_ptr,positive_index,
         torch.tensor(observed,dtype=torch.bool),source_smiles=(source.smiles,),
         transition_parent_state_index=transition_parent,transition_child_state_index=transition_child,transition_added_action_index=transition_action,

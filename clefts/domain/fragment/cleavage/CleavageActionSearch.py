@@ -14,7 +14,7 @@ class CleavageActionSearchStats:
     num_primitive_actions: int = 0
     num_raw_combinations: int = 0
     num_hard_conflict_pruned: int = 0
-    num_precedence_cycle_pruned: int = 0
+    num_invalidated_action_pruned: int = 0
     num_redundancy_pruned: int = 0
     num_duplicate_sequence_pruned: int = 0
     num_duplicate_effect_pruned: int = 0
@@ -111,18 +111,12 @@ class CleavageActionSearch:
                     if rejection == "hard_conflict":
                         self.stats.num_hard_conflict_pruned += 1
                     else:
-                        self.stats.num_precedence_cycle_pruned += 1
+                        self.stats.num_invalidated_action_pruned += 1
                     continue
-                has_hint = any(self.relations.redundancy_hint_mask[j] & (1 << k)
-                               for j in indices for k in indices if j != k)
                 sequence = CleavageActionSequence((*previous, action))
                 if len(sequence.actions) < len(previous) + 1:
                     self.stats.num_redundancy_pruned += 1
                 if not sequence.retained_atom_maps or len(sequence.actions) > self.max_action_count:
-                    continue
-                # Hints may prune only once the sequence confirms unchanged history;
-                # a discarded center can still have a surviving cut/order contribution.
-                if has_hint and sequence == parent:
                     continue
                 if sequence == parent:
                     self.stats.num_duplicate_sequence_pruned += 1

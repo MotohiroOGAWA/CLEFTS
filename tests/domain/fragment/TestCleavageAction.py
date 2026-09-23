@@ -13,8 +13,8 @@ class TestCleavageAction(unittest.TestCase):
                               frozenset(matched if matched is not None else [roles]), frozenset(cuts), product_molecule_id=0)
 
     def test_subset_order_duplicates_and_identity(self):
-        a = self.action(roles=(2, 3))
-        b = self.action(retained=(1,), pattern_id=1)
+        a = self.action(retained=(1,2,3))
+        b = self.action(retained=(1,2), pattern_id=1)
         seq = CleavageActionSequence((a, b, a))
         self.assertEqual(seq.actions, (b,))
         self.assertEqual(seq, CleavageActionSequence((b, a)))
@@ -30,8 +30,8 @@ class TestCleavageAction(unittest.TestCase):
 
     def test_context_bond_and_three_actions(self):
         a = self.action(roles=(1, 2, 3), retained=(1, 2, 3), matched=((1, 2), (2, 3)), cuts=((1, 2),))
-        b = self.action(roles=(2, 3), retained=(1, 3), pattern_id=1, cuts=((2, 3),))
-        c = self.action(roles=(1,), matched=(), pattern_id=2)
+        b = self.action(roles=(2, 3), retained=(1, 2, 3), pattern_id=1, cuts=((2, 3),))
+        c = self.action(roles=(1,), retained=(1, 2, 3), matched=(), pattern_id=2)
         self.assertTrue(CleavageActionSequence((c, a, b)).actions)
 
     def test_shared_atom_allowed_and_single_rdkit_execution(self):
@@ -64,7 +64,7 @@ class TestCleavageAction(unittest.TestCase):
 
     def test_equal_retention_does_not_remove_all_actions(self):
         a = self.action()
-        b = self.action(roles=(2, 3), pattern_id=1)
+        b = self.action(roles=(2, 1), pattern_id=1)
         self.assertEqual(CleavageActionSequence((b, a)).actions, (a,))
 
     def test_existing_rules_manual_match_with_compound(self):

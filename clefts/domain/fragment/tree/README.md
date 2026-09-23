@@ -1,6 +1,6 @@
 # Source-anchored FragmentTreeBuilder
 
-`FragmentTreeBuilder` matches every pattern once on Original Source, inspects product templates once, and enumerates unordered primitive action combinations in Python. After conflict, precedence-cycle, redundancy, and duplicate checks, each unique final effect is compiled and applied once to Original Source. Intermediate fragments are never matched or reacted.
+`FragmentTreeBuilder` matches every pattern once on Original Source, inspects product templates once, and enumerates unordered, simultaneous primitive action combinations in Python. Every action must preserve every other action's concrete Source match. After mutual-retention, changed-bond conflict, redundancy, and duplicate checks, each unique final effect is compiled and applied once to Original Source. Intermediate fragments are never matched or reacted.
 
 ```python
 builder = FragmentTreeBuilder(
@@ -28,7 +28,7 @@ The retained set of a primitive action is the Source connected component contain
 
 `max_action_count` replaces the builder's `max_depth`; `min_depth_only_from`, `cleave_by_pattern`, and `cleave_by_pattern_id` were removed. Builder dictionaries now require `max_action_count`. `only_add_min_action_count` remains a presentation option for minimum action count edges and never suppresses expansion of a different history. Graph traversal depth remains the number of edges, which can differ from action count for multi-action seeds.
 
-`builder._build_result(source_compound)` returns `search_stats`, `expansion_states`, and `processed_expansion_states` alongside the tree and node compounds. Counters include primitive actions, raw combinations, hard conflicts, precedence cycles, normalization reductions, duplicate histories/effects, compiled sequences, RDKit executions, and generated effects. For the generic single-bond pattern on `CC(O)N` at action limit 3, the current search considers 28 raw candidates and runs 10 unique effects.
+`builder._build_result(source_compound)` returns `search_stats`, `expansion_states`, and `processed_expansion_states` alongside the tree and node compounds. Counters include primitive actions, raw combinations, hard conflicts, invalidated action centers, normalization reductions, duplicate histories/effects, compiled sequences, RDKit executions, and generated effects.
 
 `FragmentIonTreeBuilder` and `Fragmenter` forward `max_action_count` and `seed_action_sequences`. `Fragmenter.precursor_candidate_max_action_count` limits the normalized Source action count of precursor candidates, including every action in a seed. Candidate selection never uses graph depth. Pathway presentation follows compatible parent/child action histories and checks precursor and total action budgets independently of edge distance. `tree_max_action_count` exposes the builder limit; the former `tree_max_depth` accessor has been removed. Presets, serialization, copying and ML callers use the action count names.
 

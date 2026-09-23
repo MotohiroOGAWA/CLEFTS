@@ -168,11 +168,11 @@ class TestCleavageActionCombinationSearch(unittest.TestCase):
         self.assertTrue(all(len(c.action_sequence.actions) == 1 for c in candidates))
         self.assertEqual(search.stats.num_hard_conflict_pruned, 1)
 
-    def test_reverse_ordering_is_allowed_with_precedence(self) -> None:
+    def test_matched_context_change_does_not_create_action_ordering(self) -> None:
         a = action(0, (1, 2), matched=((1, 2),), cuts=((1, 2),))
         b = action(1, (1, 2, 3), matched=((1, 2), (2, 3)), cuts=((2, 3),))
         relations = _ActionRelations.from_actions((a, b))
-        self.assertEqual(relations.must_precede_mask, (0, 1))
+        self.assertEqual(relations.invalidation_mask, (0, 0))
         search = CleavageActionSearch((a, b), max_action_count=2)
         self.assertIn(CleavageActionSequence((a, b)), {c.action_sequence for c in search.enumerate()})
 
@@ -182,32 +182,33 @@ class TestCleavageActionCombinationSearch(unittest.TestCase):
         search = CleavageActionSearch((a, b), max_action_count=2)
         self.assertIn(CleavageActionSequence((a, b)), {c.action_sequence for c in search.enumerate()})
 
-    def test_two_and_three_action_precedence_cycles_are_pruned(self) -> None:
+    def test_multiple_simultaneous_actions_need_no_ordering(self) -> None:
         a = action(0, (1, 2, 3), matched=((1, 2), (2, 3)), cuts=((1, 2),))
         b = action(1, (1, 2, 3), matched=((1, 2), (2, 3)), cuts=((2, 3),))
         search = CleavageActionSearch((a, b), max_action_count=2)
-        self.assertTrue(all(len(c.action_sequence.actions) == 1 for c in search.enumerate()))
-        self.assertEqual(search.stats.num_precedence_cycle_pruned, 1)
+        self.assertIn(CleavageActionSequence((a,b)),{c.action_sequence for c in search.enumerate()})
+        self.assertEqual(search.stats.num_invalidated_action_pruned, 0)
         c = action(2, (1, 2, 3, 4), matched=((3, 4), (1, 2)), cuts=((3, 4),))
         b = action(1, (2, 3, 4), matched=((2, 3), (3, 4)), cuts=((2, 3),))
         search = CleavageActionSearch((a, b, c), max_action_count=3)
         sequences = {x.action_sequence for x in search.enumerate()}
         self.assertEqual(sum(len(s.actions) == 2 for s in sequences), 3)
-        self.assertFalse(any(len(s.actions) == 3 for s in sequences))
-        self.assertGreater(search.stats.num_precedence_cycle_pruned, 0)
+        self.assertTrue(any(len(s.actions) == 3 for s in sequences))
+        self.assertEqual(search.stats.num_invalidated_action_pruned, 0)
 
-    def test_atom_deletion_precedence_and_cycle(self) -> None:
+    def test_every_action_must_retain_every_other_action_source_match(self) -> None:
         a = action(0, (1, 2), retained=(1, 2, 3))
         b = action(1, (3, 4), matched=((3, 4),), cuts=((3, 4),))
         relations = _ActionRelations.from_actions((a, b))
-        self.assertEqual(relations.must_precede_mask, (0, 1))
-        # Give B a surviving cut, ensuring normalization retains its contribution.
-        b = action(1, (2, 3, 4), matched=((2, 3),), cuts=((2, 3),))
+        self.assertEqual(relations.invalidation_mask, (2, 0))
+        self.assertEqual(relations.rejection((0, 1)), 'invalidated_action')
         search = CleavageActionSearch((a, b), max_action_count=2)
-        self.assertIn(CleavageActionSequence((a, b)), {c.action_sequence for c in search.enumerate()})
-        b = action(1, (3, 4), retained=(2, 3, 4))
+        self.assertTrue(all(len(c.action_sequence.actions)==1 for c in search.enumerate()))
+        # Reverse containment is independently required as well.
+        b = action(1, (2, 3), retained=(2, 3, 4))
         relations = _ActionRelations.from_actions((a, b))
-        self.assertEqual(relations.rejection((0, 1)), 'precedence_cycle')
+        self.assertEqual(relations.invalidation_mask, (0, 1))
+        self.assertEqual(relations.rejection((0, 1)), 'invalidated_action')
 
     def test_redundancy_preserves_surviving_cut_and_order_updates(self) -> None:
         deletion = action(2, (3, 4), retained=(1, 2, 3))
@@ -230,14 +231,14 @@ class TestCleavageActionCombinationSearch(unittest.TestCase):
         self.assertIn(CleavageActionSequence((a, b, c)), sequences)
         self.assertTrue(all(len(sequence.actions) <= 2 for sequence in sequences))
 
-    def test_discarded_center_hint_keeps_a_contributing_action(self) -> None:
+    def test_discarding_another_action_center_rejects_combination(self) -> None:
         a = action(0, (1, 2), retained=(1, 2, 3))
         b = action(1, (3,), retained=(3, 4))
         search = CleavageActionSearch((a, b), max_action_count=2)
-        self.assertEqual(search.relations.redundancy_hint_mask[0], 1 << 1)
-        combined = CleavageActionSequence((a, b))
-        self.assertEqual(combined.retained_atom_maps, frozenset((3,)))
-        self.assertIn(combined, {c.action_sequence for c in search.enumerate()})
+        self.assertEqual(search.relations.invalidation_mask, (0, 1))
+        self.assertEqual(search.relations.rejection((0,1)),'invalidated_action')
+        with self.assertRaises(ValueError):CleavageActionSequence((a,b))
+        self.assertTrue(all(len(c.action_sequence.actions)==1 for c in search.enumerate()))
 
     def test_effect_signature_ignores_discarded_bond_edits(self) -> None:
         a = action(0, (3, 4), retained=(1, 2), matched=((3, 4),), cuts=((3, 4),))
@@ -350,17 +351,18 @@ class TestFragmentTreeBuilder(unittest.TestCase):
         self.assertEqual(len({r.action_sequence for r in results}), 7)
         self.assertTrue(all(r.smirks for r in results))
 
-    def test_cycle_and_conflict_candidates_never_run_rdkit(self) -> None:
+    def test_invalidated_and_conflicting_candidates_never_run_rdkit(self) -> None:
         source = Compound.from_smiles('[CH3:1][CH2:2][CH2:3][CH3:4]')
-        a = action(0, (1, 2, 3), matched=((1, 2), (2, 3)), cuts=((1, 2),))
-        b = action(1, (1, 2, 3), matched=((1, 2), (2, 3)), cuts=((2, 3),))
+        a = action(0, (1, 2), retained=(1, 2, 3))
+        b = action(1, (3, 4), matched=((3, 4),), cuts=((3, 4),))
         build = builder(limit=2)
         with patch.object(FragmentTreeBuilder, 'create_cleavage_actions', return_value=(a, b)):
             result = build._build_result(source)
         stats = result['search_stats']
         self.assertEqual(stats['num_raw_combinations'], 3)
-        self.assertEqual(stats['num_precedence_cycle_pruned'], 1)
+        self.assertEqual(stats['num_invalidated_action_pruned'], 1)
         self.assertEqual(stats['num_rdkit_run_reactants'], 2)
+        a = action(0, (1, 2), matched=((1, 2),), cuts=((1, 2),))
         b = action(1, (1, 2), matched=((1, 2),), cuts=((1, 2),))
         with patch.object(FragmentTreeBuilder, 'create_cleavage_actions', return_value=(a, b)):
             result = build._build_result(source)

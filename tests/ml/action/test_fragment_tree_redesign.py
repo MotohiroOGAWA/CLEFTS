@@ -14,6 +14,7 @@ from clefts.ml.mol.graph_builder import MolGraphBuilder
 from clefts.ml.specgen import materialization
 from clefts.ml.specgen.spectrum_generator import create_spectrum_generator
 from clefts.ml.specgen.post_materialization_model import normalized_attention_pool
+from clefts.ml.specgen.components.action.action_compatibility import ActionCompatibilityEngine
 from clefts.ml.training.fragment_tree_training.model import ActionFragmentTreeTrainingModel,smooth_max_mil
 from .TestActionPipeline import config
 
@@ -46,6 +47,25 @@ def test_log_path_probability_and_zero_threshold():
     assert log_probability.item()==pytest.approx(math.log(.4))
     generator=create_spectrum_generator(config())
     assert generator.feature_model.decoder.branch_log_threshold==-math.inf
+
+
+def test_candidate_mask_requires_mutual_action_center_retention():
+    engine=ActionCompatibilityEngine(max_action_count=3)
+    # A is selected. B preserves A and is preserved by A. C is invalidated by
+    # A; D invalidates A. Because actions are simultaneous, both directions
+    # make the composite invalid rather than establishing an execution order.
+    invalidation=torch.zeros((1,4,4),dtype=torch.bool)
+    invalidation[0,0,2]=True
+    invalidation[0,3,0]=True
+    expansion=engine.expand(
+        state_action_index=torch.tensor([[0,-1,-1]]),state_sample_index=torch.tensor([0]),
+        pool_valid=torch.ones((1,4),dtype=torch.bool),
+        pool_conflict=torch.zeros((1,4,4),dtype=torch.bool),
+        pool_invalidation=invalidation,
+        pool_dominance=torch.zeros((1,4,4),dtype=torch.bool),
+        pool_retained=torch.full((1,4,1),15,dtype=torch.long),
+        source_atom_valid=torch.full((1,1),15,dtype=torch.long))
+    assert expansion.valid.tolist()==[False,True,False,False]
 
 
 def test_positive_mil_is_normalized_and_smooth():

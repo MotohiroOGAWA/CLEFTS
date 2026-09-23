@@ -30,6 +30,9 @@ class CleavageActionSequence:
             shared = a.changed_bond_maps & b.changed_bond_maps
             if shared:
                 raise ValueError(f"Actions {a.key} and {b.key} share changed Source bonds: {sorted(shared)}")
+            if (not set(a.source_atom_maps) <= b.retained_atom_maps
+                    or not set(b.source_atom_maps) <= a.retained_atom_maps):
+                raise ValueError("Every action must retain every other action's Source match")
         # Retained-set inclusion alone cannot remove additional cuts between surviving atoms.
         kept = [a for a in unique if not any(action_dominates(b, a) for b in unique)]
         object.__setattr__(self, "actions", tuple(kept))

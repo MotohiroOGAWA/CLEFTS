@@ -14,7 +14,7 @@ class ActionPool:
     valid: Tensor
     embeddings: Tensor
     conflict: Tensor
-    precedence: Tensor
+    invalidation: Tensor
     dominance: Tensor
     retained: Tensor
     source_atom_valid: Tensor
@@ -66,7 +66,7 @@ def build_action_pool(action_h: Tensor, data: object) -> ActionPool:
     retained.index_put_((rows,slots,atom//64),bits,accumulate=True)
     return ActionPool(chosen_ids.masked_fill(~valid, -1), valid, padded_h[chosen_ids],
                       dense(data.action_conflict_index),
-                      dense(data.action_precedence_index), dense(data.action_dominance_index),
+                      dense(data.action_invalidation_index), dense(data.action_dominance_index),
                       retained, atom_valid)
 
 
@@ -101,7 +101,7 @@ class BranchingCleavageDecoder(nn.Module):
                  ) -> None:
         super().__init__()
         self.state_encoder = ActionStateEncoder(hidden_dim, num_heads=num_heads,num_layers=state_num_layers,dropout=state_dropout)
-        self.compatibility = ActionCompatibilityEngine(max_action_count,enforce_reactant_order=True)
+        self.compatibility = ActionCompatibilityEngine(max_action_count)
         self.query = nn.Linear(hidden_dim + main_adduct_dim, hidden_dim)
         self.key = nn.Linear(hidden_dim, hidden_dim, bias=False)
         if not 0 <= branch_path_threshold <= 1:raise ValueError("branch_path_threshold must be a probability in [0,1]")
@@ -119,7 +119,7 @@ class BranchingCleavageDecoder(nn.Module):
         context = torch.cat((h, main_adduct_h[sample]), dim=1)
         action = torch.einsum("ph,pkh->pk", self.query(context), self.key(pool.embeddings[sample])) * self.scale
         expansion = self.compatibility.expand(state_action_index=state, state_sample_index=sample,
-            pool_valid=pool.valid, pool_conflict=pool.conflict, pool_precedence=pool.precedence,
+            pool_valid=pool.valid, pool_conflict=pool.conflict, pool_invalidation=pool.invalidation,
             pool_dominance=pool.dominance, pool_retained=pool.retained, source_atom_valid=pool.source_atom_valid)
         valid = expansion.valid.reshape(state.shape[0], pool.valid.shape[1]) & ((state >= 0).sum(dim=1) < self.max_action_count)[:, None]
         logits = action.masked_fill(~valid, -torch.inf)

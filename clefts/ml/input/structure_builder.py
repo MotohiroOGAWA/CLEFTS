@@ -25,7 +25,10 @@ def _walk_pathway_chains(tree, fragmenter, pathway):
                     if transition.parent_action_sequence!=state:continue
                     action=transition.added_action
                     if state is not None and action is not None:
-                        if not set(action.source_atom_maps)<=state.retained_atom_maps or any(previous.changed_bond_maps & action.matched_bond_maps for previous in state.actions):continue
+                        if any(not set(action.source_atom_maps)<=previous.retained_atom_maps
+                               or not set(previous.source_atom_maps)<=action.retained_atom_maps
+                               or bool(previous.changed_bond_maps & action.changed_bond_maps)
+                               for previous in state.actions):continue
                     if node.is_precursor and len(transition.action_sequence.actions)>fragmenter.precursor_candidate_max_action_count:continue
                     next_states.append((edge.target_index,transition.action_sequence,(*chain,(transition.action_sequence,action))))
         states=next_states
