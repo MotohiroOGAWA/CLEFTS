@@ -6,7 +6,7 @@ from clefts.ml.input.source_action_structure import SourceActionStructure
 from clefts.ml.specgen.spectrum_generator import create_spectrum_generator
 from clefts.ml.specgen.predict_spectrum import load_generator
 from clefts.ml.training.fragment_tree_training.spectrum_validation import validate_spectra
-root=Path('data/train_preprocessing/test/branching_v6_verification')
+root=Path('data/train_preprocessing/test/fragment_tree_redesign_verification')
 checkpoint=torch.load(root/'training/last.pt',map_location='cpu',weights_only=False)
 c=checkpoint['model_config']
 torch.manual_seed(checkpoint['training_settings']['seed'])

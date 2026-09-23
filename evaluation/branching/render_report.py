@@ -4,7 +4,7 @@ from pathlib import Path
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-root=Path('data/train_preprocessing/test/branching_v6_verification')
+root=Path('data/train_preprocessing/test/fragment_tree_redesign_verification')
 metrics=json.loads((root/'training/metrics.json').read_text())
 history=metrics['history']
 results=json.loads((root/f"training/spectrum_validation/epoch_{history[-1]['epoch']}.json").read_text())

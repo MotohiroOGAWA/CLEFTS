@@ -6,7 +6,7 @@ from clefts.libs.mmkit.mmkit import Adduct
 from clefts.ml.mol.graph_builder import MolGraphBuilder
 from clefts.ml.mol.formula_encoder import FormulaTensorizer
 
-ARCHITECTURE = 'source-anchored-branching-v1'
+ARCHITECTURE = 'fragment-tree-physical-ion'
 
 def validate_limits(max_node=-1, max_edge=-1):
     if type(max_node) is not int or not (max_node == -1 or max_node > 0):

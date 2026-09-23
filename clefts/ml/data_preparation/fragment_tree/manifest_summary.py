@@ -6,9 +6,12 @@ def structure_manifest_fields(structure):
     def mean(key):
         values=[sample[key] for sample in annotations if sample.get(key) is not None]
         return sum(values)/len(values) if values else None
-    return dict(num_teacher_nodes=structure.teacher_node_sample_index.numel(),
+    return dict(num_teacher_nodes=structure.teacher_node_branch_group_index.numel(),
                 num_positive_transitions=structure.transition_added_action_index.numel(),
-                num_precursor_candidates=structure.precursor_row_action_ptr.numel()-1,
+                num_branch_groups=structure.num_branch_groups,
+                num_transition_states=structure.transition_state_branch_group_index.numel(),
+                num_physical_ion_candidates=downstream.physical_candidate_node_index.numel() if downstream else 0,
+                num_ion_explanations=downstream.explanation_ion_type_index.numel() if downstream else 0,
                 max_ms2_depth=int(structure.teacher_node_ms2_depth.max()) if structure.teacher_node_ms2_depth.numel() else 0,
                 num_nodes=sum(tree.num_nodes for tree in decoded.trees) if decoded else None,
                 num_edges=sum(tree.num_edges for tree in decoded.trees) if decoded else None,

@@ -128,7 +128,7 @@ def validate(payload: dict, *, check_datasets: bool = True) -> dict:
 def model(payload: dict) -> dict:
     import torch
     checkpoint=torch.load(payload['path'],map_location='cpu')
-    if checkpoint.get('fragmentation_schema')!='source-anchored-branching-v1': raise ValueError('Choose a compatible Source-anchored action training checkpoint.')
+    if checkpoint.get('architecture')!='fragment-tree-physical-ion': raise ValueError('Choose a compatible physical-ion fragment-tree checkpoint.')
     config=checkpoint.get('model_config')
     if not isinstance(config,dict): raise ValueError('Checkpoint does not contain a model configuration.')
     return {'modelConfig':config.get('params',config),'path':payload['path']}
@@ -150,13 +150,13 @@ def structure_manifest(payload):
 def training_checkpoint(payload):
     import torch
     checkpoint = torch.load(payload['path'], map_location='cpu', weights_only=False)
-    if checkpoint.get('fragmentation_schema') != 'source-anchored-branching-v1':
+    if checkpoint.get('architecture') != 'fragment-tree-physical-ion':
         raise ValueError('Checkpoint architecture is incompatible with training.')
     config = checkpoint.get('model_config')
     if not config:
         raise ValueError('Checkpoint does not contain model configuration.')
     group = checkpoint['optimizer_state_dict']['param_groups'][0]
-    fields={'absolute_weight':'absoluteWeight','next_weight':'nextWeight','minimum_positive_weight':'minimumPositiveWeight','negative_weight':'negativeWeight','intensity_weight':'intensityWeight','absolute_intensity_weight':'absoluteIntensityWeight','train_mol_encoder':'trainMolEncoder','validation_interval_steps':'validationIntervalSteps','validation_fraction':'validationFraction'}
+    fields={'branch_weight':'branchWeight','negative_weight':'negativeWeight','branch_mil_temperature':'branchMilTemperature','intensity_weight':'intensityWeight','train_mol_encoder':'trainMolEncoder','validation_interval_steps':'validationIntervalSteps','validation_fraction':'validationFraction'}
     restored={field:checkpoint.get('training_settings',{})[key] for key,field in fields.items() if key in checkpoint.get('training_settings',{})}
     return {'modelConfig': config.get('params', config), 'lr': group['lr'], 'weightDecay': group.get('weight_decay', 0), 'trainingSettings':restored}
 

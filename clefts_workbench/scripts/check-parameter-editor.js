@@ -13,7 +13,7 @@ class Element {
  setCustomValidity(message){this.validationMessage=message;}
  querySelectorAll(){return walk(this).filter(node=>'advanced' in node.dataset);}
 }
-function walk(node){return [node,...node.children.flatMap(walk)];}
+function walk(node){return [node,...(node.children||[]).filter(child=>child&&typeof child==='object').flatMap(walk)];}
 global.document={createElement:tag=>new Element(tag)};
 const {createParameterEditor}=require('../src/workbench/parameter-editor');
 const service=require('../src/workbench/parameter-service');

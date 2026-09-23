@@ -9,7 +9,7 @@ python -m clefts.cli train fragment-tree \
   --epochs 100 --batch-size 4 --lr 0.0001
 ```
 
-The model learns absolute primitive-action filtering, multi-positive next actions and EOS, and materialized fragment formula intensities. Their weights are configurable with `--absolute-weight`, `--next-weight`, `--negative-weight` and `--intensity-weight`. AdamW uses `--weight-decay`; `--gradient-clip 0` disables gradient clipping.
+The model learns CE-independent fragment branches with normalized positive MIL and depth-diverse weak negatives, then predicts CE-dependent physical-ion intensities. Their weights are configurable with `--branch-weight`, `--negative-weight`, `--branch-mil-temperature`, and `--intensity-weight`. AdamW uses `--weight-decay`; `--gradient-clip 0` disables gradient clipping.
 
 ## Compatible pretrained checkpoint
 

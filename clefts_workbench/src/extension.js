@@ -16,7 +16,6 @@ const parameterService = require('./workbench/parameter-service');
 const workbench = require('./workbench/panel');
 const trainingMetrics = require('./features/training-metrics/editor');
 const trainingReport = require('./features/training-report/view');
-const fineTune = require('./features/fragment-tree-finetune/editor');
 const smartsSearch = require('./features/smarts-search/editor');
 const evaluation = require('./features/evaluation/editor');
 const spectrumPrediction = require('./features/spectrum-prediction/editor');
@@ -87,10 +86,10 @@ function defaultTrainingConfig(context) {
   const root = projectRoot(context);
   const defaultParams = path.join(root, 'clefts', 'presets', 'spectrum_generator_params', 'source_anchored_pos_model_config.json');
   return workbenchDefaults.workflowDefaults('training',{
-    application: 'fragment-tree-training', modelConfig: {...parameterService.defaults(root),action_model_params:{...parameterService.defaults(root).action_model_params,action_prefilter_threshold_logit:1}}, params: defaultParams, trainDir: '', valDir: '',
+    application: 'fragment-tree-training', modelConfig: parameterService.defaults(root), params: defaultParams, trainDir: '', valDir: '',
     outputDir: '',
-    experimentName: 'exp_main', molEncoderCheckpoint: '', epochs: 1, batchSize: 4, device: 'cuda', maxSamples:128, seed:42, warmupSteps:100, validationIntervalSteps:0, validationFraction:0.1, lrPatience:3, earlyStoppingPatience:10, minLr:0.000001, absoluteIntensityWeight:1, gradientClip:1, lr: 0.0001, dropout: 0.5, resume: '',
-    fineTuneCheckpoint: '', fineTunePatternSet: '', adapterWidth: 8
+    experimentName: 'exp_main', molEncoderCheckpoint: '', epochs: 1, batchSize: 4, device: 'cuda', maxSamples:128, seed:42, warmupSteps:100, validationIntervalSteps:0, validationFraction:0.1, lrPatience:3, earlyStoppingPatience:10, minLr:0.000001, branchWeight:1, negativeWeight:0.2, branchMilTemperature:0.1, intensityWeight:1, gradientClip:1, lr: 0.0001, dropout: 0.5, resume: '',
+    fineTuneCheckpoint: '', adapterWidth: 8
   },root);
 }
 
@@ -101,7 +100,6 @@ function openWorkbench(context, output, initialPage = "home") {
   });
   projects.attach(panel, context, projectRoot);
   smartsSearch.attach(panel, context, projectRoot);
-  fineTune.attach(panel, context, projectRoot, output);
   spectrumPrediction.attach(panel, context, projectRoot, output);
   trainingMetrics.attach(panel);
   workbench.attach(panel, context, projectRoot, output, initialPage);
@@ -361,7 +359,7 @@ function buildTrainingArgs(c) {
   const encoder=c.molEncoderCheckpoint||c.modelConfig?.mol_encoder_checkpoint;
   if(encoder&&!c.resume&&!c.fineTuneCheckpoint)a.push('--mol-encoder-checkpoint',encoder);
   if(!c.resume&&!c.fineTuneCheckpoint){
-    const sections={action_model_params:{hidden_dim:'action-hidden-dim',condition_dim:'action-condition-dim',num_heads:'action-num-heads',max_roles:'action-max-roles',action_prefilter_top_k:'action-top-k',action_prefilter_max_k:'action-max-k',action_prefilter_threshold_logit:'action-threshold',beam_size:'beam-size',max_decode_steps:'max-decode-steps',state_num_layers:'action-state-layers',prediction_threshold:'branch-threshold'},post_model_params:{hidden_dim:'post-hidden-dim',num_layers:'post-num-layers',num_heads:'post-num-heads',cosine_loss_weight:'post-cosine-loss-weight',ion_loss_weight:'post-ion-loss-weight',ion_prediction_threshold:'post-ion-threshold',intensity_power:'post-intensity-power',precursor_free_loss_weight:'post-precursor-free-weight'}};
+    const sections={action_model_params:{hidden_dim:'action-hidden-dim',branch_main_adduct_dim:'action-main-adduct-dim',num_heads:'action-num-heads',max_roles:'action-max-roles',branch_path_threshold:'branch-path-threshold',max_fragment_nodes:'max-fragment-nodes',state_num_layers:'action-state-layers'},post_model_params:{hidden_dim:'post-hidden-dim',num_layers:'post-num-layers',num_heads:'post-num-heads',ion_embedding_dim:'ion-embedding-dim',unsaturation_embedding_dim:'unsaturation-embedding-dim',radical_embedding_dim:'radical-embedding-dim',state_hidden_dim:'ion-state-hidden-dim',main_adduct_dim:'main-adduct-embedding-dim',collision_energy_dim:'collision-energy-feature-dim',cosine_loss_weight:'post-cosine-loss-weight',ion_loss_weight:'post-ion-loss-weight',ion_prediction_threshold:'post-ion-threshold',peak_intensity_threshold:'post-peak-intensity-threshold',intensity_power:'post-intensity-power',precursor_free_loss_weight:'post-precursor-free-weight'}};
     for(const [section,flags]of Object.entries(sections))for(const [key,flag]of Object.entries(flags)){const value=c.modelConfig?.[section]?.[key];if(value!==undefined&&value!==null)a.push('--'+flag,String(value));}
   }
   for (const [key, flag] of Object.entries(workbench.trainingFlags)) if (c[key] !== undefined && c[key] !== '') a.push(flag, String(c[key]));
@@ -584,7 +582,7 @@ function datasetStatisticsHtml(stats) {
 }
 
 function manifestTableHtml(manifest, index) {
-  const columns = ['file', 'status', 'smiles', 'num_input_records', 'num_valid_samples', 'rejected_sample_count', 'rejection_log', 'num_teacher_nodes', 'num_positive_transitions', 'num_precursor_candidates', 'max_ms2_depth', 'num_nodes', 'num_edges', 'assignment_score', 'assignment_score_without_precursor'];
+  const columns = ['file', 'status', 'smiles', 'num_input_records', 'num_valid_samples', 'rejected_sample_count', 'rejection_log', 'num_branch_groups', 'num_teacher_nodes', 'num_transition_states', 'num_positive_transitions', 'num_physical_ion_candidates', 'num_ion_explanations', 'max_ms2_depth', 'num_nodes', 'num_edges', 'assignment_score', 'assignment_score_without_precursor'];
   const rows = manifest.rows.map(row => `<tr>${columns.map(column => { const value = row[column] ?? ''; if(column.startsWith('assignment_score')) return `<td data-value="${escapeHtml(value)}" title="Mean per-sample intensity coverage">${value!==''&&Number.isFinite(Number(value))?(Number(value)*100).toFixed(2)+'%':'Unavailable'}</td>`; if(column==='rejection_log'&&!value)return '<td data-value="">—</td>'; if (column === 'file' && value && row.exists) return `<td data-value="${escapeHtml(value)}"><button class="manifest-file" data-open-file="${encodeURIComponent(row.relative)}">${escapeHtml(value)}</button></td>`; if (column === 'file' && value) return `<td data-value="${escapeHtml(value)}"><span>${escapeHtml(value)}</span><small class="missing-file">not generated (${escapeHtml(row.status || 'missing')})</small></td>`; if (column === 'rejection_log' && value) return `<td data-value="${escapeHtml(value)}"><button class="manifest-file" data-open-file="${encodeURIComponent(path.join(manifest.relativeBase || '', value))}">${escapeHtml(value)}</button></td>`; return `<td data-value="${escapeHtml(value)}">${escapeHtml(value)}</td>`; }).join('')}</tr>`).join('');
   return `<div class="manifest-grid" data-manifest-grid="${index}"><h3>${escapeHtml(manifest.directory)}</h3><div class="manifest-controls"><input type="search" data-manifest-search placeholder="Filter all columns…"><label>Rows <select data-page-size><option>20</option><option selected>50</option><option>100</option><option>250</option></select></label><button data-page-prev>Previous</button><span data-page-label></span><button data-page-next>Next</button></div><div class="table-scroll manifest-scroll"><table><thead><tr>${columns.map((column,columnIndex) => `<th class="sortable" data-manifest-sort="${columnIndex}" data-label="${escapeHtml(column)}">${escapeHtml(column)} ↕</th>`).join('')}</tr><tr class="column-filters">${columns.map((column,columnIndex) => `<th><input data-column-filter="${columnIndex}" placeholder="Filter…" aria-label="Filter ${escapeHtml(column)}"></th>`).join('')}</tr></thead><tbody>${rows}</tbody></table></div></div>`;
 }
@@ -643,36 +641,9 @@ const HELP = {
   valDir: 'Directory containing generated validation structures with compatible preprocessing settings.',
   initializeFrom: 'Initialize compatible Source-anchored model weights for fine-tuning with a fresh optimizer.',
   molEncoderCheckpoint: 'Pretrained molecular encoder checkpoint used by FragmentTreeFeatureModel.',
-  conditionAdductEmbeddingDim: 'Width of the learned main-adduct embedding.',
-  conditionCeFeatureDim: 'Fixed feature width produced from collision energy.',
-  conditionCeFcDims: 'Comma-separated hidden widths in the collision-energy MLP.',
-  conditionFeatureDim: 'Output width of the complete spectrum-condition encoder.',
-  conditionFcDims: 'Comma-separated hidden widths used to fuse adduct and collision-energy features.',
-  treeHiddenDim: 'Node representation width in the fragment-tree transformer.',
-  treeNumLayers: 'Number of fragment-tree transformer layers.',
-  treeNumHeads: 'Attention heads used by every fragment-tree transformer layer.',
-  treeMaxDegree: 'Largest node degree represented by the tree positional encoding.',
   dropout: 'Dropout shared by the constructed fragment-tree model.',
-  edgeFeatureDim: 'Width of each structural cleavage-edge representation.',
-  edgeCategoryDim: 'Embedding width for cleavage pattern, reaction, and product IDs.',
-  edgeAttentionHeads: 'Attention heads used while an edge attends to nearby atoms.',
-  attentionMaxGraphDistance: 'Maximum atom-graph distance visible from a cleavage center.',
-  maxEdgesPerDepth: 'Comma-separated inference budgets for successive cleavage depths.',
-  trainingEdgesPerSample: 'Target/path and background candidates proposed per sample before the global step cap.',
-  trainingZeroEdgeFraction: 'Fraction of the per-sample proposal budget reserved for unassigned/background edges.',
   assignmentScoreThreshold: 'Minimum assignment score accepted for training and the filtered validation view. Reads assignment_scores.tsv from each split. Default: 0.8. Validation also evaluates all samples by combining disjoint above- and below-threshold results without repeating inference.',
   maxSamples: 'Maximum spectra packed into one loaded compound batch.',
-  maxEdgesPerStep: 'Hard upper bound on edges receiving expensive atom attention in one optimization step.',
-  maxRetainedEdges: 'Highest-scoring edges retained at each progressive inference stage.',
-  maxEdgesPerTree: 'Per stored tree (shared across every sample that references it), the highest cross-sample-importance edges kept for expensive attention encoding. Applies identically during training and inference; target/positive edges are always favored so the budget cannot silently drop them.',
-  maxNextCleavageCandidates: 'Nodes allowed to produce the next cleavage depth during inference.',
-  edgeConditionInteractionDim: 'Projection width for the edge × spectrum-condition score.',
-  rankingLossWeight: 'Multiplier applied to the absolute edge-ranking loss.',
-  topN: 'Total comparison partners per anchor group/edge, capping tiers 1-3 combined.',
-  nearestLowerPartners: 'Tier 1: nearest lower-intensity partners always compared.',
-  extendedLowerPartners: 'Tier 2: additional farther lower-intensity partners compared after tier 1.',
-  backgroundPartners: 'Tier 3: unassigned/background edges compared after tiers 1-2.',
-  rankingIntensityThreshold: 'Minimum intensity difference required for an ordered comparison (gates tiers 1-2 only).',
   experimentName: 'Checkpoint experiment directory name.', ckptId: 'Optional checkpoint identifier to resume.',
   batchSize: 'Number of prepared compound batches per optimizer step.', device: 'PyTorch execution device.',
   epochs: 'Number of complete training epochs.', validationIntervalSteps: 'Run validation after this many optimizer steps; use 0 to disable step validation.',
@@ -688,9 +659,8 @@ const HELP = {
 function workbenchHtml(config, trainingConfig, predictionConfig = {}, molConfig = {}) {
   return `<!doctype html><html><head><meta charset="UTF-8"><style>${commonCss()}${formCss()}${trainingCss()}${trainingWorkbench.css()}${molTraining.css()}${pathDrop.css()}${workbench.css()}${parameterEditor.css()}</style></head><body><main>
   ${layout.header()}
-  ${workbench.html()}<nav id="legacyNavigation"><button class="tab" data-app="smarts">SMARTS Search</button><button class="tab" data-app="cleavage">Cleavage Pattern Set</button><button class="tab active" data-app="data">Data Preparation</button><button class="tab" data-app="training">Training</button><button class="tab" data-app="molTraining">Mol Training</button><button class="tab" data-app="metrics">Metrics</button><button class="tab" data-app="finetune">Fine-tuning</button><button class="tab" data-app="predict">Predict Spectrum</button></nav>
+  ${workbench.html()}<nav id="legacyNavigation"><button class="tab" data-app="smarts">SMARTS Search</button><button class="tab" data-app="cleavage">Cleavage Pattern Set</button><button class="tab active" data-app="data">Data Preparation</button><button class="tab" data-app="training">Training</button><button class="tab" data-app="molTraining">Mol Training</button><button class="tab" data-app="metrics">Metrics</button><button class="tab" data-app="predict">Predict Spectrum</button></nav>
   ${trainingMetrics.html()}
-  ${fineTune.html()}
   ${smartsSearch.html()}
   ${cleavageUi.html()}
   ${preparation.html()}
@@ -711,7 +681,6 @@ function webviewScript() { return `
     const form=document.getElementById('form'), trainingForm=document.getElementById('trainingForm'), predictForm=document.getElementById('predictForm'), statusEl=document.getElementById('status'), stop=document.getElementById('stop'),trainingStatusEl=document.getElementById('trainingStatus'),trainingStop=document.getElementById('trainingStop');
     ${cleavageUi.state()}
     ${trainingMetrics.script()}
-    ${fineTune.script()}
     ${smartsSearch.script()}
     const htmlEscape=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
     function setFormConfig(target,c){for(const [k,v] of Object.entries(c)){const el=target.elements[k];if(!el)continue;if(el.type==='checkbox')el.checked=!!v;else el.value=Array.isArray(v)?v.join(target===trainingForm?',':' '):v??'';}}
@@ -723,7 +692,7 @@ function webviewScript() { return `
     const tooltip=document.getElementById('helpTooltip'); let tooltipTimer;
     document.querySelectorAll('[data-help]').forEach(el=>{el.addEventListener('mouseenter',()=>{tooltipTimer=setTimeout(()=>{const r=el.getBoundingClientRect();tooltip.textContent=el.dataset.help;tooltip.style.left=Math.min(r.left,window.innerWidth-390)+'px';tooltip.style.top=(r.bottom+7)+'px';tooltip.classList.add('visible');},500);});el.addEventListener('mouseleave',()=>{clearTimeout(tooltipTimer);tooltip.classList.remove('visible');});});
     setConfig(initial);setFormConfig(trainingForm,initialTraining);setFormConfig(predictForm,initialPrediction);if(initialPrediction.adductType)predictForm.elements.adductType.dataset.restoreValue=initialPrediction.adductType;setPredictEnabled(false); document.querySelectorAll('[data-pick]').forEach(b=>b.onclick=()=>vscode.postMessage({type:'pick',form:b.dataset.form||'data',field:b.dataset.pick,kind:b.dataset.kind}));
-    document.querySelectorAll('[data-app]').forEach(button=>button.onclick=()=>{document.querySelectorAll('[data-app]').forEach(x=>x.classList.toggle('active',x===button));const app=button.dataset.app;document.getElementById('homePage').hidden=true;document.getElementById('jobPage').hidden=true;document.getElementById('environmentPage').hidden=true;document.getElementById('metricsApp').hidden=app!=='metrics';document.getElementById('fineTuneApp').hidden=app!=='finetune';document.getElementById('smartsApp').hidden=app!=='smarts';document.getElementById('cleavageApp').hidden=app!=='cleavage';form.hidden=app!=='data';trainingForm.hidden=app!=='training';document.getElementById('molTrainingForm').hidden=app!=='molTraining';predictForm.hidden=app!=='predict';document.getElementById('dataActions').hidden=app!=='data';document.getElementById('appSubtitle').textContent=app==='metrics'?'Training Metrics':app==='finetune'?'Fragment Tree Fine-tuning':app==='smarts'?'SMARTS Search':app==='cleavage'?'Cleavage Pattern Set Editor':app==='training'?'Fragment Tree Training':app==='molTraining'?'Mol Training':app==='predict'?'Predict Spectrum':'Fragment Tree Data Preparation';});
+    document.querySelectorAll('[data-app]').forEach(button=>button.onclick=()=>{document.querySelectorAll('[data-app]').forEach(x=>x.classList.toggle('active',x===button));const app=button.dataset.app;document.getElementById('homePage').hidden=true;document.getElementById('jobPage').hidden=true;document.getElementById('environmentPage').hidden=true;document.getElementById('metricsApp').hidden=app!=='metrics';document.getElementById('smartsApp').hidden=app!=='smarts';document.getElementById('cleavageApp').hidden=app!=='cleavage';form.hidden=app!=='data';trainingForm.hidden=app!=='training';document.getElementById('molTrainingForm').hidden=app!=='molTraining';predictForm.hidden=app!=='predict';document.getElementById('dataActions').hidden=app!=='data';document.getElementById('appSubtitle').textContent=app==='metrics'?'Training Metrics':app==='smarts'?'SMARTS Search':app==='cleavage'?'Cleavage Pattern Set Editor':app==='training'?'Fragment Tree Training':app==='molTraining'?'Mol Training':app==='predict'?'Predict Spectrum':'Fragment Tree Data Preparation';});
     document.getElementById('save').onclick=()=>vscode.postMessage({type:'saveConfig',config:getConfig()}); document.getElementById('load').onclick=()=>vscode.postMessage({type:'loadConfig'}); document.getElementById('openResult').onclick=()=>vscode.postMessage({type:'openResult'}); document.getElementById('openEvaluation').onclick=()=>vscode.postMessage({type:'openEvaluation'});
     ${cleavageUi.script()}
     form.onsubmit=e=>{e.preventDefault();vscode.postMessage({type:'run',config:getConfig()});}; document.getElementById('copyCommand').onclick=()=>vscode.postMessage({type:'copyCommand',config:getConfig()}); stop.onclick=()=>vscode.postMessage({type:'stop'});

@@ -88,7 +88,7 @@ def prepare_model_config(*, checkpoint_path, pattern_set_path, new_params_path, 
     if not isinstance(checkpoint, dict) or not isinstance(checkpoint.get('model_state_dict'), dict):
         raise ValueError('An action training checkpoint with model_state_dict is required.')
     from clefts.ml.specgen.source_anchored_spectrum_predictor import SourceAnchoredFragmentSpectrumGenerator
-    if checkpoint.get('fragmentation_schema') != SourceAnchoredFragmentSpectrumGenerator.architecture:
+    if checkpoint.get('architecture') != SourceAnchoredFragmentSpectrumGenerator.architecture:
         raise ValueError('This command fine-tunes a Source-anchored action checkpoint.')
     base_config = deepcopy(checkpoint.get('model_config', {}))
     base_config = base_config.get('params', base_config)

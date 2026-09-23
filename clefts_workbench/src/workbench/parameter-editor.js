@@ -20,42 +20,42 @@ function createParameterEditor(container, initial, kind = "training", editCleava
     max_node:'Maximum unique fragment nodes after merging identical fragments, including the source. -1 means unlimited.',
     max_edge:'Maximum total distinct cleavage transitions across all node pairs. Multiple routes to the same merged node count separately. -1 means unlimited.',
     hidden_dim:'Hidden representation dimension for this model component.',
-    condition_dim:'Dimension of the encoded spectrum conditions.',
+    branch_main_adduct_dim:'Main-adduct feature width used only by the Branch Scorer.',
     node_dim:'Molecular encoder atom representation dimension.',graph_dim:'Molecular encoder graph representation dimension.',
     dropout:'Fraction of molecular encoder activations dropped during training.',
     max_roles:'Maximum SMARTS query role embeddings; leave the override unset to infer a safe size from the patterns.',
     num_layers:'Number of transformer layers.',num_heads:'Number of attention heads. Must divide the corresponding hidden dimension.',
     max_degree:'Maximum degree represented in graph structural embeddings.',max_spatial_dist:'Maximum atom graph distance encoded by the molecular encoder.',max_edge_dist:'Maximum bond distance encoded by the molecular encoder.',
-    action_prefilter_top_k:'Number of primitive source actions retained by the absolute action scorer.',
-    action_prefilter_max_k:'Maximum action pool size during teacher-forced training, including forced positive actions.',
-    action_prefilter_threshold_logit:'Absolute scorer logit threshold used before top-K action selection.',
-    prediction_threshold:'Independent sigmoid probability required to generate a branch (0 < value < 1).',
-    beam_size:'Maximum candidate normalized action states retained at each decoding step.',
+    branch_path_threshold:'Minimum cumulative path probability retained by tree search. Zero disables threshold pruning.',
+    max_fragment_nodes:'Maximum nodes shared by the complete (compound, main adduct) branch group.',
     state_num_layers:'Number of Set Transformer layers encoding the current action set.',state_dropout:'Dropout in the action state Set Transformer.',cosine_loss_weight:'Spectrum cosine loss weight, added to log intensity MSE.',
     ion_loss_weight:'Weight of the balanced ion score loss: pushes each candidate ion (node, hydrogen shift, radical, adduct) toward the observed peak match or toward zero, independent of the aggregated intensity loss.',
     ion_prediction_threshold:'Minimum ion confidence (sigmoid probability) kept when generating a spectrum. Below this, a candidate adduct/hydrogen-shift is suppressed instead of appearing as a small peak. Does not affect training loss.',
+    peak_intensity_threshold:'Minimum max-normalized intensity retained in inference output. Does not affect training loss.',
     intensity_power:'Power applied to each max-normalized peak before the intensity/cosine loss (0.5 = square root). Below 1, this raises small peaks relative to the base peak so training weighs them more; the model still outputs ordinary intensities.',
     precursor_free_loss_weight:'Weight of an auxiliary copy of every spectrum loss (intensity, cosine, ion score) recomputed with the precursor peak excluded and the rest re-normalized to its own max, so the usually-dominant precursor cannot starve gradient for the rest of the spectrum. Prediction always still includes the precursor.',
-    max_decode_steps:'Maximum MS2 branch expansion depth from each precursor seed.',
+    ion_embedding_dim:'Embedding width for normalized ion-shift identity.',unsaturation_embedding_dim:'Embedding width for the prepared unsaturation state.',radical_embedding_dim:'Embedding width for radical/non-radical state.',state_hidden_dim:'Hidden width of the ion-state explanation encoder.',main_adduct_dim:'Main-adduct feature width passed separately to the intensity head.',collision_energy_dim:'Collision-energy feature width passed separately to the intensity head.',equivalent_state_aggregation:'Normalized aggregation for equivalent latent explanations; attention is required.',
     adduct_type_strs:'Supported precursor adduct types, in model embedding order.',
     name:'Human-readable name stored in this configuration.',
     mol_encoder_checkpoint:'Pretrained molecular encoder checkpoint path.',
     freeze_mol_encoder:'Freeze the molecular encoder during training.',
   };
   const templates={patterns:{name:'new_pattern',reactant_smarts:'[!#1:1]-[!#1:2]',products:[{name:'product',smarts:'[!#1:1]'}]},products:{name:'product',smarts:'[!#1:1]'},adduct_rules:{name:'new_rule',adduct_type:'[M+H]+',radical:false,unsaturation:0,ion_shifts:[]},ion_shifts:{ion_shift:'[M+H]+'},atoms:'C',symbols:'C',adduct_type_strs:'[M+H]+'};
-  const optional={action_model_params:{num_heads:4,max_roles:64,state_num_layers:2,prediction_threshold:0.5},mol_encoder_params:{dropout:0},post_model_params:{cosine_loss_weight:0.5,ion_loss_weight:0.5,ion_prediction_threshold:0.5,intensity_power:0.5,precursor_free_loss_weight:0.5}};
+  const optional={action_model_params:{branch_main_adduct_dim:128,num_heads:4,max_roles:64,state_num_layers:2,branch_path_threshold:0,max_fragment_nodes:100},mol_encoder_params:{dropout:0},post_model_params:{ion_embedding_dim:32,unsaturation_embedding_dim:16,radical_embedding_dim:8,state_hidden_dim:128,main_adduct_dim:128,collision_energy_dim:16,equivalent_state_aggregation:'attention',cosine_loss_weight:0.5,ion_loss_weight:0.5,ion_prediction_threshold:0.5,peak_intensity_threshold:0,intensity_power:0.5,precursor_free_loss_weight:0.5}};
   // Purely cosmetic sub-headings for the sections with the most fields; any
   // field not listed here (e.g. a newer option) still renders, just ungrouped.
   const fieldGroups={
     action_model_params:{
-      'Architecture':['hidden_dim','condition_dim','num_heads','max_roles'],
-      'Action selection':['action_prefilter_top_k','action_prefilter_max_k','action_prefilter_threshold_logit'],
-      'Branch decoding':['beam_size','max_decode_steps','state_num_layers','prediction_threshold'],
+      'Architecture':['hidden_dim','branch_main_adduct_dim','num_heads','max_roles'],
+      'Branch Scorer · Architecture':['state_num_layers'],
+      'Search':['branch_path_threshold','max_fragment_nodes'],
     },
     post_model_params:{
-      'Architecture':['hidden_dim','num_layers','num_heads'],
+      'Fragment Transformer · Architecture':['hidden_dim','num_layers','num_heads'],
+      'Ion-State Encoder · Architecture':['ion_embedding_dim','unsaturation_embedding_dim','radical_embedding_dim','state_hidden_dim','equivalent_state_aggregation'],
+      'Intensity Head · Architecture':['main_adduct_dim','collision_energy_dim'],
       'Loss weights':['cosine_loss_weight','ion_loss_weight','intensity_power','precursor_free_loss_weight'],
-      'Generation':['ion_prediction_threshold'],
+      'Generation':['ion_prediction_threshold','peak_intensity_threshold'],
     },
   };
   // A resumed/saved model_config always has these (training_model_config writes
@@ -63,6 +63,7 @@ function createParameterEditor(container, initial, kind = "training", editCleava
   // here independently of it -- only one dropout value can ever be specified.
   const linkedToSharedDropout=new Set(['action_model_params.state_dropout','post_model_params.dropout']);
   const basic=new Set(['fragmenter_params.fragment_ion_tree_builder.max_action_count','fragmenter_params.precursor_candidate_max_action_count','fragmenter_params.mass_tolerance']);
+  const badge=full=>full.endsWith('.max_action_count')?'Dataset inherited':full.endsWith('.branch_path_threshold')||full.endsWith('.max_fragment_nodes')?'Search':/(ion_prediction_threshold|peak_intensity_threshold)$/.test(full)?'Inference only':/(loss_weight|intensity_power)$/.test(full)?'Training only':/(hidden_dim|embedding_dim|main_adduct_dim|collision_energy_dim|branch_main_adduct_dim|num_layers|num_heads|state_num_layers|equivalent_state_aggregation)$/.test(full)?'Architecture':'';
   const node=(tag,text)=>{const n=document.createElement(tag);if(text!==undefined)n.textContent=text;return n;};
   const button=(text,fn)=>{const b=node('button',text);b.type='button';b.onclick=fn;return b;};
   const title=key=>String(key).replaceAll('_',' ').replace(/\b\w/g,c=>c.toUpperCase()).replace('Smarts','SMARTS');
@@ -99,7 +100,7 @@ function createParameterEditor(container, initial, kind = "training", editCleava
       host.append(group);return;
     }
     const fieldKey=typeof key==='number'?path.split('.').at(-1):key;
-    const wrapper=node('label'),label=node('span',typeof key==='number'?title(fieldKey)+' '+(key+1):title(key));label.dataset.help=help(fieldKey,full);const input=node('input');input.dataset.parameterPath=full;input.type=typeof value==='boolean'?'checkbox':typeof value==='number'?'number':'text';
+    const wrapper=node('label'),label=node('span',typeof key==='number'?title(fieldKey)+' '+(key+1):title(key));label.dataset.help=help(fieldKey,full);const mark=badge(full);if(mark){const tag=node('small',mark);tag.className='parameter-badge';label.append(' ',tag);}const input=node('input');input.dataset.parameterPath=full;input.type=typeof value==='boolean'?'checkbox':typeof value==='number'?'number':'text';
     if(input.type==='number')input.step='any';if(input.type==='checkbox'){input.checked=value;wrapper.className='check';}else input.value=value??'';
     input.oninput=()=>{if(input.type==='number'&&(!input.value.trim()||!Number.isFinite(Number(input.value)))){input.setCustomValidity('Enter a finite number.');return;}input.setCustomValidity('');parent[key]=input.type==='checkbox'?input.checked:input.type==='number'?Number(input.value):input.value;};
     wrapper.append(label,input);if(optional[path]?.[key]!==undefined)wrapper.append(button('Use Default',()=>{delete parent[key];render();}));host.append(wrapper);
@@ -154,4 +155,4 @@ function client(){
   let timer;const tooltip=el('helpTooltip');document.addEventListener('mouseover',event=>{const label=event.target.closest('[data-help]');if(!label||!label.dataset.help)return;clearTimeout(timer);timer=setTimeout(()=>{const rect=label.getBoundingClientRect();tooltip.textContent=label.dataset.help;tooltip.style.left=Math.max(8,Math.min(rect.left,innerWidth-390))+'px';tooltip.style.top=Math.min(rect.bottom+7,innerHeight-110)+'px';tooltip.classList.add('visible');},500);});document.addEventListener('mouseout',event=>{if(event.target.closest('[data-help]')){clearTimeout(timer);tooltip.classList.remove('visible');}});
 }
 function importHtml(target){return `<section><h2>Import Parameters</h2><p class="muted">${target==='training'?'Drop an Action Model / Post Model parameter JSON to populate the trainable model settings. Dataset and encoder settings are loaded automatically.':'Optionally browse or drop a fragmenter / model JSON file to populate the fields below. Execution uses the current form values.'}</p><button type="button" id="${target}ParameterDrop" class="parameter-drop">Drop a parameter JSON file here or click to Browse</button><label><span data-help="Load a configuration into individual parameter fields. Later edits to the form override the imported file.">Parameter File</span><div class="path"><input id="${target}ParameterFile" data-path-kind="file" placeholder="Drop a JSON file here"><button type="button" id="${target}ParameterBrowse">Browse</button><button type="button" id="${target}ParameterLoad">Load Parameters</button></div></label><p id="${target}ParameterStatus" role="status"></p></section><div id="${target}ParameterEditor" class="parameter-editor"></div>`;}
-module.exports={createParameterEditor,importHtml,script:()=>`${createParameterEditor.toString()}(${client.toString()})();`,css:()=>`.parameter-editor fieldset{border:1px solid var(--border);border-radius:5px;margin:12px 0;padding:14px;min-width:0}.parameter-editor legend{font-weight:600}.parameter-editor input[type=checkbox]{width:auto}.parameter-array-item{border-left:2px solid var(--border);margin:10px 0;padding:0 12px}.parameter-editor fieldset>label{display:inline-block;vertical-align:top;width:calc(50% - 16px);margin-right:16px}.parameter-editor .check{display:inline-flex}.parameter-group-heading{flex-basis:100%;font-size:11px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;opacity:.65;margin:14px 0 2px}.parameter-group-heading:first-child{margin-top:0}#helpTooltip{pointer-events:none}@media(max-width:700px){.parameter-editor fieldset>label{width:100%}}`};
+module.exports={createParameterEditor,importHtml,script:()=>`${createParameterEditor.toString()}(${client.toString()})();`,css:()=>`.parameter-editor fieldset{border:1px solid var(--border);border-radius:5px;margin:12px 0;padding:14px;min-width:0}.parameter-editor legend{font-weight:600}.parameter-editor input[type=checkbox]{width:auto}.parameter-array-item{border-left:2px solid var(--border);margin:10px 0;padding:0 12px}.parameter-editor fieldset>label{display:inline-block;vertical-align:top;width:calc(50% - 16px);margin-right:16px}.parameter-editor .check{display:inline-flex}.parameter-group-heading{flex-basis:100%;font-size:11px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;opacity:.65;margin:14px 0 2px}.parameter-group-heading:first-child{margin-top:0}.parameter-badge{display:inline-block;padding:1px 5px;border:1px solid var(--border);border-radius:10px;font-size:9px;opacity:.75}#helpTooltip{pointer-events:none}@media(max-width:700px){.parameter-editor fieldset>label{width:100%}}`};

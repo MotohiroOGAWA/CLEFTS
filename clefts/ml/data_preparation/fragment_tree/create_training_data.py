@@ -1,4 +1,4 @@
-"""Regenerate schema-v6 branching teachers directly from original MSDataset."""
+"""Prepare CE-independent branch groups and physical-ion tensors."""
 from __future__ import annotations
 import argparse,json,math,sys,os,pickle,tempfile,shutil,csv
 from itertools import islice
@@ -185,18 +185,21 @@ def create_action_training_data(*, dataset: MSDataset, model_config: dict, outpu
                     run_parallel_subprocesses(commands,max_workers=min(num_workers,len(commands)),print_output=False,
                                               env=env,on_complete=on_complete,progress=progress)
     with (output/'manifest.tsv').open('w',newline='') as stream:
-        writer=csv.DictWriter(stream,fieldnames=['file','smiles','record_indexes','num_input_records','num_valid_samples','rejected_sample_count','rejection_log','num_teacher_nodes','num_positive_transitions','num_precursor_candidates','max_ms2_depth','num_nodes','num_edges','assignment_score','assignment_score_without_precursor','status','reason'],delimiter='\t')
+        writer=csv.DictWriter(stream,fieldnames=['file','smiles','record_indexes','num_input_records','num_valid_samples','rejected_sample_count','rejection_log','num_branch_groups','num_teacher_nodes','num_transition_states','num_positive_transitions','num_physical_ion_candidates','num_ion_explanations','max_ms2_depth','num_nodes','num_edges','assignment_score','assignment_score_without_precursor','status','reason'],delimiter='\t')
         writer.writeheader();writer.writerows(sorted(manifest_rows,key=lambda row:row['smiles']))
     with (output/'assignment_scores.tsv').open('w',newline='') as stream:
         writer=csv.DictWriter(stream,fieldnames=['structure_file','sample_index','record_index','assignment_score','assignment_score_without_precursor'],delimiter='\t')
         writer.writeheader();writer.writerows(sorted(score_rows,key=lambda row:(row['structure_file'],row['sample_index'])))
     (output/'skipped_sources.json').write_text(json.dumps(skipped,indent=2))
-    (output/'action_statistics.json').write_text(json.dumps(dict(schema_version=6,fragmentation_schema=generator.architecture,
+    (output/'action_statistics.json').write_text(json.dumps(dict(architecture=generator.architecture,
         num_teacher_nodes=sum(row.get('num_teacher_nodes',0) or 0 for row in manifest_rows),
         num_positive_transitions=sum(row.get('num_positive_transitions',0) or 0 for row in manifest_rows),
         mean_teacher_nodes_per_sample=sum(row.get('num_teacher_nodes',0) or 0 for row in manifest_rows)/max(prepared_records,1),
         mean_positive_edges_per_sample=sum(row.get('num_positive_transitions',0) or 0 for row in manifest_rows)/max(prepared_records,1),
-        mean_precursor_candidates=sum(row.get('num_precursor_candidates',0) or 0 for row in manifest_rows)/max(prepared_records,1),
+        num_branch_groups=sum(row.get('num_branch_groups',0) or 0 for row in manifest_rows),
+        num_transition_states=sum(row.get('num_transition_states',0) or 0 for row in manifest_rows),
+        num_physical_ion_candidates=sum(row.get('num_physical_ion_candidates',0) or 0 for row in manifest_rows),
+        num_ion_explanations=sum(row.get('num_ion_explanations',0) or 0 for row in manifest_rows),
         max_teacher_ms2_depth=max((row.get('max_ms2_depth',0) or 0 for row in manifest_rows),default=0),
         num_sources=len(files),num_samples=prepared_records,num_metadata_valid_records=len(dataset),num_skipped_sources=len(skipped),
         num_skipped_records=sum(len(source['record_indexes']) for source in skipped),

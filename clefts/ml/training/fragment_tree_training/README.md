@@ -1,9 +1,9 @@
-# Branching cleavage training (schema v6)
+# Fragment-tree training
 
-Training uses a pretrained molecular encoder, Source-anchored concrete cleavage
-actions, a `BranchingCleavageDecoder`, and the post-materialization intensity
-model. Each valid action receives an independent sigmoid probability. Several
-cleavages can be positive at one fragment node; there is no action/EOS softmax.
+Training has two objectives. The branch model predicts cleavage paths once per
+`(compound, main adduct)` group, without collision energy. The intensity model
+then predicts each prepared physical-ion candidate independently for every
+spectrum, using main adduct and collision energy as separate inputs.
 
 ```bash
 python -m clefts.cli train fragment-tree \
@@ -12,97 +12,68 @@ python -m clefts.cli train fragment-tree \
   --output-dir training/run \
   --mol-encoder-checkpoint mol_encoder_pretrained.pt \
   --epochs 20 --device cuda \
-  --next-weight 1 --negative-weight 0.2 \
-  --minimum-positive-weight 0.05 --branch-threshold 0.5
+  --branch-weight 1 --negative-weight 0.2 \
+  --branch-mil-temperature 0.1 --intensity-weight 1 \
+  --branch-path-threshold 0 --max-fragment-nodes 100
 ```
 
-`--next-weight` remains an alias in the existing CLI vocabulary for the branching
-loss weight. The Workbench calls this **Branching Action Loss**. The prediction
-threshold belongs to training/model configuration (`prediction_threshold`), not
-to the Preparation CLI. Existing preparation arguments remain unchanged.
+`max_action_count` is inherited from the prepared dataset. A zero branch path
+threshold disables score pruning. Search always deduplicates normalized states,
+keeps the highest cumulative log probability, and applies the fragment-node
+budget once to the shared branch group.
 
-## Teacher semantics
+## Branch objective
 
-A teacher node is `(sample, precursor candidate row, normalized action state)`.
-Source precursors have an empty seed. Non-root precursor preparation is stored
-separately and contributes no MS2 branch target. MS2 depth starts at zero at each
-seed. Candidates have independent teacher provenance even if their structures
-later merge during materialization.
+Every transition log probability is `logsigmoid(logit)`. A path score is the
+sum of its transition log probabilities. Alternative explanations for one peak
+use a normalized smooth maximum:
 
-Preparation retains actual peak-assigned pathway transitions, unions ambiguous
-pathways, and closes each supported path back to its precursor. It does not
-enumerate all combinations or permutations for teacher creation. The chemistry
-FragmentTree still explores chemistry under the existing resource limits.
+```text
+T * (logsumexp(path_score / T) - log(number_of_paths))
+```
 
-`teacher_positive_action_ptr/index/weight` is sparse CSR. Raw weight is the
-maximum observed descendant intensity, including direct observations. Thus an
-unobserved intermediate cleavage receives the salience of the observed fragments
-it supports. Sample absolute positives are the union of MS2 branch actions;
-precursor preparation is only mandatory pool context.
+Preparation unions positive paths over every collision energy in the branch
+group. At each teacher-supported depth, a chemically valid continuation absent
+from that union is stored as a weak negative. The branch loss combines positive
+MIL with `negative_weight * mean(softplus(negative_logit))`.
 
-## Loss and compatibility
+## Physical-ion intensity
 
-For valid positive logits, use weighted `softplus(-logit)`, normalized by the sum
-of positive weights. Effective weight is `raw_salience + minimum_positive_weight`.
-For valid negatives, use mean `softplus(logit)` multiplied by `negative_weight`.
-Unobserved valid candidates are weak negatives, including candidates at teacher
-leaves. Invalid actions have no loss. Positives are forced into the training pool;
-validation generation uses the naturally filtered pool.
+Preparation groups equivalent final formula/adduct/charge states into one
+physical candidate while preserving every `(ion, unsaturation, radical)`
+explanation. The model embeds those three fields and aggregates equivalent
+explanations with normalized attention. It never sums one intensity per
+explanation. Physical candidates use independent softplus intensities, so
+several ion states of one fragment can be non-zero simultaneously.
 
-Training and inference use `ActionCompatibilityEngine` via the same
-`score_states` method: selected actions, conflicts, reactant invalidation,
-precedence violations, empty retained fragments, no-ops and capacity violations
-are masked. No RDKit runs in training forward. Selected inference states are
-materialized through the explicit chemistry boundary before intensity prediction.
+Targets are max-normalized per spectrum. `intensity_power` is used only inside
+the full-spectrum and precursor-free losses; inference max-normalizes raw model
+outputs without applying that power. Ion-assignment supervision remains an
+auxiliary term, and there is no independent hydrogen-shift loss.
 
-`beam_size` is retained as a per-sample bound on states at each generation level.
-`max_decode_steps` limits MS2 expansions from the precursor. A branch ends when
-no accepted child remains or a limit is reached. Structure deduplication is
-separate from action-state provenance.
+## Prepared-tensor boundary
 
-## Validation and outputs
+Training consumes source/fragment graphs, action/state transitions, MIL paths,
+physical candidates, explanation indices, masses, formulas, and targets already
+stored by preparation. Forward, loss, backward, and optimizer steps perform
+only tensor and neural-network operations. RDKit parsing, fragmentation,
+materialization, ion chemistry, formula calculation, and graph construction are
+not permitted in the training hot path.
 
-Every epoch and every enabled intermediate validation calls the real generator
-in eval/no-grad mode using only source molecules, adducts and collision energies.
-It performs natural action filtering, branching decoding, materialization and
-post-model spectrum generation. Teacher-forced loss remains a separate diagnostic
-and controls scheduling/checkpoint selection.
+Prepared data is intentionally versionless. When its contract changes,
+regenerate it from the original spectra; no migration or old-format converter
+is provided.
 
-`training.pft.json` is a small live run manifest. Opening it in CLEFTS Workbench
-selects the training-result viewer by its internal `clefts.training-report`
-schema; the `.pft.json` extension is shared with the other CLEFTS result types.
+## Metrics and outputs
 
-`spectrum_validation/epoch_N.json` and `step_N.json` contain every generated
-spectrum and original peak set, one-to-one mass-tolerance matched cosine and
-intensity-weighted assignment coverage per sample. Both scores are also saved
-without precursor peaks. Reports include q10/q25/median/q75/q90 representatives,
-empirical collision-energy tertiles, normalized main adducts, and MS2-depth
-breakdowns where the precursor is depth 0. Unassigned original peaks and
-unmatched predictions remain in the cosine norms. Empty predictions score zero
-and contribute to the nonempty-spectrum fraction. These detailed artifacts can
-be large for production validation sets; `training.pft.json` references them
-instead of duplicating them.
+Reports include branch positive/negative loss, recall and state counts by depth,
+generated-tree search statistics, physical candidate/explanation counts, full
+and precursor-free cosine, and intensity MAE. Validation also generates spectra
+with the inference path. TensorBoard, JSON/TSV reports, last/best checkpoints,
+and detailed spectrum-validation artifacts are written to the run directory.
 
-Metrics include branching precision/recall, positive/valid/predicted actions per
-node, recall by MS2 depth, generated/unique fragment counts, natural prefilter
-recall, teacher-spectrum cosine, free-running spectrum cosine, and assignment
-coverage. Batch and spectrum distributions are written as q10/q25/median/q75/q90
-plus mean so Workbench can switch every series between mean, median, and
-distribution views. TensorBoard, JSON/TSV reports, last/best checkpoints and
-intermediate subset provenance are written to the training directory.
-
-Schema v5 structures are rejected with a regeneration message. Regenerate from
-original MSDataset files. Old autoregressive configuration names are accepted as
-configuration aliases; old decoder checkpoints are not compatible with v6 weights.
-
-## Verification
+Run the focused regression suite with:
 
 ```bash
-OMP_NUM_THREADS=2 python -m pytest tests/ml/action/test_branching_v6.py -q
-PYTHONPATH=. OMP_NUM_THREADS=2 python evaluation/branching/prepare_smoke.py
+pytest -q tests/ml/action/test_fragment_tree_redesign.py
 ```
-
-The real-data smoke recipe selects small molecule-disjoint subsets from the two
-files in `data/train_preprocessing/test/preparation_config.json`, retaining source
-record indexes. See `evaluation/branching/IMPLEMENTATION_REPORT.md` for commands,
-measured results, and limitations.

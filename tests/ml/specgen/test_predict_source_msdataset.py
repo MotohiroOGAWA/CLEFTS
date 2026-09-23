@@ -10,7 +10,6 @@ from tests.ml.action.TestActionPipeline import config
 
 def _generator(ion_prediction_threshold=0.5):
     value = config()
-    value['action_model_params']['action_prefilter_threshold_logit'] = 1.
     value['post_model_params']['ion_prediction_threshold'] = ion_prediction_threshold
     return create_spectrum_generator(value).eval()
 

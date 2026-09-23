@@ -10,11 +10,8 @@ OPTIONS = {
     'max_action_count': ('fragmenter_params', 'fragment_ion_tree_builder', 'max_action_count'),
     'precursor_max_action_count': ('fragmenter_params', 'precursor_candidate_max_action_count'),
     'mass_tolerance': ('fragmenter_params', 'mass_tolerance'),
-    'action_top_k': ('action_model_params', 'action_prefilter_top_k'),
-    'action_max_k': ('action_model_params', 'action_prefilter_max_k'),
-    'action_threshold': ('action_model_params', 'action_prefilter_threshold_logit'),
-    'beam_size': ('action_model_params', 'beam_size'),
-    'max_decode_steps': ('action_model_params', 'max_decode_steps'),
+    'branch_path_threshold': ('action_model_params', 'branch_path_threshold'),
+    'max_fragment_nodes': ('action_model_params', 'max_fragment_nodes'),
 }
 
 def configure_model_options(parser: argparse.ArgumentParser) -> None:
@@ -24,7 +21,7 @@ def configure_model_options(parser: argparse.ArgumentParser) -> None:
         parser.add_argument('--'+group+'-params-json', help='Inline parameter object overriding the corresponding configuration section.')
     parser.add_argument('--adduct-types-json', help='JSON array of supported adduct strings.')
     for key in OPTIONS:
-        kind = str if key == 'mass_tolerance' else float if key == 'action_threshold' else int
+        kind = str if key == 'mass_tolerance' else float if key == 'branch_path_threshold' else int
         parser.add_argument('--'+key.replace('_','-'), type=kind, help='Override '+'.'.join(OPTIONS[key])+'.')
     parser.add_argument('--set', dest='parameter_overrides', action='append', default=[], metavar='PATH=JSON',
                         help='Override any individual parameter, including nested array entries. Repeat as needed; applied last.')

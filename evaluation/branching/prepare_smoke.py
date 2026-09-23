@@ -6,14 +6,14 @@ import torch
 from clefts.libs.msentity.msentity import MSDataset
 from clefts.ml.data_preparation.fragment_tree.create_training_data import main
 
-root=Path('data/train_preprocessing/test/branching_v6_verification')
+root=Path('data/train_preprocessing/test/fragment_tree_redesign_verification')
 root.mkdir(parents=True,exist_ok=True)
 original=json.loads(Path('data/train_preprocessing/test/preparation_config.json').read_text())
 config=original['model_config']
 encoder=Path('data/training/mol_projects/main/mol_encoder_pretrained.pt').resolve()
 config['mol_encoder_params']=torch.load(encoder,map_location='cpu',weights_only=False)['mol_encoder_params']
-config['architecture']='source-anchored-branching-v1'
-config['action_model_params'].update(hidden_dim=32,condition_dim=32,action_prefilter_top_k=64,action_prefilter_max_k=128,beam_size=32,max_decode_steps=3,prediction_threshold=.5)
+config['architecture']='fragment-tree-physical-ion'
+config['action_model_params'].update(hidden_dim=32,branch_main_adduct_dim=32,branch_path_threshold=0,max_fragment_nodes=100)
 config['post_model_params'].update(hidden_dim=32,num_layers=1,num_heads=4)
 used=set();provenance={}
 for key,name,limit in [('input','train',8),('validation_input','validation',4)]:

@@ -220,22 +220,12 @@ The file is loaded once and each distinct input SMILES is parsed once per run.
 
 ### Fragment Tree Fine-tuning
 
-Open **Fine-tuning**, select a base fragment-tree `model.pt`, a complete expanded
-Cleavage Pattern Set, and training/validation splits regenerated with that set.
-Select a separate output directory. All old parameters and MolEncoder are frozen;
-only new category embeddings and small per-projection low-rank expansions train.
-**Added nodes per projection** defaults to 8. The original model dimensions stay
-the same. Use representative old compounds as well as new-pattern examples when
-checking performance.
-
-**Validate only** checks preprocessing/configuration and checkpoint compatibility
-and reports trainable/frozen parameter counts. **Run Fine-tuning CLI** invokes
-`python -m clefts.cli train fragment-tree-finetune`; **Copy Command** copies the
-same arguments. Logs stream into the tab and the CLEFTS output channel. The new
-set must include all old definitions, and other Fragmenter settings must match
-the base. The validation split must include `valid_records.msds`.
-**Load Configuration** and **Save Configuration** preserve all file paths and
-fine-tuning hyperparameters in an editable, versioned JSON document.
+Fine-tuning is part of **Fragment Tree Training**. Choose **Fine-tune patterns**,
+select a base checkpoint, and use training/validation structures regenerated
+with the complete expanded cleavage set. The training command uses
+`--fine-tune-checkpoint` and `--adapter-width`; resume an interrupted expansion
+from the same page. Existing base parameters remain frozen while new category
+parameters and projection adapters train.
 
 See `../clefts/ml/training/fragment_tree_training/README.md` for CLI usage,
 checkpoint/resume behavior, and the exact expansion architecture.
@@ -261,18 +251,19 @@ selected charts are retained in the webview state.
 Open `CLEFTS: Open Workbench` or use the CLEFTS Activity Bar. The dashboard
 provides quick actions, environment diagnostics and recent training jobs.
 The navigation retains the existing preprocessing, prediction, fragment viewer,
-SMARTS, fine-tuning and evaluation tools.
+SMARTS and evaluation tools. Checkpoint initialization and adapter training are
+configured directly in the training workflow.
 
-Training supports AdamW weight decay, gradient clipping and separate absolute
- action, next action, negative action and fragment intensity loss weights.
+Training supports AdamW weight decay, gradient clipping, normalized branch MIL,
+depth-diverse weak negatives, and physical-ion intensity loss.
 Data Preparation and Training expose individual parameter fields. Import Parameters
 accepts model or fragmenter JSON through Browse or drag-and-drop and expands it into
 the form. The file is optional; execution uses a snapshot of the edited fields.
 Advanced buttons reveal less frequently changed settings. Hover over a parameter
 label for 500ms to see its description.
 The CLI is `python -m clefts.cli train fragment-tree`; new options are
-`--weight-decay`, `--gradient-clip`, `--absolute-weight`, `--next-weight`,
-`--negative-weight` and `--intensity-weight`.
+`--weight-decay`, `--gradient-clip`, `--branch-weight`, `--negative-weight`,
+`--branch-mil-temperature` and `--intensity-weight`.
 
 Training Jobs shows live stdout/stderr, epoch progress, searchable logs and a
 link to the metrics charts. Training writes `metrics.tsv` and emits JSON Lines
@@ -281,7 +272,7 @@ storage. Training continues when its panel closes and uses detached processes
 so it can survive extension host restarts. Restored running PIDs are checked;
 if the process disappeared, its exit status is reported as unknown. Stopping a
 restored process requires verifying it in the terminal to avoid killing a reused
-PID. Existing batch prediction and fine-tuning retain their original lifecycle.
+PID. Existing batch prediction retains its original lifecycle.
 
 Run `npm run check:workbench` for dashboard, CSP and CLI argument checks.
 

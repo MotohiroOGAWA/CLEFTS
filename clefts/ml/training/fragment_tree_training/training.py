@@ -1,4 +1,4 @@
-"""Schema-v5 action training entry point, with one batched teacher forward."""
+"""Prepared-tensor fragment-tree branch and physical-ion training entry point."""
 from __future__ import annotations
 import argparse
 import json
@@ -69,9 +69,8 @@ def train_actions(*, model_config: dict, train_dir: str | Path, val_dir: str | P
                   output_dir: str | Path, epochs: int = 1, batch_size: int = 4,
                   lr: float = 1e-4, device: str = "cuda", resume: str | Path | None = None,
                   weight_decay: float = 0.01, gradient_clip: float = 1.0,
-                  absolute_weight: float = 1.0, next_weight: float = 1.0,
-                  negative_weight: float = 0.2, intensity_weight: float = 1.0,
-                  absolute_intensity_weight: float = 1.0, minimum_positive_weight: float = 0.05, max_samples: int = 128,
+                  branch_weight: float = 1.0, negative_weight: float = 0.2,
+                  branch_mil_temperature: float = 0.1, intensity_weight: float = 1.0, max_samples: int = 128,
                   seed: int = 42, warmup_steps: int = 100, lr_patience: int = 3,
                   early_stopping_patience: int = 10, min_lr: float = 1e-6,
                   validation_interval_steps: int = 0, validation_fraction: float = 0.1,
@@ -87,7 +86,7 @@ def train_actions(*, model_config: dict, train_dir: str | Path, val_dir: str | P
     output=Path(output_dir);output.mkdir(parents=True,exist_ok=True)
     settings={key:value for key,value in locals().copy().items() if key in (
         'train_dir','val_dir','epochs','batch_size','lr','device','resume','weight_decay','gradient_clip',
-        'absolute_weight','next_weight','negative_weight','intensity_weight','absolute_intensity_weight','minimum_positive_weight',
+        'branch_weight','negative_weight','branch_mil_temperature','intensity_weight',
         'max_samples','seed','warmup_steps','lr_patience','early_stopping_patience','min_lr','train_mol_encoder','initialize_from',
         'validation_interval_steps','validation_fraction')}
     settings={key:str(value) if isinstance(value,Path) else value for key,value in settings.items()}
@@ -96,9 +95,9 @@ def train_actions(*, model_config: dict, train_dir: str | Path, val_dir: str | P
     write_training_report(output,status='initializing',settings=settings)
     if epochs<1 or batch_size<1 or max_samples<1 or not math.isfinite(lr) or lr<=0:
         raise ValueError('epochs, batch_size, max_samples and lr must be positive')
-    if any(not math.isfinite(value) or value<0 for value in (weight_decay,gradient_clip,absolute_weight,next_weight,negative_weight,intensity_weight,absolute_intensity_weight,minimum_positive_weight,min_lr)):
+    if any(not math.isfinite(value) or value<0 for value in (weight_decay,gradient_clip,branch_weight,negative_weight,intensity_weight,min_lr)) or not math.isfinite(branch_mil_temperature) or branch_mil_temperature<=0:
         raise ValueError('Optimizer and loss settings must be finite and non-negative')
-    if absolute_weight+next_weight+intensity_weight<=0:raise ValueError('Enable at least one training loss')
+    if branch_weight+intensity_weight<=0:raise ValueError('Enable at least one training loss')
     if min_lr>lr or min(warmup_steps,lr_patience,early_stopping_patience)<0:
         raise ValueError('min_lr must not exceed lr; schedule patience/steps must be non-negative')
     if not isinstance(validation_interval_steps, int) or validation_interval_steps < 0:
@@ -120,11 +119,11 @@ def train_actions(*, model_config: dict, train_dir: str | Path, val_dir: str | P
         prior=checkpoint.get('training_settings',{})
         if not prior:settings['train_mol_encoder']=not bool(model_config.get('fine_tuning'))
         # Restoring optimizer and loss definitions makes a resumed curve comparable.
-        for key in ('absolute_weight','next_weight','negative_weight','intensity_weight','absolute_intensity_weight','minimum_positive_weight','train_mol_encoder','gradient_clip','warmup_steps','lr_patience','min_lr','lr'):
+        for key in ('branch_weight','negative_weight','branch_mil_temperature','intensity_weight','train_mol_encoder','gradient_clip','warmup_steps','lr_patience','min_lr','lr'):
             if key in prior:settings[key]=prior[key]
-        absolute_weight=settings['absolute_weight'];next_weight=settings['next_weight'];negative_weight=settings['negative_weight']
-        intensity_weight=settings['intensity_weight'];absolute_intensity_weight=settings['absolute_intensity_weight'];train_mol_encoder=settings['train_mol_encoder']
-        minimum_positive_weight=settings['minimum_positive_weight'];gradient_clip=settings['gradient_clip'];warmup_steps=settings['warmup_steps'];lr_patience=settings['lr_patience'];min_lr=settings['min_lr'];lr=settings['lr']
+        branch_weight=settings['branch_weight'];negative_weight=settings['negative_weight'];branch_mil_temperature=settings['branch_mil_temperature']
+        intensity_weight=settings['intensity_weight'];train_mol_encoder=settings['train_mol_encoder']
+        gradient_clip=settings['gradient_clip'];warmup_steps=settings['warmup_steps'];lr_patience=settings['lr_patience'];min_lr=settings['min_lr'];lr=settings['lr']
     params=model_config.get('params',model_config)
     model_config=inherit_model_config(model_config,train_dir,val_dir,encoder_checkpoint=params.get('mol_encoder_checkpoint'),saved_model=model_config if resume or params.get('fine_tuning') else None)
     model_config['max_samples']=max_samples
@@ -136,7 +135,8 @@ def train_actions(*, model_config: dict, train_dir: str | Path, val_dir: str | P
         generator.mol_encoder.load_state_dict(pretrained['mol_encoder_state_dict'])
     if not train_mol_encoder:generator.feature_model.freeze_mol_encoder()
     model=ActionFragmentTreeTrainingModel(generator.feature_model,downstream_model=generator.post_model,
-        absolute_weight=absolute_weight,next_weight=next_weight,negative_weight=negative_weight,intensity_weight=intensity_weight,absolute_intensity_weight=absolute_intensity_weight,minimum_positive_weight=minimum_positive_weight).to(device)
+        branch_weight=branch_weight,negative_weight=negative_weight,branch_mil_temperature=branch_mil_temperature,
+        intensity_weight=intensity_weight).to(device)
     model.set_checkpoint_model_config(model_config)
     legacy=checkpoint is not None and not checkpoint.get('training_settings')
     optimizer_parameters=list(model.parameters()) if legacy else [p for p in model.parameters() if p.requires_grad]
@@ -144,7 +144,7 @@ def train_actions(*, model_config: dict, train_dir: str | Path, val_dir: str | P
     scheduler=torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer,mode='min',factor=0.5,patience=lr_patience,min_lr=min_lr)
     start=0;global_step=0;best=float('inf');bad_epochs=0;history=[];intermediate_history=[]
     if checkpoint:
-        if checkpoint.get('fragmentation_schema')!=generator.architecture:raise ValueError('Incompatible checkpoint architecture')
+        if checkpoint.get('architecture')!=generator.architecture:raise ValueError('Incompatible checkpoint architecture')
         model.load_state_dict(checkpoint['model_state_dict']);optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         start=int(checkpoint['epoch']);global_step=int(checkpoint.get('global_step',0));best=float(checkpoint.get('best_validation_loss',best))
         history=checkpoint.get('history',[])
@@ -167,15 +167,13 @@ def train_actions(*, model_config: dict, train_dir: str | Path, val_dir: str | P
     datasets=[];dataset_report={}
     for name,directory in (('train',train_dir),('validation',val_dir)):
         files=sorted(Path(directory).rglob('*.preft.pt'))
-        if not files:raise ValueError(f'No schema-v6 .preft.pt files in {directory}')
+        if not files:raise ValueError(f'No prepared .preft.pt files in {directory}')
         pieces=[];samples=0;states=0;formulas=0
         for file in files:
             data=SourceActionStructure.load(file,max_action_count=generator.feature_model.max_action_count)
             if data.num_samples<1:raise ValueError(f"Structure contains no samples: {file}")
             if data.downstream is None:raise ValueError('Full training requires stored target molecular graphs')
-            if data.precursor_next_index.numel()==0 and data.action_type.numel() and data.precursor_row_action_ptr.numel()==1:
-                raise ValueError('Regenerate structures with recorded precursor alternatives')
-            samples+=data.num_samples;states+=data.teacher_node_sample_index.numel();formulas+=data.downstream.formula_tensor.shape[0]
+            samples+=data.num_samples;states+=data.teacher_node_branch_group_index.numel();formulas+=data.downstream.formula_tensor.shape[0]
             pieces.extend(select_samples(data,range(i,min(i+max_samples,data.num_samples))) for i in range(0,data.num_samples,max_samples))
         datasets.append(pieces)
         dataset_report[name]={'files':len(files),'samples':samples,'teacher_states':states,'formula_targets':formulas,'chunks':len(pieces)}
@@ -208,8 +206,7 @@ def train_actions(*, model_config: dict, train_dir: str | Path, val_dir: str | P
         for group in groups:
             yield SourceActionStructure.from_structures([pieces[index] for index in group])
     def metric_values(result):
-        return {'loss':result.loss,'absolute_action_loss':result.absolute_loss,
-                'branching_action_loss':result.next_action_loss,'intensity_loss':result.downstream_output.loss,**result.metrics}
+        return {'loss':result.loss,**result.metrics}
     from .spectrum_validation import validate_spectra, append_metric_distributions
     def intermediate_validation(epoch):
         was_training=model.training
@@ -326,11 +323,11 @@ def train_actions(*, model_config: dict, train_dir: str | Path, val_dir: str | P
             for key,value in row.items():
                 if key!='epoch':writer.add_scalar(key,value,epoch+1)
             writer.flush();iteration_writer.flush()
-            report={'history':history,'intermediate_validation_history':intermediate_history,'schema_version':6,'fragmentation_schema':generator.architecture,'model_config':model_config,'training':settings,'datasets':dataset_report,'parameters':parameters,'best_validation_loss':best,
+            report={'history':history,'intermediate_validation_history':intermediate_history,'architecture':generator.architecture,'model_config':model_config,'training':settings,'datasets':dataset_report,'parameters':parameters,'best_validation_loss':best,
                 'elapsed_seconds':time.perf_counter()-started,'validation_mode':'free-running spectrum generation plus teacher-forced loss; original-peak cosine distributions recorded','stop_reason':'running'}
             (output/'metrics.json').write_text(json.dumps(report,indent=2))
             headers=list(dict.fromkeys(key for item in history for key in item));(output/'metrics.tsv').write_text('\t'.join(key.replace('/','_') for key in headers)+'\n'+'\n'.join('\t'.join(str(item.get(key,'')) for key in headers) for item in history)+'\n')
-            saved=dict(model_config=model_config,model_state_dict=model.state_dict(),optimizer_state_dict=optimizer.state_dict(),scheduler_state_dict=scheduler.state_dict(),epoch=epoch+1,global_step=global_step,intermediate_validation_history=intermediate_history,schema_version=6,fragmentation_schema=generator.architecture,history=history,training_settings=settings,best_validation_loss=best,bad_epochs=bad_epochs,torch_rng_state=torch.get_rng_state(),cuda_rng_state=torch.cuda.get_rng_state_all(),python_rng_state=random.getstate())
+            saved=dict(model_config=model_config,model_state_dict=model.state_dict(),optimizer_state_dict=optimizer.state_dict(),scheduler_state_dict=scheduler.state_dict(),epoch=epoch+1,global_step=global_step,intermediate_validation_history=intermediate_history,architecture=generator.architecture,history=history,training_settings=settings,best_validation_loss=best,bad_epochs=bad_epochs,torch_rng_state=torch.get_rng_state(),cuda_rng_state=torch.cuda.get_rng_state_all(),python_rng_state=random.getstate())
             torch.save(saved,output/'last.pt')
             if improved:torch.save(saved,output/'best.pt')
             write_training_report(output,status='running',settings=settings,datasets=dataset_report,
@@ -345,8 +342,8 @@ def train_actions(*, model_config: dict, train_dir: str | Path, val_dir: str | P
         write_training_report(output,status='completed',settings=settings,datasets=dataset_report,
                               completed_epochs=len(history),global_step=global_step,
                               latest_validation=f'spectrum_validation/epoch_{history[-1]["epoch"]}.json' if history else None)
-        lines=['# Fragment Tree Training Report','',f"Device: {device}; trainable parameters: {parameters['trainable']:,}",f"Best validation loss: {best:.6g}",f"Stop reason: {stop_reason}",'','Validation generates spectra in inference mode and records original-peak cosine distributions in spectrum_validation/. Teacher-forced losses are recorded separately.','','| Epoch | Train loss | Validation loss | Filter intensity recall | Spectrum cosine | LR |','|---|---|---|---|---|---|']
-        for item in history:lines.append(f"| {item['epoch']} | {item['train_loss']:.6g} | {item['validation_loss']:.6g} | {item.get('validation/intensity_recall_at_filter',0):.4f} | {item.get('validation/spectrum_cosine_similarity',0):.4f} | {item.get('learning_rate',0):.3g} |")
+        lines=['# Fragment Tree Training Report','',f"Device: {device}; trainable parameters: {parameters['trainable']:,}",f"Best validation loss: {best:.6g}",f"Stop reason: {stop_reason}",'','Validation generates spectra in inference mode and records original-peak cosine distributions in spectrum_validation/. Prepared-path losses are recorded separately.','','| Epoch | Train loss | Validation loss | Positive branch MIL | Weak-negative branch | Spectrum cosine | LR |','|---|---|---|---|---|---|---|']
+        for item in history:lines.append(f"| {item['epoch']} | {item['train_loss']:.6g} | {item['validation_loss']:.6g} | {item.get('validation/branch_positive_mil_loss',0):.4f} | {item.get('validation/branch_negative_loss',0):.4f} | {item.get('validation/spectrum_cosine_similarity',0):.4f} | {item.get('learning_rate',0):.3g} |")
         if intermediate_history:
             lines.extend(['', '## Intermediate validation', '', 'These fixed-subset checks are observational; scheduling and best-checkpoint selection use full epoch validation.', '', '| Step | Epoch | Samples | Validation loss | Spectrum cosine |', '|---|---|---|---|---|'])
             for item in intermediate_history:
@@ -369,29 +366,32 @@ def train_actions(*, model_config: dict, train_dir: str | Path, val_dir: str | P
 # Only trainable model sections are exposed by the training CLI.
 MODEL_OPTIONS = {
     'action-hidden-dim': ('action_model_params', 'hidden_dim', int, 128),
-    'action-condition-dim': ('action_model_params', 'condition_dim', int, 128),
+    'action-main-adduct-dim': ('action_model_params', 'branch_main_adduct_dim', int, 128),
     'action-num-heads': ('action_model_params', 'num_heads', int, 4),
     'action-max-roles': ('action_model_params', 'max_roles', int, None),
-    'action-top-k': ('action_model_params', 'action_prefilter_top_k', int, 64),
-    'action-max-k': ('action_model_params', 'action_prefilter_max_k', int, 128),
-    'action-threshold': ('action_model_params', 'action_prefilter_threshold_logit', float, 1.0),
-    'branch-threshold': ('action_model_params', 'prediction_threshold', float, 0.5),
-    'beam-size': ('action_model_params', 'beam_size', int, 32),
-    'max-decode-steps': ('action_model_params', 'max_decode_steps', int, 16),
+    'branch-path-threshold': ('action_model_params', 'branch_path_threshold', float, 0.0),
+    'max-fragment-nodes': ('action_model_params', 'max_fragment_nodes', int, 100),
     'action-state-layers': ('action_model_params', 'state_num_layers', int, 2),
     'post-hidden-dim': ('post_model_params', 'hidden_dim', int, 128),
     'post-num-layers': ('post_model_params', 'num_layers', int, 2),
     'post-cosine-loss-weight': ('post_model_params', 'cosine_loss_weight', float, 0.5),
     'post-ion-loss-weight': ('post_model_params', 'ion_loss_weight', float, 0.5),
     'post-ion-threshold': ('post_model_params', 'ion_prediction_threshold', float, 0.5),
+    'post-peak-intensity-threshold': ('post_model_params', 'peak_intensity_threshold', float, 0.0),
     'post-intensity-power': ('post_model_params', 'intensity_power', float, 0.5),
     'post-precursor-free-weight': ('post_model_params', 'precursor_free_loss_weight', float, 0.5),
     'post-num-heads': ('post_model_params', 'num_heads', int, 4),
+    'ion-embedding-dim': ('post_model_params', 'ion_embedding_dim', int, 32),
+    'unsaturation-embedding-dim': ('post_model_params', 'unsaturation_embedding_dim', int, 16),
+    'radical-embedding-dim': ('post_model_params', 'radical_embedding_dim', int, 8),
+    'ion-state-hidden-dim': ('post_model_params', 'state_hidden_dim', int, 128),
+    'main-adduct-embedding-dim': ('post_model_params', 'main_adduct_dim', int, 128),
+    'collision-energy-feature-dim': ('post_model_params', 'collision_energy_dim', int, 16),
 }
 
 
 def training_model_config(args):
-    config = {'max_samples':args.max_samples,'architecture': 'source-anchored-branching-v1',
+    config = {'max_samples':args.max_samples,'architecture': 'fragment-tree-physical-ion',
               'action_model_params': {}, 'post_model_params': {}}
     for flag, (section, key, _, default) in MODEL_OPTIONS.items():
         value = getattr(args, flag.replace('-', '_'))
@@ -419,9 +419,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument('--fine-tune-checkpoint',help='Base action training model.pt to expand with a new cleavage pattern set.')
     parser.add_argument('--adapter-width',type=int,default=8,help='Extra low-rank nodes per linear/attention projection (default: 8).')
     parser.add_argument('--overwrite',action='store_true',help='Reuse an existing, non-empty output directory without asking for confirmation.')
-    for name, default in (("weight-decay",0.01),("gradient-clip",1.0),
-                          ("absolute-weight",1.0),("next-weight",1.0),
-                          ("negative-weight",0.2),("minimum-positive-weight",0.05),("intensity-weight",1.0),("absolute-intensity-weight",1.0),("min-lr",1e-6)):
+    for name, default in (("weight-decay",0.01),("gradient-clip",1.0),("branch-weight",1.0),
+                          ("negative-weight",0.2),("branch-mil-temperature",0.1),("intensity-weight",1.0),("min-lr",1e-6)):
         parser.add_argument('--'+name,type=float,default=default)
     for name,default in (('max-samples',128),('seed',42),('warmup-steps',100),('lr-patience',3),('early-stopping-patience',10)):
         parser.add_argument('--'+name,type=int,default=default)
@@ -469,9 +468,9 @@ def main(argv: list[str] | None = None) -> None:
     train_actions(model_config=model_config,train_dir=args.train_dir,val_dir=args.val_dir,
         output_dir=args.output_dir,epochs=args.epochs,batch_size=args.batch_size,lr=args.lr,device=args.device,resume=args.resume,
         weight_decay=args.weight_decay,gradient_clip=args.gradient_clip,
-        absolute_weight=args.absolute_weight,next_weight=args.next_weight,
-        negative_weight=args.negative_weight,intensity_weight=args.intensity_weight,absolute_intensity_weight=args.absolute_intensity_weight,max_samples=args.max_samples,
+        branch_weight=args.branch_weight,negative_weight=args.negative_weight,branch_mil_temperature=args.branch_mil_temperature,
+        intensity_weight=args.intensity_weight,max_samples=args.max_samples,
         seed=args.seed,warmup_steps=args.warmup_steps,lr_patience=args.lr_patience,early_stopping_patience=args.early_stopping_patience,min_lr=args.min_lr,train_mol_encoder=args.train_mol_encoder,initialize_from=args.initialize_from,
-        minimum_positive_weight=args.minimum_positive_weight,validation_interval_steps=args.validation_interval_steps,validation_fraction=args.validation_fraction)
+        validation_interval_steps=args.validation_interval_steps,validation_fraction=args.validation_fraction)
 
 if __name__=='__main__':main()

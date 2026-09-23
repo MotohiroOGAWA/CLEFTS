@@ -16,10 +16,10 @@ const dimension=form.querySelector('[data-parameter-path="action_model_params.hi
 assert(!d.querySelector('[id$=SaveDefaults]'));
 assert(d.querySelector('#trainingStart').closest('.training-bottom'));
 assert(!d.querySelector('#trainingLossFields').hidden);
-for(const name of ['weightDecay','gradientClip','absoluteWeight','nextWeight','minimumPositiveWeight','negativeWeight','intensityWeight'])assert(form.elements[name]);
-assert.equal(form.elements.minimumPositiveWeight.value,'0.05');
+for(const name of ['weightDecay','gradientClip','branchWeight','negativeWeight','branchMilTemperature','intensityWeight'])assert(form.elements[name]);
+assert.equal(form.elements.branchMilTemperature.value,'0.1');
 assert.equal(form.elements.negativeWeight.value,'0.2');
-assert(d.querySelector('#trainingLossSummary').textContent.includes('Branching Action Loss'));
+assert(d.querySelector('#trainingLossSummary').textContent.includes('Branch MIL + Weak Negatives'));
 assert.equal(form.elements.validationIntervalSteps.value,'0');
 assert.equal(form.elements.validationFraction.value,'0.1');
 form.elements.validationIntervalSteps.value='1000';form.elements.validationIntervalSteps.dispatchEvent(event());

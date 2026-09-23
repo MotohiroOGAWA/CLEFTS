@@ -25,15 +25,15 @@ class TestConfigOptions(unittest.TestCase):
     def test_file_inline_named_and_individual_precedence(self):
         with tempfile.TemporaryDirectory() as directory:
             file=Path(directory)/'config.json'
-            file.write_text(json.dumps({'fragmenter_params':{'mass_tolerance':'1Da'},'action_model_params':{'beam_size':3}}))
-            args=self.parser().parse_args(['--params',str(file),'--params-json','{"action_model_params":{"beam_size":4}}',
-                '--mass-tolerance','0.02Da','--beam-size','5','--set','action_model_params.beam_size=6',
+            file.write_text(json.dumps({'fragmenter_params':{'mass_tolerance':'1Da'},'action_model_params':{'max_fragment_nodes':30}}))
+            args=self.parser().parse_args(['--params',str(file),'--params-json','{"action_model_params":{"max_fragment_nodes":40}}',
+                '--mass-tolerance','0.02Da','--max-fragment-nodes','50','--set','action_model_params.max_fragment_nodes=60',
                 '--set','fragmenter_params.fragment_ion_tree_builder.cleavage_pattern_set.patterns.0.name="custom"'])
             config=resolve_model_options(args)
-            self.assertEqual(config['action_model_params']['beam_size'],6)
+            self.assertEqual(config['action_model_params']['max_fragment_nodes'],60)
             self.assertEqual(config['fragmenter_params']['mass_tolerance'],'0.02Da')
             self.assertEqual(config['fragmenter_params']['fragment_ion_tree_builder']['cleavage_pattern_set']['patterns'][0]['name'],'custom')
-            self.assertEqual(config['action_model_params']['action_prefilter_top_k'],64)
+            self.assertEqual(config['action_model_params']['branch_path_threshold'],0)
 
     def test_fragmenter_file_without_model_wrapper(self):
         parser=self.parser()
@@ -43,10 +43,10 @@ class TestConfigOptions(unittest.TestCase):
 
     def test_repeat_options_survive_official_cli_forwarding(self):
         parser=self.parser()
-        args=parser.parse_args(['--set','action_model_params.beam_size=4','--set','action_model_params.max_decode_steps=7'])
+        args=parser.parse_args(['--set','action_model_params.max_fragment_nodes=40','--set','action_model_params.branch_path_threshold=0.2'])
         forwarded=namespace_argv(parser,args)
         self.assertEqual(forwarded.count('--set'),2)
-        self.assertEqual(resolve_model_options(parser.parse_args(forwarded))['action_model_params']['max_decode_steps'],7)
+        self.assertEqual(resolve_model_options(parser.parse_args(forwarded))['action_model_params']['branch_path_threshold'],0.2)
 
     def test_malformed_override_is_rejected(self):
         with self.assertRaises(ValueError):resolve_model_options(self.parser().parse_args(['--set','beam_size']))
@@ -57,7 +57,7 @@ class TestConfigOptions(unittest.TestCase):
         parser=preparation.build_arg_parser()
         args=parser.parse_args(['--input','input.msds','--output-dir','out',
                                '--max-action-count','2','--max-node','500','--max-edge','1000','--num-workers','2','--chunk-size','3','--symbols-json','["C","O"]','--smiles-column','CanonicalSMILES',
-                               '--set','action_model_params.beam_size=7'])
+                               '--set','action_model_params.max_fragment_nodes=70'])
         import pandas as pd
         with tempfile.TemporaryDirectory() as directory, patch.object(preparation.MSDataset,'load',return_value=preparation_dataset('CanonicalSMILES')), patch.object(preparation,'create_action_training_data') as run:
             args.output_dir=directory
@@ -70,19 +70,19 @@ class TestConfigOptions(unittest.TestCase):
         self.assertEqual(kwargs['chunk_size'],3)
         self.assertEqual(kwargs['model_config']['mol_encoder_params']['symbols'],['C','O'])
         self.assertEqual(kwargs['model_config']['fragmenter_params']['fragment_ion_tree_builder']['max_action_count'],2)
-        self.assertEqual(kwargs['model_config']['action_model_params']['beam_size'],7)
+        self.assertEqual(kwargs['model_config']['action_model_params']['max_fragment_nodes'],70)
 
     def test_official_training_command_forwards_explicit_options(self):
         from clefts.cli.train.commands.fragment_tree import FragmentTreeTrainCommand
         from clefts.ml.training.fragment_tree_training import training
         args=training.build_arg_parser().parse_args(['--train-dir','train','--val-dir','val','--output-dir','out',
-            '--mol-encoder-checkpoint','encoder.pt','--beam-size','8','--train-mol-encoder',
+            '--mol-encoder-checkpoint','encoder.pt','--max-fragment-nodes','80','--train-mol-encoder',
             '--weight-decay','0','--intensity-weight','0.5',
             '--validation-interval-steps','1000','--validation-fraction','0.1'])
         with tempfile.TemporaryDirectory() as directory, patch('clefts.ml.training.fragment_tree_training.sources.inherit_model_config',side_effect=lambda config,*args,**kwargs:config), patch.object(training,'train_actions',return_value={}) as run, patch('builtins.print'):
             args.output_dir=directory
             FragmentTreeTrainCommand().run(args)
-        self.assertEqual(run.call_args.kwargs['model_config']['action_model_params']['beam_size'],8)
+        self.assertEqual(run.call_args.kwargs['model_config']['action_model_params']['max_fragment_nodes'],80)
         self.assertEqual(run.call_args.kwargs['weight_decay'],0)
         self.assertEqual(run.call_args.kwargs['intensity_weight'],0.5)
         self.assertTrue(run.call_args.kwargs['train_mol_encoder'])

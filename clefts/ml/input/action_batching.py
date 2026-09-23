@@ -1,76 +1,79 @@
-"""Slice prepared tensor records before transfer; no chemistry is performed."""
+"""Slice prepared spectra while retaining each shared branch group once."""
 from dataclasses import replace
 import torch
 from torch_geometric.data import Batch
-from .source_action_structure import csr, coo
+from .source_action_structure import csr
 
 
-def select_samples(data, indices):
+def select_samples(data,indices):
     indices=torch.as_tensor(indices,dtype=torch.long,device=data.device)
-    if data.device.type!='cpu':
-        raise ValueError('Slice structures before transfer to CUDA')
-    remap=torch.full((data.num_samples,),-1,dtype=torch.long)
-    remap[indices]=torch.arange(indices.numel())
-    state_ids=(remap[data.teacher_node_sample_index]>=0).nonzero().flatten()
-    state_map=torch.full((data.teacher_node_sample_index.numel(),),-1,dtype=torch.long)
-    state_map[state_ids]=torch.arange(state_ids.numel())
-    def rows(ptr,values,ids):
-        return csr([values[ptr[i]:ptr[i+1]].tolist() for i in ids.tolist()])
+    if data.device.type!='cpu':raise ValueError('Slice structures before transfer to CUDA')
+    sample_map=torch.full((data.num_samples,),-1,dtype=torch.long);sample_map[indices]=torch.arange(indices.numel())
+    old_groups=torch.unique(data.sample_branch_group_index[indices],sorted=True)
+    group_map=torch.full((data.num_branch_groups,),-1,dtype=torch.long);group_map[old_groups]=torch.arange(old_groups.numel())
+    state_ids=(group_map[data.teacher_node_branch_group_index]>=0).nonzero().flatten()
+    state_map=torch.full((data.teacher_node_branch_group_index.numel(),),-1,dtype=torch.long);state_map[state_ids]=torch.arange(state_ids.numel())
+    transition_state_ids=(group_map[data.transition_state_branch_group_index]>=0).nonzero().flatten()
+    transition_state_map=torch.full((data.transition_state_branch_group_index.numel(),),-1,dtype=torch.long)
+    transition_state_map[transition_state_ids]=torch.arange(transition_state_ids.numel())
+    def rows(ptr,values,ids,offset=0):return csr([(values[ptr[i]:ptr[i+1]]+offset).tolist() for i in ids.tolist()])
     state_ptr,state_index=rows(data.teacher_node_action_ptr,data.teacher_node_action_index,state_ids)
-    next_ptr,next_index=rows(data.teacher_positive_action_ptr,data.teacher_positive_action_index,state_ids)
-    positive_ptr,positive_index=rows(data.sample_positive_action_ptr,data.sample_positive_action_index,indices)
-    seed_ids=torch.cat([torch.arange(data.sample_precursor_row_ptr[i],data.sample_precursor_row_ptr[i+1]) for i in indices.tolist()])
-    seed_ptr,seed_index=rows(data.precursor_row_action_ptr,data.precursor_row_action_index,seed_ids)
-    seed_counts=data.sample_precursor_row_ptr[indices+1]-data.sample_precursor_row_ptr[indices]
-    seed_map=torch.full((data.precursor_row_action_ptr.numel()-1,),-1,dtype=torch.long)
-    seed_map[seed_ids]=torch.arange(seed_ids.numel())
-    pair=data.precursor_next_index
-    okay=seed_map[pair[0]]>=0
-    precursor_next=torch.stack((seed_map[pair[0,okay]],pair[1,okay]))
-    transitions=state_map[data.transition_parent_state_index]>=0
-    state_nodes=data.state_fragment_node_index[state_ids] if data.state_fragment_node_index.numel() else data.state_fragment_node_index
-    downstream=data.downstream
+    positive_ptr,positive_index=rows(data.teacher_positive_action_ptr,data.teacher_positive_action_index,state_ids)
+    valid_ptr,valid_actions=rows(data.state_transition_ptr,data.state_transition_action_index,state_ids)
+    valid_next=[]
+    for state in state_ids.tolist():
+        a,b=data.state_transition_ptr[state:state+2];values=data.state_transition_next_state_index[a:b]
+        valid_next.extend(transition_state_map[values].tolist())
+    transition_state_ptr,transition_state_actions=rows(data.transition_state_action_ptr,data.transition_state_action_index,transition_state_ids)
+    negative_ptr,negative_actions=rows(data.weak_negative_action_ptr,data.weak_negative_action_index,state_ids)
+    transitions=(state_map[data.transition_parent_state_index]>=0)&(state_map[data.transition_child_state_index]>=0)
+    peak_ids=(group_map[data.teacher_peak_branch_group_index]>=0).nonzero().flatten();paths=[];steps=[];peak_groups=[]
+    for peak in peak_ids.tolist():
+        peak_groups.append(int(group_map[data.teacher_peak_branch_group_index[peak]]));paths.append([])
+        for path in range(int(data.teacher_peak_path_ptr[peak]),int(data.teacher_peak_path_ptr[peak+1])):
+            paths[-1].append(len(steps));a,b=data.teacher_path_step_ptr[path:path+2]
+            steps.append([(int(state_map[s]),int(action)) for s,action in zip(data.teacher_path_step_state_index[a:b],data.teacher_path_step_action_index[a:b])])
+    peak_ptr,_=csr(paths);step_ptr,step_states=csr([[s for s,_ in row] for row in steps]);step_actions=torch.tensor([a for row in steps for _,a in row],dtype=torch.long)
     annotations=tuple(data.sample_annotations[i] for i in indices.tolist()) if data.sample_annotations else ()
+    downstream=data.downstream;state_nodes=data.state_fragment_node_index[state_ids]
     if downstream is not None:
-        decoded=downstream.decoded
-        node_ids=(remap[decoded.node_sample_index]>=0).nonzero().flatten()
-        node_map=torch.full((len(decoded.compounds),),-1,dtype=torch.long)
-        node_map[node_ids]=torch.arange(node_ids.numel())
-        edges=(node_map[decoded.edge_index[0]]>=0)&(node_map[decoded.edge_index[1]]>=0)
-        edge_map=torch.full((edges.numel(),),-1,dtype=torch.long);edge_map[edges]=torch.arange(int(edges.sum()))
-        seed_pair=decoded.edge_seed_action_index
-        keep_seed=edge_map[seed_pair[0]]>=0
-        seed_pair=torch.stack((edge_map[seed_pair[0,keep_seed]],seed_pair[1,keep_seed]))
-        terminals=decoded.terminal_node_index[node_map[decoded.terminal_node_index]>=0]
-        graphs=decoded.node_graph.to_data_list()
-        tree_graphs=downstream.tree_graph.to_data_list()
-        subset=replace(decoded,node_graph=Batch.from_data_list([graphs[i] for i in node_ids.tolist()]),edge_index=node_map[decoded.edge_index[:,edges]],
-            node_sample_index=remap[decoded.node_sample_index[node_ids]],edge_added_action_index=decoded.edge_added_action_index[edges],terminal_node_index=node_map[terminals],
-            node_log_score=decoded.node_log_score[node_ids],trees=tuple(decoded.trees[i] for i in indices.tolist()),compounds=tuple(decoded.compounds[i] for i in node_ids.tolist()),
-            edge_seed_action_index=seed_pair,materialized_state_index=torch.empty(0,dtype=torch.long),materialized_node_index=torch.empty(0,dtype=torch.long))
-        formula_ids=(remap[downstream.formula_sample_index]>=0).nonzero().flatten()
-        formula_map=torch.full((downstream.formula_sample_index.numel(),),-1,dtype=torch.long)
-        formula_map[formula_ids]=torch.arange(formula_ids.numel())
-        ions=formula_map[downstream.ion_formula_index]>=0
-        downstream=replace(downstream,decoded=subset,tree_graph=Batch.from_data_list([tree_graphs[i] for i in indices.tolist()]),
-            ion_node_index=node_map[downstream.ion_node_index[ions]],ion_features=downstream.ion_features[ions],formula_sample_index=remap[downstream.formula_sample_index[formula_ids]],
-            formula_tensor=downstream.formula_tensor[formula_ids],formula_mz=downstream.formula_mz[formula_ids],ion_formula_index=formula_map[downstream.ion_formula_index[ions]],
-            target_intensity=downstream.target_intensity[formula_ids] if downstream.target_intensity is not None else None,
-            ion_is_positive=downstream.ion_is_positive[ions] if downstream.ion_is_positive is not None else None,
-            ion_adduct=tuple(adduct for adduct,keep in zip(downstream.ion_adduct,ions.tolist()) if keep) if downstream.ion_adduct else (),
-            unique_node_graph=None,node_graph_inverse=None,unique_source_index=None,node_smiles=tuple(downstream.node_smiles[i] for i in node_ids.tolist()))
-        if state_nodes.numel():state_nodes=torch.where(state_nodes>=0,node_map[state_nodes.clamp_min(0)],state_nodes)
-        annotations=tuple({**sample,'peaks':[{**peak,'matches':[
-            {**match,'nodeIndices':[int(node_map[index]) for index in match['nodeIndices'] if node_map[index]>=0]}
-            for match in peak['matches']]} for peak in sample['peaks']]} for sample in annotations)
+        decoded=downstream.decoded;node_ids=(group_map[decoded.node_sample_index]>=0).nonzero().flatten()
+        node_map=torch.full((len(decoded.compounds),),-1,dtype=torch.long);node_map[node_ids]=torch.arange(node_ids.numel())
+        edge_keep=(node_map[decoded.edge_index[0]]>=0)&(node_map[decoded.edge_index[1]]>=0)
+        edge_map=torch.full((edge_keep.numel(),),-1,dtype=torch.long);edge_map[edge_keep]=torch.arange(int(edge_keep.sum()))
+        terminal=decoded.terminal_node_index[node_map[decoded.terminal_node_index]>=0]
+        subset=replace(decoded,node_graph=Batch.from_data_list([decoded.node_graph.to_data_list()[i] for i in node_ids.tolist()]),
+            edge_index=node_map[decoded.edge_index[:,edge_keep]],node_sample_index=group_map[decoded.node_sample_index[node_ids]],
+            edge_added_action_index=decoded.edge_added_action_index[edge_keep],terminal_node_index=node_map[terminal],
+            node_log_score=decoded.node_log_score[node_ids],trees=tuple(decoded.trees[i] for i in old_groups.tolist()),
+            compounds=tuple(decoded.compounds[i] for i in node_ids.tolist()),
+            materialized_state_index=torch.empty(0,dtype=torch.long),materialized_node_index=torch.empty(0,dtype=torch.long))
+        candidates=(sample_map[downstream.physical_candidate_sample_index]>=0).nonzero().flatten();explanations=[]
+        for candidate in candidates.tolist():
+            a,b=downstream.physical_candidate_explanation_ptr[candidate:candidate+2]
+            explanations.append(list(zip(downstream.explanation_ion_type_index[a:b].tolist(),downstream.explanation_unsaturation[a:b].tolist(),downstream.explanation_radical[a:b].tolist())))
+        explanation_ptr,flat=csr(explanations);triples=flat.reshape(-1,3) if flat.numel() else torch.empty((0,3),dtype=torch.long)
+        downstream=replace(downstream,decoded=subset,tree_graph=Batch.from_data_list([downstream.tree_graph.to_data_list()[i] for i in old_groups.tolist()]),
+            physical_candidate_node_index=node_map[downstream.physical_candidate_node_index[candidates]],
+            physical_candidate_sample_index=sample_map[downstream.physical_candidate_sample_index[candidates]],
+            physical_candidate_formula_tensor=downstream.physical_candidate_formula_tensor[candidates],physical_candidate_mz=downstream.physical_candidate_mz[candidates],
+            physical_candidate_charge=downstream.physical_candidate_charge[candidates],physical_candidate_explanation_ptr=explanation_ptr,
+            explanation_ion_type_index=triples[:,0],explanation_unsaturation=triples[:,1],explanation_radical=triples[:,2],
+            target_intensity=downstream.target_intensity[candidates] if downstream.target_intensity is not None else None,
+            physical_candidate_is_positive=downstream.physical_candidate_is_positive[candidates] if downstream.physical_candidate_is_positive is not None else None,
+            physical_candidate_adduct=tuple(downstream.physical_candidate_adduct[i] for i in candidates.tolist()),unique_node_graph=None,node_graph_inverse=None,unique_source_index=None,
+            node_smiles=tuple(downstream.node_smiles[i] for i in node_ids.tolist()))
+        state_nodes=torch.where(state_nodes>=0,node_map[state_nodes.clamp_min(0)],state_nodes)
     return replace(data,sample_tree_index=data.sample_tree_index[indices],condition_features=data.condition_features[indices],
-        teacher_node_sample_index=remap[data.teacher_node_sample_index[state_ids]],teacher_node_action_ptr=state_ptr,teacher_node_action_index=state_index,
-        teacher_node_precursor_row_index=seed_map[data.teacher_node_precursor_row_index[state_ids]],
+        sample_branch_group_index=group_map[data.sample_branch_group_index[indices]],branch_group_tree_index=data.branch_group_tree_index[old_groups],branch_group_adduct_index=data.branch_group_adduct_index[old_groups],
+        teacher_node_branch_group_index=group_map[data.teacher_node_branch_group_index[state_ids]],teacher_node_action_ptr=state_ptr,teacher_node_action_index=state_index,
+        teacher_positive_action_ptr=positive_ptr,teacher_positive_action_index=positive_index,teacher_node_observed=data.teacher_node_observed[state_ids],
         teacher_node_parent_index=torch.where(data.teacher_node_parent_index[state_ids]>=0,state_map[data.teacher_node_parent_index[state_ids].clamp_min(0)],data.teacher_node_parent_index[state_ids]),
         teacher_node_added_action_index=data.teacher_node_added_action_index[state_ids],teacher_node_ms2_depth=data.teacher_node_ms2_depth[state_ids],
-        teacher_positive_action_weight=torch.cat([data.teacher_positive_action_weight[data.teacher_positive_action_ptr[i]:data.teacher_positive_action_ptr[i+1]] for i in state_ids.tolist()]) if state_ids.numel() else torch.empty(0),
-        teacher_positive_action_ptr=next_ptr,teacher_positive_action_index=next_index,teacher_node_observed=data.teacher_node_observed[state_ids],
-        sample_positive_action_ptr=positive_ptr,sample_positive_action_index=positive_index,
-        sample_precursor_row_ptr=torch.cat((torch.zeros(1,dtype=torch.long),seed_counts.cumsum(0))),precursor_row_action_ptr=seed_ptr,precursor_row_action_index=seed_index,precursor_next_index=precursor_next,
         transition_parent_state_index=state_map[data.transition_parent_state_index[transitions]],transition_child_state_index=state_map[data.transition_child_state_index[transitions]],transition_added_action_index=data.transition_added_action_index[transitions],
+        state_transition_ptr=valid_ptr,state_transition_action_index=valid_actions,state_transition_next_state_index=torch.tensor(valid_next),weak_negative_action_ptr=negative_ptr,weak_negative_action_index=negative_actions,
+        transition_state_branch_group_index=group_map[data.transition_state_branch_group_index[transition_state_ids]],
+        transition_state_action_ptr=transition_state_ptr,transition_state_action_index=transition_state_actions,
+        teacher_node_transition_state_index=transition_state_map[data.teacher_node_transition_state_index[state_ids]],
+        teacher_peak_path_ptr=peak_ptr,teacher_peak_branch_group_index=torch.tensor(peak_groups),teacher_path_step_ptr=step_ptr,teacher_path_step_state_index=step_states,teacher_path_step_action_index=step_actions,
         state_fragment_node_index=state_nodes,downstream=downstream,sample_annotations=annotations)

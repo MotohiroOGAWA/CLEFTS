@@ -1,6 +1,6 @@
-# Creating branching teacher data
+# Preparing fragment-tree training data
 
-Run the existing Preparation CLI from `mnt/app`:
+Run preparation from the application root:
 
 ```bash
 python -m clefts.cli train create-fragment-tree-data \
@@ -11,44 +11,27 @@ python -m clefts.cli train create-fragment-tree-data \
   --normalize-intensities 1 --overwrite 1
 ```
 
-All Preparation argument names, defaults and choices are preserved. There are no
-new branching Preparation flags. The Workbench uses this same command.
+Preparation is the chemistry boundary. It parses molecules, creates primitive
+actions, assigns peaks to pathways, materializes fragments, constructs graph
+tensors, enumerates ion/hydrogen states, computes final formulas and masses,
+groups equivalent physical ions, and stores target assignments.
 
-Each Source SMILES produces a schema-v6 `SourceActionStructure` `.preft.pt`.
-`fragmentation_schema` is `source-anchored-branching-v1`. v5 structures require
-regeneration from the original spectra.
+Spectra with the same compound and normalized main adduct share one branch
+group. Their positive pathways are unioned across collision energies before
+weak negatives are created. Packed data includes:
 
-The chemistry tree assigns measured peaks to pathways. Each supported pathway
-retains its actual transition order and precursor seed. Only MS2 suffixes become
-teacher nodes and positive transitions, including their intermediate ancestors.
-Ambiguous pathways are retained. Multiple precursor candidates are independent
-rows; Source itself has an empty row. Teacher MS2 depth starts at zero.
+- source graphs and primitive-action features;
+- teacher action sets at multiple depths;
+- valid continuation actions and explicit next-state indices;
+- positive paths grouped by experimental peak and weak-negative actions;
+- shared fragment-tree topology and prepared fragment graph tensors;
+- physical-ion candidates and packed `(ion, unsaturation, radical)` explanations;
+- final formula tensors, exact m/z, charge, targets, and peak assignments.
 
-The action generator deterministically deduplicates exact actions and removes
-unsupported chemistry, empty fragments and true no-ops. Preparation never uses
-neural scores or random rankings to remove teachers. Every positive action must
-remain in the Source action universe.
+The prepared payload uses one current contract and contains no data-format
+version or migration layer. Regenerate `.preft.pt` files after a contract change.
+Training loads these tensors directly and must not invoke RDKit or other
+chemistry operations.
 
-Stored fields include:
-
-- `teacher_node_sample_index`, `teacher_node_precursor_row_index`,
-  `teacher_node_parent_index`, `teacher_node_added_action_index`,
-  `teacher_node_ms2_depth` and CSR `teacher_node_action_ptr/index`.
-- CSR `teacher_positive_action_ptr/index/weight`; weights are maximum descendant
-  observed intensities. `teacher_node_observed` is observation metadata, not EOS.
-- CSR `sample_positive_action_ptr/index` containing only learned MS2 branch actions.
-- CSR `sample_precursor_row_ptr`, `precursor_row_action_ptr/index` for seed alternatives.
-- Positive transition tensors, teacher-to-materialized-node mapping, prepared
-  post-model graphs, formula intensities, and original peak annotations.
-
-Full possible action states, negative transitions and dense node/action labels
-are not stored. Valid candidates and weak negatives are generated during forward
-through the same chemistry compatibility component used at inference.
-
-Manifests and statistics report teacher node count, positive transitions,
-precursor candidates and maximum MS2 depth in addition to the existing fields.
-The result viewer displays schema-v6 summaries and branching action targets.
-Collation offsets sample, action, precursor, teacher and materialized node indexes.
-
-Training details and validation outputs are described in
+Training details are in
 [`fragment_tree_training/README.md`](../../training/fragment_tree_training/README.md).

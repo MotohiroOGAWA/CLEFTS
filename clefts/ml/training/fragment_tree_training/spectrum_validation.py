@@ -232,8 +232,10 @@ def validate_spectra(generator, pieces, output_dir, label, *, global_step=None, 
                             'assignment_score': assignment_score([p['mz'] for p in predicted], target, tolerance),
                             'assignment_score_without_precursor': assignment_score([p['mz'] for p in predicted_np], target_np, tolerance) if target_np else None,
                             'observed_peak_count': len(target), 'generated_peak_count': len(predicted)}
-                    nodes = output.fragments.node_sample_index == sample
-                    raw = output.selection.decoded.state_sample_index == sample
+                    branch_group=int(data.sample_branch_group_index[sample])
+                    nodes = output.fragments.node_sample_index == branch_group
+                    raw = output.selection.decoded.state_sample_index == branch_group
+                    path_depth=float((output.selection.decoded.state_action_index[raw]>=0).sum(1).float().mean()) if torch.any(raw) else 0.
                     records.append(dict(piece_index=piece_index, sample_index=input_index,
                         adduct=annotation['adduct'], main_adduct=annotation.get('mainAdduct', str(generator.fragmenter._resolve_main_adduct_type(adducts[input_index]))),
                         collision_energy=float(annotation['collisionEnergy']), precursor_mz=precursor_mz,
@@ -243,6 +245,7 @@ def validate_spectra(generator, pieces, output_dir, label, *, global_step=None, 
                         assignment_score_without_precursor=assignment_score([p['mz'] for p in generated_np], observed_np, tolerance) if observed_np else None,
                         preparation_assignment_score=annotation.get('assignmentScore'), preparation_assignment_score_without_precursor=annotation.get('assignmentScoreWithoutPrecursor'),
                         generated_peak_count=sum(value > 0 for value in intensity), generated_fragment_nodes=int(raw.sum()), unique_fragment_nodes=int(nodes.sum()),
+                        mean_path_depth=path_depth,duplicate_states_removed=(float(output.selection.decoded.duplicate_states_removed) if output.selection.decoded.duplicate_states_removed is not None else 0.),
                         generated_mz=mz, generated_intensity=intensity, generated_peaks=generated, original_peaks=observed, depth_metrics=depth_metrics))
             if progress is not None: progress(piece_index, 'end')
     finally:
@@ -272,4 +275,7 @@ def validate_spectra(generator, pieces, output_dir, label, *, global_step=None, 
         assignment_score_without_precursor=mean(r['assignment_score_without_precursor'] for r in records),
         spectrum_nonempty_fraction=summary['nonempty_spectrum_fraction'],
         generated_fragment_nodes=float(np.mean([r['generated_fragment_nodes'] for r in records])),
-        unique_fragment_nodes=float(np.mean([r['unique_fragment_nodes'] for r in records])))
+        unique_fragment_nodes=float(np.mean([r['unique_fragment_nodes'] for r in records])),
+        mean_generated_fragment_nodes=float(np.mean([r['unique_fragment_nodes'] for r in records])),
+        mean_path_depth=float(np.mean([r['mean_path_depth'] for r in records])),
+        duplicate_states_removed=float(np.mean([r['duplicate_states_removed'] for r in records])))

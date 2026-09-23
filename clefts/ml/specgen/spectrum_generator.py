@@ -54,8 +54,7 @@ def fragment_spectrum_output_to_msdataset(output: FragmentSpectrumGeneratorOutpu
     data = np.asarray(peak_rows, dtype=np.float64)
     if data.size == 0:
         data = np.empty((0, 2), dtype=np.float64)
-    # A confidence threshold (or an aggressive prefilter, as in an untrained
-    # test model) can legitimately leave every sample with zero peaks;
+    # Inference thresholds can legitimately leave every sample with zero peaks;
     # pd.DataFrame([]) then has no columns at all, which PeakSeries's
     # metadata_columns selection would reject.
     peak_metadata = pd.DataFrame(peak_metadata_rows, columns=["sample_id", "formula"])
@@ -69,6 +68,6 @@ def create_spectrum_generator(params: Dict):
     # Training initialization metadata is not a generator constructor argument.
     config.pop("mol_encoder_checkpoint", None)
     architecture = config.pop("architecture", None)
-    if architecture not in (None, "source-anchored-action-autoregressive-v1", SourceAnchoredFragmentSpectrumGenerator.architecture):
+    if architecture not in (None, SourceAnchoredFragmentSpectrumGenerator.architecture):
         raise ValueError(f"Unknown spectrum generator architecture: {architecture}")
     return SourceAnchoredFragmentSpectrumGenerator(**config)
