@@ -39,6 +39,7 @@ export type DataRequest =
   | { type: 'data/preview' | 'data/check'; target: 'train' | 'validation' | 'home'; requestId: string; path: string; mapping?: Record<string, string>; fragmenterParams?: Record<string, unknown> }
   | { type: 'data/preflight'; requestId: string; config: Record<string, unknown> }
   | { type: 'data/model'; requestId: string; path: string };
+export type DataProgressEvent = { type: 'data/check-progress'; target: 'train' | 'validation'; requestId: string; current: number; total: number };
 export type ResourceRequest =
   | { type: 'library/load' | 'shell/document' | 'shell/github' }
   | { type: 'library/copy' | 'library/open'; path: string }

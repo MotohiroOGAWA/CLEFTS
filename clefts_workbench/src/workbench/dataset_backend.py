@@ -51,7 +51,12 @@ def preview(payload: dict) -> dict:
     inspection={}
     if check_values and not errors:
         from clefts.ml.data_preparation.fragment_tree.record_validation import inspect_records
-        inspection=inspect_records(dataset,fragmenter,mapping)
+        def report_progress(current, total):
+            print('CLEFTS_PROGRESS '+json.dumps({'current':current,'total':total}),file=sys.stderr,flush=True)
+        # Every record is checked. Only detailed invalid-record samples are
+        # bounded so a very dirty dataset cannot overflow the webview response.
+        inspection=inspect_records(dataset,fragmenter,mapping,
+            progress=report_progress if payload.get('reportProgress') else None,invalid_detail_limit=5000)
         validation=inspection['validation']
         if not inspection['eligibleRecords']: errors.append('The dataset contains no valid records to prepare.')
     import numpy as np

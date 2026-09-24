@@ -160,9 +160,15 @@ function openWorkbench(context, output, initialPage = "home") {
         await vscode.env.clipboard.writeText(command);
         panel.webview.postMessage({ type: 'status', status: 'idle', text: 'Command copied.', command });
       } else if (message.type === 'run') {
+        const config=normalizeConfig(message.config),root=projectRoot(context),target=path.resolve(root,config.outputDir||'');
+        if(!config.overwrite&&config.outputDir&&fs.existsSync(target)){
+          const choice=await vscode.window.showWarningMessage(`Output directory already exists: ${target}\nOverwrite it before processing?`,{modal:true},'Overwrite');
+          if(choice!=='Overwrite'){panel.webview.postMessage({type:'status',status:'idle',text:'Run cancelled. The output directory was not changed.'});return;}
+          config.overwrite=true;
+        }
         panel.webview.postMessage({type:'status',status:'running',text:'Validating datasets and configuration…'});
-        await workbenchServices.validateRun(context,projectRoot(context),normalizeConfig(message.config));
-        await runFragmentTree(context, output, normalizeConfig(message.config), panel);
+        await workbenchServices.validateRun(context,root,config);
+        await runFragmentTree(context, output, config, panel);
       } else if (message.type === 'copyTrainingCommand') {
         const python = vscode.workspace.getConfiguration('clefts').get('pythonPath', 'python');
         const command = shellDisplay(python, buildTrainingArgs(normalizeTrainingConfig(message.config)));
@@ -327,8 +333,6 @@ async function runFragmentTree(context, output, config, panel) {
   for (const key of ['input', 'outputDir']) if (!config[key]) throw new Error(`${key} is required.`);
   const root = projectRoot(context);
   const python = vscode.workspace.getConfiguration('clefts').get('pythonPath', 'python');
-  await fs.promises.mkdir(config.outputDir, { recursive: true });
-  await fs.promises.writeFile(path.join(config.outputDir,'preparation_config.json'),JSON.stringify({workbench_config:config},null,2)+'\n');
   const resultPath = path.join(config.outputDir, 'train_structures', 'fragment-tree.pft.json');
   const args = buildArgs(config);
   const command = shellDisplay(python, args);

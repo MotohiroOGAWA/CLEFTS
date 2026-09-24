@@ -28,6 +28,22 @@ def _reset_output(output, overwrite, protected_paths=()):
     output.mkdir(parents=True,exist_ok=True)
 
 
+def _confirm_existing_output(args):
+    output = Path(args.output_dir).resolve()
+    if args.overwrite or not output.exists():
+        return
+    if not output.is_dir():
+        raise FileExistsError(f'Output path already exists and is not a directory: {output}')
+    message = f'Output directory already exists: {output}'
+    if sys.stdin.isatty():
+        answer = input(message + '\nOverwrite it before processing? [y/N] ').strip().lower()
+        if answer in ('y', 'yes'):
+            args.overwrite = 1
+            return
+        raise FileExistsError('Cancelled because the output directory already exists.')
+    raise FileExistsError(message + '. Re-run with --overwrite 1 or choose another directory.')
+
+
 def _prepare_group(task, builder, options):
     tree,smiles,rows,dataset=task
     output=Path(options['output_dir'])
@@ -231,6 +247,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> None:
     args=build_arg_parser().parse_args(argv)
+    # Decide whether an existing destination may be replaced before loading or
+    # validating either dataset; those checks can be expensive on large files.
+    _confirm_existing_output(args)
     dataset=load_spectrum_dataset(args.input)
     config=resolve_model_options(args)
     imported_max_node=config.pop('max_node',-1);imported_max_edge=config.pop('max_edge',-1)

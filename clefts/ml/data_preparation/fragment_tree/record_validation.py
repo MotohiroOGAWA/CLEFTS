@@ -9,7 +9,7 @@ from clefts.domain.mass.parse_ce import parse_ce_to_ev
 DEFAULT_MAPPING = {'smilesColumn': 'SMILES', 'adductTypeColumn': 'AdductType',
                    'collisionEnergyColumn': 'CollisionEnergy', 'precursorMzColumn': 'PrecursorMZ'}
 
-def inspect_records(dataset, fragmenter, mapping=None):
+def inspect_records(dataset, fragmenter, mapping=None, *, progress=None, invalid_detail_limit=None):
     mapping = {**DEFAULT_MAPPING, **(mapping or {})}
     missing = [name for name in mapping.values() if name not in dataset.columns]
     if missing:
@@ -17,6 +17,7 @@ def inspect_records(dataset, fragmenter, mapping=None):
     validation = {key: {'column': name, 'exists': True, 'valid': 0, 'total': len(dataset)}
                   for key, name in mapping.items()}
     invalid = []
+    invalid_count = 0
     accepted = []
     # Reference libraries (e.g. NIST) repeat a handful of distinct adduct/CE
     # strings across hundreds of thousands of rows; caching by the raw string
@@ -32,7 +33,11 @@ def inspect_records(dataset, fragmenter, mapping=None):
                'precursorMzColumn': 'Cannot parse precursor m/z to a finite positive number'}
     values = {key: dataset[name].tolist() for key, name in mapping.items()}
     ids = dataset['SpecID'].astype(str).tolist() if 'SpecID' in dataset.columns else None
-    for index in tqdm(range(len(dataset)), total=len(dataset), desc='Inspecting records', file=sys.stderr):
+    total = len(dataset)
+    progress_step = max(1, total // 100)
+    if progress:
+        progress(0, total)
+    for index in tqdm(range(total), total=total, desc='Inspecting records', file=sys.stderr):
         failures = []
         for key, item in validation.items():
             value = values[key][index]
@@ -77,11 +82,15 @@ def inspect_records(dataset, fragmenter, mapping=None):
             if not valid:
                 failures.append({'field': key, 'column': item['column'], 'reason': reasons[key]})
         if failures:
-            invalid.append({'index': index, 'id': ids[index] if ids else str(index),
-                            'values': {key: str(items[index]) for key, items in values.items()},
-                            'issues': failures})
+            invalid_count += 1
+            if invalid_detail_limit is None or len(invalid) < invalid_detail_limit:
+                invalid.append({'index': index, 'id': ids[index] if ids else str(index),
+                                'values': {key: str(items[index]) for key, items in values.items()},
+                                'issues': failures})
         else:
             accepted.append(index)
+        if progress and ((index + 1) % progress_step == 0 or index + 1 == total):
+            progress(index + 1, total)
     return {'validation': validation, 'invalidRecords': invalid, 'validIndexes': accepted,
-            'eligibleRecords': len(accepted), 'excludedRecords': len(invalid),
+            'invalidRecordCount': invalid_count, 'eligibleRecords': len(accepted), 'excludedRecords': invalid_count,
             'eligibleUniqueSmiles': len({str(values['smilesColumn'][index]) for index in accepted})}

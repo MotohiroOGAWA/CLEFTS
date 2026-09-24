@@ -13,7 +13,9 @@ from clefts.libs.msentity.msentity import MSDataset
 from clefts.libs.msentity.msentity.core.PeakSeries import PeakSeries
 from clefts.libs.mmkit.mmkit import Compound
 from clefts.ml.data_preparation.fragment_tree.datasets import load_spectrum_dataset, split_by_smiles
-from clefts.ml.data_preparation.fragment_tree.create_training_data import main
+from clefts.ml.data_preparation.fragment_tree.create_training_data import main, _confirm_existing_output
+from clefts.ml.data_preparation.fragment_tree.context import create_preparation_context
+from clefts.ml.data_preparation.fragment_tree.record_validation import inspect_records
 from .TestActionPipeline import config
 
 spec=importlib.util.spec_from_file_location('workbench_dataset_backend',Path('clefts_workbench/src/workbench/dataset_backend.py'))
@@ -27,6 +29,18 @@ class TestPreparationWorkflow(unittest.TestCase):
         metadata=pd.DataFrame({'SMILES':smiles,'AdductType':['[M+H]+']*5,'CollisionEnergy':[20]*5,'PrecursorMZ':mzs})
         peaks=np.array([[mz,1] for mz in mzs],dtype=float)
         return MSDataset(metadata,PeakSeries(peaks,np.arange(6,dtype=np.int64)))
+
+    def test_existing_output_is_confirmed_before_processing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            args=type('Args',(),{'output_dir':directory,'overwrite':0})()
+            with unittest.mock.patch('sys.stdin.isatty',return_value=True),unittest.mock.patch('builtins.input',return_value='yes') as prompt:
+                _confirm_existing_output(args)
+            prompt.assert_called_once()
+            self.assertEqual(args.overwrite,1)
+            args.overwrite=0
+            with unittest.mock.patch('sys.stdin.isatty',return_value=True),unittest.mock.patch('builtins.input',return_value='no'):
+                with self.assertRaisesRegex(FileExistsError,'Cancelled'):
+                    _confirm_existing_output(args)
 
     def test_split_is_deterministic_and_keeps_source_groups(self):
         data=self.dataset()
@@ -75,9 +89,17 @@ class TestPreparationWorkflow(unittest.TestCase):
             self.assertFalse(result['errors'])
             self.assertEqual(result['eligibleRecords'],1)
             self.assertEqual(result['excludedRecords'],4)
+            self.assertEqual(result['invalidRecordCount'],4)
             self.assertEqual([row['index'] for row in result['invalidRecords']],[1,2,3,4])
             self.assertEqual(result['invalidRecords'][1]['values']['adductTypeColumn'],'invalid')
             self.assertIn('main adduct',result['invalidRecords'][1]['issues'][0]['reason'])
+            progress=[]
+            limited=inspect_records(MSDataset(metadata,data.peaks),create_preparation_context(config()).fragmenter,
+                progress=lambda current,total:progress.append((current,total)),invalid_detail_limit=2)
+            self.assertEqual(limited['excludedRecords'],4)
+            self.assertEqual(len(limited['invalidRecords']),2)
+            self.assertEqual(progress[0],(0,5))
+            self.assertEqual(progress[-1],(5,5))
             from clefts.ml.data_preparation.fragment_tree.create_training_data import create_action_training_data
             model=config();model['fragmenter_params']['fragment_ion_tree_builder']['max_action_count']=1
             with contextlib.redirect_stdout(io.StringIO()):
@@ -286,7 +308,9 @@ class TestPreparationWorkflow(unittest.TestCase):
             # / manifest.tsv already report the same data once the run ends.
             self.assertNotIn('"event": "progress"',log.getvalue())
             self.assertNotIn('"event": "source_skipped"',log.getvalue())
-            with self.assertRaises(FileExistsError),contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(FileExistsError),contextlib.redirect_stdout(io.StringIO()),unittest.mock.patch(
+                    'clefts.ml.data_preparation.fragment_tree.create_training_data.load_spectrum_dataset',
+                    side_effect=AssertionError('existing output must be rejected before loading the dataset')):
                 main(['--input',str(file),'--output-dir',str(root/'out'),'--validation-ratio','0.5',
                       '--params-json',json.dumps(model),'--overwrite','0'])
 
