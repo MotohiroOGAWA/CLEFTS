@@ -10,7 +10,10 @@ const host = require('./host');
 
 const VIEW_TYPE = 'clefts.cleavagePatternSetEditor';
 const PATTERN_VIEW_TYPE = 'clefts.cleavagePatternEditor';
-const FILE_SUFFIX = '.clevageset.json';
+// .pft (not .json) so VS Code's contributed language icon actually shows:
+// every icon theme already claims plain .json, which always wins over a
+// contributed language icon, but no theme claims .pft.
+const FILE_SUFFIX = '.clevageset.pft';
 
 function emptyDocument() {
   return {
@@ -113,7 +116,7 @@ class CleavagePatternSetEditorProvider {
         if (message.type === 'saveCleavagePatternSet') {
           const value = normalizeDocument(message.value);
           const defaultUri = vscode.Uri.file(host.cleavagePatternSetSavePath(value.cleavage_pattern_set.name, message.path, FILE_SUFFIX));
-          const selected = await vscode.window.showSaveDialog({ filters: { 'CLEFTS Cleavage Pattern Set': ['json'] }, defaultUri });
+          const selected = await vscode.window.showSaveDialog({ filters: { 'CLEFTS Cleavage Pattern Set': ['pft'] }, defaultUri });
           if (selected) {
             const target = vscode.Uri.file(host.ensureFileSuffix(selected.fsPath, FILE_SUFFIX));
             await fs.promises.writeFile(target.fsPath, `${JSON.stringify(value, null, 2)}\n`);
@@ -124,9 +127,9 @@ class CleavagePatternSetEditorProvider {
         }
         if (message.type === 'saveCleavagePattern') {
           const pattern = normalizePattern(message.pattern);
-          const selected = await vscode.window.showSaveDialog({ filters: { 'CLEFTS Cleavage Pattern': ['json'] }, defaultUri: vscode.Uri.file(`${host.safeFileStem(pattern.name || 'pattern')}.cleavage.json`) });
+          const selected = await vscode.window.showSaveDialog({ filters: { 'CLEFTS Cleavage Pattern': ['pft'] }, defaultUri: vscode.Uri.file(`${host.safeFileStem(pattern.name || 'pattern')}.cleavage.pft`) });
           if (selected) {
-            const target = vscode.Uri.file(host.ensureFileSuffix(selected.fsPath, '.cleavage.json', ['.clevage.json']));
+            const target = vscode.Uri.file(host.ensureFileSuffix(selected.fsPath, '.cleavage.pft', ['.clevage.pft']));
             await fs.promises.writeFile(target.fsPath, `${JSON.stringify(pattern, null, 2)}\n`);
             vscode.window.showInformationMessage(`Saved ${path.basename(target.fsPath)}`);
           }

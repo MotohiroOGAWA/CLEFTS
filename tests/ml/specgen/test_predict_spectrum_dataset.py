@@ -118,10 +118,10 @@ def test_main_writes_msds_and_mssim_without_an_output_name_argument(tmp_path, mo
     similarity = SimilarityDataset.load(str(mssim_path))
     assert similarity.matched_datasets is not None
 
-    # Mirrors training/data-prep's own .pft.json convention, so the
+    # Mirrors training/data-prep's own .pft convention, so the
     # Workbench's "Load From Run" can restore this run's settings.
     import json
-    pft = json.loads((output_dir / "prediction.pft.json").read_text())
+    pft = json.loads((output_dir / "prediction.pft").read_text())
     assert pft["application"] == "spectrum-prediction"
     assert pft["input"] == str(input_path.resolve())
     assert pft["modelPath"] == str(model_path.resolve())
@@ -193,7 +193,7 @@ def test_main_writes_pft_json_before_prediction_even_if_it_later_fails(tmp_path,
         predict_spectrum.main()
 
     import json
-    pft = json.loads((output_dir / "prediction.pft.json").read_text())
+    pft = json.loads((output_dir / "prediction.pft").read_text())
     assert pft["application"] == "spectrum-prediction"
     assert not (output_dir / "predicted.msds").exists()
 

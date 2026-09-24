@@ -32,9 +32,17 @@ async function validationResult(root, manifest) {
 
 async function readRun(directory) {
   let report;
-  if (directory.endsWith('.pft.json')) {
-    report = JSON.parse(await fs.promises.readFile(directory, 'utf8'));
-    if (report.schema !== 'clefts.training-report') throw new Error('This .pft.json is not a training report.');
+  // Extension-agnostic: whether this path is a training-report file (any
+  // name) or a run directory is decided by what it actually is on disk, not
+  // by its suffix.
+  let stat;
+  try { stat = await fs.promises.stat(directory); } catch { stat = null; }
+  if (stat?.isFile()) {
+    let parsed;
+    try { parsed = JSON.parse(await fs.promises.readFile(directory, 'utf8')); }
+    catch { throw new Error('This file is not a training report (not valid JSON).'); }
+    if (parsed.schema !== 'clefts.training-report') throw new Error('This file is not a training report.');
+    report = parsed;
     directory = path.dirname(directory);
   }
   const series = new Map();
@@ -118,20 +126,19 @@ function attach(panel) {
   const vscode = require('vscode');
   panel.webview.onDidReceiveMessage(async message => {
     if (message.type === 'metricsPick') {
-      const picked = await vscode.window.showOpenDialog({ canSelectFiles: true, canSelectFolders: true, canSelectMany: false,
-        filters: { 'Training report or run': ['pft.json', 'json', 'tsv'] } });
+      const picked = await vscode.window.showOpenDialog({ canSelectFiles: true, canSelectFolders: true, canSelectMany: false });
       if (picked?.[0]) panel.webview.postMessage({ type: 'metricsPicked', directory: picked[0].fsPath });
     }
     if (message.type !== 'metricsLoad') return;
     try {
-      if (typeof message.directory !== 'string' || !path.isAbsolute(message.directory.trim())) throw new Error('Enter an absolute path to the training run or training.pft.json.');
+      if (typeof message.directory !== 'string' || !path.isAbsolute(message.directory.trim())) throw new Error('Enter an absolute path to the training run or training.pft.');
       const data = await readRun(message.directory.trim());
       panel.webview.postMessage({ type: 'metricsData', request: message.request, data });
     } catch (error) { panel.webview.postMessage({ type: 'metricsData', request: message.request, error: error.message }); }
   });
 }
 function html({ hidden = true } = {}) {
-  return `<div id="metricsApp"${hidden ? ' hidden' : ''}><section><h2>Training Report</h2><label>Run directory or training.pft.json<input id="metricsDirectory" type="text" data-path-kind="folder" placeholder="/path/to/run/training.pft.json" style="width:100%"></label><div class="actions"><button id="metricsBrowse">Browse…</button><button id="metricsLoad">Load / Refresh</button><label><input id="metricsAuto" type="checkbox"> Auto refresh (15s)</label></div><p id="metricsStatus" role="status"></p><p class="muted">Each metric appears once. After adding it, switch that card between mean, median, and q10–q90 distribution views, or exclude precursor peaks. Train uses warm colors and validation uses cool colors; a breakdown (collision energy, adduct, depth) colors each category instead.</p><div class="actions"><input id="metricsFilter" type="search" placeholder="Filter charts" aria-label="Filter charts"><select id="metricsChoice" aria-label="Chart metric" style="max-width:80%"></select><button id="metricsAdd" disabled>＋ Add chart</button><button id="metricsAddAll" disabled>Add all charts</button><button id="metricsClear">Clear charts</button><label>Layout <select id="metricsLayout"><option value="grid">Grid</option><option value="vertical">Vertical</option></select></label></div></section><div id="metricsCharts" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,440px),1fr));gap:16px"></div><section><h2>Representative validation spectra</h2><div class="actions"><label>Rank by <select id="representativeMetric"><option value="cosine_similarity">Cosine similarity</option><option value="assignment_score">Assignment score (m/z coverage)</option></select></label><label><input id="representativePrecursor" type="checkbox" checked> Include precursor</label><span id="representativeStatus" class="muted"></span></div><p class="muted">Compare the generated (top) and observed (bottom) spectrum in one card, switching its representative level between q10, q25, median, q75, and q90. Available once a training.pft.json report with spectrum validation is loaded.</p><div id="representativeSpectra" style="display:grid;grid-template-columns:minmax(min(100%,760px),1fr);gap:12px"></div></section></div>`;
+  return `<div id="metricsApp"${hidden ? ' hidden' : ''}><section><h2>Training Report</h2><label>Run directory or training.pft<input id="metricsDirectory" type="text" data-path-kind="folder" placeholder="/path/to/run/training.pft" style="width:100%"></label><div class="actions"><button id="metricsBrowse">Browse…</button><button id="metricsLoad">Load / Refresh</button><label><input id="metricsAuto" type="checkbox"> Auto refresh (15s)</label></div><p id="metricsStatus" role="status"></p><p class="muted">Each metric appears once. After adding it, switch that card between mean, median, and q10–q90 distribution views, or exclude precursor peaks. Train uses warm colors and validation uses cool colors; a breakdown (collision energy, adduct, depth) colors each category instead.</p><div class="actions"><input id="metricsFilter" type="search" placeholder="Filter charts" aria-label="Filter charts"><select id="metricsChoice" aria-label="Chart metric" style="max-width:80%"></select><button id="metricsAdd" disabled>＋ Add chart</button><button id="metricsAddAll" disabled>Add all charts</button><button id="metricsClear">Clear charts</button><label>Layout <select id="metricsLayout"><option value="grid">Grid</option><option value="vertical">Vertical</option></select></label></div></section><div id="metricsCharts" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,440px),1fr));gap:16px"></div><section><h2>Representative validation spectra</h2><div class="actions"><label>Rank by <select id="representativeMetric"><option value="cosine_similarity">Cosine similarity</option><option value="assignment_score">Assignment score (m/z coverage)</option></select></label><label><input id="representativePrecursor" type="checkbox" checked> Include precursor</label><span id="representativeStatus" class="muted"></span></div><p class="muted">Compare the generated (top) and observed (bottom) spectrum in one card, switching its representative level between q10, q25, median, q75, and q90. Available once a training.pft report with spectrum validation is loaded.</p><div id="representativeSpectra" style="display:grid;grid-template-columns:minmax(min(100%,760px),1fr);gap:12px"></div></section></div>`;
 }
 function client(groupSeries) {
   const el = id => document.getElementById(id);
@@ -368,7 +375,7 @@ function client(groupSeries) {
       level.onchange = draw; draw();
       el('representativeSpectra').append(card);
     }
-    el('representativeStatus').textContent = validation ? validation.file+' · '+(validation.summary.samples||0)+' spectra' : (report ? 'No validation spectrum artifact is available yet.' : 'Load a training.pft.json report to see representative spectra.');
+    el('representativeStatus').textContent = validation ? validation.file+' · '+(validation.summary.samples||0)+' spectra' : (report ? 'No validation spectrum artifact is available yet.' : 'Load a training.pft report to see representative spectra.');
   }
   el('metricsFilter').oninput = updateChoices;
   el('metricsAddAll').onclick = () => {

@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 
 
-REPORT_NAME = 'training.pft.json'
+REPORT_NAME = 'training.pft'
 
 
 def write_training_report(output_dir, *, status, settings=None, datasets=None,

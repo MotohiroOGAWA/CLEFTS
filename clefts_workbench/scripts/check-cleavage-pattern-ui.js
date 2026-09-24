@@ -212,11 +212,12 @@ const dom=new JSDOM(extension.workbenchHtml({modelConfig:preset},{modelConfig:pr
  const filename=require.resolve('../src/extension'),compiled=new Module(filename,module);compiled.filename=filename;compiled.paths=module.paths;
  compiled._compile(fs.readFileSync(filename,'utf8')+'\nmodule.exports.readCleavageImport=readCleavageImport;module.exports.cleavagePatternSetSavePath=cleavagePatternSetSavePath;',filename);
  const savePath=compiled.exports.cleavagePatternSetSavePath;
- assert.equal(savePath('my_set'),'my_set.clevageset.json');
- assert.equal(savePath('新しいセット','/tmp/old.clevageset.json'),'/tmp/新しいセット.clevageset.json');
- assert.equal(savePath('a/b:c'),'a_b_c.clevageset.json');
- assert.equal(savePath('   '),'patterns.clevageset.json');
- assert.equal(savePath('named.clevageset.json'),'named.clevageset.json');
+ assert.equal(savePath('my_set'),'my_set.clevageset.pft');
+ assert.equal(savePath('新しいセット','/tmp/old.clevageset.json'),'/tmp/新しいセット.clevageset.pft');
+ assert.equal(savePath('a/b:c'),'a_b_c.clevageset.pft');
+ assert.equal(savePath('   '),'patterns.clevageset.pft');
+ // A name that already carries the current suffix round-trips as-is.
+ assert.equal(savePath('named.clevageset.pft'),'named.clevageset.pft');
  const root=fs.mkdtempSync(path.join(os.tmpdir(),'clefts-pattern-import-'));
  try{
   const file=path.join(root,'set.clevageset.json'),value={cleavage_pattern_set:{name:'imported_set',patterns:[]}};

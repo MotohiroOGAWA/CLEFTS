@@ -38,9 +38,9 @@ Module._load=function(name,parent,main){
 const feature=require('../src/features/cleavage-pattern-set/editor');Module._load=load;
 feature.register({subscriptions:[]});
 const manifest=require('../package.json');
-for(const suffix of ['*.cleavage.json','*.clevage.json'])assert(manifest.contributes.customEditors.some(item=>item.viewType==='clefts.cleavagePatternEditor'&&item.priority==='default'&&item.selector.some(selector=>selector.filenamePattern===suffix)));
+for(const suffix of ['*.cleavage.pft','*.clevage.pft'])assert(manifest.contributes.customEditors.some(item=>item.viewType==='clefts.cleavagePatternEditor'&&item.priority==='default'&&item.selector.some(selector=>selector.filenamePattern===suffix)));
 assert(manifest.activationEvents.includes('onCustomEditor:clefts.cleavagePatternEditor'));
-assert(manifest.contributes.customEditors.some(item=>item.viewType==='clefts.cleavagePatternSetEditor'&&item.selector.some(selector=>selector.filenamePattern==='*.clevageset.json')));
+assert(manifest.contributes.customEditors.some(item=>item.viewType==='clefts.cleavagePatternSetEditor'&&item.selector.some(selector=>selector.filenamePattern==='*.clevageset.pft')));
 assert.equal(feature.PATTERN_VIEW_TYPE,'clefts.cleavagePatternEditor');assert.equal(feature.VIEW_TYPE,'clefts.cleavagePatternSetEditor');
 
 async function open(viewType,value){
@@ -123,9 +123,9 @@ async function open(viewType,value){
   const single2=await open('clefts.cleavagePatternEditor',original);
   saveDialogResult={fsPath:path.join(tmp,'exported_pattern')};
   await single2.send({type:'saveCleavagePattern',pattern:{name:'exported',reactant_smarts:'[#6:1]',products:[]}});
-  const savedPattern=JSON.parse(fs.readFileSync(path.join(tmp,'exported_pattern.cleavage.json'),'utf8'));
+  const savedPattern=JSON.parse(fs.readFileSync(path.join(tmp,'exported_pattern.cleavage.pft'),'utf8'));
   assert.deepEqual(savedPattern,{name:'exported',reactant_smarts:'[#6:1]',products:[]});
-  assert(informationMessages.some(text=>text.includes('exported_pattern.cleavage.json')));
+  assert(informationMessages.some(text=>text.includes('exported_pattern.cleavage.pft')));
 
   importResult={value:{name:'imported',reactant_smarts:'[#8:1]',products:[]},path:'/tmp/imported.cleavage.json'};
   await single2.send({type:'loadCleavagePattern',index:0});
@@ -161,7 +161,7 @@ async function open(viewType,value){
   saveDialogResult={fsPath:path.join(tmp2,'exported_set')};
   try{
    await set.send({type:'saveCleavagePatternSet',value:{cleavage_pattern_set:{name:'exported_set',patterns:[original]}},path:''});
-   const savedSet=JSON.parse(fs.readFileSync(path.join(tmp2,'exported_set.clevageset.json'),'utf8'));
+   const savedSet=JSON.parse(fs.readFileSync(path.join(tmp2,'exported_set.clevageset.pft'),'utf8'));
    assert.deepEqual(savedSet,{cleavage_pattern_set:{name:'exported_set',patterns:[original]}});
   }finally{fs.rmSync(tmp2,{recursive:true,force:true});}
  }finally{await new Promise(resolve=>setTimeout(resolve,0));setDom?.window.close();set.dispose();}

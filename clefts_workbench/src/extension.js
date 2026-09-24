@@ -28,7 +28,6 @@ const cleavagePatternSetEditor = require('./features/cleavage-pattern-set/editor
 const adductUi = require('./features/adduct-rule-set/ui');
 const adductRuleSetEditor = require('./features/adduct-rule-set/editor');
 const cleavageHost = require('./features/cleavage-pattern-set/host');
-const fileBadges = require('./workbench/file-badges');
 const { projectRoot, isCleftsRoot, runChemistryBackend, showElementPicker, readCleavageImport, safeFileStem, ensureFileSuffix } = cleavageHost;
 
 const RESULT_NAME = 'fragment-tree.pft';
@@ -51,7 +50,6 @@ function activate(context) {
   cleavagePatternSetEditor.register(context);
   adductRuleSetEditor.register(context);
   workbench.register(context, output, projectRoot, openWorkbench);
-  fileBadges.register(context);
   enableDevelopmentReload(context, output);
 }
 
@@ -127,10 +125,12 @@ function openWorkbench(context, output, initialPage = "home") {
           panel.webview.postMessage({ type: 'picked', form: message.form, field: message.field, value: picked[0].fsPath });
         }
       } else if (message.type === 'saveConfig') {
-        const target = await vscode.window.showSaveDialog({ filters: { 'CLEFTS run configuration': ['pft.json', 'json'] }, defaultUri: vscode.Uri.file('fragment-tree.pft.json') });
+        const target = await vscode.window.showSaveDialog({ filters: { 'CLEFTS run configuration': ['pft'] }, defaultUri: vscode.Uri.file('fragment-tree.pft') });
         if (target) {await fs.promises.writeFile(target.fsPath, JSON.stringify(normalizeConfig(message.config), null, 2) + '\n');projects.record(context,'data',message.config,{label:path.basename(target.fsPath),reason:'exported',sourcePath:target.fsPath,base:projectRoot(context)});}
       } else if (['loadConfig','loadConfigFile','loadConfigJSON'].includes(message.type)) {
-        const picked = message.type==='loadConfigFile'?[vscode.Uri.file(message.path)]:message.type==='loadConfigJSON'?[{fsPath:message.name||'fragment-tree.pft.json'}]:await vscode.window.showOpenDialog({ filters: { 'CLEFTS run configuration': ['pft.json', 'json'] }, canSelectMany: false });
+        // Extension-agnostic: this always loads a data-preparation run
+        // configuration by content (normalizeConfig), so any filename works.
+        const picked = message.type==='loadConfigFile'?[vscode.Uri.file(message.path)]:message.type==='loadConfigJSON'?[{fsPath:message.name||'fragment-tree.pft'}]:await vscode.window.showOpenDialog({ canSelectMany: false });
         if (picked && picked[0]) {
           const config = normalizeConfig(JSON.parse(message.type==='loadConfigJSON'?message.json:await fs.promises.readFile(picked[0].fsPath, 'utf8')));
           if (!config.modelConfig && config.params) config.modelConfig = parameterService.merge(parameterService.defaults(projectRoot(context)), parameterService.unpack(JSON.parse(await fs.promises.readFile(path.resolve(path.dirname(picked[0].fsPath), config.params), 'utf8'))));
@@ -143,7 +143,9 @@ function openWorkbench(context, output, initialPage = "home") {
       } else if (['loadTrainingConfig','loadTrainingConfigFile','loadTrainingConfigJSON'].includes(message.type)) {
         if(message.type==='loadTrainingConfigJSON'&&(typeof message.json!=='string'||message.json.length>2000000))throw new Error('Training configuration is too large or invalid.');
         if(message.type==='loadTrainingConfigFile'&&(typeof message.path!=='string'||!message.path.trim()))throw new Error('Select a training configuration file.');
-        const picked = message.type==='loadTrainingConfigFile'?[vscode.Uri.file(message.path)]:message.type==='loadTrainingConfigJSON'?[{fsPath:message.name||'fragment_tree.pfttrain.json'}]:await vscode.window.showOpenDialog({ filters: { 'CLEFTS training configuration': ['pfttrain.json'] }, canSelectMany: false });
+        // Extension-agnostic: this always loads a training run configuration
+        // by content (normalizeTrainingConfig), so any filename works.
+        const picked = message.type==='loadTrainingConfigFile'?[vscode.Uri.file(message.path)]:message.type==='loadTrainingConfigJSON'?[{fsPath:message.name||'fragment_tree.pfttrain.json'}]:await vscode.window.showOpenDialog({ canSelectMany: false });
         if (picked && picked[0]) {
           const raw=JSON.parse(message.type==='loadTrainingConfigJSON'?message.json:await fs.promises.readFile(picked[0].fsPath, 'utf8'));
           if(!raw.modelConfig&&raw.params){if(message.type==='loadTrainingConfigJSON')throw new Error('Dropped training configurations must contain their model settings.');raw.modelConfig=parameterService.merge(parameterService.defaults(projectRoot(context)),parameterService.unpack(JSON.parse(await fs.promises.readFile(path.resolve(path.dirname(picked[0].fsPath),raw.params),'utf8'))));}
@@ -189,7 +191,7 @@ function openWorkbench(context, output, initialPage = "home") {
       } else if (message.type === 'saveCleavagePatternSet') {
         const value = cleavagePatternSetEditor.normalizeDocument(message.value);
         const defaultUri = vscode.Uri.file(cleavagePatternSetSavePath(value.cleavage_pattern_set.name, message.path));
-        const selected = await vscode.window.showSaveDialog({ filters: { 'CLEFTS Cleavage Pattern Set': ['json'] }, defaultUri });
+        const selected = await vscode.window.showSaveDialog({ filters: { 'CLEFTS Cleavage Pattern Set': ['pft'] }, defaultUri });
         if (selected) {
           const target = vscode.Uri.file(ensureFileSuffix(selected.fsPath, cleavagePatternSetEditor.FILE_SUFFIX));
           await fs.promises.writeFile(target.fsPath, `${JSON.stringify(value, null, 2)}\n`);
@@ -204,9 +206,9 @@ function openWorkbench(context, output, initialPage = "home") {
         }
       } else if (message.type === 'saveCleavagePattern') {
         const pattern = normalizePattern(message.pattern);
-        const selected = await vscode.window.showSaveDialog({ filters: { 'CLEFTS Cleavage Pattern': ['json'] }, defaultUri: vscode.Uri.file(`${safeFileStem(pattern.name || 'pattern')}.cleavage.json`) });
+        const selected = await vscode.window.showSaveDialog({ filters: { 'CLEFTS Cleavage Pattern': ['pft'] }, defaultUri: vscode.Uri.file(`${safeFileStem(pattern.name || 'pattern')}.cleavage.pft`) });
         if (selected) {
-          const target = vscode.Uri.file(ensureFileSuffix(selected.fsPath, '.cleavage.json', ['.clevage.json']));
+          const target = vscode.Uri.file(ensureFileSuffix(selected.fsPath, '.cleavage.pft', ['.clevage.pft']));
           await fs.promises.writeFile(target.fsPath, `${JSON.stringify(pattern, null, 2)}\n`);
           vscode.window.showInformationMessage(`Saved ${path.basename(target.fsPath)}`);
         }
@@ -218,10 +220,10 @@ function openWorkbench(context, output, initialPage = "home") {
         }
       } else if (message.type === 'saveAdductRuleSet') {
         const value=adductRuleSetEditor.normalizeDocument(message.value),defaultUri=vscode.Uri.file(cleavageHost.cleavagePatternSetSavePath(value.fragment_ion_adduct_rule_set.name,message.path,adductRuleSetEditor.FILE_SUFFIX));
-        const selected=await vscode.window.showSaveDialog({filters:{'CLEFTS Fragment Ion Adduct Rule Set':['json']},defaultUri});
+        const selected=await vscode.window.showSaveDialog({filters:{'CLEFTS Fragment Ion Adduct Rule Set':['pft']},defaultUri});
         if(selected){const target=vscode.Uri.file(ensureFileSuffix(selected.fsPath,adductRuleSetEditor.FILE_SUFFIX));await fs.promises.writeFile(target.fsPath,JSON.stringify(value,null,2)+'\n');panel.webview.postMessage({type:'adductRuleSetSaved',path:target.fsPath});vscode.window.showInformationMessage(`Saved ${path.basename(target.fsPath)}`);}
       } else if (message.type === 'saveAdductRule') {
-        const rule=adductRuleSetEditor.normalizeRule(message.rule),selected=await vscode.window.showSaveDialog({filters:{'CLEFTS Fragment Ion Adduct Rule':['json']},defaultUri:vscode.Uri.file(safeFileStem(rule.name||'adduct_rule')+adductRuleSetEditor.RULE_SUFFIX)});
+        const rule=adductRuleSetEditor.normalizeRule(message.rule),selected=await vscode.window.showSaveDialog({filters:{'CLEFTS Fragment Ion Adduct Rule':['pft']},defaultUri:vscode.Uri.file(safeFileStem(rule.name||'adduct_rule')+adductRuleSetEditor.RULE_SUFFIX)});
         if(selected){const target=vscode.Uri.file(ensureFileSuffix(selected.fsPath,adductRuleSetEditor.RULE_SUFFIX));await fs.promises.writeFile(target.fsPath,JSON.stringify(rule,null,2)+'\n');vscode.window.showInformationMessage(`Saved ${path.basename(target.fsPath)}`);}
       } else if (message.type === 'selectElements') {
         const elements = await showElementPicker(message.elements);
@@ -335,7 +337,7 @@ async function runFragmentTree(context, output, config, panel) {
   for (const key of ['input', 'outputDir']) if (!config[key]) throw new Error(`${key} is required.`);
   const root = projectRoot(context);
   const python = vscode.workspace.getConfiguration('clefts').get('pythonPath', 'python');
-  const resultPath = path.join(config.outputDir, 'train_structures', 'fragment-tree.pft.json');
+  const resultPath = path.join(config.outputDir, 'train_structures', 'fragment-tree.pft');
   const args = buildArgs(config);
   const command = shellDisplay(python, args);
   output.clear(); output.show(true); output.appendLine(`$ ${command}`);
@@ -357,14 +359,14 @@ async function runFragmentTree(context, output, config, panel) {
     const status = observed.job.status;
     if (code === 0) {
       for(const split of ['train','validation']){
-        const target=path.join(config.outputDir,split+'_structures','fragment-tree.pft.json');
+        const target=path.join(config.outputDir,split+'_structures','fragment-tree.pft');
         if(!fs.existsSync(target))continue;
         const saved=JSON.parse(await fs.promises.readFile(target,'utf8'));
         await fs.promises.writeFile(target,JSON.stringify({...saved,status:'completed',startedAt,finishedAt:new Date().toISOString(),exitCode:code,command:args},null,2)+'\n');
       }
     }
     panel.webview.postMessage({ type: 'status', status, text: signal ? 'Cancelled.' : code === 0 ? 'Completed.' : `Failed with exit code ${code}.`, resultPath });
-    if (code === 0) {const validationPath=path.join(config.outputDir,'validation_structures','fragment-tree.pft.json');vscode.window.showInformationMessage('CLEFTS fragment tree data preparation completed.', 'Open Train Result',...(fs.existsSync(validationPath)?['Open Validation Result']:[])).then(choice => { if (choice) openResult(vscode.Uri.file(choice==='Open Validation Result'?validationPath:resultPath)); });}
+    if (code === 0) {const validationPath=path.join(config.outputDir,'validation_structures','fragment-tree.pft');vscode.window.showInformationMessage('CLEFTS fragment tree data preparation completed.', 'Open Train Result',...(fs.existsSync(validationPath)?['Open Validation Result']:[])).then(choice => { if (choice) openResult(vscode.Uri.file(choice==='Open Validation Result'?validationPath:resultPath)); });}
   });
 }
 
@@ -410,7 +412,10 @@ function buildTrainingArgs(c) {
 
 function shellDisplay(program, args) { return [program, ...args].map(v => /^[A-Za-z0-9_./:=,-]+$/.test(v) ? v : `'${v.replace(/'/g, "'\\''")}'`).join(' '); }
 async function openResultPicker() {
-  const picked = await vscode.window.showOpenDialog({ filters: { 'CLEFTS result': ['pft.json', 'pft', 'clefts-result'] }, canSelectMany: false });
+  // Extension-agnostic: the result viewer renders whatever JSON structure it
+  // finds, so any filename works here too (unlike an Explorer double-click,
+  // which VS Code itself gates by the registered customEditors extensions).
+  const picked = await vscode.window.showOpenDialog({ canSelectMany: false });
   if (picked && picked[0]) openResult(picked[0]);
 }
 function openResult(uri) { return vscode.commands.executeCommand('vscode.openWith', uri, 'clefts.resultViewer'); }

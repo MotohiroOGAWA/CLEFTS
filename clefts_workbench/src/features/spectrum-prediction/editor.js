@@ -55,11 +55,12 @@ function attach(panel, context, projectRoot, output) {
         return;
       }
       if (message.type === 'predictLoadConfigFile') {
-        // predict_spectrum.py's main() writes prediction.pft.json into every
+        // predict_spectrum.py's main() writes prediction.pft into every
         // run's --output-dir with these same flat, camelCased field names,
         // so a past run's settings can be restored the same way a data
-        // preparation or training .pft.json already can.
-        const picked = (await vscode.window.showOpenDialog({ filters: { 'CLEFTS run configuration': ['pft.json', 'json'] }, canSelectMany: false }))?.[0];
+        // preparation or training .pft already can. Extension-agnostic: any
+        // filename with this content works, so no filter is applied here.
+        const picked = (await vscode.window.showOpenDialog({ canSelectMany: false }))?.[0];
         if (!picked) return;
         const loaded = JSON.parse(await require('fs').promises.readFile(picked.fsPath, 'utf8'));
         panel.webview.postMessage({ type: 'predictConfigLoaded', path: picked.fsPath, config: loaded });
@@ -120,7 +121,7 @@ function attach(panel, context, projectRoot, output) {
 }
 
 function html() {
-  return `<section id="predictConfiguration"><div class="section-title"><div><h2>Prediction Configuration</h2><p class="muted">Save or restore the model, single-spectrum conditions, and batch MSDataset settings.</p></div><div class="actions"><button type="button" id="predictLoadConfig">Load Configuration</button><button type="button" id="predictLoadConfigFile">Load From Run (.pft.json)</button><button type="button" id="predictSaveConfig">Save Configuration</button></div></div></section><section id="predictBatchSection" data-predict-mode="batch"><div class="section-title"><div><h2>Batch MSDataset prediction</h2><p class="muted">Predict in bounded batches and reuse molecular features across shared conditions.</p></div></div>
+  return `<section id="predictConfiguration"><div class="section-title"><div><h2>Prediction Configuration</h2><p class="muted">Save or restore the model, single-spectrum conditions, and batch MSDataset settings.</p></div><div class="actions"><button type="button" id="predictLoadConfig">Load Configuration</button><button type="button" id="predictLoadConfigFile">Load From Run (.pft)</button><button type="button" id="predictSaveConfig">Save Configuration</button></div></div></section><section id="predictBatchSection" data-predict-mode="batch"><div class="section-title"><div><h2>Batch MSDataset prediction</h2><p class="muted">Predict in bounded batches and reuse molecular features across shared conditions.</p></div></div>
   <div class="grid"><label>Output directory *<div class="path"><input name="batchOutputDir" data-path-kind="folder"><button type="button" data-predict-batch-pick="outputDir">Browse</button></div></label><label>Input MSDataset *<div class="path"><input name="batchInput" data-path-kind="file"><button type="button" data-predict-batch-pick="input">Browse</button></div></label><label>Maximum simultaneous samples<input name="batchMaxSamples" type="number" min="1" step="1" value="128"></label><label>DB label<input name="batchDb" value="unspecified"></label><label>SpecID column<input name="batchSpecIdColumn" value="SpecID"></label><label>SMILES column<input name="batchSmilesColumn" value="SMILES"></label><label>Precursor m/z column<input name="batchPrecursorMzColumn" value="PrecursorMZ"></label><label>Adduct column<input name="batchAdductTypeColumn" value="AdductType"></label><label>Collision energy column<input name="batchCollisionEnergyColumn" value="CollisionEnergy"></label><label>Instrument column (optional)<input name="batchInstrumentColumn"></label><label>Parallel prepare workers<input name="batchNumWorkers" type="number" min="1" step="1" value="1"></label><label>Compounds per worker chunk<input name="batchChunkSize" type="number" min="1" step="1" value="1"></label></div>
   <label class="check"><input name="batchOverwrite" type="checkbox"><span>Overwrite existing output</span></label>
   <label class="check"><input name="batchKeepTemp" type="checkbox"><span>Keep parallel prepare temp files</span></label>

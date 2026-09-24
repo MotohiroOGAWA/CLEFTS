@@ -322,11 +322,15 @@ def main(argv: list[str] | None = None) -> None:
         train,validation=dataset,None
     if not args.overwrite and (list(output.rglob('*.preft.pt')) or any(list((output/name).rglob('*.preft.pt')) for name in ('train_structures','validation_structures'))):
         raise FileExistsError('Output already contains training structures. Enable overwrite or choose another directory.')
-    workbench_path=output/'fragment-tree.pft.json'
+    workbench_path=output/'fragment-tree.pft'
     try:
+        legacy_path=output/'fragment-tree.pft.json'
+        legacy_split_path=output/'train_structures/fragment-tree.pft.json'
         if workbench_path.exists(): previous=json.loads(workbench_path.read_text())
+        elif legacy_path.exists(): previous=json.loads(legacy_path.read_text())
         elif (output/'preparation_config.json').exists(): previous=json.loads((output/'preparation_config.json').read_text()).get('workbench_config',{})
-        elif (output/'train_structures/fragment-tree.pft.json').exists(): previous=json.loads((output/'train_structures/fragment-tree.pft.json').read_text())
+        elif (output/'train_structures/fragment-tree.pft').exists(): previous=json.loads((output/'train_structures/fragment-tree.pft').read_text())
+        elif legacy_split_path.exists(): previous=json.loads(legacy_split_path.read_text())
         else: previous={}
         if not isinstance(previous,dict): previous={}
     except (OSError,json.JSONDecodeError):
@@ -355,11 +359,11 @@ def main(argv: list[str] | None = None) -> None:
         directory=output/(name+'_structures')
         directory.mkdir(parents=True,exist_ok=True)
         split_config={**restored,'split':name,'status':'running'}
-        (directory/'fragment-tree.pft.json').write_text(json.dumps(split_config,indent=2))
+        (directory/'fragment-tree.pft').write_text(json.dumps(split_config,indent=2))
         # The split is newly empty after resetting Output Directory. Do not delete its configuration.
         create_action_training_data(dataset=split_dataset,output_dir=directory,split=name,**{**(kwargs if name=='train' else validation_kwargs),'overwrite':False},_check_existing=False)
         split_config['status']='completed'
-        (directory/'fragment-tree.pft.json').write_text(json.dumps(split_config,indent=2))
+        (directory/'fragment-tree.pft').write_text(json.dumps(split_config,indent=2))
     (output/'invalid_records.json').write_text(json.dumps(reports,indent=2))
     (output/'preparation_config.json').write_text(json.dumps(preparation_config,indent=2))
 

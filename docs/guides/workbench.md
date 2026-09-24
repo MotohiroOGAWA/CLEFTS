@@ -28,7 +28,7 @@ To update a preparation run, open **Training Data → Fragmentation → Fragment
 
 ## Fragment ion adduct rules
 
-Open **Data → Adduct Rules**, or run **CLEFTS: Edit Fragment Ion Adduct Rules**. The shared editor manages the rule-set name and each rule's precursor adduct, radical flag, maximum unsaturation, ion shifts, and optional element restrictions. Rules and ion shifts are collapsed initially. Complete sets use `*.adductset.json`; individual rules use `*.adduct.json`, and both open in their dedicated CLEFTS custom editor.
+Open **Data → Adduct Rules**, or run **CLEFTS: Edit Fragment Ion Adduct Rules**. The shared editor manages the rule-set name and each rule's precursor adduct, radical flag, maximum unsaturation, ion shifts, and optional element restrictions. Rules and ion shifts are collapsed initially. Complete sets use `*.adductset.pft`; individual rules use `*.adduct.pft`, and both open in their dedicated CLEFTS custom editor.
 
 The same editor is embedded under the collapsed **Training Data → Fragmentation → Fragmenter Parameters → Fragment Ion Adduct Rule Set** summary. Expanding it edits the current preparation configuration in place without navigating to another tab. **Cleavage Pattern Set** uses its existing shared editor in the same way; both summaries remain collapsed by default.
 
@@ -105,7 +105,7 @@ terminates its worker processes.
 
 ## Fragment Tree Dataset Results
 
-Use the preparation page's top-right **Load Configuration** drop area to select `fragment-tree.pft.json` by clicking or dragging from the filesystem or Explorer. The preparation heading does not display a fixed preset name.
+Use the preparation page's top-right **Load Configuration** drop area to select `fragment-tree.pft` by clicking or dragging from the filesystem or Explorer. The preparation heading does not display a fixed preset name.
 
 The result viewer has a toolbar and light/dark toggle, without a sidebar. Select an output file to inspect its stored fragment trees. **Structure Detail** shows total nodes, edges, transitions, spectra, branch groups, physical-ion candidates, explanations, primitive actions and teacher states. The tree and table display one entry per materialized fragment node, with unique node IDs. In-memory trees without assigned persistent IDs use their local node indices, indicated in the legend. Diamonds mark precursors; orange circles mark terminal branch nodes.
 
@@ -134,8 +134,8 @@ directory. Existing datasets without saved peak records must be regenerated
 to display the peak table and both scores.
 
 
-Open `train_structures/fragment-tree.pft.json` or
-`validation_structures/fragment-tree.pft.json` to view that split independently.
+Open `train_structures/fragment-tree.pft` or
+`validation_structures/fragment-tree.pft` to view that split independently.
 These files also retain the preparation settings for import. The Python
 `preparation_config.json` remains at the output root. A training-only CLI run
 uses `train_structures` as well.

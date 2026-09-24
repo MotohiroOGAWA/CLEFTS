@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import shutil
 import sys
 import tempfile
 from pathlib import Path
@@ -14,22 +15,36 @@ from clefts.ml.specgen.components.action.action_encoder import NEIGHBORHOOD_MODE
 from .model import ActionFragmentTreeTrainingModel
 
 
-def confirm_output_overwrite(output: Path, *, overwrite: bool, resume) -> None:
-    """A fresh run into a non-empty output directory can silently clobber a
-    previous run's checkpoints/metrics. Resuming into that same directory is
-    the normal, intentional case and is never asked about."""
-    if resume or overwrite or not output.exists() or not any(output.iterdir()):
+def confirm_output_overwrite(output: Path, *, overwrite: bool, resume, protected_paths=()) -> None:
+    """A fresh run into a non-empty output directory used to silently mix in
+    a previous run's leftovers: metric_distributions.tsv is appended to (not
+    replaced), and spectrum_validation/*.json from a longer or differently
+    configured previous run is never cleaned up on its own. So confirming an
+    overwrite here also clears the directory (mirroring the data-preparation
+    CLI's --overwrite), guarded by the same protected-paths check so it can
+    never delete an input dataset or checkpoint accidentally pointed at the
+    output directory. Resuming into that same directory is the normal,
+    intentional case, is never asked about, and never clears anything."""
+    if resume:
         return
-    if sys.stdin.isatty():
-        answer = input(f'Output directory {output} already exists and is not empty. Overwrite it? [y/N] ')
-        if answer.strip().lower() in ('y', 'yes'):
-            return
-        raise SystemExit('Aborted: pass --overwrite to reuse a non-empty output directory without asking.')
-    raise SystemExit(
-        f'Output directory {output} already exists and is not empty. '
-        'Pass --overwrite to reuse it, or choose an empty directory. '
-        '(No interactive terminal is attached, so confirmation cannot be prompted for.)'
-    )
+    if not output.exists() or not any(output.iterdir()):
+        return
+    if not overwrite:
+        if sys.stdin.isatty():
+            answer = input(f'Output directory {output} already exists and is not empty. Overwrite it? [y/N] ')
+            if answer.strip().lower() not in ('y', 'yes'):
+                raise SystemExit('Aborted: pass --overwrite to reuse a non-empty output directory without asking.')
+        else:
+            raise SystemExit(
+                f'Output directory {output} already exists and is not empty. '
+                'Pass --overwrite to reuse it, or choose an empty directory. '
+                '(No interactive terminal is attached, so confirmation cannot be prompted for.)'
+            )
+    resolved = output.resolve()
+    for protected in (Path(__file__).resolve(), *(Path(value).resolve() for value in protected_paths if value)):
+        if protected.is_relative_to(resolved):
+            raise ValueError(f'Output directory contains {protected}; choose a separate output directory.')
+    shutil.rmtree(resolved)
 
 
 def _sample_meets_assignment_score(sample, minimum_assignment_score, minimum_assignment_score_without_precursor):
@@ -489,7 +504,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> None:
     args=build_arg_parser().parse_args(argv)
     output=Path(args.output_dir)
-    confirm_output_overwrite(output,overwrite=args.overwrite,resume=args.resume)
+    confirm_output_overwrite(output,overwrite=args.overwrite,resume=args.resume,
+        protected_paths=(args.train_dir,args.val_dir,args.mol_encoder_checkpoint,args.fine_tune_checkpoint,args.initialize_from))
     output.mkdir(parents=True,exist_ok=True)
     (output/'training_args.json').write_text(json.dumps(vars(args),indent=2))
     if not (args.resume or args.fine_tune_checkpoint or args.mol_encoder_checkpoint):

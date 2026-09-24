@@ -48,7 +48,10 @@ def dataset_model_config(directory):
     files = [(directory / 'preparation_config.json', 'preparation_config.json')]
     if directory.name in ('train_structures', 'validation_structures'):
         files.append((directory.parent / 'preparation_config.json', '../preparation_config.json'))
-    files.extend((directory / filename, filename) for filename in ('fragment-tree.pft.json', 'action_statistics.json'))
+    # fragment-tree.pft.json is the pre-rename name; datasets prepared before
+    # that change only have it, and its data is otherwise identical.
+    files.extend((directory / filename, filename) for filename in
+                 ('fragment-tree.pft', 'fragment-tree.pft.json', 'action_statistics.json'))
     for file, filename in files:
         if not file.is_file():
             continue

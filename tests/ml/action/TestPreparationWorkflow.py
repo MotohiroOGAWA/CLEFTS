@@ -183,7 +183,7 @@ class TestPreparationWorkflow(unittest.TestCase):
             output=root/'out';(output/'train_structures/stale').mkdir(parents=True)
             (output/'train_structures/stale/old.bin').write_text('stale')
             (output/'orphan.txt').write_text('old')
-            (output/'fragment-tree.pft.json').write_text(json.dumps({'validationRatio':0.25}))
+            (output/'fragment-tree.pft').write_text(json.dumps({'validationRatio':0.25}))
             model=config();model['fragmenter_params']['fragment_ion_tree_builder']['max_action_count']=1
             with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()):
                 main(['--input',str(input_file),'--validation-input',str(validation_file),'--output-dir',str(output),
@@ -191,7 +191,7 @@ class TestPreparationWorkflow(unittest.TestCase):
                     '--normalize-intensities','0','--minimum-relative-intensity','0.2','--validation-seed','7'])
             self.assertFalse((output/'orphan.txt').exists())
             self.assertFalse((output/'train_structures/stale').exists())
-            saved=json.loads((output/'train_structures/fragment-tree.pft.json').read_text())
+            saved=json.loads((output/'train_structures/fragment-tree.pft').read_text())
             self.assertEqual(saved['validationInput'],str(validation_file))
             self.assertEqual(saved['validationRatio'],0.25)
             self.assertEqual(saved['validationSeed'],7)
@@ -292,9 +292,9 @@ class TestPreparationWorkflow(unittest.TestCase):
             self.assertTrue((root/'out/preparation_config.json').is_file())
             self.assertFalse((root/'out/train_structures/preparation_config.json').exists())
             self.assertFalse((root/'out/validation_structures/preparation_config.json').exists())
-            self.assertFalse((root/'out/fragment-tree.pft.json').exists())
-            self.assertTrue((root/'out/train_structures/fragment-tree.pft.json').exists())
-            self.assertTrue((root/'out/validation_structures/fragment-tree.pft.json').exists())
+            self.assertFalse((root/'out/fragment-tree.pft').exists())
+            self.assertTrue((root/'out/train_structures/fragment-tree.pft').exists())
+            self.assertTrue((root/'out/validation_structures/fragment-tree.pft').exists())
             for split in ('train','validation'):
                 folder=root/'out'/f'{split}_structures'
                 self.assertEqual(len(list((folder/'data').glob('*.preft.pt'))),2)

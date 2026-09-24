@@ -50,12 +50,12 @@ assert(page.includes('batchSpecIdColumn'));
 assert(page.includes('batchOutputDir'));
 for (const match of page.matchAll(/<script>([\s\S]*?)<\/script>/g)) new Function(match[1]);
 (async () => {
-  // predictLoadConfigFile: reads prediction.pft.json (as predict_spectrum.py's
+  // predictLoadConfigFile: reads prediction.pft (as predict_spectrum.py's
   // main() writes it) via a real file dialog + fs read, and relays it through
   // the same predictConfigLoaded message the existing Load Configuration button
   // already posts, so the client applies it with no further changes.
   const fs = require('fs'), os = require('os'), path = require('path');
-  const pftPath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'clefts-pft-')), 'prediction.pft.json');
+  const pftPath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'clefts-pft-')), 'prediction.pft');
   const pftConfig = { application: 'spectrum-prediction', input: '/data/in.msds', outputDir: '/data/out', modelPath: '/models/m.pt', db: 'MoNA', numWorkers: 4, chunkSize: 8 };
   fs.writeFileSync(pftPath, JSON.stringify(pftConfig));
   const posted = [];
@@ -74,7 +74,7 @@ for (const match of page.matchAll(/<script>([\s\S]*?)<\/script>/g)) new Function
   assert(loaded, 'predictLoadConfigFile did not post predictConfigLoaded');
   assert.equal(loaded.path, pftPath);
   assert.deepEqual(loaded.config, pftConfig);
-  console.log('Load From Run (.pft.json) round-trip check passed.');
+  console.log('Load From Run (.pft) round-trip check passed.');
 })().then(() => {
   console.log('Batch spectrum prediction CLI and Workbench checks passed.');
 }).catch(error => { console.error(error); process.exit(1); });

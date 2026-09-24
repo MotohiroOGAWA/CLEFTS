@@ -53,8 +53,15 @@ function attach(panel,context,projectRoot){
  if(message.type==='library/load')post({type:'library/data',...await library(root)});
  if(message.type==='library/copy'){if(typeof message.path==='string')await vscode.env.clipboard.writeText(message.path);}
  if(message.type==='library/open'){
- if(typeof message.path!=='string')throw new Error('Invalid resource path.');const stat=await fs.promises.stat(message.path);
- if(stat.isDirectory())await vscode.commands.executeCommand('revealInExplorer',vscode.Uri.file(message.path));else if(/\.(pft(?:\.json)?|clefts-result)$/.test(message.path))await vscode.commands.executeCommand('vscode.openWith',vscode.Uri.file(message.path),'clefts.resultViewer');else await vscode.commands.executeCommand('revealInExplorer',vscode.Uri.file(message.path));
+ if(typeof message.path!=='string')throw new Error('Invalid resource path.');
+ // Buttons built from a job's outputDir guess the current filename (e.g.
+ // fragment-tree.pft); a job from before that convention changed only has
+ // the old fragment-tree.pft.json on disk, so fall back to it by content
+ // rather than erroring just because the guessed name doesn't exist.
+ let resolvedPath=message.path;
+ if(!fs.existsSync(resolvedPath)&&resolvedPath.endsWith('.pft')&&fs.existsSync(resolvedPath+'.json'))resolvedPath+='.json';
+ const stat=await fs.promises.stat(resolvedPath);
+ if(stat.isDirectory())await vscode.commands.executeCommand('revealInExplorer',vscode.Uri.file(resolvedPath));else if(/\.(pft(?:\.json)?|clefts-result)$/.test(resolvedPath))await vscode.commands.executeCommand('vscode.openWith',vscode.Uri.file(resolvedPath),'clefts.resultViewer');else await vscode.commands.executeCommand('revealInExplorer',vscode.Uri.file(resolvedPath));
  }
  if(message.type==='library/pick'){
  const allowed=['quickTrainDir','quickValDir','quickTrainOutput','quickCheckpoint','quickPredictModel'];if(!allowed.includes(message.target))return;

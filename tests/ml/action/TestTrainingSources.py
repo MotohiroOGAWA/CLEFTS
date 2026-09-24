@@ -25,6 +25,66 @@ class TestTrainingSources(unittest.TestCase):
         self.assertEqual(kwargs['position'], 1)
         self.assertIn('{bar:36}', kwargs['bar_format'])
 
+    def test_overwrite_removes_previous_run_leftovers(self):
+        # metric_distributions.tsv is appended to across a run, and
+        # spectrum_validation/*.json from a longer previous run is never
+        # cleaned up on its own -- --overwrite must not leave those behind.
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / 'out'
+            (output / 'spectrum_validation').mkdir(parents=True)
+            (output / 'spectrum_validation' / 'epoch_9.json').write_text('{}')
+            (output / 'metric_distributions.tsv').write_text('stale\trow\n')
+            (output / 'last.pt').write_text('stale checkpoint')
+            training.confirm_output_overwrite(output, overwrite=True, resume=None)
+            self.assertFalse(output.exists())
+
+    def test_interactive_yes_also_clears_the_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / 'out'
+            output.mkdir()
+            (output / 'stale.json').write_text('{}')
+            with patch('sys.stdin.isatty', return_value=True), patch('builtins.input', return_value='y'):
+                training.confirm_output_overwrite(output, overwrite=False, resume=None)
+            self.assertFalse(output.exists())
+
+    def test_declining_interactively_raises_without_deleting_anything(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / 'out'
+            output.mkdir()
+            (output / 'stale.json').write_text('{}')
+            with patch('sys.stdin.isatty', return_value=True), patch('builtins.input', return_value='n'):
+                with self.assertRaises(SystemExit):
+                    training.confirm_output_overwrite(output, overwrite=False, resume=None)
+            self.assertTrue((output / 'stale.json').exists())
+
+    def test_resume_never_clears_even_with_overwrite_requested(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / 'out'
+            output.mkdir()
+            (output / 'last.pt').write_text('checkpoint')
+            training.confirm_output_overwrite(output, overwrite=True, resume='last.pt')
+            self.assertTrue((output / 'last.pt').exists())
+
+    def test_empty_or_missing_output_directory_is_a_no_op(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / 'out'
+            output.mkdir()
+            training.confirm_output_overwrite(output, overwrite=True, resume=None)
+            self.assertTrue(output.exists())  # untouched, not recreated
+            missing = Path(directory) / 'missing'
+            training.confirm_output_overwrite(missing, overwrite=True, resume=None)
+            self.assertFalse(missing.exists())
+
+    def test_overwrite_refuses_to_delete_a_protected_input_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / 'out'
+            train_dir = output / 'train_structures'
+            train_dir.mkdir(parents=True)
+            (output / 'stale.json').write_text('{}')
+            with self.assertRaises(ValueError):
+                training.confirm_output_overwrite(output, overwrite=True, resume=None, protected_paths=(str(train_dir),))
+            self.assertTrue(train_dir.exists())
+
     def _dataset(self, root: Path, name: str, symbols: list[str]) -> Path:
         directory = root / name
         directory.mkdir()
@@ -70,7 +130,7 @@ class TestTrainingSources(unittest.TestCase):
             model = {'fragmenter_params': fragmenter, 'symbols': ['C', 'O'],
                      'adduct_type_strs': ['[M+H]+'], 'metadata_source': 'preparation'}
             (directory / 'preparation_config.json').write_text(json.dumps({'model_config': model}))
-            (directory / 'fragment-tree.pft.json').write_text(json.dumps({
+            (directory / 'fragment-tree.pft').write_text(json.dumps({
                 'fragmenterParams': fragmenter, 'symbols': ['O', 'C']}))
             (directory / 'action_statistics.json').write_text(json.dumps({'model_config': {
                 'fragmenter_params': fragmenter, 'mol_encoder_params': {'symbols': ['C', 'O']},
