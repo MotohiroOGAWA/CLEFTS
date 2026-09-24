@@ -10,7 +10,7 @@ from clefts.libs.mmkit.mmkit import Adduct, Compound, Formula
 from clefts.ml.data_preparation.fragment_tree.context import create_preparation_context
 from clefts.ml.input.action_batching import select_samples
 from clefts.ml.input.structure_builder import ActionStructureBuilder
-from clefts.ml.training.fragment_tree_training.sources import dataset_sources, inherit_model_config
+from clefts.ml.training.fragment_tree_training.sources import dataset_model_config, dataset_sources, inherit_model_config
 from clefts.ml.training.fragment_tree_training import training
 from .TestActionPipeline import config
 
@@ -60,6 +60,29 @@ class TestTrainingSources(unittest.TestCase):
             validation = self._dataset(root, 'validation', ['C', 'N', 'S'])
             with self.assertRaisesRegex(ValueError, 'different elements'):
                 dataset_sources(train, validation)
+
+    def test_metadata_priority_and_stale_file_conflicts(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            directory = root / 'train'
+            directory.mkdir()
+            fragmenter = {'mass_tolerance': '0.01Da'}
+            model = {'fragmenter_params': fragmenter, 'symbols': ['C', 'O'],
+                     'adduct_type_strs': ['[M+H]+'], 'metadata_source': 'preparation'}
+            (directory / 'preparation_config.json').write_text(json.dumps({'model_config': model}))
+            (directory / 'fragment-tree.pft.json').write_text(json.dumps({
+                'fragmenterParams': fragmenter, 'symbols': ['O', 'C']}))
+            (directory / 'action_statistics.json').write_text(json.dumps({'model_config': {
+                'fragmenter_params': fragmenter, 'mol_encoder_params': {'symbols': ['C', 'O']},
+                'adduct_type_strs': ['[M+H]+']}}))
+            loaded = dataset_model_config(directory)
+            self.assertEqual(loaded['metadata_source'], 'preparation')
+            self.assertEqual(loaded['adduct_type_strs'], ['[M+H]+'])
+            stale = {'fragmenter_params': {'mass_tolerance': '0.5Da'},
+                     'mol_encoder_params': {'symbols': ['C', 'N']}, 'adduct_type_strs': ['[M+Na]+']}
+            (directory / 'action_statistics.json').write_text(json.dumps({'model_config': stale}))
+            with self.assertRaisesRegex(ValueError, 'Regenerate this dataset'):
+                dataset_model_config(directory)
 
     def test_molecular_encoder_symbols_must_match_prepared_data(self):
         with tempfile.TemporaryDirectory() as temporary:
