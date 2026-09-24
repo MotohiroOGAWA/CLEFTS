@@ -53,6 +53,14 @@ const app=path.resolve(__dirname,'../..'),preset=service.defaults(app);
  assert(walk(ionRoot).some(node=>node.className==='parameter-group-heading'&&node.textContent==='Loss weights'));
  const ionArgs=buildTrainingArgs({trainDir:'train',valDir:'val',outputDir:'out',modelConfig:ionEditor.getValue()});
  assert.equal(ionArgs[ionArgs.indexOf('--post-ion-loss-weight')+1],'0.5');
+ // action_neighborhood_mode is a closed-choice Primitive Action Encoder setting,
+ // defaulted like every other optional action_model_params field.
+ const neighborhoodRoot=new Element('div'),neighborhoodEditor=createParameterEditor(neighborhoodRoot,{action_model_params:{}},'training');
+ const neighborhoodMode=walk(neighborhoodRoot).find(node=>node.dataset.parameterPath==='action_model_params.action_neighborhood_mode');
+ assert.equal(neighborhoodMode.tag,'select');assert.deepEqual(neighborhoodMode.children.map(option=>option.value),['hop_pooling','none']);assert.equal(neighborhoodMode.value,'hop_pooling');
+ neighborhoodMode.value='none';neighborhoodMode.onchange();assert.equal(neighborhoodEditor.getValue().action_model_params.action_neighborhood_mode,'none');
+ const neighborhoodArgs=buildTrainingArgs({trainDir:'train',valDir:'val',outputDir:'out',modelConfig:neighborhoodEditor.getValue()});
+ assert.equal(neighborhoodArgs[neighborhoodArgs.indexOf('--action-neighborhood-mode')+1],'none');
  // Dropout is one shared training-level flag, not a per-component model_config override.
  const dropoutArgs=buildTrainingArgs({trainDir:'train',valDir:'val',outputDir:'out',dropout:0.3});
  assert.equal(dropoutArgs[dropoutArgs.indexOf('--dropout')+1],'0.3');

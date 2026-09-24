@@ -24,6 +24,16 @@ assert config['mol_encoder_checkpoint'] == 'encoder.pt'
 assert 'fragmenter_params' not in config and 'mol_encoder_params' not in config
 for _, (section, key, kind, _) in MODEL_OPTIONS.items():
     assert config[section][key] == (0.25 if kind is float else 64)
+assert config['action_model_params']['action_neighborhood_mode'] == 'hop_pooling'
+none_config = training_model_config(parser.parse_args(argv + ['--action-neighborhood-mode', 'none']))
+assert none_config['action_model_params']['action_neighborhood_mode'] == 'none'
+with contextlib.redirect_stderr(io.StringIO()):
+    try:
+        parser.parse_args(argv + ['--action-neighborhood-mode', 'gnn'])
+    except SystemExit as error:
+        assert error.code == 2
+    else:
+        raise AssertionError('--action-neighborhood-mode gnn')
 try:
     with tempfile.TemporaryDirectory() as output_dir:
         main(['--train-dir', 'train', '--val-dir', 'val', '--output-dir', output_dir])

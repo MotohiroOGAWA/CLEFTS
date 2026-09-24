@@ -10,6 +10,7 @@ import torch
 from tqdm.auto import tqdm
 from clefts.ml.input.source_action_structure import SourceActionStructure
 from clefts.ml.specgen.spectrum_generator import create_spectrum_generator
+from clefts.ml.specgen.components.action.action_encoder import NEIGHBORHOOD_MODES
 from .model import ActionFragmentTreeTrainingModel
 
 
@@ -422,6 +423,9 @@ def training_model_config(args):
     # A single shared dropout, not one knob per component.
     config['action_model_params']['state_dropout'] = args.dropout
     config['post_model_params']['dropout'] = args.dropout
+    # A closed-choice architecture setting, like equivalent_state_aggregation;
+    # kept out of the generic int/float MODEL_OPTIONS loop below.
+    config['action_model_params']['action_neighborhood_mode'] = args.action_neighborhood_mode
     if args.mol_encoder_checkpoint:
         config['mol_encoder_checkpoint'] = args.mol_encoder_checkpoint
     return config
@@ -432,6 +436,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument('--mol-encoder-checkpoint', help='Pretrained Mol Encoder checkpoint; required for new training.')
     parser.add_argument('--dropout', type=float, default=0.5,
         help='Shared dropout applied to every trainable component (action state encoder, post-materialization tree encoder).')
+    parser.add_argument('--action-neighborhood-mode', choices=NEIGHBORHOOD_MODES, default='hop_pooling',
+        help='How the Primitive Action Encoder folds in atoms outside the reacting site: '
+             '"hop_pooling" pools 1/2/3-hop neighbors into the action; "none" ignores them entirely.')
     for flag, (_, _, kind, default) in MODEL_OPTIONS.items():
         parser.add_argument('--'+flag, type=kind, default=default)
     for name in ('train-dir','val-dir','output-dir'):parser.add_argument('--'+name,required=True)

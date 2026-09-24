@@ -29,6 +29,7 @@ function createParameterEditor(container, initial, kind = "training", editCleava
     max_degree:'Maximum degree represented in graph structural embeddings.',max_spatial_dist:'Maximum atom graph distance encoded by the molecular encoder.',max_edge_dist:'Maximum bond distance encoded by the molecular encoder.',
     branch_path_threshold:'Minimum cumulative path probability retained by tree search. Zero disables threshold pruning.',
     max_fragment_nodes:'Maximum nodes shared by the complete (compound, main adduct) branch group.',
+    action_neighborhood_mode:'How the Primitive Action Encoder folds in atoms outside the reacting site: hop_pooling pools 1/2/3-hop neighbors into the action; none ignores them entirely.',
     state_num_layers:'Number of Set Transformer layers encoding the current action set.',state_dropout:'Dropout in the action state Set Transformer.',cosine_loss_weight:'Spectrum cosine loss weight, added to log intensity MSE.',
     ion_loss_weight:'Weight of the balanced ion score loss: pushes each candidate ion (node, hydrogen shift, radical, adduct) toward the observed peak match or toward zero, independent of the aggregated intensity loss.',
     ion_prediction_threshold:'Minimum ion confidence (sigmoid probability) kept when generating a spectrum. Below this, a candidate adduct/hydrogen-shift is suppressed instead of appearing as a small peak. Does not affect training loss.',
@@ -40,12 +41,12 @@ function createParameterEditor(container, initial, kind = "training", editCleava
     freeze_mol_encoder:'Freeze the molecular encoder during training.',
   };
   const templates={patterns:{name:'new_pattern',reactant_smarts:'[!#1:1]-[!#1:2]',products:[{name:'product',smarts:'[!#1:1]'}]},products:{name:'product',smarts:'[!#1:1]'},adduct_rules:{name:'new_rule',adduct_type:'[M+H]+',radical:false,unsaturation:0,ion_shifts:[]},ion_shifts:{ion_shift:'[M+H]+'},atoms:'C',symbols:'C'};
-  const optional={action_model_params:{branch_main_adduct_dim:128,num_heads:4,max_roles:64,state_num_layers:2,branch_path_threshold:0,max_fragment_nodes:100},mol_encoder_params:{dropout:0},post_model_params:{ion_embedding_dim:32,unsaturation_embedding_dim:16,radical_embedding_dim:8,state_hidden_dim:128,main_adduct_dim:128,collision_energy_dim:16,equivalent_state_aggregation:'attention',cosine_loss_weight:0.5,ion_loss_weight:0.5,ion_prediction_threshold:0.5,peak_intensity_threshold:0,intensity_power:0.5,precursor_free_loss_weight:0.5}};
+  const optional={action_model_params:{branch_main_adduct_dim:128,num_heads:4,max_roles:64,state_num_layers:2,branch_path_threshold:0,max_fragment_nodes:100,action_neighborhood_mode:'hop_pooling'},mol_encoder_params:{dropout:0},post_model_params:{ion_embedding_dim:32,unsaturation_embedding_dim:16,radical_embedding_dim:8,state_hidden_dim:128,main_adduct_dim:128,collision_energy_dim:16,equivalent_state_aggregation:'attention',cosine_loss_weight:0.5,ion_loss_weight:0.5,ion_prediction_threshold:0.5,peak_intensity_threshold:0,intensity_power:0.5,precursor_free_loss_weight:0.5}};
   // Purely cosmetic sub-headings for the sections with the most fields; any
   // field not listed here (e.g. a newer option) still renders, just ungrouped.
   const fieldGroups={
     action_model_params:{
-      'Architecture':['hidden_dim','branch_main_adduct_dim','num_heads','max_roles'],
+      'Architecture':['hidden_dim','branch_main_adduct_dim','num_heads','max_roles','action_neighborhood_mode'],
       'Branch Scorer · Architecture':['state_num_layers'],
       'Search':['branch_path_threshold','max_fragment_nodes'],
     },
@@ -65,9 +66,9 @@ function createParameterEditor(container, initial, kind = "training", editCleava
   // The model currently supports only normalized attention, but defining the
   // choices here makes future aggregation strategies appear automatically as
   // explicit options instead of asking users to know their string values.
-  const choices={equivalent_state_aggregation:['attention']};
+  const choices={equivalent_state_aggregation:['attention'],action_neighborhood_mode:['hop_pooling','none']};
   const basic=new Set(['fragmenter_params.fragment_ion_tree_builder.max_action_count','fragmenter_params.precursor_candidate_max_action_count','fragmenter_params.mass_tolerance']);
-  const badge=full=>full.endsWith('.max_action_count')?'Dataset inherited':full.endsWith('.branch_path_threshold')||full.endsWith('.max_fragment_nodes')?'Search':/(ion_prediction_threshold|peak_intensity_threshold)$/.test(full)?'Inference only':/(loss_weight|intensity_power)$/.test(full)?'Training only':/(hidden_dim|embedding_dim|main_adduct_dim|collision_energy_dim|branch_main_adduct_dim|num_layers|num_heads|state_num_layers|equivalent_state_aggregation)$/.test(full)?'Architecture':'';
+  const badge=full=>full.endsWith('.max_action_count')?'Dataset inherited':full.endsWith('.branch_path_threshold')||full.endsWith('.max_fragment_nodes')?'Search':/(ion_prediction_threshold|peak_intensity_threshold)$/.test(full)?'Inference only':/(loss_weight|intensity_power)$/.test(full)?'Training only':/(hidden_dim|embedding_dim|main_adduct_dim|collision_energy_dim|branch_main_adduct_dim|num_layers|num_heads|state_num_layers|equivalent_state_aggregation|action_neighborhood_mode)$/.test(full)?'Architecture':'';
   const node=(tag,text)=>{const n=document.createElement(tag);if(text!==undefined)n.textContent=text;return n;};
   const button=(text,fn)=>{const b=node('button',text);b.type='button';b.onclick=fn;return b;};
   const title=key=>String(key).replaceAll('_',' ').replace(/\b\w/g,c=>c.toUpperCase()).replace('Smarts','SMARTS');
