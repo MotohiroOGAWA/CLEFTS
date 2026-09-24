@@ -56,7 +56,8 @@ def preview(payload: dict) -> dict:
         # Every record is checked. Only detailed invalid-record samples are
         # bounded so a very dirty dataset cannot overflow the webview response.
         inspection=inspect_records(dataset,fragmenter,mapping,
-            progress=report_progress if payload.get('reportProgress') else None,invalid_detail_limit=5000)
+            progress=report_progress if payload.get('reportProgress') else None,invalid_detail_limit=5000,
+            symbols=payload.get('symbols') or payload.get('modelConfig',{}).get('mol_encoder_params',{}).get('symbols'))
         validation=inspection['validation']
         if not inspection['eligibleRecords']: errors.append('The dataset contains no valid records to prepare.')
     import numpy as np

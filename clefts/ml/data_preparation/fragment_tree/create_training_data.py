@@ -1,6 +1,6 @@
 """Prepare CE-independent branch groups and physical-ion tensors."""
 from __future__ import annotations
-import argparse,json,math,sys,os,pickle,tempfile,shutil,csv
+import argparse,json,math,sys,os,pickle,tempfile,shutil,csv,traceback
 from itertools import islice
 from pathlib import Path
 from tqdm import tqdm
@@ -85,6 +85,12 @@ def _prepare_group_safely(task, builder, options):
                     smiles=task[1],record_indexes=kept_rows,assignment_scores=scores,summary=summary,reason=reason)
     except (FragmentTreeLimitExceeded,UnresolvedPrecursorError) as error:
         return dict(skipped=dict(source_index=task[0],smiles=task[1],record_indexes=task[2],reason=str(error)))
+    except Exception as error:
+        # One malformed or unsupported molecule must not abort a whole
+        # (possibly hours-long) run: record it as skipped, with the traceback
+        # kept in skipped_sources.json for diagnosis, and carry on.
+        return dict(skipped=dict(source_index=task[0],smiles=task[1],record_indexes=task[2],
+                                 reason=f'{type(error).__name__}: {error}',error=traceback.format_exc()))
 
 
 def create_action_training_data(*, dataset: MSDataset, model_config: dict, output_dir: str | Path,
@@ -100,7 +106,7 @@ def create_action_training_data(*, dataset: MSDataset, model_config: dict, outpu
         raise ValueError('Worker processes and chunk size must be positive integers.')
     inspection=inspect_records(dataset,create_preparation_context(model_config).fragmenter,
         dict(smilesColumn=smiles_column,adductTypeColumn=adduct_type_column,
-             collisionEnergyColumn=collision_energy_column,precursorMzColumn=precursor_mz_column))
+             collisionEnergyColumn=collision_energy_column,precursorMzColumn=precursor_mz_column),symbols=model_config['mol_encoder_params']['symbols'])
     original_rows=inspection['validIndexes']
     dataset=dataset[original_rows]
     if not len(dataset): raise ValueError('The dataset contains no valid records to prepare.')
@@ -175,15 +181,40 @@ def create_action_training_data(*, dataset: MSDataset, model_config: dict, outpu
             root=str(Path(__file__).resolve().parents[4])
             env['PYTHONPATH']=os.pathsep.join(filter(None,[root,env.get('PYTHONPATH')]))
             with tqdm(total=total_chunks,desc=f'Fragment trees ({split})',unit='chunk',file=sys.stderr) as progress:
-                def on_complete(command):
-                    result_file=Path(command[command.index('--result')+1])
-                    task_file=Path(command[command.index('--task')+1])
+                worker_module='clefts.ml.data_preparation.fragment_tree.subprocess_worker'
+                def remove_task_files(command):
+                    for flag in ('--task','--result'): Path(command[command.index(flag)+1]).unlink(missing_ok=True)
+                def consume_results(command):
                     try:
-                        for result in json.loads(result_file.read_text()): collect_result(result)
+                        for result in json.loads(Path(command[command.index('--result')+1]).read_text()): collect_result(result)
                     finally:
-                        result_file.unlink(missing_ok=True)
-                        task_file.unlink(missing_ok=True)
+                        remove_task_files(command)
+                def on_complete(command):
+                    consume_results(command)
                     progress.set_postfix(prepared=len(files),skipped=len(skipped),refresh=False)
+                def retry_individually(command):
+                    # The worker process itself died (a Python exception is
+                    # already recorded as skipped by _prepare_group_safely),
+                    # e.g. a native crash or an OOM kill. Re-run each SMILES
+                    # group of the chunk in its own process so that only the
+                    # offending group is skipped, not the whole chunk or run.
+                    task_file=Path(command[command.index('--task')+1])
+                    with task_file.open('rb') as stream: payload=pickle.load(stream)
+                    remove_task_files(command)
+                    singles={}
+                    for position,task in enumerate(payload['tasks']):
+                        single_file=task_file.with_name(f'{task_file.stem}-{position}.pkl')
+                        with single_file.open('wb') as stream:
+                            pickle.dump({**payload,'tasks':[task]},stream,pickle.HIGHEST_PROTOCOL)
+                        singles[str(single_file)]=task
+                    def on_single_error(single_command,error):
+                        remove_task_files(single_command)
+                        tree,smiles,rows,_=singles[single_command[single_command.index('--task')+1]]
+                        collect_result(dict(skipped=dict(source_index=tree,smiles=smiles,record_indexes=rows,
+                            reason=f'Worker process exited with status {error.returncode}',error=(error.stderr or '')[-4000:])))
+                    with tqdm(disable=True) as quiet:
+                        run_parallel_subprocesses([[sys.executable,'-m',worker_module,'--task',single,'--result',str(Path(single).with_suffix('.json'))] for single in singles],max_workers=min(num_workers,len(singles)),
+                                                  print_output=False,env=env,on_complete=consume_results,on_error=on_single_error,progress=quiet)
                 task_id=0
                 while True:
                     commands=[]
@@ -195,11 +226,13 @@ def create_action_training_data(*, dataset: MSDataset, model_config: dict, outpu
                         with task_file.open('wb') as stream:
                             pickle.dump(dict(tasks=chunk,model_config=model_config,observed_adducts=generator.adduct_type_strs,
                                              options=options),stream,pickle.HIGHEST_PROTOCOL)
-                        commands.append([sys.executable,'-m','clefts.ml.data_preparation.fragment_tree.subprocess_worker',
-                                         '--task',str(task_file),'--result',str(result_file)])
+                        commands.append([sys.executable,'-m',worker_module,'--task',str(task_file),'--result',str(result_file)])
                     if not commands: break
+                    crashed=[]
                     run_parallel_subprocesses(commands,max_workers=min(num_workers,len(commands)),print_output=False,
-                                              env=env,on_complete=on_complete,progress=progress)
+                                              env=env,on_complete=on_complete,on_error=lambda command,error:crashed.append(command),progress=progress)
+                    for command in crashed: retry_individually(command)
+                    if crashed: progress.set_postfix(prepared=len(files),skipped=len(skipped),refresh=False)
     with (output/'manifest.tsv').open('w',newline='') as stream:
         writer=csv.DictWriter(stream,fieldnames=['file','smiles','record_indexes','num_input_records','num_valid_samples','rejected_sample_count','rejection_log','num_branch_groups','num_teacher_nodes','num_transition_states','num_positive_transitions','num_physical_ion_candidates','num_ion_explanations','max_ms2_depth','num_nodes','num_edges','assignment_score','assignment_score_without_precursor','status','reason'],delimiter='\t')
         writer.writeheader();writer.writerows(sorted(manifest_rows,key=lambda row:row['smiles']))
@@ -274,7 +307,7 @@ def main(argv: list[str] | None = None) -> None:
     reports={}
     for name,data in (('train',dataset),('validation',validation_dataset)):
         if data is None: continue
-        report=inspect_records(data,checker,mapping if name=='train' else validation_mapping)
+        report=inspect_records(data,checker,mapping if name=='train' else validation_mapping,symbols=config['mol_encoder_params']['symbols'])
         reports[name]=report['invalidRecords']
         filtered=data[report['validIndexes']]
         if not len(filtered): raise ValueError(name+' dataset contains no valid records to prepare.')
