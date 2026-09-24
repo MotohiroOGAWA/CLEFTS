@@ -1,0 +1,130 @@
+{
+  "fragment_ion_adduct_rule_set": {
+    "name": "adduct_rule_pos_H_Na_NH4_2M",
+    "adduct_rules": [
+      {
+        "name": "pos_H_r1_u2",
+        "adduct_type": "[M+H]+",
+        "radical": true,
+        "unsaturation": 2,
+        "ion_shifts": [
+          {
+            "ion_shift": "[M-H]+",
+            "atoms": [
+              "C",
+              "P",
+              "S"
+            ]
+          },
+          {
+            "ion_shift": "[M+H]+",
+            "atoms": [
+              "P",
+              "S",
+              "N",
+              "O"
+            ]
+          }
+        ]
+      },
+      {
+        "name": "pos_Na_r1_u2",
+        "adduct_type": "[M+Na]+",
+        "radical": true,
+        "unsaturation": 2,
+        "ion_shifts": [
+          {
+            "ion_shift": "[M+Na]+"
+          },
+          {
+            "ion_shift": "[M-H]+",
+            "atoms": [
+              "C",
+              "P",
+              "S"
+            ]
+          },
+          {
+            "ion_shift": "[M+H]+",
+            "atoms": [
+              "P",
+              "S",
+              "N",
+              "O"
+            ]
+          }
+        ]
+      },
+      {
+        "name": "pos_NH4_r1_u2",
+        "adduct_type": "[M+H4N]+",
+        "radical": true,
+        "unsaturation": 2,
+        "ion_shifts": [
+          {
+            "ion_shift": "[M+H4N]+"
+          },
+          {
+            "ion_shift": "[M+H]+",
+            "atoms": [
+              "P",
+              "S",
+              "N",
+              "O"
+            ]
+          },
+          {
+            "ion_shift": "[M-H]+",
+            "atoms": [
+              "C",
+              "P",
+              "S"
+            ]
+          }
+        ]
+      },
+      {
+        "name": "pos_2M_H_to_M_r1_u2",
+        "adduct_type": "[2M+H]+",
+        "radical": true,
+        "unsaturation": 2,
+        "ion_shifts": [
+          {
+            "ion_shift": "[2M+H]+",
+            "atoms": [
+              "P",
+              "S",
+              "N",
+              "O"
+            ]
+          },
+          {
+            "ion_shift": "[2M-H]+",
+            "atoms": [
+              "C",
+              "P",
+              "S"
+            ]
+          },
+          {
+            "ion_shift": "[M+H]+",
+            "atoms": [
+              "P",
+              "S",
+              "N",
+              "O"
+            ]
+          },
+          {
+            "ion_shift": "[M-H]+",
+            "atoms": [
+              "C",
+              "P",
+              "S"
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

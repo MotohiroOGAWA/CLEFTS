@@ -22,7 +22,13 @@ Open **Data → Cleavage Patterns**, or run **CLEFTS: Edit Cleavage Patterns** f
 
 Import a pattern set or an individual pattern by dropping its JSON file onto the corresponding import control, or click that control to browse. **Save Configuration** exports the complete pattern set; individual entries can also be saved separately. Import errors appear in the editor.
 
-To update a preparation run, open **Training Data → Fragmentation → Cleavage Patterns** and choose **Edit Cleavage Patterns** or **Add Pattern Visually**. The editor starts with that run's current pattern set. After adding, editing or importing patterns, click **Apply Patterns to Parameters** to return to Data Preparation and include the edited set in the preparation configuration. Saving a standalone pattern set does not apply it to a preparation run.
+To update a preparation run, open **Training Data → Fragmentation → Fragmenter Parameters** and expand **Cleavage Pattern Set**. The same complete editor is embedded in place and starts with that run's current pattern set; changes are applied to the preparation configuration immediately. Saving a standalone pattern set is still separate from the current preparation run.
+
+## Fragment ion adduct rules
+
+Open **Data → Adduct Rules**, or run **CLEFTS: Edit Fragment Ion Adduct Rules**. The shared editor manages the rule-set name and each rule's precursor adduct, radical flag, maximum unsaturation, ion shifts, and optional element restrictions. Rules and ion shifts are collapsed initially. Complete sets use `*.adductset.json`; individual rules use `*.adduct.json`, and both open in their dedicated CLEFTS custom editor.
+
+The same editor is embedded under the collapsed **Training Data → Fragmentation → Fragmenter Parameters → Fragment Ion Adduct Rule Set** summary. Expanding it edits the current preparation configuration in place without navigating to another tab. **Cleavage Pattern Set** uses its existing shared editor in the same way; both summaries remain collapsed by default.
 
 ## Cleavage viewer
 

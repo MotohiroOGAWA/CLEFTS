@@ -1,5 +1,5 @@
 // A DOM-only configuration editor shared by data preparation and training.
-function createParameterEditor(container, initial, kind = "training", editCleavagePatternSet) {
+function createParameterEditor(container, initial, kind = "training", editCleavagePatternSet, editAdductRuleSet) {
   const clone=value=>JSON.parse(JSON.stringify(value));
   const dataValue=value=>({fragmenter_params:clone(value.fragmenter_params||value),symbols:clone(value.symbols||value.mol_encoder_params?.symbols||initial.mol_encoder_params?.symbols||['C','N','O','P','S','F','Cl','Br','I']),max_node:value.max_node??-1,max_edge:value.max_edge??-1});
   const trainingValue=value=>{const source=value?.params||value||{},result={};for(const key of ['action_model_params','post_model_params','fine_tuning'])if(source[key]&&typeof source[key]==='object'&&!Array.isArray(source[key]))result[key]=clone(source[key]);return result;};
@@ -74,6 +74,8 @@ function createParameterEditor(container, initial, kind = "training", editCleava
   function help(key,path){return descriptions[key]||'Configure '+path.replaceAll('_',' ').replaceAll('.',' / ')+'. This value is passed to the CLEFTS Python workflow.';}
   function renderValue(parent,key,host,path,excludeBasic=false){
     const full=path?path+'.'+key:String(key),value=parent[key];if(excludeBasic&&basic.has(full))return;if(linkedToSharedDropout.has(full))return;
+    if(key==='cleavage_pattern_set'&&editCleavagePatternSet){const details=node('details'),summary=node('summary','Cleavage Pattern Set · '+(value.name||'(unnamed)')),mount=node('div');mount.className='embedded-set-editor';details.append(summary,mount);details.ontoggle=()=>{if(details.open)editCleavagePatternSet(clone(parent[key]),updated=>{parent[key]=clone(updated);summary.textContent='Cleavage Pattern Set · '+(updated.name||'(unnamed)');},mount);};host.append(details);return;}
+    if(key==='fragment_ion_adduct_rule_set'&&editAdductRuleSet){const mainAdducts=set=>[...new Set((set.adduct_rules||[]).map(rule=>rule.adduct_type).filter(Boolean))].join(', ')||'no main adducts',details=node('details'),summary=node('summary','Fragment Ion Adduct Rule Set · '+(value.name||'(unnamed)')+' · '+mainAdducts(value)),mount=node('div');mount.className='embedded-set-editor';details.append(summary,mount);details.ontoggle=()=>{if(details.open)editAdductRuleSet(clone(parent[key]),updated=>{parent[key]=clone(updated);summary.textContent='Fragment Ion Adduct Rule Set · '+(updated.name||'(unnamed)')+' · '+mainAdducts(updated);},mount);};host.append(details);return;}
     if(Array.isArray(value)||value&&typeof value==='object'){
       const group=node('fieldset'),legend=node('legend',title(key));legend.dataset.help=help(key,full);group.append(legend);
       if(Array.isArray(value)){
@@ -100,7 +102,6 @@ function createParameterEditor(container, initial, kind = "training", editCleava
         if('ion_shift' in value&&!('atoms' in value))group.append(button('Add Atom Restrictions',()=>{value.atoms=[];render();}));
         if('ion_shift' in value&&'atoms' in value)group.append(button('Remove Atom Restrictions',()=>{delete value.atoms;render();}));
       }
-      if(key==='cleavage_pattern_set'&&editCleavagePatternSet)group.append(button('Edit Cleavage Pattern Set Visually',()=>editCleavagePatternSet(clone(value),updated=>{parent[key]=clone(updated);render();})));
       host.append(group);return;
     }
     const fieldKey=typeof key==='number'?path.split('.').at(-1):key;
@@ -116,7 +117,7 @@ function createParameterEditor(container, initial, kind = "training", editCleava
     for(const row of rows)for(const symbol of row.split(' ')){if(symbol==='.'){grid.append(node('span'));continue;}const selected=model.symbols.includes(symbol);const tile=button(symbol,()=>{model.symbols=selected?model.symbols.filter(item=>item!==symbol):[...model.symbols,symbol];render();if(container.dispatchEvent)container.dispatchEvent(new Event('input',{bubbles:true}));});tile.dataset.symbol=symbol;tile.setAttribute('aria-pressed',String(selected));tile.title=symbol+(selected?' — enabled':' — disabled');grid.append(tile);}section.append(grid);
   }
   function render(){
-    const expanded=new Set([...container.querySelectorAll('[data-advanced]')].filter(n=>!n.hidden).map(n=>n.dataset.advanced));container.replaceChildren();
+    const expanded=new Set([...container.querySelectorAll('[data-advanced]')].filter(n=>!n.hidden).map(n=>n.dataset.advanced));for(const [app,mount]of [['cleavageApp','cleavagePageMount'],['adductApp','adductPageMount']]){const element=document.getElementById?.(app),page=document.getElementById?.(mount);if(element&&page&&container.contains?.(element)){element.hidden=true;page.append(element);}}container.replaceChildren();
     for(const [key,value]of Object.entries(model)){
       if(kind==='data'&&key==='symbols'){const section=node('section');section.append(node('h2','Symbols'));renderSymbols(section);container.append(section);continue;}
       if(kind==='training'&&['architecture','mol_encoder_checkpoint','fine_tuning','fragmenter_params','mol_encoder_params','adduct_type_strs','symbols','max_node','max_edge'].includes(key))continue;
@@ -125,7 +126,8 @@ function createParameterEditor(container, initial, kind = "training", editCleava
       if(kind==='data'&&key==='fragmenter_params'){renderValue(model,'max_node',section,'');renderValue(model,'max_edge',section,'');}
       if(key==='fragmenter_params')for(const path of basic){const parts=path.split('.');let parent=model;for(const part of parts.slice(0,-1))parent=parent?.[part];if(parent&&parts.at(-1) in parent)renderValue(parent,parts.at(-1),section,parts.slice(0,-1).join('.'));}
       const advanced=node('div');advanced.dataset.advanced=key;advanced.hidden=!expanded.has(key);
-      if(key==='fragmenter_params'||['mol_encoder_params','action_model_params','post_model_params'].includes(key)||(kind==='data'&&key!=='architecture')){const toggle=button('Advanced '+title(key),()=>{advanced.hidden=!advanced.hidden;toggle.setAttribute('aria-expanded',String(!advanced.hidden));});toggle.dataset.parameterToggle=key;toggle.setAttribute('aria-expanded',String(!advanced.hidden));section.append(toggle);renderValue(model,key,advanced,'',true);section.append(advanced);}
+      if(kind==='data'&&key==='fragmenter_params'){const builder=value.fragment_ion_tree_builder||{};for(const child of Object.keys(builder))if(child!=='max_action_count')renderValue(builder,child,section,'fragmenter_params.fragment_ion_tree_builder',true);for(const child of Object.keys(value))if(!['fragment_ion_tree_builder','precursor_candidate_max_action_count','mass_tolerance'].includes(child))renderValue(value,child,section,'fragmenter_params',true);}
+      else if(['mol_encoder_params','action_model_params','post_model_params'].includes(key)||(kind==='data'&&key!=='architecture')){const toggle=button('Advanced '+title(key),()=>{advanced.hidden=!advanced.hidden;toggle.setAttribute('aria-expanded',String(!advanced.hidden));});toggle.dataset.parameterToggle=key;toggle.setAttribute('aria-expanded',String(!advanced.hidden));section.append(toggle);renderValue(model,key,advanced,'',true);section.append(advanced);}
       else renderValue(model,key,section,'');container.append(section);
     }
   }
@@ -135,22 +137,9 @@ function client(){
   const el=id=>document.getElementById(id),form=el('form'),training=el('trainingForm');
   const defaultModel=initial.modelConfig||{fragmenter_params:initial.fragmenterParams||initialTraining.modelConfig?.fragmenter_params,symbols:initial.symbols||initialTraining.modelConfig?.mol_encoder_params?.symbols};
   const dataInitial={...defaultModel,symbols:initial.symbols||defaultModel.symbols||defaultModel.mol_encoder_params?.symbols,max_node:initial.maxNode??defaultModel.max_node,max_edge:initial.maxEdge??defaultModel.max_edge};
-  let applyPatterns,patternTarget;
-  function editPatterns(target){return (value,apply)=>{applyPatterns=apply;patternTarget=target;cleavageModel={cleavage_pattern_set:value};cleavagePath='';renderCleavage();el('cleavagePath').textContent='Editing '+(target==='data'?'Data Preparation':'Training')+' Cleavage Patterns';el('applyParameterPatterns').hidden=false;document.querySelector('#navigationRail [data-page=cleavage]').click();};}
-  const editors={data:createParameterEditor(el('dataParameterEditor'),dataInitial,'data',editPatterns('data')),training:createParameterEditor(el('trainingParameterEditor'),initialTraining.modelConfig||defaultModel,'training',editPatterns('training'))};
-  function openDataPatterns(visually=false){
-    const model=editors.data.getValue();
-    const value=model.fragmenter_params?.fragment_ion_tree_builder?.cleavage_pattern_set||{name:'new_cleavage_pattern_set',patterns:[]};
-    editPatterns('data')(JSON.parse(JSON.stringify(value)),updated=>{
-      const current=editors.data.getValue();
-      current.fragmenter_params.fragment_ion_tree_builder.cleavage_pattern_set=JSON.parse(JSON.stringify(updated));
-      editors.data.setValue(current);form.dispatchEvent(new Event('input',{bubbles:true}));
-    });
-    if(visually)el('addVisualPattern').click();
-  }
-  el('dataEditCleavagePatterns').onclick=()=>openDataPatterns();
-  el('dataAddVisualPattern').onclick=()=>openDataPatterns(true);
-  el('applyParameterPatterns').onclick=()=>{if(applyPatterns){applyPatterns(cleavageModel.cleavage_pattern_set);el('applyParameterPatterns').hidden=true;document.querySelector('[data-page='+patternTarget+']').click();}};
+  function editPatterns(target){return (value,apply,mount)=>{cleavageModel={cleavage_pattern_set:value};cleavagePath='';mount.append(el('cleavageApp'));el('cleavageApp').hidden=false;el('applyParameterPatterns').hidden=true;el('cleavagePath').textContent='Embedded in '+(target==='data'?'Data Preparation':'Training');onCleavageChange=()=>{apply(cleavageModel.cleavage_pattern_set);form.dispatchEvent(new Event('input',{bubbles:true}));};renderCleavage();};}
+  function editAdducts(target){return (value,apply,mount)=>{adductModel={fragment_ion_adduct_rule_set:value};adductPath='';mount.append(el('adductApp'));el('adductApp').hidden=false;el('applyParameterAdductRules').hidden=true;el('adductPath').textContent='Embedded in '+(target==='data'?'Data Preparation':'Training');onAdductChange=()=>{apply(adductModel.fragment_ion_adduct_rule_set);form.dispatchEvent(new Event('input',{bubbles:true}));};renderAdductRules();};}
+  const editors={data:createParameterEditor(el('dataParameterEditor'),dataInitial,'data',editPatterns('data'),editAdducts('data')),training:createParameterEditor(el('trainingParameterEditor'),initialTraining.modelConfig||defaultModel,'training',editPatterns('training'),editAdducts('training'))};
   function snapshot(target,application){const config={application};for(const input of target.elements){if(input.name)config[input.name]=input.type==='number'?Number(input.value):input.type==='checkbox'?input.checked:input.value;}return config;}
   getConfig=()=>{const value=editors.data.getValue();return {...snapshot(form,'fragment-tree-data-preparation'),fragmenterParams:value.fragmenter_params,symbols:value.symbols,maxNode:value.max_node,maxEdge:value.max_edge};};
   getTrainingConfig=()=>({...snapshot(training,'fragment-tree-training'),modelConfig:editors.training.getValue()});

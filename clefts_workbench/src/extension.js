@@ -25,6 +25,8 @@ const fs = require('fs');
 const path = require('path');
 const { spawn } = require('child_process');
 const cleavagePatternSetEditor = require('./features/cleavage-pattern-set/editor');
+const adductUi = require('./features/adduct-rule-set/ui');
+const adductRuleSetEditor = require('./features/adduct-rule-set/editor');
 const cleavageHost = require('./features/cleavage-pattern-set/host');
 const { projectRoot, isCleftsRoot, runChemistryBackend, showElementPicker, readCleavageImport, safeFileStem, ensureFileSuffix } = cleavageHost;
 
@@ -46,6 +48,7 @@ function activate(context) {
   );
   evaluation.register(context, output, projectRoot);
   cleavagePatternSetEditor.register(context);
+  adductRuleSetEditor.register(context);
   workbench.register(context, output, projectRoot, openWorkbench);
   enableDevelopmentReload(context, output);
 }
@@ -199,6 +202,19 @@ function openWorkbench(context, output, initialPage = "home") {
           await fs.promises.writeFile(target.fsPath, `${JSON.stringify(pattern, null, 2)}\n`);
           vscode.window.showInformationMessage(`Saved ${path.basename(target.fsPath)}`);
         }
+      } else if (message.type === 'loadAdductRuleSet' || message.type === 'loadAdductRule') {
+        const source = await readCleavageImport(context, message);
+        if (source) {
+          if (message.type === 'loadAdductRuleSet') panel.webview.postMessage({type:'adductRuleSet',value:adductRuleSetEditor.normalizeDocument(source.value),path:source.path});
+          else panel.webview.postMessage({type:'adductRuleLoaded',rule:adductRuleSetEditor.normalizeRule(source.value),index:message.index,path:source.path});
+        }
+      } else if (message.type === 'saveAdductRuleSet') {
+        const value=adductRuleSetEditor.normalizeDocument(message.value),defaultUri=vscode.Uri.file(cleavageHost.cleavagePatternSetSavePath(value.fragment_ion_adduct_rule_set.name,message.path,adductRuleSetEditor.FILE_SUFFIX));
+        const selected=await vscode.window.showSaveDialog({filters:{'CLEFTS Fragment Ion Adduct Rule Set':['json']},defaultUri});
+        if(selected){const target=vscode.Uri.file(ensureFileSuffix(selected.fsPath,adductRuleSetEditor.FILE_SUFFIX));await fs.promises.writeFile(target.fsPath,JSON.stringify(value,null,2)+'\n');panel.webview.postMessage({type:'adductRuleSetSaved',path:target.fsPath});vscode.window.showInformationMessage(`Saved ${path.basename(target.fsPath)}`);}
+      } else if (message.type === 'saveAdductRule') {
+        const rule=adductRuleSetEditor.normalizeRule(message.rule),selected=await vscode.window.showSaveDialog({filters:{'CLEFTS Fragment Ion Adduct Rule':['json']},defaultUri:vscode.Uri.file(safeFileStem(rule.name||'adduct_rule')+adductRuleSetEditor.RULE_SUFFIX)});
+        if(selected){const target=vscode.Uri.file(ensureFileSuffix(selected.fsPath,adductRuleSetEditor.RULE_SUFFIX));await fs.promises.writeFile(target.fsPath,JSON.stringify(rule,null,2)+'\n');vscode.window.showInformationMessage(`Saved ${path.basename(target.fsPath)}`);}
       } else if (message.type === 'selectElements') {
         const elements = await showElementPicker(message.elements);
         if (elements) panel.webview.postMessage({ type: 'elementSelectionResult', requestId: message.requestId, elements });
@@ -222,6 +238,7 @@ function openWorkbench(context, output, initialPage = "home") {
       }
     } catch (error) {
       if (/^(load|save)Cleavage/.test(message.type)) panel.webview.postMessage({ type: 'cleavagePatternError', message: String(error.message || error) });
+      if (/^(load|save)Adduct/.test(message.type)) panel.webview.postMessage({ type: 'adductRuleError', message: String(error.message || error) });
       if (message.type === 'chemistry') panel.webview.postMessage({ type: 'chemistryError', requestId: message.requestId, message: String(error.message || error) });
       const trainingMessage = ['runTraining', 'copyTrainingCommand', 'saveTrainingConfig', 'loadTrainingConfig', 'loadTrainingConfigFile', 'loadTrainingConfigJSON'].includes(message.type);
       panel.webview.postMessage({ type: trainingMessage ? 'trainingStatus' : 'status', status: 'error', text: String(error.message || error) });
@@ -675,11 +692,12 @@ const HELP = {
 function workbenchHtml(config, trainingConfig, predictionConfig = {}, molConfig = {}) {
   return `<!doctype html><html><head><meta charset="UTF-8"><style>${commonCss()}${formCss()}${trainingCss()}${trainingWorkbench.css()}${molTraining.css()}${pathDrop.css()}${workbench.css()}${parameterEditor.css()}</style></head><body><main>
   ${layout.header()}
-  ${workbench.html()}<nav id="legacyNavigation"><button class="tab" data-app="smarts">SMARTS Search</button><button class="tab" data-app="cleavageViewer">Cleavage Viewer</button><button class="tab" data-app="cleavage">Cleavage Pattern Set</button><button class="tab active" data-app="data">Data Preparation</button><button class="tab" data-app="training">Training</button><button class="tab" data-app="molTraining">Mol Training</button><button class="tab" data-app="metrics">Metrics</button><button class="tab" data-app="predict">Predict Spectrum</button></nav>
+  ${workbench.html()}<nav id="legacyNavigation"><button class="tab" data-app="smarts">SMARTS Search</button><button class="tab" data-app="cleavageViewer">Cleavage Viewer</button><button class="tab" data-app="cleavage">Cleavage Pattern Set</button><button class="tab" data-app="adduct">Adduct Rule Set</button><button class="tab active" data-app="data">Data Preparation</button><button class="tab" data-app="training">Training</button><button class="tab" data-app="molTraining">Mol Training</button><button class="tab" data-app="metrics">Metrics</button><button class="tab" data-app="predict">Predict Spectrum</button></nav>
   ${trainingMetrics.html()}
   ${smartsSearch.html()}
   <div id="cleavageViewerApp" data-app-panel="cleavageViewer" hidden><section><div class="section-title"><div><h2>Single-SMILES Cleavage Viewer</h2><p class="muted">Use the patterns currently loaded in Cleavage Patterns. Enumerate valid simultaneous action sets or add compatible actions interactively.</p></div><button type="button" id="cleavageViewerLoadPatterns">Load Pattern Set</button></div></section><div id="cleavageViewerMount"></div></div>
-  ${cleavageUi.html()}
+  <div id="cleavagePageMount">${cleavageUi.html()}</div>
+  <div id="adductPageMount">${adductUi.html()}</div>
   ${preparation.html()}
   ${trainingWorkbench.html({pathField,field,optimization:workbench.trainingHtml(),parameters:parameterEditor.importHtml('training'),defaults:workbenchDefaults.html('training')})}${molTraining.html(molConfig)}
   <form id="predictForm" data-app-panel="predict" hidden>
@@ -697,6 +715,7 @@ function safeJson(value) { return JSON.stringify(value).replace(/</g, '\\u003c')
 function webviewScript() { return `
     const form=document.getElementById('form'), trainingForm=document.getElementById('trainingForm'), predictForm=document.getElementById('predictForm'), statusEl=document.getElementById('status'), stop=document.getElementById('stop'),trainingStatusEl=document.getElementById('trainingStatus'),trainingStop=document.getElementById('trainingStop');
     ${cleavageUi.state()}
+    ${adductUi.state()}
     ${trainingMetrics.script()}
     ${smartsSearch.script()}
     const htmlEscape=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -709,10 +728,12 @@ function webviewScript() { return `
     const tooltip=document.getElementById('helpTooltip'); let tooltipTimer;
     document.querySelectorAll('[data-help]').forEach(el=>{el.addEventListener('mouseenter',()=>{tooltipTimer=setTimeout(()=>{const r=el.getBoundingClientRect();tooltip.textContent=el.dataset.help;tooltip.style.left=Math.min(r.left,window.innerWidth-390)+'px';tooltip.style.top=(r.bottom+7)+'px';tooltip.classList.add('visible');},500);});el.addEventListener('mouseleave',()=>{clearTimeout(tooltipTimer);tooltip.classList.remove('visible');});});
     setConfig(initial);setFormConfig(trainingForm,initialTraining);setFormConfig(predictForm,initialPrediction);if(initialPrediction.adductType)predictForm.elements.adductType.dataset.restoreValue=initialPrediction.adductType;setPredictEnabled(false); document.querySelectorAll('[data-pick]').forEach(b=>b.onclick=()=>vscode.postMessage({type:'pick',form:b.dataset.form||'data',field:b.dataset.pick,kind:b.dataset.kind}));
-    document.querySelectorAll('[data-app]').forEach(button=>button.onclick=()=>{document.querySelectorAll('[data-app]').forEach(x=>x.classList.toggle('active',x===button));const app=button.dataset.app;document.getElementById('homePage').hidden=true;document.getElementById('jobPage').hidden=true;document.getElementById('environmentPage').hidden=true;document.getElementById('metricsApp').hidden=app!=='metrics';document.getElementById('smartsApp').hidden=app!=='smarts';document.getElementById('cleavageViewerApp').hidden=app!=='cleavageViewer';document.getElementById('cleavageApp').hidden=app!=='cleavage';form.hidden=app!=='data';trainingForm.hidden=app!=='training';document.getElementById('molTrainingForm').hidden=app!=='molTraining';predictForm.hidden=app!=='predict';document.getElementById('dataActions').hidden=app!=='data';document.getElementById('appSubtitle').textContent=app==='metrics'?'Training Metrics':app==='smarts'?'SMARTS Search':app==='cleavageViewer'?'Cleavage Viewer':app==='cleavage'?'Cleavage Pattern Set Editor':app==='training'?'Fragment Tree Training':app==='molTraining'?'Mol Training':app==='predict'?'Predict Spectrum':'Fragment Tree Data Preparation';if(app==='cleavageViewer')window.dispatchEvent(new Event('cleavageViewer/open'));});
+    document.querySelectorAll('[data-app]').forEach(button=>button.onclick=()=>{document.querySelectorAll('[data-app]').forEach(x=>x.classList.toggle('active',x===button));const app=button.dataset.app;if(app==='cleavage'){document.getElementById('cleavagePageMount').append(document.getElementById('cleavageApp'));onCleavageChange=()=>{};}if(app==='adduct'){document.getElementById('adductPageMount').append(document.getElementById('adductApp'));onAdductChange=()=>{};}document.getElementById('homePage').hidden=true;document.getElementById('jobPage').hidden=true;document.getElementById('environmentPage').hidden=true;document.getElementById('metricsApp').hidden=app!=='metrics';document.getElementById('smartsApp').hidden=app!=='smarts';document.getElementById('cleavageViewerApp').hidden=app!=='cleavageViewer';document.getElementById('cleavageApp').hidden=app!=='cleavage';document.getElementById('adductApp').hidden=app!=='adduct';form.hidden=app!=='data';trainingForm.hidden=app!=='training';document.getElementById('molTrainingForm').hidden=app!=='molTraining';predictForm.hidden=app!=='predict';document.getElementById('dataActions').hidden=app!=='data';document.getElementById('appSubtitle').textContent=app==='metrics'?'Training Metrics':app==='smarts'?'SMARTS Search':app==='cleavageViewer'?'Cleavage Viewer':app==='cleavage'?'Cleavage Pattern Set Editor':app==='adduct'?'Fragment Ion Adduct Rule Set Editor':app==='training'?'Fragment Tree Training':app==='molTraining'?'Mol Training':app==='predict'?'Predict Spectrum':'Fragment Tree Data Preparation';if(app==='cleavageViewer')window.dispatchEvent(new Event('cleavageViewer/open'));});
     document.getElementById('cleavageViewerLoadPatterns').onclick=()=>vscode.postMessage({type:'loadCleavagePatternSet'});
     document.getElementById('save').onclick=()=>vscode.postMessage({type:'saveConfig',config:getConfig()}); document.getElementById('load').onclick=()=>vscode.postMessage({type:'loadConfig'}); document.getElementById('openResult').onclick=()=>vscode.postMessage({type:'openResult'}); document.getElementById('openEvaluation').onclick=()=>vscode.postMessage({type:'openEvaluation'});
     ${cleavageUi.script()}
+    ${adductUi.script()}
+    const initialAdductSet=initial.modelConfig?.fragmenter_params?.fragment_ion_tree_builder?.fragment_ion_adduct_rule_set;if(initialAdductSet)window.dispatchEvent(new MessageEvent('message',{data:{type:'adductRuleSet',value:{fragment_ion_adduct_rule_set:JSON.parse(JSON.stringify(initialAdductSet))},path:''}}));
     form.onsubmit=e=>{e.preventDefault();vscode.postMessage({type:'run',config:getConfig()});}; document.getElementById('copyCommand').onclick=()=>vscode.postMessage({type:'copyCommand',config:getConfig()}); stop.onclick=()=>vscode.postMessage({type:'stop'});
     trainingForm.onsubmit=e=>{e.preventDefault();vscode.postMessage({type:'runTraining',config:getTrainingConfig()})};document.getElementById('trainingCopyCommand').onclick=()=>vscode.postMessage({type:'copyTrainingCommand',config:getTrainingConfig()});trainingStop.onclick=()=>vscode.postMessage({type:'stop'});document.getElementById('saveTraining').onclick=()=>vscode.postMessage({type:'saveTrainingConfig',config:getTrainingConfig()});document.getElementById('loadTraining').onclick=()=>vscode.postMessage({type:'loadTrainingConfig'});
     let predictSequence=0,predictWaiters=new Map(),predictListSequence=0,predictListWaiters=new Map();
