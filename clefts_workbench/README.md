@@ -8,7 +8,7 @@ Choose **Home > Open / Create Project** to keep automatic form drafts, named con
 
 ## Cleavage file editors
 
-Open `*.cleavage.json` directly in VS Code to edit one cleavage pattern: its name, reactant SMARTS, and products. Ctrl/Cmd+S saves the single-pattern JSON format. `*.clevageset.json` continues to open the pattern-set editor; the legacy `*.clevage.json` suffix also opens the single-pattern editor.
+Open `*.cleavage.pft` directly in VS Code to edit one cleavage pattern: its name, reactant SMARTS, and products. Ctrl/Cmd+S saves the single-pattern JSON format. `*.clevageset.pft` continues to open the pattern-set editor; the alternate `*.clevage.pft` spelling also opens the single-pattern editor.
 
 ## Development
 
@@ -30,7 +30,7 @@ The `Training` tab follows the same workflow: select the generated training and 
 python -m clefts.ml.training.fragment_tree_training.training_model ...
 ```
 
-Training configurations use the dedicated `*.pfttrain.json` suffix. Every CLI run writes `fragment_tree.pfttrain.json` into its output directory, and the same file can be loaded from the Training tab. The Workbench only passes arguments to the CLI and displays its output; training, configuration output, checkpoints, and model artifacts remain owned by the Python implementation.
+Training configurations use the dedicated `*.pfttrain.json` suffix. Load, drop, or save them from the top-right of the Fragment Tree Training page. They contain run settings and trainable Branch / Fragment Transformer / Ion-State / Intensity parameters only. Fragmenter settings, Cleavage Patterns, ion-adduct rules, Symbols, molecular-encoder parameters, and adduct ordering are inherited from prepared datasets and checkpoints, checked for compatibility, and displayed read-only. The Workbench only passes supported training arguments to the CLI; resolved model metadata remains owned by the Python implementation and its checkpoints.
 
 Set `clefts.pythonPath` when the required Python environment is not available as `python`. The CLEFTS project directory defaults to the parent directory of this extension and can be overridden with `clefts.applicationRoot`.
 
@@ -67,7 +67,7 @@ temporary-cache option, and overwrite option.
 
 - `Save Configuration` and `Load Configuration` export and import Workbench settings as JSON.
 - Fragmenter parameters use a reusable form component with separate `Load Fragmenter` and `Save Fragmenter` actions. Add/remove AdductType rules, ion shifts, and atoms with the +/− controls. `Edit Cleavage Pattern Set` opens the existing pattern editor; `Apply to Fragmenter` applies its changes.
-- Every run also writes `fragment-tree.pft.json` with input/output settings and embedded `fragmenterParams` to its output directory. Load this file to restore the run. Both Run CLI and Copy Command pass the edited values using `--params-json`; loading a Fragmenter file never makes it an output destination.
+- Every run also writes `fragment-tree.pft` with input/output settings and embedded `fragmenterParams` to its output directory. Load this file to restore the run. Both Run CLI and Copy Command pass the edited values using `--params-json`; loading a Fragmenter file never makes it an output destination.
 - Every output directory receives a `fragment-tree.pft` result manifest. Opening it in Explorer displays the run status and structure manifests in the CLEFTS result viewer.
 - Select a JSON or TSV entry in the result viewer to open it in the standard VS Code editor.
 - Select an individual `.preft.pt` structure to inspect its fragment-tree drawing,
@@ -79,14 +79,14 @@ temporary-cache option, and overwrite option.
 
 ## Cleavage Pattern Set editor
 
-Select `Cleavage Pattern Set` on the left side of the Workbench navigation. The tab provides its own `Load Configuration` and `Save Configuration` actions for `*.clevageset.json` documents. It allows you to:
+Select `Cleavage Pattern Set` on the left side of the Workbench navigation. The tab provides its own `Load Configuration` and `Save Configuration` actions for `*.clevageset.pft` documents. It allows you to:
 
 - edit the pattern-set name;
 - add and remove patterns;
 - edit each pattern name and `reactant_smarts` value;
 - add and remove products;
 - edit each product name and `smarts` value.
-- load or save an individual pattern as `*.cleavage.json` (legacy `*.clevage.json` files remain supported);
+- load or save an individual pattern as `*.cleavage.pft` (the alternate `*.clevage.pft` spelling is also supported);
 - build a pattern visually from a SMILES structure using RDKit;
 - draw single, double, triple, and aromatic bonds in a PubChem-style structure view;
 - select atoms and bonds individually or with a freehand lasso, and clear the selection explicitly;
@@ -120,7 +120,11 @@ The editor reads and writes this JSON shape:
 
 `Apply Reactant` and `Add Product` validate their generated SMARTS/SMIRKS with CLEFTS `_CleavagePattern.from_rules()`. Validation failures appear as VS Code error notifications.
 
-Opening a `*.clevageset.json` file directly in Explorer also uses the dedicated structured editor. Directly opened documents support VS Code save, undo, and redo. Use `Reopen Editor With... > Text Editor` when raw JSON editing is preferred.
+Opening a `*.clevageset.pft` file directly in Explorer also uses the dedicated structured editor. Directly opened documents support VS Code save, undo, and redo. Use `Reopen Editor With... > Text Editor` when raw JSON editing is preferred.
+
+## Single-SMILES cleavage viewer
+
+Open `Visualization → Cleavage Viewer`, load a pattern set, and select either the complete set or one pattern. In `Stepwise actions`, first choose a reaction center from `Matched reactions`; this filters `Matched reactants` to the reactant matches associated with that center. Selecting a reactant keeps every related reactant visible and opens its product choices, so comparisons only require switching the active reactant or product. Clicking a bond displays every reaction associated with that bond. Each selected action can be removed independently. `Exhaustive candidates` enumerates valid unordered action sets up to `Max actions` and shows each fragment and SMIRKS. This page reuses the exact Reaction Preview UI instance from the Cleavage Pattern editor.
 
 ## Package
 
@@ -220,22 +224,12 @@ The file is loaded once and each distinct input SMILES is parsed once per run.
 
 ### Fragment Tree Fine-tuning
 
-Open **Fine-tuning**, select a base fragment-tree `model.pt`, a complete expanded
-Cleavage Pattern Set, and training/validation splits regenerated with that set.
-Select a separate output directory. All old parameters and MolEncoder are frozen;
-only new category embeddings and small per-projection low-rank expansions train.
-**Added nodes per projection** defaults to 8. The original model dimensions stay
-the same. Use representative old compounds as well as new-pattern examples when
-checking performance.
-
-**Validate only** checks preprocessing/configuration and checkpoint compatibility
-and reports trainable/frozen parameter counts. **Run Fine-tuning CLI** invokes
-`python -m clefts.cli train fragment-tree-finetune`; **Copy Command** copies the
-same arguments. Logs stream into the tab and the CLEFTS output channel. The new
-set must include all old definitions, and other Fragmenter settings must match
-the base. The validation split must include `valid_records.msds`.
-**Load Configuration** and **Save Configuration** preserve all file paths and
-fine-tuning hyperparameters in an editable, versioned JSON document.
+Fine-tuning is part of **Fragment Tree Training**. Choose **Fine-tune patterns**,
+select a base checkpoint, and use training/validation structures regenerated
+with the complete expanded cleavage set. The training command uses
+`--fine-tune-checkpoint` and `--adapter-width`; resume an interrupted expansion
+from the same page. Existing base parameters remain frozen while new category
+parameters and projection adapters train.
 
 See `../clefts/ml/training/fragment_tree_training/README.md` for CLI usage,
 checkpoint/resume behavior, and the exact expansion architecture.
@@ -261,18 +255,19 @@ selected charts are retained in the webview state.
 Open `CLEFTS: Open Workbench` or use the CLEFTS Activity Bar. The dashboard
 provides quick actions, environment diagnostics and recent training jobs.
 The navigation retains the existing preprocessing, prediction, fragment viewer,
-SMARTS, fine-tuning and evaluation tools.
+SMARTS and evaluation tools. Checkpoint initialization and adapter training are
+configured directly in the training workflow.
 
-Training supports AdamW weight decay, gradient clipping and separate absolute
- action, next action, negative action and fragment intensity loss weights.
+Training supports AdamW weight decay, gradient clipping, normalized branch MIL,
+depth-diverse weak negatives, and physical-ion intensity loss.
 Data Preparation and Training expose individual parameter fields. Import Parameters
 accepts model or fragmenter JSON through Browse or drag-and-drop and expands it into
 the form. The file is optional; execution uses a snapshot of the edited fields.
 Advanced buttons reveal less frequently changed settings. Hover over a parameter
 label for 500ms to see its description.
 The CLI is `python -m clefts.cli train fragment-tree`; new options are
-`--weight-decay`, `--gradient-clip`, `--absolute-weight`, `--next-weight`,
-`--negative-weight` and `--intensity-weight`.
+`--weight-decay`, `--gradient-clip`, `--branch-weight`, `--negative-weight`,
+`--branch-mil-temperature` and `--intensity-weight`.
 
 Training Jobs shows live stdout/stderr, epoch progress, searchable logs and a
 link to the metrics charts. Training writes `metrics.tsv` and emits JSON Lines
@@ -281,7 +276,7 @@ storage. Training continues when its panel closes and uses detached processes
 so it can survive extension host restarts. Restored running PIDs are checked;
 if the process disappeared, its exit status is reported as unknown. Stopping a
 restored process requires verifying it in the terminal to avoid killing a reused
-PID. Existing batch prediction and fine-tuning retain their original lifecycle.
+PID. Existing batch prediction retains its original lifecycle.
 
 Run `npm run check:workbench` for dashboard, CSP and CLI argument checks.
 

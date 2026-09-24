@@ -1,70 +1,54 @@
-# Source anchored action model (schema v4)
+# Source-anchored fragment-tree model
 
-`SourceAnchoredFragmentSpectrumGenerator` selects normalized sets of actions
-on the original Source. `ActionEncoder` pools Source atom roles with a
-SetTransformer; `ActionStateEncoder` uses attention over a BOS token and the
-selected action set without positional encodings. SMARTS role IDs describe
-chemical roles and preserve the correspondence with `source_atom_maps`.
-Permuting the action list or the selected set does not change its meaning.
+Primitive cleavage actions are encoded once from the source molecular graph.
+Each branch group is identified by `(compound, normalized main adduct)` and
+starts from the empty Source action state. `ActionStateEncoder` represents the
+selected action set without positional encoding. `BranchingCleavageDecoder`
+scores every chemically compatible next action from the complete primitive
+action universe; collision energy is not an input to this scorer.
 
-The shared Source MolEncoder and static action encoder run once per unique
-Source, across all CE/adduct conditions. The absolute condition scorer applies
-a logit threshold followed by top K (default 64, maximum 128). Sparse domain
-conflict, precedence and dominance tables are converted to dense relations
-only within that pool. Retained Source regions use packed 64-bit words.
+Actions in a state are an unordered, simultaneous cleavage set. There is no
+"run A before B" interpretation. For candidate `B` and every selected action
+`A`, compatibility requires both:
 
-The Torch decoder checks conflict and precedence cycles before normalization,
-supports replacement without increasing the action count, rejects no-ops and
-empty retained regions, and groups equal normalized states by maximum score.
-EOS is available at BOS and is the only choice at the action count limit.
-Its bounded iteration loop operates on tensor batches of states and candidates.
-
-`forward()` performs action selection only. `predict()` then invokes
-`materialize_action_states` on terminal states and their ancestor closure,
-compiling against the original Source and caching each unique effect across
-conditions. The downstream model consumes those molecular graphs, tree edges,
-ion states and formula groups. Target graphs, formula and m/z never enter
-action selection.
-
-## Prepare and train
-
-Use `clefts/presets/spectrum_generator_params/source_anchored_pos_model_config.json`
-as the configuration. Regenerate teachers from the original MSDataset:
-
-```sh
-python -m clefts.ml.data_preparation.fragment_tree.create_action_training_data \
-  --input train.msds --params model.json --output-dir train_structures
-python -m clefts.ml.data_preparation.fragment_tree.create_action_training_data \
-  --input validation.msds --params model.json --output-dir validation_structures
-python -m clefts.ml.training.fragment_tree_training.action_training \
-  --params model.json --train-dir train_structures \
-  --val-dir validation_structures --output-dir run --epochs 10
+```text
+B.source_atom_maps ⊆ A.retained_atom_maps
+A.source_atom_maps ⊆ B.retained_atom_maps
+A.changed_bond_maps ∩ B.changed_bond_maps = ∅
 ```
 
-The existing training entry point dispatches configurations with this
-architecture to the same trainer. Prediction loads its `last.pt` through the
-existing prediction CLI; no first-cleavage cache is prepared for this model.
-Resume with `--resume run/last.pt` in the action trainer.
+The tensor candidate mask is therefore:
 
-Schema v4 stores Source graphs, primitive action features, sparse relation
-indices, CSR teacher prefixes and multiple positive next actions/EOS, transition
-DAGs, state-to-node correspondence and precomputed downstream molecular graphs.
-Teacher preparation retains all valid orders leading to target states,
-including replacement histories. Training force-includes their positive
-actions; recall is measured before that inclusion. A pool union exceeding the
-configured maximum raises an error rather than dropping teacher actions.
-Training and validation forward, including intensity loss, do not run RDKit.
+```text
+pool_valid(B)
+AND B not already selected
+AND mutual_source_retention(A, B) for every selected A
+AND no_changed_bond_conflict(A, B) for every selected A
+AND intersection(retained_atom_maps of the normalized set) is non-empty
+AND normalized set differs from the parent set
+AND normalized action count <= max_action_count
+```
 
-The old full-tree edge model and v3 reader remain for legacy configurations and
-checkpoints. The action trainer rejects v3 data and legacy checkpoints; it does
-not convert them or infer their action representation.
+Preparation stores the directional invalidation relation `A -> B` when
+`B.source_atom_maps` is not a subset of `A.retained_atom_maps`. The mask checks
+all ordered pairs in the proposed set, so either `A -> B` or `B -> A` rejects
+the composite action. A changed bond merely appearing in another action's
+matched SMARTS context does not establish ordering; only two actions changing
+the same Source bond is a conflict.
 
-## Verification
+Search accumulates `logsigmoid` transition scores, prunes on cumulative path
+probability when enabled, deduplicates equal normalized states by maximum score,
+and enforces `max_action_count` plus one shared `max_fragment_nodes` budget per
+branch group. There is no learned absolute action filter, top-k pool, beam, or
+EOS classifier.
 
-`bash tests/run_tests.sh` captures diagnostic output and emits unittest results.
-Action tests cover set permutation invariance, shared encoding, conflict,
-two-/three-action precedence cycles, replacement, no-op, BOS/EOS,
-multi-positive likelihood, forced inclusion, target blindness, RDKit-free
-forward/backward, materialization parity, schema offsets and dehydration
-precursor training. Randomized parity checks compare 10,368 Torch expansions
-against domain normalization. CUDA parity checks run when CUDA is available.
+After search, selected states cross the explicit chemistry boundary and are
+materialized. The post model encodes the resulting fragment tree. Prepared ion
+explanations embed normalized ion identity, unsaturation, and radical state;
+normalized attention combines explanations of the same physical ion. An
+independent intensity is then predicted from fragment, physical ion, main
+adduct, and collision-energy features.
+
+Training uses prepared graphs and packed transition/path/candidate tensors only.
+It does not parse SMILES, match SMARTS, materialize fragments, calculate
+formulas, generate ion candidates, or call RDKit.

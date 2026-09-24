@@ -5,7 +5,7 @@ from collections.abc import Sequence
 from types import SimpleNamespace
 import torch
 from clefts.libs.mmkit.mmkit import Compound, Adduct
-from clefts.domain.fragment.cleavage import CleavageActionSequence
+from clefts.domain.fragment.cleavage import CleavageActionSequence, FragmentTreeLimitExceeded
 from .source_action_structure import SourceActionStructure, prepare_source_actions, UnresolvedPrecursorError
 from ..specgen.source_anchored_spectrum_predictor import SourceAnchoredFragmentSpectrumGenerator
 from ..specgen.components.action.action_decoder import ActionDecoderOutput
@@ -25,7 +25,10 @@ def _walk_pathway_chains(tree, fragmenter, pathway):
                     if transition.parent_action_sequence!=state:continue
                     action=transition.added_action
                     if state is not None and action is not None:
-                        if not set(action.source_atom_maps)<=state.retained_atom_maps or any(previous.changed_bond_maps & action.matched_bond_maps for previous in state.actions):continue
+                        if any(not set(action.source_atom_maps)<=previous.retained_atom_maps
+                               or not set(previous.source_atom_maps)<=action.retained_atom_maps
+                               or bool(previous.changed_bond_maps & action.changed_bond_maps)
+                               for previous in state.actions):continue
                     if node.is_precursor and len(transition.action_sequence.actions)>fragmenter.precursor_candidate_max_action_count:continue
                     next_states.append((edge.target_index,transition.action_sequence,(*chain,(transition.action_sequence,action))))
         states=next_states
@@ -37,10 +40,15 @@ def _walk_pathway(tree,fragmenter,pathway):
 
 
 class ActionStructureBuilder:
-    def __init__(self, generator: SourceAnchoredFragmentSpectrumGenerator, *, max_node: int = -1, max_edge: int = -1) -> None:
+    def __init__(self, generator: SourceAnchoredFragmentSpectrumGenerator, *,
+                 max_unique_fragment_smiles: int = -1, max_cleavage_combinations: int = -1) -> None:
         self.generator = generator
-        self.max_node = max_node
-        self.max_edge = max_edge
+        self.max_unique_fragment_smiles = max_unique_fragment_smiles
+        self.max_cleavage_combinations = max_cleavage_combinations
+        # Fragment-tree search statistics of the most recent build() call,
+        # including one that stopped at a search limit or failed after the
+        # tree was built; None when the tree search never ran.
+        self.last_search_stats: dict[str, int] | None = None
 
     def build(self, source: Compound, precursor_types: Sequence[Adduct], collision_energy: Sequence[float],
               peaks_mz: Sequence[Sequence[float]], peaks_intensity: Sequence[Sequence[float]]) -> tuple[SourceActionStructure, tuple[int, ...]]:
@@ -58,20 +66,24 @@ class ActionStructureBuilder:
         for mz,intensity in zip(peaks_mz,peaks_intensity):
             if len(mz)!=len(intensity):
                 raise ValueError("Peak m/z and intensity lengths differ")
+        self.last_search_stats=None
         generator=self.generator
         fragmenter=generator.fragmenter
         actions=fragmenter.fragment_ion_tree_builder.create_cleavage_actions(source)
         # Full chemistry is permitted here, never inside neural forward.
-        tree=fragmenter.build_fragment_ion_tree(source,max_node=self.max_node,max_edge=self.max_edge,_include_fragment_compound_cache=True)
-        # Recorded once per sample, from the SAME already-built tree: which
-        # Source action set(s) already select this sample's precursor ion.
-        # Real MS2 fragmentation always happens on that selected ion, so
-        # prepare_source_actions requires every other teacher state to be
-        # consistent with one of these alternatives. Computed before anything
-        # else so unreachable samples can be dropped up front.
-        precursor_sequences_all=[tuple(pa.action_sequence for pa in fragmenter.resolve_precursor_actions(tree,precursor_type))
-                                 for precursor_type in precursor_types]
-        kept=tuple(index for index,sequences in enumerate(precursor_sequences_all) if sequences)
+        try:
+            tree=fragmenter.build_fragment_ion_tree(source,max_unique_fragment_smiles=self.max_unique_fragment_smiles,
+                max_cleavage_combinations=self.max_cleavage_combinations,_include_fragment_compound_cache=True)
+        except FragmentTreeLimitExceeded as error:
+            self.last_search_stats=error.stats
+            raise
+        self.last_search_stats=getattr(tree,'_search_stats',None)
+        # Resolve the observed precursor against the same already-built tree so
+        # unreachable records can be dropped before teacher assignment. These
+        # paths are validation metadata, not decoder seeds: branching starts at
+        # Source and is conditioned by normalized main adduct.
+        precursor_reachable=[bool(fragmenter.resolve_precursor_actions(tree,precursor_type)) for precursor_type in precursor_types]
+        kept=tuple(index for index,reachable in enumerate(precursor_reachable) if reachable)
         if not kept:
             raise UnresolvedPrecursorError("No sample in this group has a valid precursor action sequence from Source")
         if len(kept)!=len(precursor_types):
@@ -79,29 +91,32 @@ class ActionStructureBuilder:
             collision_energy=[collision_energy[index] for index in kept]
             peaks_mz=[peaks_mz[index] for index in kept]
             peaks_intensity=[peaks_intensity[index] for index in kept]
-            precursor_sequences=[precursor_sequences_all[index] for index in kept]
-        else:
-            precursor_sequences=precursor_sequences_all
         assignments=fragmenter.assign_fragment_pathways_to_peak_sets(tree,zip(precursor_types,peaks_mz))
         teacher_paths=[]
-        for (_,groups),intensities in zip(assignments,peaks_intensity):
-            paths=[]
-            for group,intensity in zip(groups,intensities):
+        for _,groups in assignments:
+            peaks=[]
+            for group in groups:
+                paths=[]
                 for pathway in group:
-                    paths.extend((chain,float(intensity)) for chain in _walk_pathway_chains(tree,fragmenter,pathway))
-            teacher_paths.append(paths)
-        conditions=torch.tensor([[generator.adduct_type_strs.index(str(adduct)),ce]
-                                 for adduct,ce in zip(precursor_types,collision_energy)],dtype=torch.float32)
+                    paths.extend(_walk_pathway_chains(tree,fragmenter,pathway))
+                peaks.append(paths)
+            teacher_paths.append(peaks)
+        mains=[fragmenter._resolve_main_adduct_type(adduct) for adduct in precursor_types]
+        conditions=torch.tensor([[generator.adduct_type_strs.index(str(main)),ce]
+                                 for main,ce in zip(mains,collision_energy)],dtype=torch.float32)
+        group_keys={};sample_groups=[]
+        for main in mains:sample_groups.append(group_keys.setdefault(str(main),len(group_keys)))
+        group_adduct=torch.tensor([generator.adduct_type_strs.index(key) for key in group_keys],dtype=torch.long)
         data=prepare_source_actions(source=source,actions=actions,graph_builder=generator.mol_encoder.graph_builder,
             condition_features=conditions,max_action_count=fragmenter.tree_max_action_count,teacher_pathways=teacher_paths,
-            precursor_sequences=precursor_sequences)
-        # Materialization adds its own Source bookkeeping roots. Teacher roots
-        # are precursor seeds at MS2 depth zero, including nonempty seeds.
+            sample_branch_group_index=torch.tensor(sample_groups),branch_group_adduct_index=group_adduct)
+        # Materialization adds its own Source bookkeeping root. Teacher depth
+        # zero is the shared empty action state for each branch group.
         rows=[tuple(data.teacher_node_action_index[a:b].tolist()) for a,b in zip(data.teacher_node_action_ptr[:-1],data.teacher_node_action_ptr[1:])]
-        samples=data.teacher_node_sample_index.tolist()
+        samples=data.teacher_node_branch_group_index.tolist()
         dense_rows=[];dense_sample=[];parents=[];added=[];terminal=[];teacher_dense={}
         width=fragmenter.tree_max_action_count
-        for sample in range(len(precursor_types)):
+        for sample in range(data.num_branch_groups):
             source_row=len(dense_rows)
             dense_rows.append(tuple([-1]*width));dense_sample.append(sample);parents.append(-1);added.append(-1);terminal.append(False)
             for node,(owner,ids) in enumerate(zip(samples,rows)):
@@ -113,8 +128,8 @@ class ActionStructureBuilder:
                 added.append(int(data.teacher_node_added_action_index[node]));terminal.append(True)
         synthetic=ActionDecoderOutput(torch.tensor(dense_sample),torch.tensor(dense_rows,dtype=torch.long),
             torch.zeros(len(dense_rows)),torch.tensor(terminal),torch.tensor(parents),torch.tensor(added),
-            SimpleNamespace(action_index=torch.arange(len(actions)).expand(len(precursor_types),-1)))
-        decoded=materialize_action_states(synthetic,(source,),(actions,),data.sample_tree_index,generator.mol_encoder.graph_builder)
+            SimpleNamespace(action_index=torch.arange(len(actions)).expand(data.num_branch_groups,-1)))
+        decoded=materialize_action_states(synthetic,(source,),(actions,),data.branch_group_tree_index,generator.mol_encoder.graph_builder)
         node_by_state={(dense_sample[row],tuple(i for i in dense_rows[row] if i>=0)):node
                        for row,node in zip(decoded.materialized_state_index.tolist(),decoded.materialized_node_index.tolist())}
         state_nodes=torch.tensor([node_by_state.get((sample,tuple(row)),-1) for sample,row in zip(samples,rows)],dtype=torch.long)
@@ -125,6 +140,7 @@ class ActionStructureBuilder:
         # aggregated formula-level intensity loss.
         positive_node_adducts=[]
         for sample,((_,groups),adduct,energy,mzs,intensities) in enumerate(zip(assignments,precursor_types,collision_energy,peaks_mz,peaks_intensity)):
+            branch_group=sample_groups[sample]
             main=fragmenter._resolve_main_adduct_type(adduct)
             precursor_mz=adduct.apply_to_formula(source.formula).normalized.exact_mass
             peaks=[]
@@ -133,8 +149,8 @@ class ActionStructureBuilder:
                 matches=[]
                 for pathway in group:
                     sequences=_walk_pathway(tree,fragmenter,pathway)
-                    local_nodes=sorted({node_by_state[(sample,tuple(sorted(actions.index(action) for action in seq.actions)) if seq else ())]
-                                        for seq in sequences if (sample,tuple(sorted(actions.index(action) for action in seq.actions)) if seq else ()) in node_by_state})
+                    local_nodes=sorted({node_by_state[(branch_group,tuple(sorted(actions.index(action) for action in seq.actions)) if seq else ())]
+                                        for seq in sequences if (branch_group,tuple(sorted(actions.index(action) for action in seq.actions)) if seq else ()) in node_by_state})
                     if not local_nodes:continue
                     for node in local_nodes:positive.add((node,str(pathway.adduct)))
                     match=dict(nodeIndices=local_nodes,smiles=pathway.terminal_node.smiles,
@@ -152,9 +168,11 @@ class ActionStructureBuilder:
                                     precursorMz=float(precursor_mz),peaks=peaks,
                                     assignmentScore=score(peaks),
                                     assignmentScoreWithoutPrecursor=score([peak for peak in peaks if not peak['precursor']])))
-        downstream=prepare_post_materialization(decoded,fragmenter,precursor_types,generator.tensorizer,ion_positive_sets=positive_node_adducts)
+        downstream=prepare_post_materialization(decoded,fragmenter,precursor_types,generator.tensorizer,
+            ion_positive_sets=positive_node_adducts,sample_branch_group_index=data.sample_branch_group_index,
+            ion_type_strs=getattr(generator,'ion_type_strs',None))
         target=[]
-        for sample,mz in zip(downstream.formula_sample_index.tolist(),downstream.formula_mz.tolist()):
+        for sample,mz in zip(downstream.physical_candidate_sample_index.tolist(),downstream.physical_candidate_mz.tolist()):
             matches=[float(intensity) for observed,intensity in zip(peaks_mz[sample],peaks_intensity[sample])
                      if fragmenter.mass_tolerance.within(observed,mz)]
             target.append(max(matches,default=0.))

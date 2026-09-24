@@ -28,15 +28,18 @@ export type ParameterRequest =
   | { type: 'training/sources'; requestId: string; config: { trainDir: string; valDir: string; molEncoderCheckpoint?: string; resume?: string; fineTuneCheckpoint?: string } }
   | { type: 'parameters/pick'; target: 'data' | 'training' }
   | { type: 'parameters/import'; target: 'data' | 'training'; name: string; json: string }
-  | { type: 'parameters/load'; target: 'data' | 'training'; path: string };
+  | { type: 'parameters/load'; target: 'data' | 'training'; path: string }
+  | { type: 'parameters/save'; target: 'data'; fragmenterParams: Record<string, unknown> };
 export type ParameterEvent =
   | { type: 'parameters/loaded'; target: 'data' | 'training'; path: string; modelConfig: Record<string, unknown> }
+  | { type: 'parameters/saved'; target: 'data'; path: string }
   | { type: 'parameters/error'; target: 'data' | 'training'; error: string };
 
 export type DataRequest =
   | { type: 'data/preview' | 'data/check'; target: 'train' | 'validation' | 'home'; requestId: string; path: string; mapping?: Record<string, string>; fragmenterParams?: Record<string, unknown> }
   | { type: 'data/preflight'; requestId: string; config: Record<string, unknown> }
   | { type: 'data/model'; requestId: string; path: string };
+export type DataProgressEvent = { type: 'data/check-progress'; target: 'train' | 'validation'; requestId: string; current: number; total: number };
 export type ResourceRequest =
   | { type: 'library/load' | 'shell/document' | 'shell/github' }
   | { type: 'library/copy' | 'library/open'; path: string }

@@ -9,8 +9,8 @@ for(const id of ['homePage','navigationRail','jobPage','environmentPage','dataPa
 for(const match of html.matchAll(/<script>([\s\S]*?)<\/script>/g))new Function(match[1]);
 const secured=panel.secure(html,{cspSource:'vscode-webview://test'});
 assert(secured.includes("default-src 'none'"));assert(!secured.includes('<script>'));assert(secured.includes('script nonce='));
-const args=extension.buildTrainingArgs({params:'a b.json',trainDir:'train',valDir:'val',outputDir:'out',epochs:2,batchSize:4,weightDecay:0,gradientClip:1,absoluteWeight:0});
-assert.deepEqual(args.slice(0,4),['-m','clefts.cli','train','fragment-tree']);assert(!args.includes('--params')); assert.equal(args[args.indexOf('--weight-decay')+1],'0');assert.equal(args[args.indexOf('--absolute-weight')+1],'0');
+const args=extension.buildTrainingArgs({params:'a b.json',trainDir:'train',valDir:'val',outputDir:'out',epochs:2,batchSize:4,weightDecay:0,gradientClip:1,branchWeight:0});
+assert.deepEqual(args.slice(0,4),['-m','clefts.cli','train','fragment-tree']);assert(!args.includes('--params')); assert.equal(args[args.indexOf('--weight-decay')+1],'0');assert.equal(args[args.indexOf('--branch-weight')+1],'0');
 assert(!args.includes('--overwrite'));
 assert(extension.buildTrainingArgs({trainDir:'train',valDir:'val',outputDir:'out',overwrite:true}).includes('--overwrite'));
 assert(html.indexOf('<strong>Prepare Data</strong>') < html.indexOf('<strong>Train a Model</strong>'));
@@ -30,7 +30,7 @@ assert(!html.includes('Save as Workbench Defaults'));
 assert(html.includes('name="fineTuneResume"'));
 assert(!html.includes('id="trainingLossFields" hidden'));
 assert(html.includes('<footer class="training-bottom">'));
-const resumedArgs=extension.buildTrainingArgs({resume:'resume.pt',fineTuneCheckpoint:'base.pt',fineTunePatternSet:'patterns.json'});
+const resumedArgs=extension.buildTrainingArgs({resume:'resume.pt',fineTuneCheckpoint:'base.pt'});
 assert(resumedArgs.includes('--resume'));
 assert(!resumedArgs.includes('--fine-tune-checkpoint'));
 const layoutSource=require('fs').readFileSync(require.resolve('../src/workbench/layout'),'utf8');
@@ -43,3 +43,6 @@ assert.equal(inheritedArgs[inheritedArgs.indexOf('--action-hidden-dim')+1],'64')
 assert.equal(inheritedArgs[inheritedArgs.indexOf('--dropout')+1],'0.3');
 assert(!inheritedArgs.includes('--action-state-dropout'));assert(!inheritedArgs.includes('--post-dropout'));
 assert(!html.match(/<form id="trainingForm"[\s\S]*?<\/form>/)[0].includes('name="fineTunePatternSet"'));
+const savedTraining=extension.normalizeTrainingConfig({adduct_type_strs:['top'],symbols:['C'],modelConfig:{architecture:'x',fragmenter_params:{x:1},mol_encoder_params:{node_dim:9},adduct_type_strs:['nested'],action_model_params:{hidden_dim:64},post_model_params:{hidden_dim:32}}});
+assert(!('adduct_type_strs' in savedTraining));assert(!('adduct_type_strs' in savedTraining.modelConfig));assert(!('fragmenter_params' in savedTraining.modelConfig));assert(!('mol_encoder_params' in savedTraining.modelConfig));assert.deepEqual(Object.keys(savedTraining.modelConfig).sort(),['action_model_params','post_model_params']);
+const migratedTraining=extension.normalizeTrainingConfig({modelConfig:{mol_encoder_checkpoint:'legacy-encoder.pt',action_model_params:{hidden_dim:64}}});assert.equal(migratedTraining.molEncoderCheckpoint,'legacy-encoder.pt');assert(!('mol_encoder_checkpoint' in migratedTraining.modelConfig));

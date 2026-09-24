@@ -1,5 +1,5 @@
 {
-  "architecture": "source-anchored-action-autoregressive-v1",
+  "architecture": "fragment-tree-physical-ion",
   "fragmenter_params": {
     "fragment_ion_tree_builder": {
       "max_action_count": 3,
@@ -172,17 +172,29 @@
   },
   "action_model_params": {
     "hidden_dim": 128,
-    "condition_dim": 128,
-    "action_prefilter_top_k": 64,
-    "action_prefilter_max_k": 128,
-    "action_prefilter_threshold_logit": 0.0,
-    "beam_size": 32,
-    "max_decode_steps": 16
+    "branch_main_adduct_dim": 128,
+    "num_heads": 4,
+    "state_num_layers": 2,
+    "branch_path_threshold": 0.0,
+    "max_fragment_nodes": 100
   },
   "post_model_params": {
     "hidden_dim": 128,
     "num_layers": 2,
-    "num_heads": 4
+    "num_heads": 4,
+    "ion_embedding_dim": 32,
+    "unsaturation_embedding_dim": 16,
+    "radical_embedding_dim": 8,
+    "state_hidden_dim": 128,
+    "main_adduct_dim": 128,
+    "collision_energy_dim": 16,
+    "equivalent_state_aggregation": "attention",
+    "cosine_loss_weight": 0.5,
+    "ion_loss_weight": 0.5,
+    "ion_prediction_threshold": 0.5,
+    "peak_intensity_threshold": 0.0,
+    "intensity_power": 0.5,
+    "precursor_free_loss_weight": 0.5
   },
   "adduct_type_strs": [
     "[M+H]+",

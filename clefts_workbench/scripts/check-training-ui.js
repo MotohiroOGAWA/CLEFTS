@@ -10,16 +10,22 @@ const event=()=>new w.Event('change',{bubbles:true});
 const post=data=>w.dispatchEvent(new w.MessageEvent('message',{data}));
 assert.deepEqual(errors,[]);
 d.querySelector('#legacyNavigation [data-app=training]').click();
+assert(d.querySelector('#loadTraining').closest('.training-heading'));
+assert(d.querySelector('#saveTraining').closest('.training-heading'));
+assert(!form.querySelector('section:nth-last-of-type(1) #loadTraining'));
+assert(!d.getElementById('trainingParameterDrop'),'Training uses the complete configuration loader instead of a second parameter importer');
+d.getElementById('loadTraining').click();assert.equal(messages.at(-1).type,'loadTrainingConfig');
+const drop=new w.Event('drop',{bubbles:true,cancelable:true});Object.defineProperty(drop,'dataTransfer',{value:{files:[],getData:type=>type==='text/uri-list'?'file:///tmp/training.pfttrain.json':''}});d.getElementById('loadTraining').ondrop(drop);assert.equal(messages.at(-1).type,'loadTrainingConfigFile');assert.equal(messages.at(-1).path,'/tmp/training.pfttrain.json');
 for(const button of form.querySelectorAll('[data-model-component]')){button.click();const section=d.querySelector('#trainingParameterEditor [data-model-block="'+button.dataset.modelComponent+'"]');assert(section);assert(!section.querySelector('[data-advanced]')?.hidden);}
 for(const key of ['mol_encoder_params','fragmenter_params','adduct_type_strs'])assert(!form.querySelector('[data-model-block="'+key+'"]'));
 const dimension=form.querySelector('[data-parameter-path="action_model_params.hidden_dim"]');dimension.value='64';dimension.dispatchEvent(new w.Event('input',{bubbles:true}));assert.equal(w.eval('getTrainingConfig()').modelConfig.action_model_params.hidden_dim,64);
 assert(!d.querySelector('[id$=SaveDefaults]'));
 assert(d.querySelector('#trainingStart').closest('.training-bottom'));
 assert(!d.querySelector('#trainingLossFields').hidden);
-for(const name of ['weightDecay','gradientClip','absoluteWeight','nextWeight','minimumPositiveWeight','negativeWeight','intensityWeight'])assert(form.elements[name]);
-assert.equal(form.elements.minimumPositiveWeight.value,'0.05');
+for(const name of ['weightDecay','gradientClip','branchWeight','negativeWeight','branchMilTemperature','intensityWeight'])assert(form.elements[name]);
+assert.equal(form.elements.branchMilTemperature.value,'0.1');
 assert.equal(form.elements.negativeWeight.value,'0.2');
-assert(d.querySelector('#trainingLossSummary').textContent.includes('Branching Action Loss'));
+assert(d.querySelector('#trainingLossSummary').textContent.includes('Branch MIL + Weak Negatives'));
 assert.equal(form.elements.validationIntervalSteps.value,'0');
 assert.equal(form.elements.validationFraction.value,'0.1');
 form.elements.validationIntervalSteps.value='1000';form.elements.validationIntervalSteps.dispatchEvent(event());
@@ -40,12 +46,25 @@ post({type:'workbench/trainingDataset',field:'trainDir',path,count:68,bytes:1010
 form.elements.valDir.value='/fixtures/validation_structures';form.elements.molEncoderCheckpoint.value='/model/encoder.pt';form.elements.molEncoderCheckpoint.dispatchEvent(event());
 const sourceRequest=messages.filter(m=>m.type==='training/sources').at(-1);assert(sourceRequest);
 post({type:'training/sources',requestId:sourceRequest.requestId,modelConfig:{fragmenter_params:preset.fragmenter_params,mol_encoder_params:{...preset.mol_encoder_params,node_dim:48},adduct_type_strs:preset.adduct_type_strs}});
-assert.equal(w.eval('getTrainingConfig()').modelConfig.mol_encoder_params.node_dim,48);assert.equal(w.eval('getTrainingConfig()').modelConfig.action_model_params.hidden_dim,64);assert(!form.querySelector('[data-model-block=mol_encoder_params]'));
+const configuredModel=w.eval('getTrainingConfig()').modelConfig;assert.equal(configuredModel.action_model_params.hidden_dim,64);for(const key of ['mol_encoder_checkpoint','mol_encoder_params','fragmenter_params','adduct_type_strs'])assert(!(key in configuredModel));assert(!form.querySelector('[data-model-block=mol_encoder_params]'));
+const inherited=d.getElementById('trainingInheritedConfig');assert(inherited.textContent.includes('Cleavage Pattern Set'));assert(inherited.textContent.includes('Ion Adduct Rule Set'));assert(inherited.textContent.includes('Molecular Encoder Parameters'));assert(inherited.querySelectorAll('details details').length>1,'patterns and adduct rules must be independently collapsible');assert.equal(inherited.querySelectorAll('input,select,textarea,button').length,0,'inherited settings must be read-only');assert(inherited.querySelector('.training-symbols'));assert.equal(inherited.querySelectorAll('.training-symbols span').length,preset.mol_encoder_params.symbols.length);
+let lastSourceRequest=sourceRequest;
+for(const [field,value]of [['trainDir',path],['valDir','/fixtures/validation_structures'],['molEncoderCheckpoint','/model/encoder.pt']]){
+ const count=messages.filter(m=>m.type==='training/sources').length;post({type:'picked',form:'training',field,value});
+ assert(!inherited.textContent.includes('Cleavage Pattern Set'),'reselection must clear stale inherited settings immediately');assert(d.getElementById('trainingStart').disabled);
+ form.elements[field].dispatchEvent(event());const refreshed=messages.filter(m=>m.type==='training/sources').at(-1);assert.equal(messages.filter(m=>m.type==='training/sources').length,count+1);assert.notEqual(refreshed.requestId,lastSourceRequest.requestId);
+ post({type:'training/sources',requestId:lastSourceRequest.requestId,modelConfig:{fragmenter_params:{stale:true},mol_encoder_params:{symbols:['Xe']},adduct_type_strs:['stale']}});assert(!inherited.textContent.includes('Cleavage Pattern Set'),'stale response must be ignored');
+ post({type:'training/sources',requestId:refreshed.requestId,modelConfig:{fragmenter_params:preset.fragmenter_params,mol_encoder_params:{...preset.mol_encoder_params,node_dim:48},adduct_type_strs:preset.adduct_type_strs}});assert(inherited.textContent.includes('Cleavage Pattern Set'));lastSourceRequest=refreshed;
+}
+post({type:'picked',form:'training',field:'molEncoderCheckpoint',value:'/model/encoder.pt'});form.elements.molEncoderCheckpoint.dispatchEvent(event());const failedRefresh=messages.filter(m=>m.type==='training/sources').at(-1);post({type:'training/sources',requestId:failedRefresh.requestId,error:'Dataset symbols do not match the MolEncoder / applicable checkpoint symbols'});assert(d.getElementById('trainingStart').disabled);assert(d.getElementById('trainingSourcesStatus').textContent.includes('do not match'));assert(!inherited.textContent.includes('Cleavage Pattern Set'));
+post({type:'picked',form:'training',field:'molEncoderCheckpoint',value:'/model/encoder.pt'});form.elements.molEncoderCheckpoint.dispatchEvent(event());lastSourceRequest=messages.filter(m=>m.type==='training/sources').at(-1);post({type:'training/sources',requestId:lastSourceRequest.requestId,modelConfig:{fragmenter_params:preset.fragmenter_params,mol_encoder_params:{...preset.mol_encoder_params,node_dim:48},adduct_type_strs:preset.adduct_type_strs}});
+form.querySelector('[data-model-checkpoint]').click();assert(inherited.querySelector('[data-inherited-model=mol]').open);
 assert(!form.elements.fineTunePatternSet);
 function mode(value){const radio=form.querySelector('input[name=trainingMode][value='+value+']');radio.checked=true;radio.dispatchEvent(event());}
 mode('resume');form.elements.resume.value='/model/resume.pt';form.elements.resume.dispatchEvent(event());assert(messages.some(m=>m.type==='training/checkpoint'&&m.path==='/model/resume.pt'));
 const fine={source_checkpoint:'/model/base.pt',pattern_set_path:'/model/patterns.json',width:16};
 post({type:'training/checkpoint',path:'/model/resume.pt',modelConfig:{...preset,fine_tuning:fine},lr:0.0003,weightDecay:0.02});assert.equal(form.elements.lr.value,'0.0003');assert(form.elements.lr.disabled);assert(form.elements.adapterWidth.disabled);assert.equal(form.elements.adapterWidth.value,'16');assert.equal(form.elements.fineTuneCheckpoint.value,'/model/base.pt');assert(!d.querySelector('#trainingPatternSettings').hidden);
+const resumeSourceCount=messages.filter(m=>m.type==='training/sources').length,resumeCheckpointCount=messages.filter(m=>m.type==='training/checkpoint').length;post({type:'picked',form:'training',field:'resume',value:'/model/resume.pt'});assert(!inherited.textContent.includes('Cleavage Pattern Set'));assert(d.getElementById('trainingStart').disabled);form.elements.resume.dispatchEvent(event());assert.equal(messages.filter(m=>m.type==='training/sources').length,resumeSourceCount+1);assert.equal(messages.filter(m=>m.type==='training/checkpoint').length,resumeCheckpointCount+1);const refreshedResumeSource=messages.filter(m=>m.type==='training/sources').at(-1);post({type:'training/sources',requestId:refreshedResumeSource.requestId,modelConfig:{fragmenter_params:preset.fragmenter_params,mol_encoder_params:preset.mol_encoder_params,adduct_type_strs:preset.adduct_type_strs}});post({type:'training/checkpoint',path:'/model/resume.pt',modelConfig:{...preset,fine_tuning:fine},lr:0.0003,weightDecay:0.02});
 form.querySelector('[data-model-component=action_model_params]').click();assert(form.querySelector('[data-parameter-path="action_model_params.hidden_dim"]').disabled);assert(!form.querySelector('[data-model-block=mol_encoder_params]'));
 mode('patterns');form.elements.fineTuneResume.value='/model/finetune.pt';form.elements.fineTuneResume.dispatchEvent(event());assert(messages.some(m=>m.type==='training/checkpoint'&&m.path==='/model/finetune.pt'));post({type:'training/checkpoint',path:'/model/finetune.pt',modelConfig:{...preset,fine_tuning:fine},lr:0.0003,weightDecay:0.02});assert.equal(w.eval('getTrainingConfig()').resume,'/model/finetune.pt');assert.equal(w.eval('getTrainingConfig()').fineTuneCheckpoint,'/model/base.pt');
 assert(!form.elements.validationIntervalSteps.disabled);assert(!form.elements.validationFraction.disabled);
@@ -53,4 +72,4 @@ post({type:'workbench/jobSelected',jobId:'partial-test'});
 post({type:'workbench/logs',job:{id:'partial-test',type:'training',name:'Partial validation test',status:'running',epochs:10},text:JSON.stringify({event:'intermediate_validation_end',global_step:1000,validation_samples:10,total_validation_samples:100,validation_loss:0.25})});
 assert(d.querySelector('#jobIntermediateValidation').textContent.includes('Step 1000 · 10 / 100 validation samples · Loss 0.250000'));
 assert(d.querySelector('#jobIntermediateValidationChart svg'));
-assert.deepEqual(errors,[]);console.log('Full webview initialization, model editing, dataset inspection, loss controls, resume and fine-tuning resume checks passed.');dom.window.close();
+assert.deepEqual(errors,[]);console.log('Full webview initialization, model editing, dataset inspection, loss controls, resume and fine-tuning resume checks passed.');setImmediate(()=>dom.window.close());

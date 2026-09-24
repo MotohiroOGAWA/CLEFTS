@@ -9,7 +9,11 @@ python -m clefts.cli train fragment-tree \
   --epochs 100 --batch-size 4 --lr 0.0001
 ```
 
-The model learns absolute primitive-action filtering, multi-positive next actions and EOS, and materialized fragment formula intensities. Their weights are configurable with `--absolute-weight`, `--next-weight`, `--negative-weight` and `--intensity-weight`. AdamW uses `--weight-decay`; `--gradient-clip 0` disables gradient clipping.
+The model learns CE-independent fragment branches with normalized positive MIL and depth-diverse weak negatives, then predicts CE-dependent physical-ion intensities. Their weights are configurable with `--branch-weight`, `--negative-weight`, `--branch-mil-temperature`, and `--intensity-weight`. AdamW uses `--weight-decay`; `--gradient-clip 0` disables gradient clipping.
+
+In **Workbench → Fragment Tree Training**, **Load Configuration** and **Save Configuration** are in the page header; the load control also accepts a dropped `*.pfttrain.json` file. Saved training configurations contain only run settings and the trainable Branch / Fragment Transformer / Ion-State / Intensity parameters. Fragmenter settings, Cleavage Patterns, ion-adduct rules, Symbols, molecular-encoder parameters, and adduct ordering are not user inputs to training. They are inherited from the prepared train/validation datasets and the molecular-encoder or model checkpoint.
+
+After selecting both prepared datasets and the applicable checkpoint, Workbench checks that the train and validation Fragmenter settings, adduct ordering, and Symbols agree, and that the molecular encoder is compatible with those Symbols. The inherited configuration is then shown read-only. Cleavage Pattern Sets and Ion Adduct Rule Sets can be collapsed as a set and one Pattern or Rule at a time; Symbols use a compact horizontal layout.
 
 ## Compatible pretrained checkpoint
 

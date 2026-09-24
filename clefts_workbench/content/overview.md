@@ -21,7 +21,7 @@ MSDataset (`.msds`), MSP, MGF and spectrum tables are supported for data prepara
 
 ## Source-anchored fragmentation
 
-Primitive cleavage actions are defined on the source molecule. Compatible action sets describe retained fragments. The absolute action scorer filters source actions, an autoregressive decoder selects normalized action states, and the fragment-tree model predicts formula-grouped intensities after materialization.
+Primitive cleavage actions are defined on the source molecule. Compatible action sets describe retained fragments. A main-adduct-conditioned branch scorer searches normalized action states, then the fragment-tree model predicts collision-energy-conditioned physical-ion intensities after materialization.
 
 Peak assignment uses the configured mass tolerance and precursor-specific ion rules. Action limits, cleavage patterns and adduct rules must be compatible across data preparation, training and prediction.
 

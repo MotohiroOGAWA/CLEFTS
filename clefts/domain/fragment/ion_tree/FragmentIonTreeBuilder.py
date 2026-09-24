@@ -50,8 +50,8 @@ class FragmentIonTreeBuilder(FragmentTreeBuilder):
         self,
         compound: Compound,
         *,
-        max_node: int = -1,
-        max_edge: int = -1,
+        max_unique_fragment_smiles: int = -1,
+        max_cleavage_combinations: int = -1,
         max_action_count: int | None = None,
         seed_action_sequences: Sequence[CleavageActionSequence] | None = None,
         print_info: bool = False,
@@ -61,8 +61,8 @@ class FragmentIonTreeBuilder(FragmentTreeBuilder):
 
         result = self._build_result(
             compound,
-            max_node=max_node,
-            max_edge=max_edge,
+            max_unique_fragment_smiles=max_unique_fragment_smiles,
+            max_cleavage_combinations=max_cleavage_combinations,
             max_action_count=max_action_count,
             seed_action_sequences=seed_action_sequences,
             print_info=print_info,
@@ -89,6 +89,10 @@ class FragmentIonTreeBuilder(FragmentTreeBuilder):
             ion_shift_candidate_store=ion_shift_candidate_store,
         )
 
+        # Search statistics of the combination search behind this tree, e.g.
+        # for data-preparation manifests. Not part of the tree's identity.
+        object.__setattr__(fragment_ion_tree, "_search_stats", result["search_stats"])
+
         if _include_fragment_compound_cache:
             object.__setattr__(
                 fragment_ion_tree,
@@ -102,8 +106,8 @@ class FragmentIonTreeBuilder(FragmentTreeBuilder):
         self,
         compound: Compound,
         *,
-        max_node: int = -1,
-        max_edge: int = -1,
+        max_unique_fragment_smiles: int = -1,
+        max_cleavage_combinations: int = -1,
         max_action_count: int | None = None,
         seed_action_sequences: Sequence[CleavageActionSequence] | None = None,
         print_info: bool = False,
@@ -112,8 +116,8 @@ class FragmentIonTreeBuilder(FragmentTreeBuilder):
 
         return super().build(
             compound,
-            max_node=max_node,
-            max_edge=max_edge,
+            max_unique_fragment_smiles=max_unique_fragment_smiles,
+            max_cleavage_combinations=max_cleavage_combinations,
             max_action_count=max_action_count,
             seed_action_sequences=seed_action_sequences,
             print_info=print_info,

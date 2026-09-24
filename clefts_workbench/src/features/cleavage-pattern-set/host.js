@@ -47,7 +47,7 @@ function runChemistryBackend(context, command, payload, owner = context) {
     try { root = projectRoot(context); }
     catch (error) { reject(error); return; }
     if (!isCleftsRoot(root)) { reject(new Error('The detected working directory is not a CLEFTS application.')); return; }
-    if (command === 'reactionPreview' || command === 'reactionPreviewProducts') {
+    if (command === 'reactionPreview' || command === 'reactionPreviewProducts' || command === 'cleavageExplore') {
       cleavageReactionService.forOwner(owner, { python, script, root }, context).request(command, payload).then(resolve, reject);
       return;
     }
@@ -86,7 +86,11 @@ async function readCleavageImport(context, message) {
   let file = typeof message.path === 'string' && message.path.trim()
     ? path.resolve(projectRoot(context), message.path) : undefined;
   if (!file) {
-    const picked = await vscode.window.showOpenDialog({ filters: { 'CLEFTS JSON': ['json'] }, canSelectMany: false });
+    // Extension-agnostic: the caller (normalizeDocument/normalizeRule/
+    // normalizePattern) validates the parsed content's shape, so any
+    // filename works here -- unlike an Explorer double-click, which VS Code
+    // itself gates by the registered customEditors extensions.
+    const picked = await vscode.window.showOpenDialog({ canSelectMany: false });
     if (!picked?.length) return undefined;
     file = picked[0].fsPath;
   }

@@ -15,7 +15,7 @@ from rdkit.Chem.Draw import rdMolDraw2D
 
 from clefts.domain.fragment.cleavage._CleavagePattern import _CleavagePattern, ProductRule
 from clefts.libs.mmkit.mmkit import Adduct, Formula
-from reaction_preview import reaction_preview, reaction_preview_products
+from reaction_preview import cleavage_explore, reaction_preview, reaction_preview_products
 
 
 def molecule(payload: dict[str, Any]) -> dict[str, Any]:
@@ -529,7 +529,8 @@ def validate(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 COMMANDS = {
-    "reactionPreview": reaction_preview, "reactionPreviewProducts": reaction_preview_products, "molecule": molecule, "depict": depict, "reactant": reactant,
+    "reactionPreview": reaction_preview, "reactionPreviewProducts": reaction_preview_products,
+    "cleavageExplore": cleavage_explore, "molecule": molecule, "depict": depict, "reactant": reactant,
     "product": product, "productFromStructure": product_from_structure,
     "productState": product_state, "productFromSelection": product_from_selection, "validate": validate,
 }

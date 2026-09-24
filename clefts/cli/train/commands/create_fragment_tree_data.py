@@ -12,8 +12,8 @@ from clefts.ml.data_preparation.fragment_tree.create_training_data import (
 class CreateFragmentTreeDataCommand(CLICommand):
     name = "create-fragment-tree-data"
     aliases = ("create-tree-data",)
-    help = "Create Source-anchored action training structure files (schema v5)."
-    description = "Create schema-v5 action training data directly from an original MSDataset."
+    help = "Create prepared fragment-tree branch and physical-ion training tensors."
+    description = "Run chemistry preparation and create training tensors directly from an original MSDataset."
     order = 20
 
     def configure(self, parser: argparse.ArgumentParser) -> None:

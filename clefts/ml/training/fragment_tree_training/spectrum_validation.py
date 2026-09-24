@@ -44,6 +44,35 @@ def assignment_score(mz, observed, tolerance):
     return sum(float(observed[j]['intensity']) for j in matched) / total
 
 
+TOP_N_VALUES = (1, 5, 10, 20)
+
+
+def top_n_assignment_metrics(generated, observed, tolerance, *, ns=TOP_N_VALUES, suffix=''):
+    """Recall/precision of the model's own top-N generated peaks (ranked by its
+    own predicted intensity) against observed peaks with prepared assignment
+    metadata (peak['assigned']), i.e. against the actual ground truth rather
+    than against every observed m/z regardless of whether it was ever
+    explained. A high assignment_score is cheap to reach by generating many
+    fragment nodes (more candidates, more chances to match); precision@N
+    (fixed denominator N, the standard "precision at k") makes that costly
+    instead of rewarding it, while recall@N still favors covering the ground
+    truth. N is capped by the model's own candidate count, so predicting
+    fewer than N peaks is scored as missing the remainder, not excused.
+    """
+    assigned = [peak for peak in observed if peak.get('assigned')]
+    ranked = sorted(generated, key=lambda peak: peak['intensity'], reverse=True)
+    result = {}
+    for n in ns:
+        top = ranked[:n]
+        matched = ({j for _, j in matched_peak_pairs([p['mz'] for p in top], [p['intensity'] for p in top], assigned, tolerance)}
+                   if top and assigned else set())
+        # No assigned ground truth at all means the question isn't answerable,
+        # not that the model scored zero (mirrors assignment_score's None).
+        result[f'peak_recall_top{n}{suffix}'] = (len(matched) / len(assigned)) if assigned else None
+        result[f'peak_precision_top{n}{suffix}'] = (len(matched) / n) if assigned else None
+    return result
+
+
 def distribution(values):
     values = np.asarray([float(value) for value in values if value is not None and np.isfinite(value)], dtype=float)
     if not len(values):
@@ -163,8 +192,14 @@ def append_metric_distributions(output_dir, global_step, split, metrics, *, epoc
 
 def _report_metrics(records):
     metrics = {}
-    names = ('cosine_similarity', 'cosine_similarity_without_precursor',
-             'assignment_score', 'assignment_score_without_precursor')
+    depth_names = ('cosine_similarity', 'cosine_similarity_without_precursor',
+                   'assignment_score', 'assignment_score_without_precursor')
+    # Top-N recall/precision are already a coarse, whole-spectrum ranking; a
+    # per-depth split of a handful of candidates isn't meaningful, so they get
+    # the flat + collision-energy/adduct facets only, not the depth facet.
+    top_n_names = tuple(f'peak_{kind}_top{n}{suffix}' for kind in ('recall', 'precision')
+                        for n in TOP_N_VALUES for suffix in ('', '_without_precursor'))
+    names = depth_names + top_n_names
     for name in names:
         metrics[name] = [record.get(name) for record in records]
     for dimension, field in (('collision_energy', 'collision_energy_bin'), ('main_adduct', 'main_adduct')):
@@ -174,7 +209,7 @@ def _report_metrics(records):
                 metrics[f'{name}@{dimension}:{category}'] = [record.get(name) for record in selected]
     depths = sorted({int(depth) for record in records for depth in record.get('depth_metrics', {})})
     for depth in depths:
-        for name in names:
+        for name in depth_names:
             metrics[f'{name}@depth:{depth}'] = [record.get('depth_metrics', {}).get(str(depth), {}).get(name)
                                                 for record in records]
     return metrics
@@ -203,7 +238,8 @@ def validate_spectra(generator, pieces, output_dir, label, *, global_step=None, 
                     confidence = [float(output.spectra.confidence[row]) for row in formula_rows]
                     if not np.isfinite(intensity).all():
                         raise FloatingPointError('Non-finite generated spectrum')
-                    observed = [dict(mz=float(p['mz']), intensity=float(p['intensity']), precursor=bool(p.get('precursor')))
+                    observed = [dict(mz=float(p['mz']), intensity=float(p['intensity']), precursor=bool(p.get('precursor')),
+                                     assigned=bool(p.get('matches')))
                                 for p in annotation['peaks']]
                     precursor_mz = float(annotation['precursorMz'])
                     node_depths = _node_depths(output.downstream, sample, precursor_mz, tolerance)
@@ -232,8 +268,13 @@ def validate_spectra(generator, pieces, output_dir, label, *, global_step=None, 
                             'assignment_score': assignment_score([p['mz'] for p in predicted], target, tolerance),
                             'assignment_score_without_precursor': assignment_score([p['mz'] for p in predicted_np], target_np, tolerance) if target_np else None,
                             'observed_peak_count': len(target), 'generated_peak_count': len(predicted)}
-                    nodes = output.fragments.node_sample_index == sample
-                    raw = output.selection.decoded.state_sample_index == sample
+                    branch_group=int(data.sample_branch_group_index[sample])
+                    nodes = output.fragments.node_sample_index == branch_group
+                    raw = output.selection.decoded.state_sample_index == branch_group
+                    path_depth=float((output.selection.decoded.state_action_index[raw]>=0).sum(1).float().mean()) if torch.any(raw) else 0.
+                    top_metrics = top_n_assignment_metrics(generated, observed, tolerance)
+                    top_metrics.update(top_n_assignment_metrics(generated_np, observed_np, tolerance, suffix='_without_precursor') if observed_np
+                                       else {f'peak_{kind}_top{n}_without_precursor': None for kind in ('recall', 'precision') for n in TOP_N_VALUES})
                     records.append(dict(piece_index=piece_index, sample_index=input_index,
                         adduct=annotation['adduct'], main_adduct=annotation.get('mainAdduct', str(generator.fragmenter._resolve_main_adduct_type(adducts[input_index]))),
                         collision_energy=float(annotation['collisionEnergy']), precursor_mz=precursor_mz,
@@ -243,8 +284,11 @@ def validate_spectra(generator, pieces, output_dir, label, *, global_step=None, 
                         assignment_score_without_precursor=assignment_score([p['mz'] for p in generated_np], observed_np, tolerance) if observed_np else None,
                         preparation_assignment_score=annotation.get('assignmentScore'), preparation_assignment_score_without_precursor=annotation.get('assignmentScoreWithoutPrecursor'),
                         generated_peak_count=sum(value > 0 for value in intensity), generated_fragment_nodes=int(raw.sum()), unique_fragment_nodes=int(nodes.sum()),
-                        generated_mz=mz, generated_intensity=intensity, generated_peaks=generated, original_peaks=observed, depth_metrics=depth_metrics))
-            if progress is not None: progress(piece_index, 'end')
+                        mean_path_depth=path_depth,duplicate_states_removed=(float(output.selection.decoded.duplicate_states_removed) if output.selection.decoded.duplicate_states_removed is not None else 0.),
+                        generated_mz=mz, generated_intensity=intensity, generated_peaks=generated, original_peaks=observed, depth_metrics=depth_metrics,
+                        **top_metrics))
+            if progress is not None:
+                progress(piece_index, 'end', float(np.mean([r['cosine_similarity'] for r in records])))
     finally:
         generator.train(was_training)
     if not records: raise ValueError('No validation spectra')
@@ -258,7 +302,7 @@ def validate_spectra(generator, pieces, output_dir, label, *, global_step=None, 
     summary = dict(samples=len(records), cosine_mean=stats['mean'], cosine_std=float(np.std(cosine)),
         cosine_quantiles=cosine_quantiles, histogram_counts=hist.tolist(), histogram_edges=edges.tolist(),
         nonempty_spectrum_fraction=sum(r['generated_peak_count'] > 0 for r in records) / len(records), collision_energy_tertiles=ce)
-    payload = dict(schema='clefts.spectrum-validation', schema_version=2, mode='free-running spectrum generation',
+    payload = dict(schema='clefts.spectrum-validation', schema_version=3, mode='free-running spectrum generation',
                    summary=summary, representatives=_representatives(records), spectra=records)
     target_dir = Path(output_dir) / 'spectrum_validation'; target_dir.mkdir(exist_ok=True, parents=True)
     (target_dir / f'{label}.json').write_text(json.dumps(payload, indent=2))
@@ -266,10 +310,16 @@ def validate_spectra(generator, pieces, output_dir, label, *, global_step=None, 
         split = 'validation' if label.startswith('epoch_') else 'intermediate_validation'
         append_metric_distributions(output_dir, global_step, split, _report_metrics(records), epoch=epoch)
     mean = lambda values: (distribution(values) or {'mean': 0.})['mean']
+    top_n_summary = {f'peak_{kind}_top{n}{suffix}': mean(r[f'peak_{kind}_top{n}{suffix}'] for r in records)
+                      for kind in ('recall', 'precision') for n in TOP_N_VALUES for suffix in ('', '_without_precursor')}
     return dict(spectrum_cosine_similarity=summary['cosine_mean'], spectrum_cosine_std=summary['cosine_std'],
         spectrum_cosine_similarity_without_precursor=mean(r['cosine_similarity_without_precursor'] for r in records),
         assignment_score=mean(r['assignment_score'] for r in records),
         assignment_score_without_precursor=mean(r['assignment_score_without_precursor'] for r in records),
         spectrum_nonempty_fraction=summary['nonempty_spectrum_fraction'],
         generated_fragment_nodes=float(np.mean([r['generated_fragment_nodes'] for r in records])),
-        unique_fragment_nodes=float(np.mean([r['unique_fragment_nodes'] for r in records])))
+        unique_fragment_nodes=float(np.mean([r['unique_fragment_nodes'] for r in records])),
+        mean_generated_fragment_nodes=float(np.mean([r['unique_fragment_nodes'] for r in records])),
+        mean_path_depth=float(np.mean([r['mean_path_depth'] for r in records])),
+        duplicate_states_removed=float(np.mean([r['duplicate_states_removed'] for r in records])),
+        **top_n_summary)

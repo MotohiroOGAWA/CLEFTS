@@ -10,11 +10,8 @@ OPTIONS = {
     'max_action_count': ('fragmenter_params', 'fragment_ion_tree_builder', 'max_action_count'),
     'precursor_max_action_count': ('fragmenter_params', 'precursor_candidate_max_action_count'),
     'mass_tolerance': ('fragmenter_params', 'mass_tolerance'),
-    'action_top_k': ('action_model_params', 'action_prefilter_top_k'),
-    'action_max_k': ('action_model_params', 'action_prefilter_max_k'),
-    'action_threshold': ('action_model_params', 'action_prefilter_threshold_logit'),
-    'beam_size': ('action_model_params', 'beam_size'),
-    'max_decode_steps': ('action_model_params', 'max_decode_steps'),
+    'branch_path_threshold': ('action_model_params', 'branch_path_threshold'),
+    'max_fragment_nodes': ('action_model_params', 'max_fragment_nodes'),
 }
 
 def configure_model_options(parser: argparse.ArgumentParser) -> None:
@@ -22,9 +19,8 @@ def configure_model_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument('--params-json', help='Inline model or fragmenter JSON; overrides --params.')
     for group in ('fragmenter', 'mol-encoder', 'action-model', 'post-model'):
         parser.add_argument('--'+group+'-params-json', help='Inline parameter object overriding the corresponding configuration section.')
-    parser.add_argument('--adduct-types-json', help='JSON array of supported adduct strings.')
     for key in OPTIONS:
-        kind = str if key == 'mass_tolerance' else float if key == 'action_threshold' else int
+        kind = str if key == 'mass_tolerance' else float if key == 'branch_path_threshold' else int
         parser.add_argument('--'+key.replace('_','-'), type=kind, help='Override '+'.'.join(OPTIONS[key])+'.')
     parser.add_argument('--set', dest='parameter_overrides', action='append', default=[], metavar='PATH=JSON',
                         help='Override any individual parameter, including nested array entries. Repeat as needed; applied last.')
@@ -63,7 +59,6 @@ def resolve_model_options(args: argparse.Namespace) -> dict:
             value=json.loads(raw)
             if not isinstance(value,dict): raise ValueError(group+' parameters must be a JSON object')
             config[group+'_params']=merge(config.get(group+'_params',{}),value)
-    if args.adduct_types_json: config['adduct_type_strs']=json.loads(args.adduct_types_json)
     for key,path in OPTIONS.items():
         value=getattr(args,key,None)
         if value is not None: set_parameter(config,list(path),value)
@@ -71,6 +66,9 @@ def resolve_model_options(args: argparse.Namespace) -> dict:
         key,separator,raw=override.partition('=')
         if not separator: raise ValueError('--set requires PATH=JSON')
         set_parameter(config,key.split('.'),json.loads(raw))
+    # Supported adducts are derived from Fragmenter rules and observed dataset
+    # metadata during preparation, never from a user configuration override.
+    config.pop('adduct_type_strs', None)
     return config
 
 def namespace_argv(parser: argparse.ArgumentParser, args: argparse.Namespace) -> list[str]:

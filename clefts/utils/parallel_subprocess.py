@@ -109,6 +109,7 @@ def run_parallel_subprocesses(
     unit: str = "it",
     on_complete: Optional[Callable[[List[str]], None]] = None,
     progress: Optional[tqdm] = None,
+    on_error: Optional[Callable[[List[str], subprocess.CalledProcessError], None]] = None,
 ) -> None:
     """Run multiple subprocesses in parallel.
 
@@ -126,6 +127,11 @@ def run_parallel_subprocesses(
     on_complete:
         Optional callback receiving the command after each successful subprocess,
         invoked in the calling thread in completion order.
+    on_error:
+        Optional callback receiving the command and its CalledProcessError
+        when a subprocess exits non-zero, invoked in the calling thread.
+        When given, a failed subprocess no longer aborts the remaining
+        ones; when omitted, the first failure is raised as before.
     progress:
         Optional externally-owned tqdm bar to advance (one update per
         completed command) instead of creating a new one. Lets a caller that
@@ -154,7 +160,15 @@ def run_parallel_subprocesses(
             unit=unit,
         )
         for future in completed:
-            future.result()
+            try:
+                future.result()
+            except subprocess.CalledProcessError as error:
+                if on_error is None:
+                    raise
+                if progress is not None:
+                    progress.update(1)
+                on_error(futures[future], error)
+                continue
             if progress is not None:
                 progress.update(1)
             if on_complete is not None:

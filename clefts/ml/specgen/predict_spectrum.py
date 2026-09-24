@@ -411,8 +411,8 @@ def predict_msdataset(
 
 def prediction_run_settings(args: argparse.Namespace) -> Dict[str, Any]:
     """CLI settings for this run, camelCased flat like
-    fragment-tree.pft.json, so the Workbench's existing "Load Configuration"
-    (drag-drop or Browse, filtered to pft.json/json) can restore a prediction
+    fragment-tree.pft, so the Workbench's existing "Load Configuration"
+    (drag-drop or Browse, filtered to pft/json) can restore a prediction
     form from a past run's output directory the same way it already does
     for data preparation and training."""
     return {
@@ -464,7 +464,7 @@ def main() -> None:
     # Written immediately, not only on success: settings should be visible
     # and loadable (Workbench "Load From Run") even if this run later fails
     # or is interrupted, just like training/data-prep's own .pft.json.
-    pft_path = output_dir / "prediction.pft.json"
+    pft_path = output_dir / "prediction.pft"
     pft_path.write_text(
         json.dumps(prediction_run_settings(args), ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )

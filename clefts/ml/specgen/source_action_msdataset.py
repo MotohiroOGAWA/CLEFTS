@@ -169,6 +169,7 @@ def predict_source_msdataset(dataset: object, generator: SourceAnchoredFragmentS
 
     spectra=[GeneratedMassSpectrum(k,[]) for k in range(len(sources))]
     threshold=generator.post_model.ion_prediction_threshold
+    intensity_threshold=generator.post_model.peak_intensity_threshold
     if sources:
         progress=tqdm(total=len(sources),desc=predict_desc)
         try:
@@ -178,7 +179,7 @@ def predict_source_msdataset(dataset: object, generator: SourceAnchoredFragmentS
                     # Below the trained ion confidence threshold: the same
                     # unrelated adduct/hydrogen-shift candidate the model learns
                     # to push toward zero, kept out of the reported spectrum.
-                    if confidence<threshold:
+                    if confidence<threshold or intensity<intensity_threshold:
                         continue
                     original=output.sample_input_index[sample]
                     spectra[original].peaks.append(GeneratedSpectrumPeak(mz=mz,intensity=max(float(intensity),0.),sample_id=original,

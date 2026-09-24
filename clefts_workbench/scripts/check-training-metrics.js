@@ -45,6 +45,17 @@ const { readRun, groupSeries, html, script } = require('../src/features/training
     assert.deepEqual(result.series.find(s => s.name === 'metrics/train_loss').points, [[10, 3]]);
     assert.deepEqual(result.series.find(s => s.name === 'distributions/train/loss_q1').points, [[10, .5]]);
     assert.equal(result.series.length, 3);
+
+    // A training report is recognized by actually being a file with the
+    // right schema, not by its extension -- so any filename works.
+    const reportPath = path.join(dir, 'whatever_i_want.txt');
+    await fs.writeFile(reportPath, JSON.stringify({ schema: 'clefts.training-report', status: 'completed' }));
+    const withReport = await readRun(reportPath);
+    assert.equal(withReport.report.schema, 'clefts.training-report');
+    await fs.rm(reportPath);
+    await fs.writeFile(reportPath, 'not json');
+    await assert.rejects(readRun(reportPath), /not a training report/);
+
     console.log('Training metrics parsing and webview syntax checks passed.');
   } finally { await fs.rm(dir, { recursive: true, force: true }); }
 })().catch(error => { console.error(error); process.exitCode = 1; });

@@ -14,20 +14,19 @@ class ActionExpansion:
     child_action_count: Tensor
     retained_atom_mask: Tensor
     hard_conflict: Tensor
-    precedence_cycle: Tensor
+    invalidated_action: Tensor
     no_op: Tensor
 
 
 class ActionCompatibilityEngine(nn.Module):
-    def __init__(self, max_action_count: int, *, enforce_reactant_order: bool = False) -> None:
+    def __init__(self, max_action_count: int) -> None:
         super().__init__()
         if type(max_action_count) is not int or max_action_count < 1:
             raise ValueError("max_action_count must be a positive integer")
         self.max_action_count = max_action_count
-        self.enforce_reactant_order=enforce_reactant_order
 
     def expand(self, *, state_action_index: Tensor, state_sample_index: Tensor,
-               pool_valid: Tensor, pool_conflict: Tensor, pool_precedence: Tensor,
+               pool_valid: Tensor, pool_conflict: Tensor, pool_invalidation: Tensor,
                pool_dominance: Tensor, pool_retained: Tensor, source_atom_valid: Tensor) -> ActionExpansion:
         p, m = state_action_index.shape
         k = pool_valid.shape[1]
@@ -42,12 +41,7 @@ class ActionCompatibilityEngine(nn.Module):
         pair_valid = present[:, :, None] & present[:, None, :]
         rows, cols = safe[:, :, None], safe[:, None, :]
         conflict = (pool_conflict[sample[:, None, None], rows, cols] & pair_valid).any(dim=(1, 2))
-        precedence = pool_precedence[sample[:, None, None], rows, cols] & pair_valid
-        active = present.clone()
-        for _ in range(m + 1):
-            incoming = (precedence & active[:, :, None] & active[:, None, :]).any(dim=1)
-            active = active & incoming
-        cycle = active.any(dim=1)
+        invalidated = (pool_invalidation[sample[:, None, None], rows, cols] & pair_valid).any(dim=(1, 2))
         dominated = (pool_dominance[sample[:, None, None], rows, cols] & pair_valid).any(dim=1)
         normalized = present & ~dominated
         count = normalized.sum(dim=1)
@@ -63,11 +57,6 @@ class ActionCompatibilityEngine(nn.Module):
                 words=pool_retained[sample,safe[:,position]]
                 retained=retained & torch.where(normalized[:,position,None],words,torch.full_like(words,-1))
         repeated = (previous == candidate[:, None]).any(dim=1)
-        # An action whose original SMARTS match was invalidated by an already
-        # selected action cannot be appended after it. This is stronger than
-        # acyclic unordered combination validity and matters after a precursor.
-        invalidated=(pool_precedence[sample[:,None],candidate[:,None],previous.clamp_min(0)] & (previous>=0)).any(dim=1)
-        valid = (pool_valid[sample, candidate] & ~repeated & ~conflict & ~cycle & ~no_op
+        valid = (pool_valid[sample, candidate] & ~repeated & ~conflict & ~invalidated & ~no_op
                  & retained.any(dim=1) & (count <= self.max_action_count))
-        if self.enforce_reactant_order:valid &= ~invalidated
-        return ActionExpansion(parent, candidate, valid, child, count, retained, conflict, cycle, no_op)
+        return ActionExpansion(parent, candidate, valid, child, count, retained, conflict, invalidated, no_op)

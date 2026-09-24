@@ -14,12 +14,15 @@
   "activationEvents": [
     "onCommand:clefts.openWorkbench",
     "onCommand:clefts.editCleavagePatterns",
+    "onCommand:clefts.editAdductRules",
     "onCommand:clefts.openResult",
     "onCommand:clefts.openEvaluation",
     "onCustomEditor:clefts.resultViewer",
     "onCustomEditor:clefts.evaluationConfigEditor",
     "onCustomEditor:clefts.cleavagePatternSetEditor",
-    "onCustomEditor:clefts.cleavagePatternEditor"
+    "onCustomEditor:clefts.cleavagePatternEditor",
+    "onCustomEditor:clefts.adductRuleEditor",
+    "onCustomEditor:clefts.adductRuleSetEditor"
   ],
   "main": "./src/extension.js",
   "contributes": {
@@ -27,6 +30,10 @@
       {
         "command": "clefts.editCleavagePatterns",
         "title": "CLEFTS: Edit Cleavage Patterns"
+      },
+      {
+        "command": "clefts.editAdductRules",
+        "title": "CLEFTS: Edit Fragment Ion Adduct Rules"
       },
       {
         "command": "clefts.openWorkbench",
@@ -98,12 +105,10 @@
         "viewType": "clefts.evaluationConfigEditor",
         "displayName": "CLEFTS Evaluation",
         "selector": [
-          {
-            "filenamePattern": "*.evalcol.json"
-          },
-          {
-            "filenamePattern": "*.evalgroup.json"
-          }
+          { "filenamePattern": "*.evalcol.pft" },
+          { "filenamePattern": "*.evalgroup.pft" },
+          { "filenamePattern": "*.evalcol.json" },
+          { "filenamePattern": "*.evalgroup.json" }
         ],
         "priority": "default"
       },
@@ -111,6 +116,8 @@
         "viewType": "clefts.cleavagePatternEditor",
         "displayName": "CLEFTS Cleavage Pattern",
         "selector": [
+          { "filenamePattern": "*.cleavage.pft" },
+          { "filenamePattern": "*.clevage.pft" },
           { "filenamePattern": "*.cleavage.json" },
           { "filenamePattern": "*.clevage.json" }
         ],
@@ -120,9 +127,26 @@
         "viewType": "clefts.cleavagePatternSetEditor",
         "displayName": "CLEFTS Cleavage Pattern Set",
         "selector": [
-          {
-            "filenamePattern": "*.clevageset.json"
-          }
+          { "filenamePattern": "*.clevageset.pft" },
+          { "filenamePattern": "*.clevageset.json" }
+        ],
+        "priority": "default"
+      },
+      {
+        "viewType": "clefts.adductRuleEditor",
+        "displayName": "CLEFTS Fragment Ion Adduct Rule",
+        "selector": [
+          { "filenamePattern": "*.adduct.pft" },
+          { "filenamePattern": "*.adduct.json" }
+        ],
+        "priority": "default"
+      },
+      {
+        "viewType": "clefts.adductRuleSetEditor",
+        "displayName": "CLEFTS Fragment Ion Adduct Rule Set",
+        "selector": [
+          { "filenamePattern": "*.adductset.pft" },
+          { "filenamePattern": "*.adductset.json" }
         ],
         "priority": "default"
       }
@@ -171,6 +195,27 @@
         }
       }
     },
+    "languages": [
+      {
+        "id": "clefts-workbench-file",
+        "aliases": ["CLEFTS Workbench File"],
+        "extensions": [
+          ".pft",
+          ".clefts-result",
+          ".evalcol.pft",
+          ".evalgroup.pft",
+          ".cleavage.pft",
+          ".clevage.pft",
+          ".clevageset.pft",
+          ".adduct.pft",
+          ".adductset.pft"
+        ],
+        "icon": {
+          "light": "./media/icons/clefts-file.svg",
+          "dark": "./media/icons/clefts-file.svg"
+        }
+      }
+    ],
     "viewsContainers": {
       "activitybar": [
         {
@@ -191,12 +236,12 @@
   },
   "scripts": {
     "dev": "code --extensionDevelopmentPath=. --new-window .",
-    "check": "node --check src/extension.js && node --check src/configuration.js && node --check src/webview-path-drop.js && node --check src/features/evaluation/editor.js && node --check src/features/evaluation/grouped-boxplot.js && node --check src/features/smarts-search/editor.js && node --check src/features/cleavage-pattern-set/editor.js && node --check src/features/cleavage-pattern-set/visual-editor.js && node --check src/features/cleavage-pattern-set/reaction-preview.js && node --check src/features/cleavage-pattern-set/reaction-service.js && node --check src/features/cleavage-pattern-set/host.js && node scripts/check-reaction-service.js && node scripts/check-reaction-preview-ui.js && python scripts/check-reaction-preview.py && node scripts/check-cleavage-file-editor.js && node scripts/check-cleavage-pattern-ui.js && node --check src/features/spectrum-prediction/editor.js && python scripts/check-cleavage-visual-products.py && node scripts/check-fragmenter-editor.js && node scripts/check-evaluation.js && node scripts/check-path-drop.js && node scripts/check-spectrum-batch.js && node scripts/check-result-webview.js && node scripts/check-score-distribution.js && node scripts/check-smarts-compound-view.js && node scripts/check-finetune.js && node scripts/check-step-validation.js && node scripts/check-training-metrics.js && node scripts/check-training-report.js",
+    "check": "node --check src/extension.js && node --check src/configuration.js && node --check src/webview-path-drop.js && node --check src/features/evaluation/editor.js && node --check src/features/evaluation/grouped-boxplot.js && node --check src/features/smarts-search/editor.js && node --check src/features/cleavage-pattern-set/editor.js && node --check src/features/cleavage-pattern-set/visual-editor.js && node --check src/features/cleavage-pattern-set/reaction-preview.js && node --check src/features/cleavage-pattern-set/reaction-service.js && node --check src/features/cleavage-pattern-set/host.js && node --check src/features/adduct-rule-set/editor.js && node --check src/features/adduct-rule-set/ui.js && node scripts/check-reaction-service.js && node scripts/check-reaction-preview-ui.js && node scripts/check-cleavage-viewer.js && python scripts/check-reaction-preview.py && node scripts/check-cleavage-file-editor.js && node scripts/check-cleavage-pattern-ui.js && node scripts/check-adduct-rule-ui.js && node --check src/features/spectrum-prediction/editor.js && python scripts/check-cleavage-visual-products.py && node scripts/check-fragmenter-editor.js && node scripts/check-evaluation.js && node scripts/check-path-drop.js && node scripts/check-spectrum-batch.js && node scripts/check-result-webview.js && node scripts/check-smarts-compound-view.js && node scripts/check-step-validation.js && node scripts/check-training-metrics.js && node scripts/check-training-report.js && node scripts/check-language-icon.js && node scripts/check-legacy-result-open.js",
     "package": "mkdir -p artifacts && npx @vscode/vsce package --allow-missing-repository --out artifacts/clefts_workbench-${npm_package_version}.vsix",
     "check:training-sources": "python scripts/check-training-sources.py",
     "check:training-ui": "node scripts/check-training-ui.js",
     "check:cleavage-pattern-ui": "node scripts/check-cleavage-file-editor.js && node scripts/check-cleavage-pattern-ui.js",
-    "check:reaction-preview": "node scripts/check-reaction-preview-ui.js && python scripts/check-reaction-preview.py && node scripts/check-reaction-service.js",
+    "check:reaction-preview": "node scripts/check-reaction-preview-ui.js && node scripts/check-cleavage-viewer.js && python scripts/check-reaction-preview.py && node scripts/check-reaction-service.js",
     "check:projects": "node scripts/check-projects.js",
     "check:workbench": "node scripts/check-projects.js && node scripts/check-workbench.js && node scripts/check-workbench-jobs.js && node scripts/check-parameter-editor.js && node scripts/check-defaults.js",
     "check:mol-training": "node scripts/check-mol-training.js && python scripts/check-mol-backend.py && python scripts/check-mol-startup.py"

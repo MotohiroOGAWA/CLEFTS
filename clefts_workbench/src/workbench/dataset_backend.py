@@ -51,7 +51,13 @@ def preview(payload: dict) -> dict:
     inspection={}
     if check_values and not errors:
         from clefts.ml.data_preparation.fragment_tree.record_validation import inspect_records
-        inspection=inspect_records(dataset,fragmenter,mapping)
+        def report_progress(current, total):
+            print('CLEFTS_PROGRESS '+json.dumps({'current':current,'total':total}),file=sys.stderr,flush=True)
+        # Every record is checked. Only detailed invalid-record samples are
+        # bounded so a very dirty dataset cannot overflow the webview response.
+        inspection=inspect_records(dataset,fragmenter,mapping,
+            progress=report_progress if payload.get('reportProgress') else None,invalid_detail_limit=5000,
+            symbols=payload.get('symbols') or payload.get('modelConfig',{}).get('mol_encoder_params',{}).get('symbols'))
         validation=inspection['validation']
         if not inspection['eligibleRecords']: errors.append('The dataset contains no valid records to prepare.')
     import numpy as np
@@ -100,7 +106,7 @@ def validate(payload: dict, *, check_datasets: bool = True) -> dict:
     from clefts.ml.data_preparation.fragment_tree.context import create_preparation_context,validate_limits
     config=payload.get('modelConfig') or {'fragmenter_params':payload['fragmenterParams'],'symbols':payload.get('symbols')}
     generator=create_preparation_context(config)
-    validate_limits(payload.get('maxNode',-1),payload.get('maxEdge',-1))
+    validate_limits(payload.get('maxUniqueFragmentSmiles',-1),payload.get('maxCleavageCombinations',-1))
     for key in ('numWorkers','chunkSize'):
         value=payload.get(key,1)
         if type(value) is not int or value<1: raise ValueError('Worker processes and chunk size must be positive integers.')
@@ -128,7 +134,7 @@ def validate(payload: dict, *, check_datasets: bool = True) -> dict:
 def model(payload: dict) -> dict:
     import torch
     checkpoint=torch.load(payload['path'],map_location='cpu')
-    if checkpoint.get('fragmentation_schema')!='source-anchored-branching-v1': raise ValueError('Choose a compatible Source-anchored action training checkpoint.')
+    if checkpoint.get('architecture')!='fragment-tree-physical-ion': raise ValueError('Choose a compatible physical-ion fragment-tree checkpoint.')
     config=checkpoint.get('model_config')
     if not isinstance(config,dict): raise ValueError('Checkpoint does not contain a model configuration.')
     return {'modelConfig':config.get('params',config),'path':payload['path']}
@@ -150,13 +156,13 @@ def structure_manifest(payload):
 def training_checkpoint(payload):
     import torch
     checkpoint = torch.load(payload['path'], map_location='cpu', weights_only=False)
-    if checkpoint.get('fragmentation_schema') != 'source-anchored-branching-v1':
+    if checkpoint.get('architecture') != 'fragment-tree-physical-ion':
         raise ValueError('Checkpoint architecture is incompatible with training.')
     config = checkpoint.get('model_config')
     if not config:
         raise ValueError('Checkpoint does not contain model configuration.')
     group = checkpoint['optimizer_state_dict']['param_groups'][0]
-    fields={'absolute_weight':'absoluteWeight','next_weight':'nextWeight','minimum_positive_weight':'minimumPositiveWeight','negative_weight':'negativeWeight','intensity_weight':'intensityWeight','absolute_intensity_weight':'absoluteIntensityWeight','train_mol_encoder':'trainMolEncoder','validation_interval_steps':'validationIntervalSteps','validation_fraction':'validationFraction'}
+    fields={'branch_weight':'branchWeight','negative_weight':'negativeWeight','branch_mil_temperature':'branchMilTemperature','intensity_weight':'intensityWeight','train_mol_encoder':'trainMolEncoder','validation_interval_steps':'validationIntervalSteps','validation_fraction':'validationFraction'}
     restored={field:checkpoint.get('training_settings',{})[key] for key,field in fields.items() if key in checkpoint.get('training_settings',{})}
     return {'modelConfig': config.get('params', config), 'lr': group['lr'], 'weightDecay': group.get('weight_decay', 0), 'trainingSettings':restored}
 
@@ -174,6 +180,29 @@ def training_sources(payload):
     config = inherit_model_config({}, payload['trainDir'], payload['valDir'],
         encoder_checkpoint=payload.get('molEncoderCheckpoint'), saved_model=saved)
     return {'modelConfig': config}
+
+def training_assignment_score_counts(payload):
+    import torch
+    minimum=float(payload.get('minimumAssignmentScore',0))
+    minimum_without_precursor=float(payload.get('minimumAssignmentScoreWithoutPrecursor',0))
+    for value,label in ((minimum,'Minimum assignment score'),(minimum_without_precursor,'Minimum assignment score without precursor')):
+        if not math.isfinite(value) or not 0<=value<=1: raise ValueError(f'{label} must be between 0 and 1.')
+    def passes(sample):
+        full=sample['assignmentScore'];without=sample['assignmentScoreWithoutPrecursor']
+        return (full is None or full>=minimum) and (without is None or without>=minimum_without_precursor)
+    result={}
+    for field,directory in (('train',payload.get('trainDir')),('validation',payload.get('valDir'))):
+        if not directory: continue
+        directory=Path(directory)
+        try: stats=json.loads((directory/'action_statistics.json').read_text())
+        except (OSError,json.JSONDecodeError): stats={}
+        samples=filtered=0
+        for file in sorted(directory.rglob('*.preft.pt')):
+            annotations=torch.load(file,map_location='cpu',weights_only=False)['structure'].sample_annotations
+            samples+=len(annotations)
+            filtered+=sum(1 for sample in annotations if passes(sample))
+        result[field]=dict(rawRecords=stats.get('num_metadata_valid_records'),samples=samples,filteredSamples=filtered)
+    return result
 
 def mol_smiles(payload):
     from rdkit import Chem, rdBase
@@ -257,7 +286,7 @@ def main():
     request=json.loads(sys.stdin.read())
     try:
         with contextlib.redirect_stdout(sys.stderr):
-            result={'mol-smiles':mol_smiles,'mol-preflight':mol_preflight,'training-sources':training_sources,'training-checkpoint':training_checkpoint,'structure-manifest':structure_manifest,'columns':columns,'preview':preview,'validate':validate,'validate-config':lambda payload:validate(payload,check_datasets=False),'model':model}[request['command']](request['payload'])
+            result={'mol-smiles':mol_smiles,'mol-preflight':mol_preflight,'training-sources':training_sources,'training-checkpoint':training_checkpoint,'training-assignment-score-counts':training_assignment_score_counts,'structure-manifest':structure_manifest,'columns':columns,'preview':preview,'validate':validate,'validate-config':lambda payload:validate(payload,check_datasets=False),'model':model}[request['command']](request['payload'])
         print(json.dumps({'ok':True,'result':result},allow_nan=False))
     except Exception as error:
         import traceback

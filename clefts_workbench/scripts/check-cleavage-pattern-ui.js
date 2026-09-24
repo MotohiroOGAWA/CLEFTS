@@ -15,8 +15,8 @@ const dom=new JSDOM(extension.workbenchHtml({modelConfig:preset},{modelConfig:pr
   assert.equal(nav.closest('details').querySelector('summary span').textContent,'Data');
   nav.click();assert(!d.getElementById('cleavageApp').hidden);assert(d.getElementById('form').hidden);
   assert(!d.getElementById('cleavageEmpty').hidden);
-  d.querySelector('#navigationRail [data-page=data]').click();d.getElementById('dataEditCleavagePatterns').click();
-  assert(!d.getElementById('cleavageApp').hidden);assert(nav.classList.contains('active'));
+  d.querySelector('#navigationRail [data-page=data]').click();const cleavageDetails=[...d.querySelectorAll('#dataParameterEditor [data-model-block=fragmenter_params]>details')].find(item=>item.querySelector('summary')?.textContent.startsWith('Cleavage Pattern Set ·'));assert(cleavageDetails);cleavageDetails.open=true;cleavageDetails.dispatchEvent(new w.Event('toggle'));
+  assert(!d.getElementById('cleavageApp').hidden);assert(!d.getElementById('form').hidden);assert(d.querySelector('#navigationRail [data-page=data]').classList.contains('active'));
   const original=preset.fragmenter_params.fragment_ion_tree_builder.cleavage_pattern_set.patterns.length;
   assert.equal(d.querySelectorAll('#cleavagePatterns .pattern-card').length,original);
   d.getElementById('addCleavagePattern').click();const index=original;assert.equal(d.activeElement.dataset.pattern,String(index));assert.equal(w.lastScrollTarget,d.activeElement.closest('.pattern-card'));
@@ -28,14 +28,13 @@ const dom=new JSDOM(extension.workbenchHtml({modelConfig:preset},{modelConfig:pr
   input('[data-pattern="'+index+'"][data-product="0"][data-key=smarts]','[#6:1]');
   d.getElementById('saveCleavage').click();assert.equal(messages.at(-1).type,'saveCleavagePatternSet');
   assert.equal(messages.at(-1).value.cleavage_pattern_set.patterns[index].name,'added_carbon_oxygen');
-  d.getElementById('applyParameterPatterns').click();assert(!d.getElementById('form').hidden);
   const config=w.eval('getConfig()'),added=config.fragmenterParams.fragment_ion_tree_builder.cleavage_pattern_set.patterns[index];
   assert.equal(config.fragmenterParams.fragment_ion_tree_builder.cleavage_pattern_set.patterns.length,original+1);
   assert.deepEqual(JSON.parse(JSON.stringify(added)),{name:'added_carbon_oxygen',reactant_smarts:'[#6:1]-[#8:2]',products:[{name:'carbon',smarts:'[#6:1]'}]});
   const args=extension.buildArgs(config);assert.deepEqual(JSON.parse(args[args.indexOf('--params-json')+1]).fragment_ion_tree_builder.cleavage_pattern_set.patterns[index],JSON.parse(JSON.stringify(added)));
   assert.equal(preset.fragmenter_params.fragment_ion_tree_builder.cleavage_pattern_set.patterns.length,original);
-  d.getElementById('dataAddVisualPattern').click();assert(!d.getElementById('visualBuilder').hidden);assert.equal(d.activeElement.id,'builderSmiles');assert.equal(d.getElementById('builderSourceType').value,'smiles');
-  assert(!d.getElementById('applyParameterPatterns').hidden);
+  d.getElementById('addVisualPattern').click();assert(!d.getElementById('visualBuilder').hidden);assert.equal(d.activeElement.id,'builderSmiles');assert.equal(d.getElementById('builderSourceType').value,'smiles');
+  assert(d.getElementById('applyParameterPatterns').hidden);
   const graph={atoms:[{index:0,x:0,y:0,symbol:'C'},{index:1,x:1,y:1,symbol:'O'}],bonds:[{index:0,begin:0,end:1,order:1}]};
   const drawing=d.getElementById('drawMolecule').onclick(),request=messages.at(-1);
   post({type:'chemistryResult',requestId:request.requestId,result:graph});await drawing;
@@ -213,11 +212,12 @@ const dom=new JSDOM(extension.workbenchHtml({modelConfig:preset},{modelConfig:pr
  const filename=require.resolve('../src/extension'),compiled=new Module(filename,module);compiled.filename=filename;compiled.paths=module.paths;
  compiled._compile(fs.readFileSync(filename,'utf8')+'\nmodule.exports.readCleavageImport=readCleavageImport;module.exports.cleavagePatternSetSavePath=cleavagePatternSetSavePath;',filename);
  const savePath=compiled.exports.cleavagePatternSetSavePath;
- assert.equal(savePath('my_set'),'my_set.clevageset.json');
- assert.equal(savePath('新しいセット','/tmp/old.clevageset.json'),'/tmp/新しいセット.clevageset.json');
- assert.equal(savePath('a/b:c'),'a_b_c.clevageset.json');
- assert.equal(savePath('   '),'patterns.clevageset.json');
- assert.equal(savePath('named.clevageset.json'),'named.clevageset.json');
+ assert.equal(savePath('my_set'),'my_set.clevageset.pft');
+ assert.equal(savePath('新しいセット','/tmp/old.clevageset.json'),'/tmp/新しいセット.clevageset.pft');
+ assert.equal(savePath('a/b:c'),'a_b_c.clevageset.pft');
+ assert.equal(savePath('   '),'patterns.clevageset.pft');
+ // A name that already carries the current suffix round-trips as-is.
+ assert.equal(savePath('named.clevageset.pft'),'named.clevageset.pft');
  const root=fs.mkdtempSync(path.join(os.tmpdir(),'clefts-pattern-import-'));
  try{
   const file=path.join(root,'set.clevageset.json'),value={cleavage_pattern_set:{name:'imported_set',patterns:[]}};

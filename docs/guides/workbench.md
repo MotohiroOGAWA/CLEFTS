@@ -14,6 +14,8 @@ Quick training requires prepared train/validation structure directories, output,
 
 The tabs are **Input Dataset**, **Fragmentation**, **Assignment**, **Output** and **Run**. Dataset inspection displays file size, record counts, unique SMILES, adduct distribution and bounded record/spectrum previews. Column validation checks train and validation datasets. When validation input is omitted, select the unique-SMILES split ratio and seed.
 
+On **Fragmentation**, the compact right-aligned **Load** / **Save** row directly below the tabs manages the fragmenter config only and also accepts drag-and-drop. It does not accept model configuration JSON.
+
 The fixed bottom-right **Run** button is always clickable. Clicking it checks dataset validation and required settings; red text explains any unmet requirements and processing does not start. Clicking during an active job also displays a message and prevents duplicate runs. The backend validates settings again before launching processing.
 
 ## Cleavage patterns
@@ -22,7 +24,22 @@ Open **Data → Cleavage Patterns**, or run **CLEFTS: Edit Cleavage Patterns** f
 
 Import a pattern set or an individual pattern by dropping its JSON file onto the corresponding import control, or click that control to browse. **Save Configuration** exports the complete pattern set; individual entries can also be saved separately. Import errors appear in the editor.
 
-To update a preparation run, open **Training Data → Fragmentation → Cleavage Patterns** and choose **Edit Cleavage Patterns** or **Add Pattern Visually**. The editor starts with that run's current pattern set. After adding, editing or importing patterns, click **Apply Patterns to Parameters** to return to Data Preparation and include the edited set in the preparation configuration. Saving a standalone pattern set does not apply it to a preparation run.
+To update a preparation run, open **Training Data → Fragmentation → Fragmenter Parameters** and expand **Cleavage Pattern Set**. The same complete editor is embedded in place and starts with that run's current pattern set; changes are applied to the preparation configuration immediately. Saving a standalone pattern set is still separate from the current preparation run.
+
+## Fragment ion adduct rules
+
+Open **Data → Adduct Rules**, or run **CLEFTS: Edit Fragment Ion Adduct Rules**. The shared editor manages the rule-set name and each rule's precursor adduct, radical flag, maximum unsaturation, ion shifts, and optional element restrictions. Rules and ion shifts are collapsed initially. Complete sets use `*.adductset.pft`; individual rules use `*.adduct.pft`, and both open in their dedicated CLEFTS custom editor.
+
+The same editor is embedded under the collapsed **Training Data → Fragmentation → Fragmenter Parameters → Fragment Ion Adduct Rule Set** summary. Expanding it edits the current preparation configuration in place without navigating to another tab. **Cleavage Pattern Set** uses its existing shared editor in the same way; both summaries remain collapsed by default.
+
+## Cleavage viewer
+
+Open **Visualization → Cleavage Viewer** to inspect cleavage of one SMILES with the pattern set currently loaded in **Cleavage Patterns**. Select the full set or one pattern and choose either mode:
+
+- **Stepwise actions** first presents **Matched reactions** as reaction centers only, without product-level rows. Select a reaction center to filter **Matched reactants** to its related reactant matches. Selecting one reactant changes only the active reactant—the other related reactants remain visible—and then displays that reactant's product choices. Clicking a highlighted bond selects its reaction center, including every currently valid reaction associated with that bond. Every selected action has its own **Remove** button.
+- **Exhaustive candidates** generates all valid unordered action sets up to **Max actions** and displays their fragments and reaction SMIRKS.
+
+The viewer and **Cleavage Patterns → Reaction Preview** are the same UI instance. The stepwise mask uses the production fragment-tree rules: every action retains every other action's Source match, no two actions change the same Source bond, duplicate/redundant actions are excluded, the retained atom intersection is nonempty, and the action limit is respected. Candidate sets must also produce an RDKit-valid fragment.
 
 ## Mol Training descriptor targets
 
@@ -63,8 +80,8 @@ excluded from these snapshots. You can also edit the three default objects direc
     "normalizeIntensities": true,
     "numWorkers": 4,
     "chunkSize": 1,
-    "maxNode": 10000,
-    "maxEdge": 50000,
+    "maxUniqueFragmentSmiles": 1000,
+    "maxCleavageCombinations": 50000,
     "symbols": ["C", "N", "O", "P", "S"],
     "fragmenterParams": {"mass_tolerance": "0.02Da,10ppm"}
   },
@@ -88,9 +105,9 @@ terminates its worker processes.
 
 ## Fragment Tree Dataset Results
 
-Use the preparation page's top-right **Load Configuration** drop area to select `fragment-tree.pft.json` by clicking or dragging from the filesystem or Explorer. The preparation heading does not display a fixed preset name.
+Use the preparation page's top-right **Load Configuration** drop area to select `fragment-tree.pft` by clicking or dragging from the filesystem or Explorer. The preparation heading does not display a fixed preset name.
 
-The result viewer has a toolbar and light/dark toggle, without a sidebar. Select an output file to inspect its stored fragment trees. **Structure Detail** shows total nodes, edges, transitions, samples, primitive actions and teacher states, with counts for the selected sample. The tree and table display one entry per materialized fragment node, with unique node IDs. In-memory trees without assigned persistent IDs use their local node indices, indicated in the legend. Diamonds mark precursors; orange circles mark EOS nodes.
+The result viewer has a toolbar and light/dark toggle, without a sidebar. Select an output file to inspect its stored fragment trees. **Structure Detail** shows total nodes, edges, transitions, spectra, branch groups, physical-ion candidates, explanations, primitive actions and teacher states. The tree and table display one entry per materialized fragment node, with unique node IDs. In-memory trees without assigned persistent IDs use their local node indices, indicated in the legend. Diamonds mark precursors; orange circles mark terminal branch nodes.
 
 Click a node or its table entry to open a separate molecule panel. Later selections update the same panel. Both molecule views and the tree have zoom controls. Expand a node's **Action sets** to inspect alternative normalized histories. Action links select the corresponding entry in **Action Reference**, which provides cleavage pattern, reactant/reaction and product molecule IDs, query-ordered Source atom maps, retained/discarded atom maps and changed/cut bonds. The mapped Original Source drawing and saved SMARTS definitions provide the reference for these IDs. Click an edge to inspect its source and target nodes, added action and parent/target action sets.
 
@@ -117,8 +134,8 @@ directory. Existing datasets without saved peak records must be regenerated
 to display the peak table and both scores.
 
 
-Open `train_structures/fragment-tree.pft.json` or
-`validation_structures/fragment-tree.pft.json` to view that split independently.
+Open `train_structures/fragment-tree.pft` or
+`validation_structures/fragment-tree.pft` to view that split independently.
 These files also retain the preparation settings for import. The Python
 `preparation_config.json` remains at the output root. A training-only CLI run
 uses `train_structures` as well.

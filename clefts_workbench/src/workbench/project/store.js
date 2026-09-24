@@ -3,7 +3,7 @@ const path = require('path');
 const crypto = require('crypto');
 const SCHEMA = 'clefts.workbench.project';
 const workflows = ['data', 'training', 'prediction', 'molTraining', 'cleavage'];
-const pathFields = new Set(['input','validationInput','trainInput','params','outputDir','batchInput','batchOutputDir','modelPath','trainDir','valDir','resume','initializeFrom','molEncoderCheckpoint','fineTuneCheckpoint','fineTuneResume','fineTunePatternSet','preprocessingCache','trainSmiles','valSmiles','mol_encoder_checkpoint','checkpoint_path']);
+const pathFields = new Set(['input','validationInput','trainInput','params','outputDir','batchInput','batchOutputDir','modelPath','trainDir','valDir','resume','initializeFrom','molEncoderCheckpoint','fineTuneCheckpoint','fineTuneResume','preprocessingCache','trainSmiles','valSmiles','mol_encoder_checkpoint','checkpoint_path']);
 function metadata(root) { return path.join(root, '.clefts'); }
 function atomic(file, value) {
   fs.mkdirSync(path.dirname(file), {recursive:true});

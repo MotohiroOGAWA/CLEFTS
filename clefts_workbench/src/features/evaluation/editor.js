@@ -6,7 +6,10 @@ const { groupedArgs, groupedHtml, groupedClient } = require('./grouped-boxplot')
 const pathDrop = require('../../webview-path-drop');
 
 const VIEW_TYPE = 'clefts.evaluationConfigEditor';
-const CONFIG_SUFFIXES = { column: '.evalcol.json', grouped: '.evalgroup.json' };
+// .pft (not .json) so VS Code's language-icon fallback actually shows the
+// CLEFTS icon: virtually every icon theme already claims plain .json, which
+// always wins over a contributed language icon, but no theme claims .pft.
+const CONFIG_SUFFIXES = { column: '.evalcol.pft', grouped: '.evalgroup.pft' };
 
 function evaluationConfigSuffix(kind) {
   const suffix = CONFIG_SUFFIXES[kind];
@@ -195,11 +198,9 @@ function attach(panel, context, output, projectRoot, initialDocument = null) {
         panel.webview.postMessage({ type: `${message.kind}ConfigSaved`, path: target.fsPath });
         vscode.window.showInformationMessage(`Saved ${path.basename(target.fsPath)}`);
       } else if (message.type === 'loadEvaluationConfig') {
-        const suffix = evaluationConfigSuffix(message.kind);
-        const selected = await vscode.window.showOpenDialog({
-          canSelectMany: false,
-          filters: { 'CLEFTS evaluation configuration': [suffix.slice(1), 'json'] }
-        });
+        // Extension-agnostic: parseEvaluationConfig validates the content
+        // and reports a clear error for the wrong shape, so any filename works.
+        const selected = await vscode.window.showOpenDialog({ canSelectMany: false });
         if (selected && selected[0]) {
           const raw = await vscode.workspace.fs.readFile(selected[0]);
           const config = parseEvaluationConfig(

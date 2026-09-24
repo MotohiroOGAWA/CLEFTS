@@ -15,7 +15,8 @@ const { readRun } = require('../src/features/training-metrics/editor');
       'global_step\tepoch\tsplit\tmetric\tvalue\n' +
       '10\t1\tvalidation\tcosine_similarity@main_adduct:[M+H]+_q10\t0.2\n' +
       '10\t1\tvalidation\tcosine_similarity@main_adduct:[M+H]+_median\t0.3\n' +
-      '10\t1\tvalidation\tcosine_similarity@main_adduct:[M+Na]+_median\t0.5\n');
+      '10\t1\tvalidation\tcosine_similarity@main_adduct:[M+Na]+_median\t0.5\n' +
+      '10\t1\tvalidation\tpeak_recall_top5_mean\t0.6\n');
     const spectrum = { main_adduct:'[M+H]+', collision_energy:20, generated_peaks:[{mz:100,intensity:1,precursor:true}], original_peaks:[{mz:100,intensity:1,precursor:true}] };
     await fs.writeFile(path.join(directory, 'spectrum_validation', 'epoch_1.json'), JSON.stringify({
       summary: { samples: 1 }, spectra: [spectrum], representatives: { cosine_similarity: { q10: { spectrum_index: 0, value: 1, target: 1 } } },
@@ -25,7 +26,7 @@ const { readRun } = require('../src/features/training-metrics/editor');
       completedEpochs: 1, globalStep: 10, updatedAt: 'now', latestValidation: 'spectrum_validation/epoch_1.json',
       datasets: { train: { samples: 2 }, validation: { samples: 1 } }, artifacts: { validationDirectory: 'spectrum_validation' },
     };
-    const reportPath = path.join(directory, 'training.pft.json');
+    const reportPath = path.join(directory, 'training.pft');
     await fs.writeFile(reportPath, JSON.stringify(manifest));
 
     // The click-to-open viewer must be a thin wrapper: no bespoke chart/spectra
@@ -37,9 +38,20 @@ const { readRun } = require('../src/features/training-metrics/editor');
     for (const match of page.matchAll(/<script(?: [^>]*)?>([\s\S]*?)<\/script>/g)) new Function(match[1]);
 
     const posted = [];
+    let webviewState = { reportScroll: { x: 11, y: 640 } }, scrollX = 0, scrollY = 0, restoredScroll = null;
     const dom = new JSDOM(page, {
       runScripts: 'dangerously',
-      beforeParse(window) { window.acquireVsCodeApi = () => ({ getState: () => ({}), setState() {}, postMessage: message => posted.push(message) }); },
+      beforeParse(window) {
+        Object.defineProperty(window, 'scrollX', { get: () => scrollX });
+        Object.defineProperty(window, 'scrollY', { get: () => scrollY });
+        window.scrollTo = (x, y) => { restoredScroll = { x, y }; };
+        window.requestAnimationFrame = callback => { callback(); return 1; };
+        window.acquireVsCodeApi = () => ({
+          getState: () => webviewState,
+          setState: value => { webviewState = value; },
+          postMessage: message => posted.push(message),
+        });
+      },
     });
     try {
       assert.equal(posted.length, 1);
@@ -49,14 +61,24 @@ const { readRun } = require('../src/features/training-metrics/editor');
       // Answer the auto-triggered load the same way training-metrics/editor.js's attach(panel) would.
       const data = await readRun(posted[0].directory);
       dom.window.dispatchEvent(new dom.window.MessageEvent('message', { data: { type: 'metricsData', request: posted[0].request, data } }));
+      await new Promise(resolve => setTimeout(resolve, 0));
 
       assert.equal(dom.window.document.querySelectorAll('#representativeSpectra article').length, 1);
       assert.equal(dom.window.document.querySelector('#representativeSpectra select').value, 'q10');
       assert.match(dom.window.document.getElementById('representativeStatus').textContent, /spectra/);
+      assert.deepEqual(restoredScroll, { x: 11, y: 640 }, 'page refresh must restore the previous viewport after charts render');
+      assert.equal(webviewState.reportScroll, undefined, 'saved viewport must be consumed only once');
+
+      scrollX = 7; scrollY = 930;
+      dom.window.document.getElementById('reportRefresh').click();
+      assert.equal(webviewState.reportScroll.x, 7, 'Refresh must save the horizontal viewport');
+      assert.equal(webviewState.reportScroll.y, 930, 'Refresh must save the vertical viewport');
+      assert.equal(posted.at(-1).type, 'refresh');
 
       dom.window.document.getElementById('metricsAddAll').click();
       const groupHeaders = [...dom.window.document.querySelectorAll('#metricsCharts > div')].filter(node => node.style.textTransform === 'uppercase');
       assert.ok(groupHeaders.some(node => node.textContent === 'Spectrum similarity'), 'expected a Spectrum similarity group header');
+      assert.ok(groupHeaders.some(node => node.textContent === 'Peak assignment (top N)'), 'expected a Peak assignment (top N) group header');
       assert.ok(groupHeaders.some(node => node.textContent === 'Loss'), 'expected a Loss group header');
       assert.ok(groupHeaders.some(node => node.textContent === 'Performance & resources'), 'expected a Performance & resources group header');
 

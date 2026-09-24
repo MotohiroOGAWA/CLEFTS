@@ -117,12 +117,12 @@ assert.throws(() => parseEvaluationConfig(configDocument, 'grouped'), /Expected 
 assert.throws(() => parseEvaluationConfig({ schemaVersion: 1 }, 'column'), /not a supported/);
 const scripts = [...page.matchAll(/<script>([\s\S]*?)<\/script>/g)];
 assert.equal(scripts.length, 3);
-assert.equal(evaluationConfigSuffix('column'), '.evalcol.json');
-assert.equal(evaluationConfigSuffix('grouped'), '.evalgroup.json');
-assert.equal(ensureEvaluationConfigSuffix('/tmp/result.json', 'column'), '/tmp/result.evalcol.json');
-assert.equal(ensureEvaluationConfigSuffix('/tmp/result.evalgroup.json', 'grouped'), '/tmp/result.evalgroup.json');
-assert.equal(ensureEvaluationConfigSuffix('/tmp/result.evalgroup.json', 'column'), '/tmp/result.evalcol.json');
-assert.equal(ensureEvaluationConfigSuffix('/tmp/result.evalcol.json', 'column'), '/tmp/result.evalcol.json');
+assert.equal(evaluationConfigSuffix('column'), '.evalcol.pft');
+assert.equal(evaluationConfigSuffix('grouped'), '.evalgroup.pft');
+assert.equal(ensureEvaluationConfigSuffix('/tmp/result.json', 'column'), '/tmp/result.evalcol.pft');
+assert.equal(ensureEvaluationConfigSuffix('/tmp/result.evalgroup.pft', 'grouped'), '/tmp/result.evalgroup.pft');
+assert.equal(ensureEvaluationConfigSuffix('/tmp/result.evalcol.pft', 'grouped'), '/tmp/result.evalgroup.pft');
+assert.equal(ensureEvaluationConfigSuffix('/tmp/result.evalcol.pft', 'column'), '/tmp/result.evalcol.pft');
 assert.equal(ensureSvgSuffix('/tmp/chart.svg'), '/tmp/chart.svg');
 assert.equal(ensureSvgSuffix('/tmp/chart.SVG'), '/tmp/chart.SVG');
 assert.equal(ensureSvgSuffix('/tmp/chart'), '/tmp/chart.svg');
@@ -130,7 +130,8 @@ assert.match(page, /evaluationConfigOpened/);
 assert.match(page, /evaluationReady/);
 const manifest = require('../package.json');
 const evaluationEditor = manifest.contributes.customEditors.find(item => item.viewType === 'clefts.evaluationConfigEditor');
-assert.deepEqual(evaluationEditor.selector.map(item => item.filenamePattern), ['*.evalcol.json', '*.evalgroup.json']);
+assert.deepEqual(evaluationEditor.selector.map(item => item.filenamePattern),
+  ['*.evalcol.pft', '*.evalgroup.pft', '*.evalcol.json', '*.evalgroup.json']);
 assert.match(fs.readFileSync(require.resolve('../src/extension'), 'utf8'), /evaluation\.register\(context, output, projectRoot\)/);
 const editorSource = fs.readFileSync(require.resolve('../src/features/evaluation/editor'), 'utf8');
 assert.match(editorSource, /CLEFTS_PROGRESS/);

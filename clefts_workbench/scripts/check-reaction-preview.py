@@ -103,4 +103,50 @@ for smiles, patterns in [('not smiles',[split]), ('',[split]), ('CC',[])]:
 
 preview.LIMIT = 2
 assert preview.reaction_preview({'smiles':'CCCC','patterns':[symmetric]})['truncated']
+
+# The Workbench cleavage viewer uses the production Source-anchored action
+# generator and the same unordered compatibility rules as FragmentTreeBuilder.
+preview.LIMIT = 512
+chain_cut = {'name':'Chain cut', 'reactant_smarts':'[#6:1]-[#6:2]',
+             'products':[{'name':'Retain role 1','smarts':'[#6:1]'}]}
+request = {'smiles':'CCCCC', 'patterns':[chain_cut], 'maxActionCount':2, 'mode':'stepwise'}
+exploration = preview.cleavage_explore(request)
+assert len(exploration['actions']) == 8
+assert exploration['availableActionIds'] == list(range(8))
+assert any(action['sourceAtomMaps'] == [2, 1] and action['atoms'] == [1, 0]
+           for action in exploration['actions']), 'query-role order must not be sorted'
+assert all(action['reactionBondMaps'] and action['reactionBonds']
+           for action in exploration['actions']), 'reaction centers must be explicit'
+assert len({tuple(map(tuple, action['reactionBondMaps']))
+            for action in exploration['actions']}) == 4
+selected_id = next(action_id for action_id in exploration['availableActionIds']
+                   if preview.cleavage_explore({**request, 'selectedActionIds':[action_id]})['availableActionIds'])
+selected = preview.cleavage_explore({**request, 'selectedActionIds':[selected_id]})
+assert selected['selectedProduct'] and '<svg' in selected['selectedProduct']['drawing']['svg']
+a = selected['actions'][selected_id]
+for candidate_id in selected['availableActionIds']:
+    b = selected['actions'][candidate_id]
+    assert set(b['sourceAtomMaps']) <= set(a['retainedAtomMaps'])
+    assert set(a['sourceAtomMaps']) <= set(b['retainedAtomMaps'])
+    assert not {tuple(edge) for edge in a['changedBondMaps']} & {tuple(edge) for edge in b['changedBondMaps']}
+generated = preview.cleavage_explore({**request, 'mode':'exhaustive'})
+assert generated['results'] and all(1 <= item['actionCount'] <= 2 for item in generated['results'])
+assert all('<svg' in item['molecule']['drawing']['svg'] for item in generated['results'])
+
+# C-S-P-O regression: after cutting S-P and retaining P-O, S-P is invalid for
+# both reasons (changed-bond overlap and a Source match outside retained atoms).
+both_sides = {'name':'Any single cut', 'reactant_smarts':'[!#1:1]-[!#1:2]',
+              'products':[{'name':'Role 1','smarts':'[!#1:1]'},
+                          {'name':'Role 2','smarts':'[!#1:2]'}]}
+chain_request = {'smiles':'CSPO', 'patterns':[both_sides], 'maxActionCount':3,
+                 'mode':'stepwise'}
+chain = preview.cleavage_explore(chain_request)
+sp = next(action for action in chain['actions']
+          if action['sourceAtomMaps'] == [3, 2] and action['retainedAtomMaps'] == [3, 4])
+after_sp = preview.cleavage_explore({**chain_request, 'selectedActionIds':[sp['id']]})
+remaining_sources = [after_sp['actions'][index]['sourceAtomMaps']
+                     for index in after_sp['availableActionIds']]
+assert remaining_sources == [[3, 4], [4, 3]]
+assert all([2, 3] not in after_sp['actions'][index]['changedBondMaps']
+           for index in after_sp['availableActionIds'])
 print('Direct reaction preview: exact source locations, omitted maps, symmetric assignments, multiple rules, dot-separated products, new bonds, RDKit SVG, validation and limits passed.')

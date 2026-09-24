@@ -12,9 +12,9 @@ from clefts.ml.training.fragment_tree_training.training import (
 class FragmentTreeTrainCommand(CLICommand):
     name = "fragment-tree"
     aliases = ("tree",)
-    help = "Train (or fine-tune) the Source-anchored action fragment-tree model."
+    help = "Train (or fine-tune) the fragment-tree branch and physical-ion model."
     description = (
-        "Train ActionFragmentTreeTrainingModel from schema-v5 .preft.pt structures. "
+        "Train ActionFragmentTreeTrainingModel from prepared .preft.pt tensors. "
         "Pass --fine-tune-checkpoint to expand "
         "a frozen base checkpoint with patterns inherited from the datasets."
     )

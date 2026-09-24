@@ -16,7 +16,6 @@ const parameterService = require('./workbench/parameter-service');
 const workbench = require('./workbench/panel');
 const trainingMetrics = require('./features/training-metrics/editor');
 const trainingReport = require('./features/training-report/view');
-const fineTune = require('./features/fragment-tree-finetune/editor');
 const smartsSearch = require('./features/smarts-search/editor');
 const evaluation = require('./features/evaluation/editor');
 const spectrumPrediction = require('./features/spectrum-prediction/editor');
@@ -26,6 +25,8 @@ const fs = require('fs');
 const path = require('path');
 const { spawn } = require('child_process');
 const cleavagePatternSetEditor = require('./features/cleavage-pattern-set/editor');
+const adductUi = require('./features/adduct-rule-set/ui');
+const adductRuleSetEditor = require('./features/adduct-rule-set/editor');
 const cleavageHost = require('./features/cleavage-pattern-set/host');
 const { projectRoot, isCleftsRoot, runChemistryBackend, showElementPicker, readCleavageImport, safeFileStem, ensureFileSuffix } = cleavageHost;
 
@@ -47,6 +48,7 @@ function activate(context) {
   );
   evaluation.register(context, output, projectRoot);
   cleavagePatternSetEditor.register(context);
+  adductRuleSetEditor.register(context);
   workbench.register(context, output, projectRoot, openWorkbench);
   enableDevelopmentReload(context, output);
 }
@@ -87,10 +89,10 @@ function defaultTrainingConfig(context) {
   const root = projectRoot(context);
   const defaultParams = path.join(root, 'clefts', 'presets', 'spectrum_generator_params', 'source_anchored_pos_model_config.json');
   return workbenchDefaults.workflowDefaults('training',{
-    application: 'fragment-tree-training', modelConfig: {...parameterService.defaults(root),action_model_params:{...parameterService.defaults(root).action_model_params,action_prefilter_threshold_logit:1}}, params: defaultParams, trainDir: '', valDir: '',
+    application: 'fragment-tree-training', modelConfig: parameterService.defaults(root), params: defaultParams, trainDir: '', valDir: '',
     outputDir: '',
-    experimentName: 'exp_main', molEncoderCheckpoint: '', epochs: 1, batchSize: 4, device: 'cuda', maxSamples:128, seed:42, warmupSteps:100, validationIntervalSteps:0, validationFraction:0.1, lrPatience:3, earlyStoppingPatience:10, minLr:0.000001, absoluteIntensityWeight:1, gradientClip:1, lr: 0.0001, dropout: 0.5, resume: '',
-    fineTuneCheckpoint: '', fineTunePatternSet: '', adapterWidth: 8
+    experimentName: 'exp_main', molEncoderCheckpoint: '', epochs: 1, batchSize: 4, device: 'cuda', maxSamples:128, seed:42, warmupSteps:100, validationIntervalSteps:0, validationFraction:0.1, lrPatience:3, earlyStoppingPatience:10, minLr:0.000001, branchWeight:1, negativeWeight:0.2, branchMilTemperature:0.1, intensityWeight:1, gradientClip:1, lr: 0.0001, dropout: 0.5, resume: '', minimumAssignmentScore:0, minimumAssignmentScoreWithoutPrecursor:0,
+    fineTuneCheckpoint: '', adapterWidth: 8
   },root);
 }
 
@@ -101,7 +103,6 @@ function openWorkbench(context, output, initialPage = "home") {
   });
   projects.attach(panel, context, projectRoot);
   smartsSearch.attach(panel, context, projectRoot);
-  fineTune.attach(panel, context, projectRoot, output);
   spectrumPrediction.attach(panel, context, projectRoot, output);
   trainingMetrics.attach(panel);
   workbench.attach(panel, context, projectRoot, output, initialPage);
@@ -124,10 +125,12 @@ function openWorkbench(context, output, initialPage = "home") {
           panel.webview.postMessage({ type: 'picked', form: message.form, field: message.field, value: picked[0].fsPath });
         }
       } else if (message.type === 'saveConfig') {
-        const target = await vscode.window.showSaveDialog({ filters: { 'CLEFTS run configuration': ['pft.json', 'json'] }, defaultUri: vscode.Uri.file('fragment-tree.pft.json') });
+        const target = await vscode.window.showSaveDialog({ filters: { 'CLEFTS run configuration': ['pft'] }, defaultUri: vscode.Uri.file('fragment-tree.pft') });
         if (target) {await fs.promises.writeFile(target.fsPath, JSON.stringify(normalizeConfig(message.config), null, 2) + '\n');projects.record(context,'data',message.config,{label:path.basename(target.fsPath),reason:'exported',sourcePath:target.fsPath,base:projectRoot(context)});}
       } else if (['loadConfig','loadConfigFile','loadConfigJSON'].includes(message.type)) {
-        const picked = message.type==='loadConfigFile'?[vscode.Uri.file(message.path)]:message.type==='loadConfigJSON'?[{fsPath:message.name||'fragment-tree.pft.json'}]:await vscode.window.showOpenDialog({ filters: { 'CLEFTS run configuration': ['pft.json', 'json'] }, canSelectMany: false });
+        // Extension-agnostic: this always loads a data-preparation run
+        // configuration by content (normalizeConfig), so any filename works.
+        const picked = message.type==='loadConfigFile'?[vscode.Uri.file(message.path)]:message.type==='loadConfigJSON'?[{fsPath:message.name||'fragment-tree.pft'}]:await vscode.window.showOpenDialog({ canSelectMany: false });
         if (picked && picked[0]) {
           const config = normalizeConfig(JSON.parse(message.type==='loadConfigJSON'?message.json:await fs.promises.readFile(picked[0].fsPath, 'utf8')));
           if (!config.modelConfig && config.params) config.modelConfig = parameterService.merge(parameterService.defaults(projectRoot(context)), parameterService.unpack(JSON.parse(await fs.promises.readFile(path.resolve(path.dirname(picked[0].fsPath), config.params), 'utf8'))));
@@ -136,13 +139,18 @@ function openWorkbench(context, output, initialPage = "home") {
         }
       } else if (message.type === 'saveTrainingConfig') {
         const target = await vscode.window.showSaveDialog({ filters: { 'CLEFTS training configuration': ['pfttrain.json'] }, defaultUri: vscode.Uri.file('fragment_tree.pfttrain.json') });
-        if (target) {await fs.promises.writeFile(target.fsPath, JSON.stringify(normalizeTrainingConfig(message.config), null, 2) + '\n');projects.record(context,'training',message.config,{label:path.basename(target.fsPath),reason:'exported',sourcePath:target.fsPath,base:projectRoot(context)});}
-      } else if (message.type === 'loadTrainingConfig') {
-        const picked = await vscode.window.showOpenDialog({ filters: { 'CLEFTS training configuration': ['pfttrain.json'] }, canSelectMany: false });
+        if (target) {const config=normalizeTrainingConfig(message.config);await fs.promises.writeFile(target.fsPath, JSON.stringify(config, null, 2) + '\n');projects.record(context,'training',config,{label:path.basename(target.fsPath),reason:'exported',sourcePath:target.fsPath,base:projectRoot(context)});}
+      } else if (['loadTrainingConfig','loadTrainingConfigFile','loadTrainingConfigJSON'].includes(message.type)) {
+        if(message.type==='loadTrainingConfigJSON'&&(typeof message.json!=='string'||message.json.length>2000000))throw new Error('Training configuration is too large or invalid.');
+        if(message.type==='loadTrainingConfigFile'&&(typeof message.path!=='string'||!message.path.trim()))throw new Error('Select a training configuration file.');
+        // Extension-agnostic: this always loads a training run configuration
+        // by content (normalizeTrainingConfig), so any filename works.
+        const picked = message.type==='loadTrainingConfigFile'?[vscode.Uri.file(message.path)]:message.type==='loadTrainingConfigJSON'?[{fsPath:message.name||'fragment_tree.pfttrain.json'}]:await vscode.window.showOpenDialog({ canSelectMany: false });
         if (picked && picked[0]) {
-          const config = JSON.parse(await fs.promises.readFile(picked[0].fsPath, 'utf8'));
-          if(!config.modelConfig && config.params)config.modelConfig=parameterService.merge(parameterService.defaults(projectRoot(context)),parameterService.unpack(JSON.parse(await fs.promises.readFile(path.resolve(path.dirname(picked[0].fsPath),config.params),'utf8'))));
-          panel.webview.postMessage({ type: 'trainingConfig', path: picked[0].fsPath, config: { ...defaultTrainingConfig(context), ...config } });
+          const raw=JSON.parse(message.type==='loadTrainingConfigJSON'?message.json:await fs.promises.readFile(picked[0].fsPath, 'utf8'));
+          if(!raw.modelConfig&&raw.params){if(message.type==='loadTrainingConfigJSON')throw new Error('Dropped training configurations must contain their model settings.');raw.modelConfig=parameterService.merge(parameterService.defaults(projectRoot(context)),parameterService.unpack(JSON.parse(await fs.promises.readFile(path.resolve(path.dirname(picked[0].fsPath),raw.params),'utf8'))));}
+          const config=normalizeTrainingConfig(raw);
+          panel.webview.postMessage({ type: 'trainingConfig', path: message.type==='loadTrainingConfigJSON'?undefined:picked[0].fsPath, config: { ...defaultTrainingConfig(context), ...config } });
         }
       } else if (message.type === 'openResult') {
         await openResultPicker();
@@ -156,9 +164,15 @@ function openWorkbench(context, output, initialPage = "home") {
         await vscode.env.clipboard.writeText(command);
         panel.webview.postMessage({ type: 'status', status: 'idle', text: 'Command copied.', command });
       } else if (message.type === 'run') {
+        const config=normalizeConfig(message.config),root=projectRoot(context),target=path.resolve(root,config.outputDir||'');
+        if(!config.overwrite&&config.outputDir&&fs.existsSync(target)){
+          const choice=await vscode.window.showWarningMessage(`Output directory already exists: ${target}\nOverwrite it before processing?`,{modal:true},'Overwrite');
+          if(choice!=='Overwrite'){panel.webview.postMessage({type:'status',status:'idle',text:'Run cancelled. The output directory was not changed.'});return;}
+          config.overwrite=true;
+        }
         panel.webview.postMessage({type:'status',status:'running',text:'Validating datasets and configuration…'});
-        await workbenchServices.validateRun(context,projectRoot(context),normalizeConfig(message.config));
-        await runFragmentTree(context, output, normalizeConfig(message.config), panel);
+        await workbenchServices.validateRun(context,root,config);
+        await runFragmentTree(context, output, config, panel);
       } else if (message.type === 'copyTrainingCommand') {
         const python = vscode.workspace.getConfiguration('clefts').get('pythonPath', 'python');
         const command = shellDisplay(python, buildTrainingArgs(normalizeTrainingConfig(message.config)));
@@ -177,7 +191,7 @@ function openWorkbench(context, output, initialPage = "home") {
       } else if (message.type === 'saveCleavagePatternSet') {
         const value = cleavagePatternSetEditor.normalizeDocument(message.value);
         const defaultUri = vscode.Uri.file(cleavagePatternSetSavePath(value.cleavage_pattern_set.name, message.path));
-        const selected = await vscode.window.showSaveDialog({ filters: { 'CLEFTS Cleavage Pattern Set': ['json'] }, defaultUri });
+        const selected = await vscode.window.showSaveDialog({ filters: { 'CLEFTS Cleavage Pattern Set': ['pft'] }, defaultUri });
         if (selected) {
           const target = vscode.Uri.file(ensureFileSuffix(selected.fsPath, cleavagePatternSetEditor.FILE_SUFFIX));
           await fs.promises.writeFile(target.fsPath, `${JSON.stringify(value, null, 2)}\n`);
@@ -192,12 +206,25 @@ function openWorkbench(context, output, initialPage = "home") {
         }
       } else if (message.type === 'saveCleavagePattern') {
         const pattern = normalizePattern(message.pattern);
-        const selected = await vscode.window.showSaveDialog({ filters: { 'CLEFTS Cleavage Pattern': ['json'] }, defaultUri: vscode.Uri.file(`${safeFileStem(pattern.name || 'pattern')}.cleavage.json`) });
+        const selected = await vscode.window.showSaveDialog({ filters: { 'CLEFTS Cleavage Pattern': ['pft'] }, defaultUri: vscode.Uri.file(`${safeFileStem(pattern.name || 'pattern')}.cleavage.pft`) });
         if (selected) {
-          const target = vscode.Uri.file(ensureFileSuffix(selected.fsPath, '.cleavage.json', ['.clevage.json']));
+          const target = vscode.Uri.file(ensureFileSuffix(selected.fsPath, '.cleavage.pft', ['.clevage.pft']));
           await fs.promises.writeFile(target.fsPath, `${JSON.stringify(pattern, null, 2)}\n`);
           vscode.window.showInformationMessage(`Saved ${path.basename(target.fsPath)}`);
         }
+      } else if (message.type === 'loadAdductRuleSet' || message.type === 'loadAdductRule') {
+        const source = await readCleavageImport(context, message);
+        if (source) {
+          if (message.type === 'loadAdductRuleSet') panel.webview.postMessage({type:'adductRuleSet',value:adductRuleSetEditor.normalizeDocument(source.value),path:source.path});
+          else panel.webview.postMessage({type:'adductRuleLoaded',rule:adductRuleSetEditor.normalizeRule(source.value),index:message.index,path:source.path});
+        }
+      } else if (message.type === 'saveAdductRuleSet') {
+        const value=adductRuleSetEditor.normalizeDocument(message.value),defaultUri=vscode.Uri.file(cleavageHost.cleavagePatternSetSavePath(value.fragment_ion_adduct_rule_set.name,message.path,adductRuleSetEditor.FILE_SUFFIX));
+        const selected=await vscode.window.showSaveDialog({filters:{'CLEFTS Fragment Ion Adduct Rule Set':['pft']},defaultUri});
+        if(selected){const target=vscode.Uri.file(ensureFileSuffix(selected.fsPath,adductRuleSetEditor.FILE_SUFFIX));await fs.promises.writeFile(target.fsPath,JSON.stringify(value,null,2)+'\n');panel.webview.postMessage({type:'adductRuleSetSaved',path:target.fsPath});vscode.window.showInformationMessage(`Saved ${path.basename(target.fsPath)}`);}
+      } else if (message.type === 'saveAdductRule') {
+        const rule=adductRuleSetEditor.normalizeRule(message.rule),selected=await vscode.window.showSaveDialog({filters:{'CLEFTS Fragment Ion Adduct Rule':['pft']},defaultUri:vscode.Uri.file(safeFileStem(rule.name||'adduct_rule')+adductRuleSetEditor.RULE_SUFFIX)});
+        if(selected){const target=vscode.Uri.file(ensureFileSuffix(selected.fsPath,adductRuleSetEditor.RULE_SUFFIX));await fs.promises.writeFile(target.fsPath,JSON.stringify(rule,null,2)+'\n');vscode.window.showInformationMessage(`Saved ${path.basename(target.fsPath)}`);}
       } else if (message.type === 'selectElements') {
         const elements = await showElementPicker(message.elements);
         if (elements) panel.webview.postMessage({ type: 'elementSelectionResult', requestId: message.requestId, elements });
@@ -221,8 +248,9 @@ function openWorkbench(context, output, initialPage = "home") {
       }
     } catch (error) {
       if (/^(load|save)Cleavage/.test(message.type)) panel.webview.postMessage({ type: 'cleavagePatternError', message: String(error.message || error) });
+      if (/^(load|save)Adduct/.test(message.type)) panel.webview.postMessage({ type: 'adductRuleError', message: String(error.message || error) });
       if (message.type === 'chemistry') panel.webview.postMessage({ type: 'chemistryError', requestId: message.requestId, message: String(error.message || error) });
-      const trainingMessage = ['runTraining', 'copyTrainingCommand', 'saveTrainingConfig', 'loadTrainingConfig'].includes(message.type);
+      const trainingMessage = ['runTraining', 'copyTrainingCommand', 'saveTrainingConfig', 'loadTrainingConfig', 'loadTrainingConfigFile', 'loadTrainingConfigJSON'].includes(message.type);
       panel.webview.postMessage({ type: trainingMessage ? 'trainingStatus' : 'status', status: 'error', text: String(error.message || error) });
       vscode.window.showErrorMessage(`CLEFTS: ${error.message || error}`);
     }
@@ -266,9 +294,11 @@ function normalizeConfig(config) {
     precursor_mz_column:'precursorMzColumn',validation_smiles_column:'validationSmilesColumn',validation_adduct_type_column:'validationAdductTypeColumn',
     validation_collision_energy_column:'validationCollisionEnergyColumn',validation_precursor_mz_column:'validationPrecursorMzColumn',
     minimum_relative_intensity:'minimumRelativeIntensity',normalize_intensities:'normalizeIntensities',
-    num_workers:'numWorkers',chunk_size:'chunkSize',max_node:'maxNode',max_edge:'maxEdge',model_config:'modelConfig'};
+    num_workers:'numWorkers',chunk_size:'chunkSize',max_unique_fragment_smiles:'maxUniqueFragmentSmiles',max_cleavage_combinations:'maxCleavageCombinations',model_config:'modelConfig'};
   for(const [from,to] of Object.entries(aliases)){if(result[from]!==undefined&&result[to]===undefined)result[to]=result[from];delete result[from];}
-  if(result.modelConfig){const model=result.modelConfig.params||result.modelConfig;result.fragmenterParams??=model.fragmenter_params;result.symbols??=model.symbols||model.mol_encoder_params?.symbols;result.maxNode??=model.max_node;result.maxEdge??=model.max_edge;if(result.fragmenterParams)delete result.modelConfig;}
+  // Legacy node/edge limits measured something else; they are dropped, never converted.
+  for(const legacy of ['max_node','max_edge','maxNode','maxEdge'])delete result[legacy];
+  if(result.modelConfig){const model=result.modelConfig.params||result.modelConfig;result.fragmenterParams??=model.fragmenter_params;result.symbols??=model.symbols||model.mol_encoder_params?.symbols;result.maxUniqueFragmentSmiles??=model.max_unique_fragment_smiles;result.maxCleavageCombinations??=model.max_cleavage_combinations;if(result.fragmenterParams)delete result.modelConfig;}
   if(result.validationRatio==null)delete result.validationRatio;
   if(result.validationInput==null)result.validationInput='';
   if (result.modelConfig || result.fragmenterParams) delete result.params;
@@ -277,7 +307,18 @@ function normalizeConfig(config) {
 }
 
 function normalizeTrainingConfig(config) {
-  return { ...config };
+  const result=JSON.parse(JSON.stringify(config||{}));
+  const model=result.modelConfig?.params||result.modelConfig;
+  if(model&&typeof model==='object'&&!Array.isArray(model)){
+    if(!result.molEncoderCheckpoint&&typeof model.mol_encoder_checkpoint==='string')result.molEncoderCheckpoint=model.mol_encoder_checkpoint;
+    result.modelConfig={};
+    for(const key of ['action_model_params','post_model_params'])if(model[key]&&typeof model[key]==='object'&&!Array.isArray(model[key]))result.modelConfig[key]=model[key];
+    if(!Object.keys(result.modelConfig).length)delete result.modelConfig;
+  }
+  for(const key of ['adduct_type_strs','fragmenter_params','mol_encoder_params','symbols'])delete result[key];
+  delete result.params;
+  delete result.initializeFrom;
+  return result;
 }
 
 async function runTraining(context, output, config, panel) {
@@ -285,7 +326,7 @@ async function runTraining(context, output, config, panel) {
   for (const key of ['trainDir', 'valDir', 'outputDir']) {
     if (!config[key]) throw new Error(`${key} is required.`);
   }
-  if (!config.resume && !config.fineTuneCheckpoint && !String(config.molEncoderCheckpoint || config.modelConfig?.mol_encoder_checkpoint || '').trim()) throw new Error('Mol encoder checkpoint is required for new training.');
+  if (!config.resume && !config.fineTuneCheckpoint && !String(config.molEncoderCheckpoint || '').trim()) throw new Error('Mol encoder checkpoint is required for new training.');
   if (config.initializeFrom && (config.resume || config.fineTuneCheckpoint)) throw new Error('Use pretrained weight initialization, resume, or frozen-base expansion separately.');
   const root = projectRoot(context);
   const python = vscode.workspace.getConfiguration('clefts').get('pythonPath', 'python');
@@ -298,9 +339,7 @@ async function runFragmentTree(context, output, config, panel) {
   for (const key of ['input', 'outputDir']) if (!config[key]) throw new Error(`${key} is required.`);
   const root = projectRoot(context);
   const python = vscode.workspace.getConfiguration('clefts').get('pythonPath', 'python');
-  await fs.promises.mkdir(config.outputDir, { recursive: true });
-  await fs.promises.writeFile(path.join(config.outputDir,'preparation_config.json'),JSON.stringify({workbench_config:config},null,2)+'\n');
-  const resultPath = path.join(config.outputDir, 'train_structures', 'fragment-tree.pft.json');
+  const resultPath = path.join(config.outputDir, 'train_structures', 'fragment-tree.pft');
   const args = buildArgs(config);
   const command = shellDisplay(python, args);
   output.clear(); output.show(true); output.appendLine(`$ ${command}`);
@@ -322,14 +361,14 @@ async function runFragmentTree(context, output, config, panel) {
     const status = observed.job.status;
     if (code === 0) {
       for(const split of ['train','validation']){
-        const target=path.join(config.outputDir,split+'_structures','fragment-tree.pft.json');
+        const target=path.join(config.outputDir,split+'_structures','fragment-tree.pft');
         if(!fs.existsSync(target))continue;
         const saved=JSON.parse(await fs.promises.readFile(target,'utf8'));
         await fs.promises.writeFile(target,JSON.stringify({...saved,status:'completed',startedAt,finishedAt:new Date().toISOString(),exitCode:code,command:args},null,2)+'\n');
       }
     }
     panel.webview.postMessage({ type: 'status', status, text: signal ? 'Cancelled.' : code === 0 ? 'Completed.' : `Failed with exit code ${code}.`, resultPath });
-    if (code === 0) {const validationPath=path.join(config.outputDir,'validation_structures','fragment-tree.pft.json');vscode.window.showInformationMessage('CLEFTS fragment tree data preparation completed.', 'Open Train Result',...(fs.existsSync(validationPath)?['Open Validation Result']:[])).then(choice => { if (choice) openResult(vscode.Uri.file(choice==='Open Validation Result'?validationPath:resultPath)); });}
+    if (code === 0) {const validationPath=path.join(config.outputDir,'validation_structures','fragment-tree.pft');vscode.window.showInformationMessage('CLEFTS fragment tree data preparation completed.', 'Open Train Result',...(fs.existsSync(validationPath)?['Open Validation Result']:[])).then(choice => { if (choice) openResult(vscode.Uri.file(choice==='Open Validation Result'?validationPath:resultPath)); });}
   });
 }
 
@@ -339,7 +378,7 @@ function buildArgs(c) {
   if(c.modelConfig || c.fragmenterParams) args.push('--params-json',JSON.stringify(c.modelConfig || c.fragmenterParams));
   else if(c.params) args.push('--params',c.params);
   if(c.symbols)args.push('--symbols-json',JSON.stringify(c.symbols));
-  for(const [key,flag]of Object.entries({maxNode:'--max-node',maxEdge:'--max-edge'}))if(c[key]!==undefined)args.push(flag,String(c[key]));
+  for(const [key,flag]of Object.entries({maxUniqueFragmentSmiles:'--max-unique-fragment-smiles',maxCleavageCombinations:'--max-cleavage-combinations'}))if(c[key]!==undefined)args.push(flag,String(c[key]));
   for(const [key,flag] of Object.entries({smilesColumn:'--smiles-column',adductTypeColumn:'--adduct-type-column',collisionEnergyColumn:'--collision-energy-column',precursorMzColumn:'--precursor-mz-column'}))if(c[key])args.push(flag,c[key]);
   // Only emitted when the validation dataset genuinely needs a different column name than training.
   if(c.validationInput)for(const [key,flag,trainKey] of [['validationSmilesColumn','--validation-smiles-column','smilesColumn'],['validationAdductTypeColumn','--validation-adduct-type-column','adductTypeColumn'],['validationCollisionEnergyColumn','--validation-collision-energy-column','collisionEnergyColumn'],['validationPrecursorMzColumn','--validation-precursor-mz-column','precursorMzColumn']])if(c[key]&&c[key]!==c[trainKey])args.push(flag,c[key]);
@@ -358,10 +397,10 @@ function buildTrainingArgs(c) {
     '--train-dir', c.trainDir, '--val-dir', c.valDir, '--output-dir', c.outputDir,
     '--epochs', String(c.epochs || 1), '--batch-size', String(c.batchSize || 4),
     '--device', c.device || 'cuda', '--lr', String(c.lr ?? 0.0001)];
-  const encoder=c.molEncoderCheckpoint||c.modelConfig?.mol_encoder_checkpoint;
+  const encoder=c.molEncoderCheckpoint;
   if(encoder&&!c.resume&&!c.fineTuneCheckpoint)a.push('--mol-encoder-checkpoint',encoder);
   if(!c.resume&&!c.fineTuneCheckpoint){
-    const sections={action_model_params:{hidden_dim:'action-hidden-dim',condition_dim:'action-condition-dim',num_heads:'action-num-heads',max_roles:'action-max-roles',action_prefilter_top_k:'action-top-k',action_prefilter_max_k:'action-max-k',action_prefilter_threshold_logit:'action-threshold',beam_size:'beam-size',max_decode_steps:'max-decode-steps',state_num_layers:'action-state-layers',prediction_threshold:'branch-threshold'},post_model_params:{hidden_dim:'post-hidden-dim',num_layers:'post-num-layers',num_heads:'post-num-heads',cosine_loss_weight:'post-cosine-loss-weight',ion_loss_weight:'post-ion-loss-weight',ion_prediction_threshold:'post-ion-threshold',intensity_power:'post-intensity-power',precursor_free_loss_weight:'post-precursor-free-weight'}};
+    const sections={action_model_params:{hidden_dim:'action-hidden-dim',branch_main_adduct_dim:'action-main-adduct-dim',num_heads:'action-num-heads',branch_path_threshold:'branch-path-threshold',max_fragment_nodes:'max-fragment-nodes',state_num_layers:'action-state-layers',action_neighborhood_mode:'action-neighborhood-mode',action_neighborhood_max_hop:'action-neighborhood-max-hop'},post_model_params:{hidden_dim:'post-hidden-dim',num_layers:'post-num-layers',num_heads:'post-num-heads',ion_embedding_dim:'ion-embedding-dim',unsaturation_embedding_dim:'unsaturation-embedding-dim',radical_embedding_dim:'radical-embedding-dim',state_hidden_dim:'ion-state-hidden-dim',main_adduct_dim:'main-adduct-embedding-dim',collision_energy_dim:'collision-energy-feature-dim',cosine_loss_weight:'post-cosine-loss-weight',ion_loss_weight:'post-ion-loss-weight',ion_prediction_threshold:'post-ion-threshold',peak_intensity_threshold:'post-peak-intensity-threshold',intensity_power:'post-intensity-power',precursor_free_loss_weight:'post-precursor-free-weight'}};
     for(const [section,flags]of Object.entries(sections))for(const [key,flag]of Object.entries(flags)){const value=c.modelConfig?.[section]?.[key];if(value!==undefined&&value!==null)a.push('--'+flag,String(value));}
   }
   for (const [key, flag] of Object.entries(workbench.trainingFlags)) if (c[key] !== undefined && c[key] !== '') a.push(flag, String(c[key]));
@@ -375,7 +414,10 @@ function buildTrainingArgs(c) {
 
 function shellDisplay(program, args) { return [program, ...args].map(v => /^[A-Za-z0-9_./:=,-]+$/.test(v) ? v : `'${v.replace(/'/g, "'\\''")}'`).join(' '); }
 async function openResultPicker() {
-  const picked = await vscode.window.showOpenDialog({ filters: { 'CLEFTS result': ['pft.json', 'pft', 'clefts-result'] }, canSelectMany: false });
+  // Extension-agnostic: the result viewer renders whatever JSON structure it
+  // finds, so any filename works here too (unlike an Explorer double-click,
+  // which VS Code itself gates by the registered customEditors extensions).
+  const picked = await vscode.window.showOpenDialog({ canSelectMany: false });
   if (picked && picked[0]) openResult(picked[0]);
 }
 function openResult(uri) { return vscode.commands.executeCommand('vscode.openWith', uri, 'clefts.resultViewer'); }
@@ -584,7 +626,7 @@ function datasetStatisticsHtml(stats) {
 }
 
 function manifestTableHtml(manifest, index) {
-  const columns = ['file', 'status', 'smiles', 'num_input_records', 'num_valid_samples', 'rejected_sample_count', 'rejection_log', 'num_teacher_nodes', 'num_positive_transitions', 'num_precursor_candidates', 'max_ms2_depth', 'num_nodes', 'num_edges', 'assignment_score', 'assignment_score_without_precursor'];
+  const columns = ['file', 'status', 'smiles', 'num_input_records', 'num_valid_samples', 'rejected_sample_count', 'rejection_log', 'num_branch_groups', 'num_teacher_nodes', 'num_transition_states', 'num_positive_transitions', 'num_physical_ion_candidates', 'num_ion_explanations', 'max_ms2_depth', 'num_nodes', 'num_edges', 'assignment_score', 'assignment_score_without_precursor', 'num_primitive_actions', 'num_raw_combinations', 'num_compiled_sequences', 'num_rdkit_run_reactants', 'num_generated_fragments', 'num_unique_fragment_smiles', 'skip_category', 'reason'];
   const rows = manifest.rows.map(row => `<tr>${columns.map(column => { const value = row[column] ?? ''; if(column.startsWith('assignment_score')) return `<td data-value="${escapeHtml(value)}" title="Mean per-sample intensity coverage">${value!==''&&Number.isFinite(Number(value))?(Number(value)*100).toFixed(2)+'%':'Unavailable'}</td>`; if(column==='rejection_log'&&!value)return '<td data-value="">—</td>'; if (column === 'file' && value && row.exists) return `<td data-value="${escapeHtml(value)}"><button class="manifest-file" data-open-file="${encodeURIComponent(row.relative)}">${escapeHtml(value)}</button></td>`; if (column === 'file' && value) return `<td data-value="${escapeHtml(value)}"><span>${escapeHtml(value)}</span><small class="missing-file">not generated (${escapeHtml(row.status || 'missing')})</small></td>`; if (column === 'rejection_log' && value) return `<td data-value="${escapeHtml(value)}"><button class="manifest-file" data-open-file="${encodeURIComponent(path.join(manifest.relativeBase || '', value))}">${escapeHtml(value)}</button></td>`; return `<td data-value="${escapeHtml(value)}">${escapeHtml(value)}</td>`; }).join('')}</tr>`).join('');
   return `<div class="manifest-grid" data-manifest-grid="${index}"><h3>${escapeHtml(manifest.directory)}</h3><div class="manifest-controls"><input type="search" data-manifest-search placeholder="Filter all columns…"><label>Rows <select data-page-size><option>20</option><option selected>50</option><option>100</option><option>250</option></select></label><button data-page-prev>Previous</button><span data-page-label></span><button data-page-next>Next</button></div><div class="table-scroll manifest-scroll"><table><thead><tr>${columns.map((column,columnIndex) => `<th class="sortable" data-manifest-sort="${columnIndex}" data-label="${escapeHtml(column)}">${escapeHtml(column)} ↕</th>`).join('')}</tr><tr class="column-filters">${columns.map((column,columnIndex) => `<th><input data-column-filter="${columnIndex}" placeholder="Filter…" aria-label="Filter ${escapeHtml(column)}"></th>`).join('')}</tr></thead><tbody>${rows}</tbody></table></div></div>`;
 }
@@ -626,7 +668,7 @@ const HELP = {
   trainInput: 'Training input MSDataset path. Required.', validationInput: 'Optional validation input MSDataset path.',
   params: 'Fragmenter parameter JSON used for preprocessing. Required.', outputDir: 'Output root directory. Required.',
   symbols: 'Element symbols that define atom-feature columns. Required and immutable for generated data.',
-  maxNode: 'Maximum fragment-tree nodes. Use -1 for no limit.', maxEdge: 'Maximum fragment-tree edges. Use -1 for no limit.',
+  maxUniqueFragmentSmiles: 'Skip a source molecule once its generated fragments exceed this many distinct canonical SMILES (source not counted). Use -1 for no limit.', maxCleavageCombinations: 'Skip a source molecule once its cleavage action search examines more than this many raw action combinations, before RDKit runs them. Use -1 for no limit.',
   smilesColumn: 'Metadata column containing SMILES strings. Default: SMILES.', precursorMzColumn: 'Metadata column containing precursor m/z values. Default: PrecursorMZ.',
   adductTypeColumn: 'Metadata column containing adduct types. Default: AdductType.', collisionEnergyColumn: 'Metadata column containing collision energies. Default: CollisionEnergy.',
   instrumentColumn: 'Optional metadata column containing instrument names. Leave blank when unavailable; for NIST-style data it is commonly InstrumentType.', validationSmilesRatio: 'Target validation SMILES count relative to unique training SMILES. Default: 0.1.',
@@ -643,36 +685,11 @@ const HELP = {
   valDir: 'Directory containing generated validation structures with compatible preprocessing settings.',
   initializeFrom: 'Initialize compatible Source-anchored model weights for fine-tuning with a fresh optimizer.',
   molEncoderCheckpoint: 'Pretrained molecular encoder checkpoint used by FragmentTreeFeatureModel.',
-  conditionAdductEmbeddingDim: 'Width of the learned main-adduct embedding.',
-  conditionCeFeatureDim: 'Fixed feature width produced from collision energy.',
-  conditionCeFcDims: 'Comma-separated hidden widths in the collision-energy MLP.',
-  conditionFeatureDim: 'Output width of the complete spectrum-condition encoder.',
-  conditionFcDims: 'Comma-separated hidden widths used to fuse adduct and collision-energy features.',
-  treeHiddenDim: 'Node representation width in the fragment-tree transformer.',
-  treeNumLayers: 'Number of fragment-tree transformer layers.',
-  treeNumHeads: 'Attention heads used by every fragment-tree transformer layer.',
-  treeMaxDegree: 'Largest node degree represented by the tree positional encoding.',
   dropout: 'Dropout shared by the constructed fragment-tree model.',
-  edgeFeatureDim: 'Width of each structural cleavage-edge representation.',
-  edgeCategoryDim: 'Embedding width for cleavage pattern, reaction, and product IDs.',
-  edgeAttentionHeads: 'Attention heads used while an edge attends to nearby atoms.',
-  attentionMaxGraphDistance: 'Maximum atom-graph distance visible from a cleavage center.',
-  maxEdgesPerDepth: 'Comma-separated inference budgets for successive cleavage depths.',
-  trainingEdgesPerSample: 'Target/path and background candidates proposed per sample before the global step cap.',
-  trainingZeroEdgeFraction: 'Fraction of the per-sample proposal budget reserved for unassigned/background edges.',
   assignmentScoreThreshold: 'Minimum assignment score accepted for training and the filtered validation view. Reads assignment_scores.tsv from each split. Default: 0.8. Validation also evaluates all samples by combining disjoint above- and below-threshold results without repeating inference.',
   maxSamples: 'Maximum spectra packed into one loaded compound batch.',
-  maxEdgesPerStep: 'Hard upper bound on edges receiving expensive atom attention in one optimization step.',
-  maxRetainedEdges: 'Highest-scoring edges retained at each progressive inference stage.',
-  maxEdgesPerTree: 'Per stored tree (shared across every sample that references it), the highest cross-sample-importance edges kept for expensive attention encoding. Applies identically during training and inference; target/positive edges are always favored so the budget cannot silently drop them.',
-  maxNextCleavageCandidates: 'Nodes allowed to produce the next cleavage depth during inference.',
-  edgeConditionInteractionDim: 'Projection width for the edge × spectrum-condition score.',
-  rankingLossWeight: 'Multiplier applied to the absolute edge-ranking loss.',
-  topN: 'Total comparison partners per anchor group/edge, capping tiers 1-3 combined.',
-  nearestLowerPartners: 'Tier 1: nearest lower-intensity partners always compared.',
-  extendedLowerPartners: 'Tier 2: additional farther lower-intensity partners compared after tier 1.',
-  backgroundPartners: 'Tier 3: unassigned/background edges compared after tiers 1-2.',
-  rankingIntensityThreshold: 'Minimum intensity difference required for an ordered comparison (gates tiers 1-2 only).',
+  minimumAssignmentScore: 'Drop a prepared sample at training load time if its assignment score (fraction of matched peak intensity, all peaks) is below this value. Data preparation keeps every sample; this only affects what training actually loads. Use 0 to keep every sample.',
+  minimumAssignmentScoreWithoutPrecursor: 'Drop a prepared sample at training load time if its assignment score excluding the precursor peak is below this value. Use 0 to keep every sample.',
   experimentName: 'Checkpoint experiment directory name.', ckptId: 'Optional checkpoint identifier to resume.',
   batchSize: 'Number of prepared compound batches per optimizer step.', device: 'PyTorch execution device.',
   epochs: 'Number of complete training epochs.', validationIntervalSteps: 'Run validation after this many optimizer steps; use 0 to disable step validation.',
@@ -688,11 +705,12 @@ const HELP = {
 function workbenchHtml(config, trainingConfig, predictionConfig = {}, molConfig = {}) {
   return `<!doctype html><html><head><meta charset="UTF-8"><style>${commonCss()}${formCss()}${trainingCss()}${trainingWorkbench.css()}${molTraining.css()}${pathDrop.css()}${workbench.css()}${parameterEditor.css()}</style></head><body><main>
   ${layout.header()}
-  ${workbench.html()}<nav id="legacyNavigation"><button class="tab" data-app="smarts">SMARTS Search</button><button class="tab" data-app="cleavage">Cleavage Pattern Set</button><button class="tab active" data-app="data">Data Preparation</button><button class="tab" data-app="training">Training</button><button class="tab" data-app="molTraining">Mol Training</button><button class="tab" data-app="metrics">Metrics</button><button class="tab" data-app="finetune">Fine-tuning</button><button class="tab" data-app="predict">Predict Spectrum</button></nav>
+  ${workbench.html()}<nav id="legacyNavigation"><button class="tab" data-app="smarts">SMARTS Search</button><button class="tab" data-app="cleavageViewer">Cleavage Viewer</button><button class="tab" data-app="cleavage">Cleavage Pattern Set</button><button class="tab" data-app="adduct">Adduct Rule Set</button><button class="tab active" data-app="data">Data Preparation</button><button class="tab" data-app="training">Training</button><button class="tab" data-app="molTraining">Mol Training</button><button class="tab" data-app="metrics">Metrics</button><button class="tab" data-app="predict">Predict Spectrum</button></nav>
   ${trainingMetrics.html()}
-  ${fineTune.html()}
   ${smartsSearch.html()}
-  ${cleavageUi.html()}
+  <div id="cleavageViewerApp" data-app-panel="cleavageViewer" hidden><section><div class="section-title"><div><h2>Single-SMILES Cleavage Viewer</h2><p class="muted">Use the patterns currently loaded in Cleavage Patterns. Enumerate valid simultaneous action sets or add compatible actions interactively.</p></div><button type="button" id="cleavageViewerLoadPatterns">Load Pattern Set</button></div></section><div id="cleavageViewerMount"></div></div>
+  <div id="cleavagePageMount">${cleavageUi.html()}</div>
+  <div id="adductPageMount">${adductUi.html()}</div>
   ${preparation.html()}
   ${trainingWorkbench.html({pathField,field,optimization:workbench.trainingHtml(),parameters:parameterEditor.importHtml('training'),defaults:workbenchDefaults.html('training')})}${molTraining.html(molConfig)}
   <form id="predictForm" data-app-panel="predict" hidden>
@@ -710,8 +728,8 @@ function safeJson(value) { return JSON.stringify(value).replace(/</g, '\\u003c')
 function webviewScript() { return `
     const form=document.getElementById('form'), trainingForm=document.getElementById('trainingForm'), predictForm=document.getElementById('predictForm'), statusEl=document.getElementById('status'), stop=document.getElementById('stop'),trainingStatusEl=document.getElementById('trainingStatus'),trainingStop=document.getElementById('trainingStop');
     ${cleavageUi.state()}
+    ${adductUi.state()}
     ${trainingMetrics.script()}
-    ${fineTune.script()}
     ${smartsSearch.script()}
     const htmlEscape=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
     function setFormConfig(target,c){for(const [k,v] of Object.entries(c)){const el=target.elements[k];if(!el)continue;if(el.type==='checkbox')el.checked=!!v;else el.value=Array.isArray(v)?v.join(target===trainingForm?',':' '):v??'';}}
@@ -723,9 +741,12 @@ function webviewScript() { return `
     const tooltip=document.getElementById('helpTooltip'); let tooltipTimer;
     document.querySelectorAll('[data-help]').forEach(el=>{el.addEventListener('mouseenter',()=>{tooltipTimer=setTimeout(()=>{const r=el.getBoundingClientRect();tooltip.textContent=el.dataset.help;tooltip.style.left=Math.min(r.left,window.innerWidth-390)+'px';tooltip.style.top=(r.bottom+7)+'px';tooltip.classList.add('visible');},500);});el.addEventListener('mouseleave',()=>{clearTimeout(tooltipTimer);tooltip.classList.remove('visible');});});
     setConfig(initial);setFormConfig(trainingForm,initialTraining);setFormConfig(predictForm,initialPrediction);if(initialPrediction.adductType)predictForm.elements.adductType.dataset.restoreValue=initialPrediction.adductType;setPredictEnabled(false); document.querySelectorAll('[data-pick]').forEach(b=>b.onclick=()=>vscode.postMessage({type:'pick',form:b.dataset.form||'data',field:b.dataset.pick,kind:b.dataset.kind}));
-    document.querySelectorAll('[data-app]').forEach(button=>button.onclick=()=>{document.querySelectorAll('[data-app]').forEach(x=>x.classList.toggle('active',x===button));const app=button.dataset.app;document.getElementById('homePage').hidden=true;document.getElementById('jobPage').hidden=true;document.getElementById('environmentPage').hidden=true;document.getElementById('metricsApp').hidden=app!=='metrics';document.getElementById('fineTuneApp').hidden=app!=='finetune';document.getElementById('smartsApp').hidden=app!=='smarts';document.getElementById('cleavageApp').hidden=app!=='cleavage';form.hidden=app!=='data';trainingForm.hidden=app!=='training';document.getElementById('molTrainingForm').hidden=app!=='molTraining';predictForm.hidden=app!=='predict';document.getElementById('dataActions').hidden=app!=='data';document.getElementById('appSubtitle').textContent=app==='metrics'?'Training Metrics':app==='finetune'?'Fragment Tree Fine-tuning':app==='smarts'?'SMARTS Search':app==='cleavage'?'Cleavage Pattern Set Editor':app==='training'?'Fragment Tree Training':app==='molTraining'?'Mol Training':app==='predict'?'Predict Spectrum':'Fragment Tree Data Preparation';});
+    document.querySelectorAll('[data-app]').forEach(button=>button.onclick=()=>{document.querySelectorAll('[data-app]').forEach(x=>x.classList.toggle('active',x===button));const app=button.dataset.app;if(app==='cleavage'){document.getElementById('cleavagePageMount').append(document.getElementById('cleavageApp'));onCleavageChange=()=>{};}if(app==='adduct'){document.getElementById('adductPageMount').append(document.getElementById('adductApp'));onAdductChange=()=>{};}document.getElementById('homePage').hidden=true;document.getElementById('jobPage').hidden=true;document.getElementById('environmentPage').hidden=true;document.getElementById('metricsApp').hidden=app!=='metrics';document.getElementById('smartsApp').hidden=app!=='smarts';document.getElementById('cleavageViewerApp').hidden=app!=='cleavageViewer';document.getElementById('cleavageApp').hidden=app!=='cleavage';document.getElementById('adductApp').hidden=app!=='adduct';form.hidden=app!=='data';trainingForm.hidden=app!=='training';document.getElementById('molTrainingForm').hidden=app!=='molTraining';predictForm.hidden=app!=='predict';document.getElementById('dataActions').hidden=app!=='data';document.getElementById('appSubtitle').textContent=app==='metrics'?'Training Metrics':app==='smarts'?'SMARTS Search':app==='cleavageViewer'?'Cleavage Viewer':app==='cleavage'?'Cleavage Pattern Set Editor':app==='adduct'?'Fragment Ion Adduct Rule Set Editor':app==='training'?'Fragment Tree Training':app==='molTraining'?'Mol Training':app==='predict'?'Predict Spectrum':'Fragment Tree Data Preparation';if(app==='cleavageViewer')window.dispatchEvent(new Event('cleavageViewer/open'));});
+    document.getElementById('cleavageViewerLoadPatterns').onclick=()=>vscode.postMessage({type:'loadCleavagePatternSet'});
     document.getElementById('save').onclick=()=>vscode.postMessage({type:'saveConfig',config:getConfig()}); document.getElementById('load').onclick=()=>vscode.postMessage({type:'loadConfig'}); document.getElementById('openResult').onclick=()=>vscode.postMessage({type:'openResult'}); document.getElementById('openEvaluation').onclick=()=>vscode.postMessage({type:'openEvaluation'});
     ${cleavageUi.script()}
+    ${adductUi.script()}
+    const initialAdductSet=initial.modelConfig?.fragmenter_params?.fragment_ion_tree_builder?.fragment_ion_adduct_rule_set;if(initialAdductSet)window.dispatchEvent(new MessageEvent('message',{data:{type:'adductRuleSet',value:{fragment_ion_adduct_rule_set:JSON.parse(JSON.stringify(initialAdductSet))},path:''}}));
     form.onsubmit=e=>{e.preventDefault();vscode.postMessage({type:'run',config:getConfig()});}; document.getElementById('copyCommand').onclick=()=>vscode.postMessage({type:'copyCommand',config:getConfig()}); stop.onclick=()=>vscode.postMessage({type:'stop'});
     trainingForm.onsubmit=e=>{e.preventDefault();vscode.postMessage({type:'runTraining',config:getTrainingConfig()})};document.getElementById('trainingCopyCommand').onclick=()=>vscode.postMessage({type:'copyTrainingCommand',config:getTrainingConfig()});trainingStop.onclick=()=>vscode.postMessage({type:'stop'});document.getElementById('saveTraining').onclick=()=>vscode.postMessage({type:'saveTrainingConfig',config:getTrainingConfig()});document.getElementById('loadTraining').onclick=()=>vscode.postMessage({type:'loadTrainingConfig'});
     let predictSequence=0,predictWaiters=new Map(),predictListSequence=0,predictListWaiters=new Map();

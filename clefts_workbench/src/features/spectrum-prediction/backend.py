@@ -158,6 +158,7 @@ def predict(request: dict[str, Any]) -> dict[str, Any]:
     if not result.spectra.mz.numel():
         raise ValueError("The model did not produce any peaks for this input.")
     threshold = generator.post_model.ion_prediction_threshold
+    intensity_threshold = generator.post_model.peak_intensity_threshold
     peaks = sorted(
         (
             {
@@ -175,12 +176,12 @@ def predict(request: dict[str, Any]) -> dict[str, Any]:
             # Below the trained ion confidence threshold: the same unrelated
             # adduct/hydrogen-shift candidate this model now learns to push
             # toward zero, kept out of the predicted spectrum shown here.
-            if confidence >= threshold
+            if confidence >= threshold and intensity >= intensity_threshold
         ),
         key=lambda peak: peak["mz"],
     )
     if not peaks:
-        raise ValueError("Every candidate peak was below the model's ion confidence threshold.")
+        raise ValueError("Every candidate peak was below the model's inference thresholds.")
     tree = _build_tree(result, sample=0, tensorizer=generator.tensorizer, threshold=threshold)
 
     rdDepictor.Compute2DCoords(mol)

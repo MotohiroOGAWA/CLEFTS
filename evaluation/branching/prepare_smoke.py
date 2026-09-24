@@ -6,14 +6,14 @@ import torch
 from clefts.libs.msentity.msentity import MSDataset
 from clefts.ml.data_preparation.fragment_tree.create_training_data import main
 
-root=Path('data/train_preprocessing/test/branching_v6_verification')
+root=Path('data/train_preprocessing/test/fragment_tree_redesign_verification')
 root.mkdir(parents=True,exist_ok=True)
 original=json.loads(Path('data/train_preprocessing/test/preparation_config.json').read_text())
 config=original['model_config']
 encoder=Path('data/training/mol_projects/main/mol_encoder_pretrained.pt').resolve()
 config['mol_encoder_params']=torch.load(encoder,map_location='cpu',weights_only=False)['mol_encoder_params']
-config['architecture']='source-anchored-branching-v1'
-config['action_model_params'].update(hidden_dim=32,condition_dim=32,action_prefilter_top_k=64,action_prefilter_max_k=128,beam_size=32,max_decode_steps=3,prediction_threshold=.5)
+config['architecture']='fragment-tree-physical-ion'
+config['action_model_params'].update(hidden_dim=32,branch_main_adduct_dim=32,branch_path_threshold=0,max_fragment_nodes=100)
 config['post_model_params'].update(hidden_dim=32,num_layers=1,num_heads=4)
 used=set();provenance={}
 for key,name,limit in [('input','train',8),('validation_input','validation',4)]:
@@ -36,6 +36,8 @@ for key,name,limit in [('input','train',8),('validation_input','validation',4)]:
 (root/'model_config.json').write_text(json.dumps(config,indent=2))
 main(['--input',str(root/'train.msds'),'--validation-input',str(root/'validation.msds'),
       '--output-dir',str(root/'prepared'),'--params-json',json.dumps(config),
-      '--validation-ratio','0.5','--num-workers','1','--max-node',str(original['max_node']),
-      '--max-edge',str(original['max_edge']),'--normalize-intensities','1','--overwrite','1'])
+      '--validation-ratio','0.5','--num-workers','1',
+      # Older configurations only saved max_node/max_edge, whose meaning differs; those run unlimited.
+      '--max-unique-fragment-smiles',str(original.get('max_unique_fragment_smiles',-1)),
+      '--max-cleavage-combinations',str(original.get('max_cleavage_combinations',-1)),'--normalize-intensities','1','--overwrite','1'])
 (root/'encoder_path.txt').write_text(str(encoder))

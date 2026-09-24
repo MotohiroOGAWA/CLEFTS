@@ -1,6 +1,7 @@
-"""Regenerate schema-v6 branching teachers directly from original MSDataset."""
+"""Prepare CE-independent branch groups and physical-ion tensors."""
 from __future__ import annotations
-import argparse,json,math,sys,os,pickle,tempfile,shutil,csv
+import argparse,json,math,sys,os,pickle,tempfile,shutil,csv,traceback
+from collections import Counter
 from itertools import islice
 from pathlib import Path
 from tqdm import tqdm
@@ -17,6 +18,15 @@ from clefts.ml.specgen.config_options import configure_model_options, resolve_mo
 from .datasets import load_spectrum_dataset, split_by_smiles, dedupe_validation
 from .record_validation import inspect_records
 
+# Fragment-tree search statistics copied from each source's search_stats into
+# manifest.tsv (see README.md for their meaning).
+SEARCH_STAT_FIELDS=('num_primitive_actions','num_raw_combinations','num_compiled_sequences',
+                    'num_rdkit_run_reactants','num_generated_fragments','num_unique_fragment_smiles')
+# Why a source was skipped: a configured search limit, an unreachable
+# precursor, any other exception while preparing it, or its worker process dying.
+SKIP_LIMIT_EXCEEDED='limit_exceeded';SKIP_UNRESOLVED_PRECURSOR='unresolved_precursor'
+SKIP_ERROR='error';SKIP_WORKER_CRASH='worker_crash'
+
 
 def _reset_output(output, overwrite, protected_paths=()):
     output=Path(output).resolve()
@@ -26,6 +36,22 @@ def _reset_output(output, overwrite, protected_paths=()):
                 raise ValueError('Output directory contains input or application files; choose a separate output directory.')
         shutil.rmtree(output)
     output.mkdir(parents=True,exist_ok=True)
+
+
+def _confirm_existing_output(args):
+    output = Path(args.output_dir).resolve()
+    if args.overwrite or not output.exists():
+        return
+    if not output.is_dir():
+        raise FileExistsError(f'Output path already exists and is not a directory: {output}')
+    message = f'Output directory already exists: {output}'
+    if sys.stdin.isatty():
+        answer = input(message + '\nOverwrite it before processing? [y/N] ').strip().lower()
+        if answer in ('y', 'yes'):
+            args.overwrite = 1
+            return
+        raise FileExistsError('Cancelled because the output directory already exists.')
+    raise FileExistsError(message + '. Re-run with --overwrite 1 or choose another directory.')
 
 
 def _prepare_group(task, builder, options):
@@ -54,42 +80,79 @@ def _prepare_group(task, builder, options):
     kept_rows=[rows[index] for index in kept]
     path=output/'data'/(make_structure_file_stem(smiles,index=tree)+'.preft.pt')
     save_fragment_tree_structure(structure=structure,output_file=path,metadata=dict(smiles=smiles,record_indexes=kept_rows,sample_annotations=structure.sample_annotations))
-    return path,kept_rows,structure.sample_annotations,structure_manifest_fields(structure)
+    return path,kept_rows,structure.sample_annotations,structure_manifest_fields(structure),builder.last_search_stats
+
+
+def _skipped(task, category, reason, search_stats, **extra):
+    return dict(skipped=dict(source_index=task[0],smiles=task[1],record_indexes=task[2],reason=reason,
+                             category=category,search_stats=search_stats,**extra))
 
 
 def _prepare_group_safely(task, builder, options):
+    # Cleared here as well as in build(): an error raised before the tree
+    # search must not report the previous source's statistics.
+    builder.last_search_stats=None
     try:
-        path,kept_rows,annotations,summary=_prepare_group(task,builder,options)
+        path,kept_rows,annotations,summary,search_stats=_prepare_group(task,builder,options)
         scores=[dict(structure_file=path.name,sample_index=index,record_index=record_index,
                      assignment_score=sample['assignmentScore'],assignment_score_without_precursor=sample['assignmentScoreWithoutPrecursor'])
                 for index,(record_index,sample) in enumerate(zip(kept_rows,annotations))]
         rejected=len(task[2])-len(kept_rows)
         reason=f'{rejected} of {len(task[2])} records dropped: unresolved precursor action sequence' if rejected else ''
         return dict(path=path,record_count=len(kept_rows),input_record_count=len(task[2]),rejected_record_count=rejected,
-                    smiles=task[1],record_indexes=kept_rows,assignment_scores=scores,summary=summary,reason=reason)
-    except (FragmentTreeLimitExceeded,UnresolvedPrecursorError) as error:
-        return dict(skipped=dict(source_index=task[0],smiles=task[1],record_indexes=task[2],reason=str(error)))
+                    smiles=task[1],record_indexes=kept_rows,assignment_scores=scores,summary=summary,reason=reason,
+                    search_stats=search_stats)
+    except FragmentTreeLimitExceeded as error:
+        # Statistics stop at the moment the limit was hit, so they are lower
+        # bounds for the source; the offending one is observed>limit.
+        return _skipped(task,SKIP_LIMIT_EXCEEDED,str(error),error.stats,limit=error.limit_name)
+    except UnresolvedPrecursorError as error:
+        return _skipped(task,SKIP_UNRESOLVED_PRECURSOR,str(error),builder.last_search_stats)
+    except Exception as error:
+        # One malformed or unsupported molecule must not abort a whole
+        # (possibly hours-long) run: record it as skipped, with the traceback
+        # kept in skipped_sources.json for diagnosis, and carry on.
+        return _skipped(task,SKIP_ERROR,f'{type(error).__name__}: {error}',builder.last_search_stats,
+                        error=traceback.format_exc())
+
+
+def _search_maxima(completed_search_stats):
+    """Largest search statistic over completed sources, with the SMILES that reached it.
+
+    num_X becomes max_X (num_unique_fragment_smiles becomes
+    max_observed_unique_fragment_smiles, so it cannot be mistaken for the
+    max_unique_fragment_smiles limit). Ties keep the lexicographically
+    smallest SMILES, so the result does not depend on worker completion order.
+    """
+    result={}
+    ordered=sorted(completed_search_stats,key=lambda item:item[0])
+    for field in SEARCH_STAT_FIELDS:
+        key='max_observed_unique_fragment_smiles' if field=='num_unique_fragment_smiles' else 'max_'+field[len('num_'):]
+        best=max(((stats[field],smiles) for smiles,stats in ordered if stats.get(field) is not None),key=lambda item:item[0],default=(None,None))
+        result[key]=best[0];result[key+'_smiles']=best[1]
+    return result
 
 
 def create_action_training_data(*, dataset: MSDataset, model_config: dict, output_dir: str | Path,
                                 smiles_column: str = 'SMILES', adduct_type_column: str = 'AdductType',
                                 collision_energy_column: str = 'CollisionEnergy', precursor_mz_column: str = 'PrecursorMZ',
                                 minimum_relative_intensity: float = 0.0, normalize_intensities: bool = True,
-                                overwrite: bool = True, split: str = 'dataset', max_node: int = -1, max_edge: int = -1, num_workers: int = 1, chunk_size: int = 1, preparation_config: dict | None = None,
+                                overwrite: bool = True, split: str = 'dataset', max_unique_fragment_smiles: int = -1, max_cleavage_combinations: int = -1, num_workers: int = 1, chunk_size: int = 1, preparation_config: dict | None = None,
                                 _check_existing: bool = True) -> list[Path]:
     if not math.isfinite(minimum_relative_intensity) or not 0<=minimum_relative_intensity<=1:
         raise ValueError('Minimum relative intensity must be between 0 and 1.')
-    validate_limits(max_node,max_edge)
+    validate_limits(max_unique_fragment_smiles,max_cleavage_combinations)
     if type(num_workers) is not int or num_workers<1 or type(chunk_size) is not int or chunk_size<1:
         raise ValueError('Worker processes and chunk size must be positive integers.')
     inspection=inspect_records(dataset,create_preparation_context(model_config).fragmenter,
         dict(smilesColumn=smiles_column,adductTypeColumn=adduct_type_column,
-             collisionEnergyColumn=collision_energy_column,precursorMzColumn=precursor_mz_column))
+             collisionEnergyColumn=collision_energy_column,precursorMzColumn=precursor_mz_column),symbols=model_config['mol_encoder_params']['symbols'])
     original_rows=inspection['validIndexes']
     dataset=dataset[original_rows]
     if not len(dataset): raise ValueError('The dataset contains no valid records to prepare.')
     generator=create_preparation_context(model_config,observed_adducts=dataset[adduct_type_column].unique())
-    builder=ActionStructureBuilder(generator,max_node=max_node,max_edge=max_edge)
+    builder=ActionStructureBuilder(generator,max_unique_fragment_smiles=max_unique_fragment_smiles,
+                                   max_cleavage_combinations=max_cleavage_combinations)
     grouped={}
     for index,smiles in enumerate(dataset[smiles_column].tolist()):grouped.setdefault(str(smiles),[]).append(index)
     output=Path(output_dir)
@@ -106,12 +169,15 @@ def create_action_training_data(*, dataset: MSDataset, model_config: dict, outpu
     (output/'invalid_records.json').write_text(json.dumps(inspection['invalidRecords'],indent=2))
     options=dict(output_dir=str(output),adduct_type_column=adduct_type_column,collision_energy_column=collision_energy_column,
         precursor_mz_column=precursor_mz_column,minimum_relative_intensity=minimum_relative_intensity,
-        normalize_intensities=normalize_intensities,max_node=max_node,max_edge=max_edge)
+        normalize_intensities=normalize_intensities,max_unique_fragment_smiles=max_unique_fragment_smiles,
+        max_cleavage_combinations=max_cleavage_combinations)
     tasks=((tree,smiles,[original_rows[index] for index in rows],dataset[rows]) for tree,(smiles,rows) in enumerate(grouped.items()))
     if preparation_config is None:
         (output/'preparation_config.json').write_text(json.dumps(dict(split=split,model_config=model_config,
             smiles_column=smiles_column,num_workers=num_workers,chunk_size=chunk_size,overwrite=overwrite,**options),indent=2))
-    files=[];skipped=[];prepared_records=0;manifest_rows=[];score_rows=[]
+    files=[];skipped=[];prepared_records=0;manifest_rows=[];score_rows=[];completed_search_stats=[]
+    def search_fields(stats):
+        return {key:(stats or {}).get(key) for key in SEARCH_STAT_FIELDS}
     completed_sources=0
     def collect_result(result):
         nonlocal prepared_records,completed_sources
@@ -122,12 +188,13 @@ def create_action_training_data(*, dataset: MSDataset, model_config: dict, outpu
         # every skip and completion once the run finishes.
         if 'skipped' in result:
             source=result['skipped']
-            manifest_rows.append(dict(file='',smiles=source['smiles'],record_indexes=json.dumps(source['record_indexes']),num_input_records=len(source['record_indexes']),num_valid_samples=0,rejected_sample_count=len(source['record_indexes']),rejection_log='skipped_sources.json',num_nodes=0,num_edges=0,assignment_score=None,assignment_score_without_precursor=None,status='skipped',reason=source['reason']))
+            manifest_rows.append(dict(file='',smiles=source['smiles'],record_indexes=json.dumps(source['record_indexes']),num_input_records=len(source['record_indexes']),num_valid_samples=0,rejected_sample_count=len(source['record_indexes']),rejection_log='skipped_sources.json',num_nodes=0,num_edges=0,assignment_score=None,assignment_score_without_precursor=None,**search_fields(source.get('search_stats')),status='skipped',skip_category=source.get('category',SKIP_ERROR),reason=source['reason']))
             skipped.append(result['skipped'])
         else:
             files.append(Path(result['path']));prepared_records+=result['record_count']
             score_rows.extend(result['assignment_scores'])
-            manifest_rows.append(dict(file=Path(result['path']).name,smiles=result['smiles'],record_indexes=json.dumps(result['record_indexes']),num_input_records=result['input_record_count'],num_valid_samples=result['record_count'],rejected_sample_count=result['rejected_record_count'],rejection_log='',**result['summary'],status='completed',reason=result['reason']))
+            completed_search_stats.append((result['smiles'],result.get('search_stats') or {}))
+            manifest_rows.append(dict(file=Path(result['path']).name,smiles=result['smiles'],record_indexes=json.dumps(result['record_indexes']),num_input_records=result['input_record_count'],num_valid_samples=result['record_count'],rejected_sample_count=result['rejected_record_count'],rejection_log='',**result['summary'],**search_fields(result.get('search_stats')),status='completed',skip_category='',reason=result['reason']))
 
     if num_workers==1 or len(grouped)<2:
         with tqdm(total=len(grouped),desc=f'Fragment trees ({split})',unit='tree',file=sys.stderr) as progress:
@@ -159,15 +226,40 @@ def create_action_training_data(*, dataset: MSDataset, model_config: dict, outpu
             root=str(Path(__file__).resolve().parents[4])
             env['PYTHONPATH']=os.pathsep.join(filter(None,[root,env.get('PYTHONPATH')]))
             with tqdm(total=total_chunks,desc=f'Fragment trees ({split})',unit='chunk',file=sys.stderr) as progress:
-                def on_complete(command):
-                    result_file=Path(command[command.index('--result')+1])
-                    task_file=Path(command[command.index('--task')+1])
+                worker_module='clefts.ml.data_preparation.fragment_tree.subprocess_worker'
+                def remove_task_files(command):
+                    for flag in ('--task','--result'): Path(command[command.index(flag)+1]).unlink(missing_ok=True)
+                def consume_results(command):
                     try:
-                        for result in json.loads(result_file.read_text()): collect_result(result)
+                        for result in json.loads(Path(command[command.index('--result')+1]).read_text()): collect_result(result)
                     finally:
-                        result_file.unlink(missing_ok=True)
-                        task_file.unlink(missing_ok=True)
+                        remove_task_files(command)
+                def on_complete(command):
+                    consume_results(command)
                     progress.set_postfix(prepared=len(files),skipped=len(skipped),refresh=False)
+                def retry_individually(command):
+                    # The worker process itself died (a Python exception is
+                    # already recorded as skipped by _prepare_group_safely),
+                    # e.g. a native crash or an OOM kill. Re-run each SMILES
+                    # group of the chunk in its own process so that only the
+                    # offending group is skipped, not the whole chunk or run.
+                    task_file=Path(command[command.index('--task')+1])
+                    with task_file.open('rb') as stream: payload=pickle.load(stream)
+                    remove_task_files(command)
+                    singles={}
+                    for position,task in enumerate(payload['tasks']):
+                        single_file=task_file.with_name(f'{task_file.stem}-{position}.pkl')
+                        with single_file.open('wb') as stream:
+                            pickle.dump({**payload,'tasks':[task]},stream,pickle.HIGHEST_PROTOCOL)
+                        singles[str(single_file)]=task
+                    def on_single_error(single_command,error):
+                        remove_task_files(single_command)
+                        tree,smiles,rows,_=singles[single_command[single_command.index('--task')+1]]
+                        collect_result(_skipped((tree,smiles,rows),SKIP_WORKER_CRASH,f'Worker process exited with status {error.returncode}',
+                                                None,error=(error.stderr or '')[-4000:]))
+                    with tqdm(disable=True) as quiet:
+                        run_parallel_subprocesses([[sys.executable,'-m',worker_module,'--task',single,'--result',str(Path(single).with_suffix('.json'))] for single in singles],max_workers=min(num_workers,len(singles)),
+                                                  print_output=False,env=env,on_complete=consume_results,on_error=on_single_error,progress=quiet)
                 task_id=0
                 while True:
                     commands=[]
@@ -179,24 +271,33 @@ def create_action_training_data(*, dataset: MSDataset, model_config: dict, outpu
                         with task_file.open('wb') as stream:
                             pickle.dump(dict(tasks=chunk,model_config=model_config,observed_adducts=generator.adduct_type_strs,
                                              options=options),stream,pickle.HIGHEST_PROTOCOL)
-                        commands.append([sys.executable,'-m','clefts.ml.data_preparation.fragment_tree.subprocess_worker',
-                                         '--task',str(task_file),'--result',str(result_file)])
+                        commands.append([sys.executable,'-m',worker_module,'--task',str(task_file),'--result',str(result_file)])
                     if not commands: break
+                    crashed=[]
                     run_parallel_subprocesses(commands,max_workers=min(num_workers,len(commands)),print_output=False,
-                                              env=env,on_complete=on_complete,progress=progress)
+                                              env=env,on_complete=on_complete,on_error=lambda command,error:crashed.append(command),progress=progress)
+                    for command in crashed: retry_individually(command)
+                    if crashed: progress.set_postfix(prepared=len(files),skipped=len(skipped),refresh=False)
     with (output/'manifest.tsv').open('w',newline='') as stream:
-        writer=csv.DictWriter(stream,fieldnames=['file','smiles','record_indexes','num_input_records','num_valid_samples','rejected_sample_count','rejection_log','num_teacher_nodes','num_positive_transitions','num_precursor_candidates','max_ms2_depth','num_nodes','num_edges','assignment_score','assignment_score_without_precursor','status','reason'],delimiter='\t')
+        writer=csv.DictWriter(stream,fieldnames=['file','smiles','record_indexes','num_input_records','num_valid_samples','rejected_sample_count','rejection_log','num_branch_groups','num_teacher_nodes','num_transition_states','num_positive_transitions','num_physical_ion_candidates','num_ion_explanations','max_ms2_depth','num_nodes','num_edges','assignment_score','assignment_score_without_precursor',*SEARCH_STAT_FIELDS,'status','skip_category','reason'],delimiter='\t')
         writer.writeheader();writer.writerows(sorted(manifest_rows,key=lambda row:row['smiles']))
     with (output/'assignment_scores.tsv').open('w',newline='') as stream:
         writer=csv.DictWriter(stream,fieldnames=['structure_file','sample_index','record_index','assignment_score','assignment_score_without_precursor'],delimiter='\t')
         writer.writeheader();writer.writerows(sorted(score_rows,key=lambda row:(row['structure_file'],row['sample_index'])))
     (output/'skipped_sources.json').write_text(json.dumps(skipped,indent=2))
-    (output/'action_statistics.json').write_text(json.dumps(dict(schema_version=6,fragmentation_schema=generator.architecture,
+    (output/'action_statistics.json').write_text(json.dumps(dict(architecture=generator.architecture,
+        **_search_maxima(completed_search_stats),
+        search_limits=dict(max_unique_fragment_smiles=max_unique_fragment_smiles,max_cleavage_combinations=max_cleavage_combinations),
+        num_skipped_sources_by_category=dict(sorted(Counter(source.get('category',SKIP_ERROR) for source in skipped).items())),
+        num_limit_skipped_sources=dict(sorted(Counter(source['limit'] for source in skipped if source.get('category')==SKIP_LIMIT_EXCEEDED).items())),
         num_teacher_nodes=sum(row.get('num_teacher_nodes',0) or 0 for row in manifest_rows),
         num_positive_transitions=sum(row.get('num_positive_transitions',0) or 0 for row in manifest_rows),
         mean_teacher_nodes_per_sample=sum(row.get('num_teacher_nodes',0) or 0 for row in manifest_rows)/max(prepared_records,1),
         mean_positive_edges_per_sample=sum(row.get('num_positive_transitions',0) or 0 for row in manifest_rows)/max(prepared_records,1),
-        mean_precursor_candidates=sum(row.get('num_precursor_candidates',0) or 0 for row in manifest_rows)/max(prepared_records,1),
+        num_branch_groups=sum(row.get('num_branch_groups',0) or 0 for row in manifest_rows),
+        num_transition_states=sum(row.get('num_transition_states',0) or 0 for row in manifest_rows),
+        num_physical_ion_candidates=sum(row.get('num_physical_ion_candidates',0) or 0 for row in manifest_rows),
+        num_ion_explanations=sum(row.get('num_ion_explanations',0) or 0 for row in manifest_rows),
         max_teacher_ms2_depth=max((row.get('max_ms2_depth',0) or 0 for row in manifest_rows),default=0),
         num_sources=len(files),num_samples=prepared_records,num_metadata_valid_records=len(dataset),num_skipped_sources=len(skipped),
         num_skipped_records=sum(len(source['record_indexes']) for source in skipped),
@@ -213,8 +314,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
         parser.add_argument('--'+name+'-column',default=default,help='Dataset metadata column.')
         parser.add_argument('--validation-'+name+'-column',help='Validation dataset column, if it differs from --'+name+'-column.')
     parser.add_argument('--symbols-json',help='JSON array of selected element symbols; overrides imported symbols.')
-    parser.add_argument('--max-node',type=int,help='Maximum unique fragment nodes, including source; -1 is unlimited.')
-    parser.add_argument('--max-edge',type=int,help='Maximum total distinct cleavage transitions, including multiple routes between merged nodes; -1 is unlimited.')
+    parser.add_argument('--max-unique-fragment-smiles',type=int,
+        help='Skip a source once its materialized fragments exceed this many distinct canonical SMILES (the source itself is not counted); -1 is unlimited.')
+    parser.add_argument('--max-cleavage-combinations',type=int,
+        help='Skip a source once its cleavage action search examines more than this many raw action combinations (all sizes up to max_action_count), before RDKit runs them; -1 is unlimited.')
     parser.add_argument('--num-workers',type=int,default=1,help='Parallel worker processes per split; 1 runs serially.')
     parser.add_argument('--chunk-size',type=int,default=1,help='SMILES groups dispatched per worker chunk.')
     parser.add_argument('--validation-input',help='Optional held-out spectrum dataset. Produces train_structures and validation_structures.')
@@ -228,12 +331,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> None:
     args=build_arg_parser().parse_args(argv)
+    # Decide whether an existing destination may be replaced before loading or
+    # validating either dataset; those checks can be expensive on large files.
+    _confirm_existing_output(args)
     dataset=load_spectrum_dataset(args.input)
     config=resolve_model_options(args)
-    imported_max_node=config.pop('max_node',-1);imported_max_edge=config.pop('max_edge',-1)
-    args.max_node=args.max_node if args.max_node is not None else imported_max_node
-    args.max_edge=args.max_edge if args.max_edge is not None else imported_max_edge
-    validate_limits(args.max_node,args.max_edge)
+    legacy=[key for key in ('max_node','max_edge') if key in config]
+    if legacy:
+        # Not converted: the old limits counted tree nodes/edges, which are
+        # neither distinct fragment SMILES nor raw cleavage combinations.
+        raise ValueError(', '.join(legacy)+' is no longer supported; use max_unique_fragment_smiles and max_cleavage_combinations (see README.md).')
+    imported_max_unique=config.pop('max_unique_fragment_smiles',-1);imported_max_combinations=config.pop('max_cleavage_combinations',-1)
+    if args.max_unique_fragment_smiles is None: args.max_unique_fragment_smiles=imported_max_unique
+    if args.max_cleavage_combinations is None: args.max_cleavage_combinations=imported_max_combinations
+    validate_limits(args.max_unique_fragment_smiles,args.max_cleavage_combinations)
     imported_symbols=config.pop('symbols',None)
     if args.symbols_json: config['mol_encoder_params']['symbols']=json.loads(args.symbols_json)
     elif imported_symbols is not None: config['mol_encoder_params']['symbols']=imported_symbols
@@ -252,7 +363,7 @@ def main(argv: list[str] | None = None) -> None:
     reports={}
     for name,data in (('train',dataset),('validation',validation_dataset)):
         if data is None: continue
-        report=inspect_records(data,checker,mapping if name=='train' else validation_mapping)
+        report=inspect_records(data,checker,mapping if name=='train' else validation_mapping,symbols=config['mol_encoder_params']['symbols'])
         reports[name]=report['invalidRecords']
         filtered=data[report['validIndexes']]
         if not len(filtered): raise ValueError(name+' dataset contains no valid records to prepare.')
@@ -266,7 +377,7 @@ def main(argv: list[str] | None = None) -> None:
     kwargs=dict(model_config=config,smiles_column=args.smiles_column,adduct_type_column=args.adduct_type_column,
         collision_energy_column=args.collision_energy_column,precursor_mz_column=args.precursor_mz_column,
         minimum_relative_intensity=args.minimum_relative_intensity,normalize_intensities=bool(args.normalize_intensities),
-        overwrite=bool(args.overwrite),max_node=args.max_node,max_edge=args.max_edge,num_workers=args.num_workers,chunk_size=args.chunk_size)
+        overwrite=bool(args.overwrite),max_unique_fragment_smiles=args.max_unique_fragment_smiles,max_cleavage_combinations=args.max_cleavage_combinations,num_workers=args.num_workers,chunk_size=args.chunk_size)
     preparation_config=dict(input=args.input,validation_input=args.validation_input,
         validation_ratio=args.validation_ratio,validation_seed=args.validation_seed,output_dir=args.output_dir,
         # Blank means "same as the training column"; only a real override is persisted,
@@ -300,11 +411,15 @@ def main(argv: list[str] | None = None) -> None:
         train,validation=dataset,None
     if not args.overwrite and (list(output.rglob('*.preft.pt')) or any(list((output/name).rglob('*.preft.pt')) for name in ('train_structures','validation_structures'))):
         raise FileExistsError('Output already contains training structures. Enable overwrite or choose another directory.')
-    workbench_path=output/'fragment-tree.pft.json'
+    workbench_path=output/'fragment-tree.pft'
     try:
+        legacy_path=output/'fragment-tree.pft.json'
+        legacy_split_path=output/'train_structures/fragment-tree.pft.json'
         if workbench_path.exists(): previous=json.loads(workbench_path.read_text())
+        elif legacy_path.exists(): previous=json.loads(legacy_path.read_text())
         elif (output/'preparation_config.json').exists(): previous=json.loads((output/'preparation_config.json').read_text()).get('workbench_config',{})
-        elif (output/'train_structures/fragment-tree.pft.json').exists(): previous=json.loads((output/'train_structures/fragment-tree.pft.json').read_text())
+        elif (output/'train_structures/fragment-tree.pft').exists(): previous=json.loads((output/'train_structures/fragment-tree.pft').read_text())
+        elif legacy_split_path.exists(): previous=json.loads(legacy_split_path.read_text())
         else: previous={}
         if not isinstance(previous,dict): previous={}
     except (OSError,json.JSONDecodeError):
@@ -317,7 +432,8 @@ def main(argv: list[str] | None = None) -> None:
         'validation_smiles_column':'validationSmilesColumn','validation_adduct_type_column':'validationAdductTypeColumn',
         'validation_collision_energy_column':'validationCollisionEnergyColumn','validation_precursor_mz_column':'validationPrecursorMzColumn',
         'minimum_relative_intensity':'minimumRelativeIntensity','normalize_intensities':'normalizeIntensities',
-        'max_node':'maxNode','max_edge':'maxEdge','num_workers':'numWorkers','chunk_size':'chunkSize'}
+        'max_unique_fragment_smiles':'maxUniqueFragmentSmiles','max_cleavage_combinations':'maxCleavageCombinations',
+        'num_workers':'numWorkers','chunk_size':'chunkSize'}
     restored={**previous,'application':'fragment-tree-data-preparation'}
     for key,value in preparation_config.items():
         if key=='model_config': continue
@@ -325,6 +441,7 @@ def main(argv: list[str] | None = None) -> None:
         restored[aliases.get(key,key)]=value
     restored.update(fragmenterParams=config['fragmenter_params'],symbols=config['mol_encoder_params']['symbols'])
     restored.pop('modelConfig',None);restored.pop('params',None)
+    restored.pop('maxNode',None);restored.pop('maxEdge',None)  # Legacy limits with different semantics.
     preparation_config['workbench_config']=restored
     (output/'preparation_config.json').write_text(json.dumps(preparation_config,indent=2))
     splits=[('train',train)]
@@ -333,11 +450,11 @@ def main(argv: list[str] | None = None) -> None:
         directory=output/(name+'_structures')
         directory.mkdir(parents=True,exist_ok=True)
         split_config={**restored,'split':name,'status':'running'}
-        (directory/'fragment-tree.pft.json').write_text(json.dumps(split_config,indent=2))
+        (directory/'fragment-tree.pft').write_text(json.dumps(split_config,indent=2))
         # The split is newly empty after resetting Output Directory. Do not delete its configuration.
         create_action_training_data(dataset=split_dataset,output_dir=directory,split=name,**{**(kwargs if name=='train' else validation_kwargs),'overwrite':False},_check_existing=False)
         split_config['status']='completed'
-        (directory/'fragment-tree.pft.json').write_text(json.dumps(split_config,indent=2))
+        (directory/'fragment-tree.pft').write_text(json.dumps(split_config,indent=2))
     (output/'invalid_records.json').write_text(json.dumps(reports,indent=2))
     (output/'preparation_config.json').write_text(json.dumps(preparation_config,indent=2))
 

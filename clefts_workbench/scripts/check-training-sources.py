@@ -1,11 +1,16 @@
 """Check inherited inputs independently of model training and dataset tensor loading."""
 import importlib.util
 import json
+import sys
 from pathlib import Path
 import tempfile
 import torch
 
-source = Path(__file__).resolve().parents[2] / 'clefts/ml/training/fragment_tree_training/sources.py'
+app_root = Path(__file__).resolve().parents[2]
+if str(app_root) not in sys.path:
+    sys.path.insert(0, str(app_root))
+
+source = app_root / 'clefts/ml/training/fragment_tree_training/sources.py'
 spec = importlib.util.spec_from_file_location('training_sources', source)
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
@@ -46,7 +51,20 @@ with tempfile.TemporaryDirectory() as directory:
     rejects(lambda: module.dataset_sources(train, validation))
     model['adduct_type_strs'].reverse()
     (validation / 'action_statistics.json').write_text(json.dumps({'model_config': model}))
-    encoder['symbols'] = ('O', 'C')
+    encoder['symbols'] = ('N', 'C')
     torch.save({'mol_encoder_params': encoder, 'mol_encoder_state_dict': {}}, checkpoint)
     rejects(lambda: module.inherit_model_config({}, train, validation, encoder_checkpoint=checkpoint))
+    metadata = root / 'metadata'
+    metadata.mkdir()
+    preferred = {**model, 'metadata_source': 'preparation'}
+    (metadata / 'preparation_config.json').write_text(json.dumps({'model_config': preferred}))
+    (metadata / 'fragment-tree.pft').write_text(json.dumps({
+        'fragmenterParams': model['fragmenter_params'], 'symbols': ['O', 'C']}))
+    (metadata / 'action_statistics.json').write_text(json.dumps({'model_config': model}))
+    loaded = module.dataset_model_config(metadata)
+    assert loaded['metadata_source'] == 'preparation'
+    stale = json.loads(json.dumps(model))
+    stale['fragmenter_params']['mass_tolerance'] = '9Da'
+    (metadata / 'action_statistics.json').write_text(json.dumps({'model_config': stale}))
+    rejects(lambda: module.dataset_model_config(metadata))
 print('Dataset inheritance, encoder checkpoint metadata, resume compatibility and mismatch checks passed.')

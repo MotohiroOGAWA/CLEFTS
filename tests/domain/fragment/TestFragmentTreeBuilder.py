@@ -12,7 +12,9 @@ from clefts.domain.fragment.cleavage import (
     CleavageAction, CleavageActionSequence, CleavagePatternSet, CompositeCleavageReaction,
 )
 from clefts.domain.fragment.cleavage._CleavagePattern import _CleavagePattern, ProductRule
-from clefts.domain.fragment.cleavage.CleavageActionSearch import CleavageActionSearch, _ActionRelations
+from clefts.domain.fragment.cleavage.CleavageActionSearch import (
+    CleavageActionSearch, FragmentTreeLimitExceeded, _ActionRelations,
+)
 from clefts.domain.fragment.tree import FragmentTreeBuilder
 from clefts.libs.mmkit.mmkit import Compound
 
@@ -168,11 +170,11 @@ class TestCleavageActionCombinationSearch(unittest.TestCase):
         self.assertTrue(all(len(c.action_sequence.actions) == 1 for c in candidates))
         self.assertEqual(search.stats.num_hard_conflict_pruned, 1)
 
-    def test_reverse_ordering_is_allowed_with_precedence(self) -> None:
+    def test_matched_context_change_does_not_create_action_ordering(self) -> None:
         a = action(0, (1, 2), matched=((1, 2),), cuts=((1, 2),))
         b = action(1, (1, 2, 3), matched=((1, 2), (2, 3)), cuts=((2, 3),))
         relations = _ActionRelations.from_actions((a, b))
-        self.assertEqual(relations.must_precede_mask, (0, 1))
+        self.assertEqual(relations.invalidation_mask, (0, 0))
         search = CleavageActionSearch((a, b), max_action_count=2)
         self.assertIn(CleavageActionSequence((a, b)), {c.action_sequence for c in search.enumerate()})
 
@@ -182,32 +184,33 @@ class TestCleavageActionCombinationSearch(unittest.TestCase):
         search = CleavageActionSearch((a, b), max_action_count=2)
         self.assertIn(CleavageActionSequence((a, b)), {c.action_sequence for c in search.enumerate()})
 
-    def test_two_and_three_action_precedence_cycles_are_pruned(self) -> None:
+    def test_multiple_simultaneous_actions_need_no_ordering(self) -> None:
         a = action(0, (1, 2, 3), matched=((1, 2), (2, 3)), cuts=((1, 2),))
         b = action(1, (1, 2, 3), matched=((1, 2), (2, 3)), cuts=((2, 3),))
         search = CleavageActionSearch((a, b), max_action_count=2)
-        self.assertTrue(all(len(c.action_sequence.actions) == 1 for c in search.enumerate()))
-        self.assertEqual(search.stats.num_precedence_cycle_pruned, 1)
+        self.assertIn(CleavageActionSequence((a,b)),{c.action_sequence for c in search.enumerate()})
+        self.assertEqual(search.stats.num_invalidated_action_pruned, 0)
         c = action(2, (1, 2, 3, 4), matched=((3, 4), (1, 2)), cuts=((3, 4),))
         b = action(1, (2, 3, 4), matched=((2, 3), (3, 4)), cuts=((2, 3),))
         search = CleavageActionSearch((a, b, c), max_action_count=3)
         sequences = {x.action_sequence for x in search.enumerate()}
         self.assertEqual(sum(len(s.actions) == 2 for s in sequences), 3)
-        self.assertFalse(any(len(s.actions) == 3 for s in sequences))
-        self.assertGreater(search.stats.num_precedence_cycle_pruned, 0)
+        self.assertTrue(any(len(s.actions) == 3 for s in sequences))
+        self.assertEqual(search.stats.num_invalidated_action_pruned, 0)
 
-    def test_atom_deletion_precedence_and_cycle(self) -> None:
+    def test_every_action_must_retain_every_other_action_source_match(self) -> None:
         a = action(0, (1, 2), retained=(1, 2, 3))
         b = action(1, (3, 4), matched=((3, 4),), cuts=((3, 4),))
         relations = _ActionRelations.from_actions((a, b))
-        self.assertEqual(relations.must_precede_mask, (0, 1))
-        # Give B a surviving cut, ensuring normalization retains its contribution.
-        b = action(1, (2, 3, 4), matched=((2, 3),), cuts=((2, 3),))
+        self.assertEqual(relations.invalidation_mask, (2, 0))
+        self.assertEqual(relations.rejection((0, 1)), 'invalidated_action')
         search = CleavageActionSearch((a, b), max_action_count=2)
-        self.assertIn(CleavageActionSequence((a, b)), {c.action_sequence for c in search.enumerate()})
-        b = action(1, (3, 4), retained=(2, 3, 4))
+        self.assertTrue(all(len(c.action_sequence.actions)==1 for c in search.enumerate()))
+        # Reverse containment is independently required as well.
+        b = action(1, (2, 3), retained=(2, 3, 4))
         relations = _ActionRelations.from_actions((a, b))
-        self.assertEqual(relations.rejection((0, 1)), 'precedence_cycle')
+        self.assertEqual(relations.invalidation_mask, (0, 1))
+        self.assertEqual(relations.rejection((0, 1)), 'invalidated_action')
 
     def test_redundancy_preserves_surviving_cut_and_order_updates(self) -> None:
         deletion = action(2, (3, 4), retained=(1, 2, 3))
@@ -230,14 +233,14 @@ class TestCleavageActionCombinationSearch(unittest.TestCase):
         self.assertIn(CleavageActionSequence((a, b, c)), sequences)
         self.assertTrue(all(len(sequence.actions) <= 2 for sequence in sequences))
 
-    def test_discarded_center_hint_keeps_a_contributing_action(self) -> None:
+    def test_discarding_another_action_center_rejects_combination(self) -> None:
         a = action(0, (1, 2), retained=(1, 2, 3))
         b = action(1, (3,), retained=(3, 4))
         search = CleavageActionSearch((a, b), max_action_count=2)
-        self.assertEqual(search.relations.redundancy_hint_mask[0], 1 << 1)
-        combined = CleavageActionSequence((a, b))
-        self.assertEqual(combined.retained_atom_maps, frozenset((3,)))
-        self.assertIn(combined, {c.action_sequence for c in search.enumerate()})
+        self.assertEqual(search.relations.invalidation_mask, (0, 1))
+        self.assertEqual(search.relations.rejection((0,1)),'invalidated_action')
+        with self.assertRaises(ValueError):CleavageActionSequence((a,b))
+        self.assertTrue(all(len(c.action_sequence.actions)==1 for c in search.enumerate()))
 
     def test_effect_signature_ignores_discarded_bond_edits(self) -> None:
         a = action(0, (3, 4), retained=(1, 2), matched=((3, 4),), cuts=((3, 4),))
@@ -350,17 +353,18 @@ class TestFragmentTreeBuilder(unittest.TestCase):
         self.assertEqual(len({r.action_sequence for r in results}), 7)
         self.assertTrue(all(r.smirks for r in results))
 
-    def test_cycle_and_conflict_candidates_never_run_rdkit(self) -> None:
+    def test_invalidated_and_conflicting_candidates_never_run_rdkit(self) -> None:
         source = Compound.from_smiles('[CH3:1][CH2:2][CH2:3][CH3:4]')
-        a = action(0, (1, 2, 3), matched=((1, 2), (2, 3)), cuts=((1, 2),))
-        b = action(1, (1, 2, 3), matched=((1, 2), (2, 3)), cuts=((2, 3),))
+        a = action(0, (1, 2), retained=(1, 2, 3))
+        b = action(1, (3, 4), matched=((3, 4),), cuts=((3, 4),))
         build = builder(limit=2)
         with patch.object(FragmentTreeBuilder, 'create_cleavage_actions', return_value=(a, b)):
             result = build._build_result(source)
         stats = result['search_stats']
         self.assertEqual(stats['num_raw_combinations'], 3)
-        self.assertEqual(stats['num_precedence_cycle_pruned'], 1)
+        self.assertEqual(stats['num_invalidated_action_pruned'], 1)
         self.assertEqual(stats['num_rdkit_run_reactants'], 2)
+        a = action(0, (1, 2), matched=((1, 2),), cuts=((1, 2),))
         b = action(1, (1, 2), matched=((1, 2),), cuts=((1, 2),))
         with patch.object(FragmentTreeBuilder, 'create_cleavage_actions', return_value=(a, b)):
             result = build._build_result(source)
@@ -393,30 +397,33 @@ class TestFragmentTreeBuilder(unittest.TestCase):
         self.assertTrue(any(edge.source_index == parent.index for edge in tree.get_in_edges(child.index)))
         self.assertEqual(result['search_stats']['num_rdkit_run_reactants'], 4)
 
-    def test_edge_limit_counts_distinct_routes_between_merged_nodes(self) -> None:
+    def test_unique_fragment_limit_counts_merged_fragments_once(self) -> None:
         source = Compound.from_smiles('[CH3:1][CH:2]([OH:3])[OH:4]')
         build = builder(pattern('[C:1]-[O:2]', '[C:1]'), limit=1)
         tree = build.build(source)
         self.assertEqual(tree.num_nodes, 2)
         self.assertEqual(tree.num_edges, 1)
         self.assertEqual(tree.num_transitions, 2)
-        with self.assertRaisesRegex(ValueError, 'edge limit'):
-            build.build(source, max_edge=1)
-        self.assertEqual(build.build(source, max_node=2, max_edge=2).num_transitions, 2)
-        with self.assertRaisesRegex(ValueError, 'node limit'):
-            build.build(source, max_node=1)
+        # Two generated fragments share one canonical SMILES; the source is not counted.
+        result = build._build_result(source, max_unique_fragment_smiles=1)
+        self.assertEqual(result['search_stats']['num_generated_fragments'], 2)
+        self.assertEqual(result['search_stats']['num_unique_fragment_smiles'], 1)
+        self.assertEqual(result['fragment_tree'].num_transitions, 2)
+        with self.assertRaisesRegex(ValueError, r'^max_cleavage_combinations exceeded: limit=1, observed>1$'):
+            build.build(source, max_cleavage_combinations=1)
+        self.assertEqual(build.build(source, max_cleavage_combinations=2).num_transitions, 2)
 
-    def test_node_and_edge_limits_stop_combination_search_and_reactions_early(self):
+    def test_search_limits_stop_combination_search_and_reactions_early(self):
         baseline=self.builder._build_result(self.source)['search_stats']
         original=CleavageActionSearch.iter_candidates
-        for limit in ({'max_node':1},{'max_edge':0}):
+        for limit in ({'max_unique_fragment_smiles':1},{'max_cleavage_combinations':1}):
             searches=[]
             def stream(search):
                 searches.append(search)
                 yield from original(search)
             with self.subTest(limit=limit),patch.object(CleavageActionSearch,'iter_candidates',stream), \
                  patch.object(CleavageActionSearch,'enumerate',side_effect=AssertionError('Eager search is forbidden')):
-                with self.assertRaisesRegex(ValueError,'limit exceeded'):
+                with self.assertRaisesRegex(ValueError,r'exceeded: limit=1, observed>1$'):
                     self.builder.build(self.source,**limit)
             stats=searches[0].stats
             self.assertLess(stats.num_raw_combinations,baseline['num_raw_combinations'])
@@ -426,9 +433,18 @@ class TestFragmentTreeBuilder(unittest.TestCase):
         for limit in (0, -1, True):
             with self.assertRaises(ValueError):
                 FragmentTreeBuilder(limit, self.builder.cleavage_pattern_set)
-        for kwargs, message in (({'max_node': 1}, 'node limit'), ({'max_edge': 0}, 'edge limit')):
+        for kwargs, message in (({'max_unique_fragment_smiles': 1}, 'max_unique_fragment_smiles exceeded'),
+                                ({'max_cleavage_combinations': 1}, 'max_cleavage_combinations exceeded')):
             with self.assertRaisesRegex(ValueError, message):
                 self.builder.build(self.source, **kwargs)
+        for name in ('max_unique_fragment_smiles', 'max_cleavage_combinations'):
+            for invalid in (0, -2, True, 1.5):
+                with self.subTest(name=name, invalid=invalid), \
+                     self.assertRaisesRegex(ValueError, name + ' must be -1 or a positive integer'):
+                    self.builder.build(self.source, **{name: invalid})
+        for removed in ('max_node', 'max_edge'):
+            with self.assertRaises(TypeError):
+                self.builder.build(self.source, **{removed: 1})
         actions = self.builder.create_cleavage_actions(self.source)
         with self.assertRaisesRegex(ValueError, 'Seed exceeds'):
             self.builder.build(self.source, seed_action_sequences=(CleavageActionSequence(actions),),
@@ -445,6 +461,90 @@ class TestFragmentTreeBuilder(unittest.TestCase):
         self.assertEqual(FragmentTreeBuilder.from_dict(data).to_dict(), data)
         self.assertEqual(self.builder.copy().to_dict(), data)
         self.assertIsNot(self.builder.copy().cleavage_pattern_set, self.builder.cleavage_pattern_set)
+
+
+    @staticmethod
+    def _signature(tree):
+        return (tree.node_smiles.tolist(), tree.source_indices.tolist(),
+                tree.target_indices.tolist(), tree.num_transitions)
+
+    def test_cleavage_combination_limit_stops_before_rdkit_runs_any_later_combination(self) -> None:
+        baseline = self.builder._build_result(self.source)
+        raw = baseline['search_stats']['num_raw_combinations']
+        run = CompositeCleavageReaction.run
+        original = CleavageActionSearch.iter_candidates
+        for limit in range(1, raw):
+            yielded = []
+            executed = []
+
+            def stream(search):
+                for candidate in original(search):
+                    yielded.append(search.stats.num_raw_combinations)
+                    yield candidate
+
+            def running(reaction, source):
+                executed.append(reaction)
+                return run(reaction, source)
+
+            with self.subTest(limit=limit), \
+                 patch.object(CleavageActionSearch, 'iter_candidates', stream), \
+                 patch.object(CompositeCleavageReaction, 'run', running):
+                with self.assertRaises(FragmentTreeLimitExceeded) as caught:
+                    self.builder.build(self.source, max_cleavage_combinations=limit)
+                error = caught.exception
+                self.assertEqual(str(error), f'max_cleavage_combinations exceeded: limit={limit}, observed>{limit}')
+                self.assertEqual(error.limit_name, 'max_cleavage_combinations')
+                self.assertEqual(error.stats['num_raw_combinations'], limit + 1)
+                # Only candidates found within the limit ever reached RDKit.
+                self.assertTrue(all(count <= limit for count in yielded))
+                self.assertEqual(len(executed), error.stats['num_rdkit_run_reactants'])
+                self.assertLessEqual(len(executed), len(yielded))
+        exact = self.builder._build_result(self.source, max_cleavage_combinations=raw)
+        self.assertEqual(self._signature(exact['fragment_tree']), self._signature(baseline['fragment_tree']))
+        self.assertEqual(exact['search_stats'], baseline['search_stats'])
+
+    def test_cleavage_combination_limit_spans_every_size_up_to_max_action_count(self) -> None:
+        pairs = builder(*(pattern(f'[C:1]-[{symbol}:2]', '[C:1]') for symbol in ('O', 'N', 'S')), limit=2)
+        up_to_pairs = pairs._build_result(self.source)['search_stats']['num_raw_combinations']
+        up_to_triples = self.builder._build_result(self.source)['search_stats']['num_raw_combinations']
+        self.assertEqual(self.builder.max_action_count, 3)
+        self.assertGreater(up_to_triples, up_to_pairs)
+        # A budget sufficient for 1- and 2-action combinations is exceeded by the 3-action ones.
+        pairs.build(self.source, max_cleavage_combinations=up_to_pairs)
+        with self.assertRaises(FragmentTreeLimitExceeded):
+            self.builder.build(self.source, max_cleavage_combinations=up_to_pairs)
+
+    def test_unique_fragment_limit_stops_right_after_the_first_excess_smiles(self) -> None:
+        search, candidates = self.builder._search(self.source, seed_action_sequences=None, max_action_count=None)
+        runs_when_reached = {}
+        for _ in self.builder._materialize_iter(self.source, search, candidates):
+            runs_when_reached.setdefault(search.stats.num_unique_fragment_smiles, search.stats.num_rdkit_run_reactants)
+        unique = search.stats.num_unique_fragment_smiles
+        baseline = self.builder._build_result(self.source)
+        # Every generated fragment is linked here, so nodes are the source plus each unique SMILES.
+        self.assertEqual(unique, baseline['fragment_tree'].num_nodes - 1)
+        self.assertGreater(unique, 2)
+        for limit in range(1, unique):
+            with self.subTest(limit=limit):
+                with self.assertRaises(FragmentTreeLimitExceeded) as caught:
+                    self.builder.build(self.source, max_unique_fragment_smiles=limit)
+                error = caught.exception
+                self.assertEqual(str(error), f'max_unique_fragment_smiles exceeded: limit={limit}, observed>{limit}')
+                self.assertEqual(error.stats['num_unique_fragment_smiles'], limit + 1)
+                # No further RDKit run happens after the excess SMILES appears.
+                self.assertEqual(error.stats['num_rdkit_run_reactants'], runs_when_reached[limit + 1])
+                self.assertLessEqual(error.stats['num_raw_combinations'], baseline['search_stats']['num_raw_combinations'])
+        exact = self.builder._build_result(self.source, max_unique_fragment_smiles=unique)
+        self.assertEqual(self._signature(exact['fragment_tree']), self._signature(baseline['fragment_tree']))
+        self.assertEqual(exact['search_stats'], baseline['search_stats'])
+
+    def test_limit_error_keeps_statistics_across_processes(self) -> None:
+        import pickle
+        with self.assertRaises(FragmentTreeLimitExceeded) as caught:
+            self.builder.build(self.source, max_unique_fragment_smiles=1)
+        restored = pickle.loads(pickle.dumps(caught.exception))
+        self.assertEqual((restored.limit_name, restored.limit, restored.stats, str(restored)),
+                         (caught.exception.limit_name, 1, caught.exception.stats, str(caught.exception)))
 
 
 if __name__ == '__main__':

@@ -9,7 +9,8 @@ from clefts.libs.mmkit.mmkit import Adduct, Compound
 from ..input.source_action_structure import SourceActionStructure, prepare_source_actions
 from ..mol.mol_encoder import MolEncoder
 from ..mol.formula_encoder import FormulaTensorizer
-from .components.condition.condition_encoder import MS2ConditionEncoder
+from .components.condition.adduct_embedding import AdductEmbeddingLayer
+from .components.condition.collision_energy_feature import CollisionEnergyFeatureLayer
 from .components.action.action_decoder import ActionDecoderOutput
 from .source_action_feature_model import SourceActionFeatureModel, SourceActionFeatures
 from .materialization import materialize_action_states, DecodedFragmentTreeBatch
@@ -36,7 +37,7 @@ class SourceAnchoredSpectrumOutput:
 
 
 class SourceAnchoredFragmentSpectrumGenerator(nn.Module):
-    architecture = "source-anchored-branching-v1"
+    architecture = "fragment-tree-physical-ion"
 
     def __init__(self, fragmenter_params: dict, mol_encoder_params: dict,
                  action_model_params: dict | None = None, post_model_params: dict | None = None,
@@ -49,23 +50,30 @@ class SourceAnchoredFragmentSpectrumGenerator(nn.Module):
         self.adduct_type_strs = tuple(dict.fromkeys(str(Adduct.parse(value)) for value in
             (adduct_type_strs or (str(adduct) for adduct in self.fragmenter.adduct_types))))
         params = dict(action_model_params or {})
+        post_params=dict(post_model_params or {})
         hidden = params.get("hidden_dim",128)
-        condition_dim = params.get("condition_dim",128)
+        main_adduct_dim=post_params.get("main_adduct_dim",128)
+        collision_energy_dim=post_params.get("collision_energy_dim",16)
         self.mol_encoder = MolEncoder(**mol_encoder_params)
-        condition = MS2ConditionEncoder(adduct_type_strs=self.adduct_type_strs,adduct_embedding_dim=32,
-            ce_feature_dim=16,feature_dim=condition_dim)
+        adduct_encoder=AdductEmbeddingLayer(self.adduct_type_strs,32)
+        collision_energy_encoder=CollisionEnergyFeatureLayer(collision_energy_dim)
         patterns=self.fragmenter.fragment_ion_tree_builder.cleavage_patterns
         params.setdefault("max_roles",max(64,max((pattern.reactant_query.GetNumAtoms() for pattern in patterns),default=0)))
         sizes=(max((pattern.pattern_id for pattern in patterns),default=0)+1,
                max((reaction.id for pattern in patterns for reaction in pattern.cleavage_reactions),default=0)+1,
                max((len(reaction.prod_temp) for pattern in patterns for reaction in pattern.cleavage_reactions),default=1))
-        self.feature_model=SourceActionFeatureModel(self.mol_encoder,sizes,2,
-            max_action_count=self.fragmenter.tree_max_action_count,condition_encoder=condition,**params)
+        self.feature_model=SourceActionFeatureModel(self.mol_encoder,sizes,
+            max_action_count=self.fragmenter.tree_max_action_count,adduct_encoder=adduct_encoder,
+            collision_energy_encoder=collision_energy_encoder,
+            intensity_main_adduct_dim=main_adduct_dim,**params)
         self.tensorizer=FormulaTensorizer.from_symbols_and_adducts(symbols=self.mol_encoder.symbols,adducts=self.fragmenter.adduct_types)
-        post_params=dict(post_model_params or {})
         post_params.setdefault("hidden_dim",hidden)
-        self.post_model=PostMaterializationFragmentTreeModel(self.mol_encoder,hidden,condition_dim,self.tensorizer.dim,
+        ion_types=tuple(dict.fromkeys(str(shift.ion_shift) for rule in self.fragmenter.adduct_rule_set.adduct_rules for shift in rule.ion_shifts))
+        max_unsaturation=max((rule.unsaturation for rule in self.fragmenter.adduct_rule_set.adduct_rules),default=0)
+        post_params.setdefault("ion_type_count",len(ion_types));post_params.setdefault("max_unsaturation",max_unsaturation)
+        self.post_model=PostMaterializationFragmentTreeModel(self.mol_encoder,hidden,
             max_action_count=self.fragmenter.tree_max_action_count,**post_params)
+        self.ion_type_strs=ion_types
         if fine_tuning:
             from .fine_tuning import install_expansion
             install_expansion(self, fine_tuning)
@@ -73,7 +81,7 @@ class SourceAnchoredFragmentSpectrumGenerator(nn.Module):
     def forward(self, data: SourceActionStructure) -> SourceAnchoredSelectionOutput:
         """Neural forward, including validation, never invokes RDKit."""
         features=self.feature_model(data)
-        return SourceAnchoredSelectionOutput(features,self.feature_model.decoder(features.pool,features.condition_h))
+        return SourceAnchoredSelectionOutput(features,self.feature_model.decoder(features.pool,features.branch_main_adduct_h))
 
     def prepare(self, sources: Sequence[Compound], precursor_types: Sequence[Adduct], collision_energy: Sequence[float], *,
                 precomputed: dict[str,dict] | None = None) -> tuple[SourceActionStructure, tuple[Compound,...], tuple[tuple,...], tuple[Adduct,...], tuple[int,...]]:
@@ -87,33 +95,20 @@ class SourceAnchoredFragmentSpectrumGenerator(nn.Module):
             source=sources[rows[0]]
             cached=precomputed.get(source.smiles) if precomputed else None
             if cached is not None:
-                # Cleavage actions and, for adducts already resolved, the
-                # candidate precursor sequences came from a prior (possibly
-                # parallel, subprocess-isolated) precompute pass -- reused
-                # verbatim, with no RDKit call here for a fully cached group.
+                # Primitive actions came from a prior, possibly subprocess-
+                # isolated preparation pass and are reused verbatim.
                 actions=cached["actions"]
-                precursor_cache=dict(cached["precursor_sequences"])
             else:
                 actions=self.fragmenter.fragment_ion_tree_builder.create_cleavage_actions(source)
-                precursor_cache={}
-            conditions=torch.tensor([[self.adduct_type_strs.index(str(precursor_types[i])),collision_energy[i]] for i in rows],dtype=torch.float32)
-            # Bounded by precursor_candidate_max_action_count (not the full
-            # tree_max_action_count), so resolving a given precursor stays a
-            # small, fixed-cost preparation step, never an exhaustive search.
-            # Built lazily: with a fully cached group, this never runs.
-            precursor_tree=None
-            for i in rows:
-                key=str(precursor_types[i])
-                if key not in precursor_cache:
-                    if precursor_tree is None:
-                        precursor_tree=self.fragmenter.build_fragment_ion_tree(source,
-                            max_action_count=self.fragmenter.precursor_candidate_max_action_count,_include_fragment_compound_cache=True)
-                    sequences={pa.action_sequence for pa in self.fragmenter.resolve_precursor_actions(precursor_tree,precursor_types[i])}
-                    precursor_cache[key]=tuple(sorted(sequences,key=lambda seq:(seq is not None,seq.key if seq else ())))
-            precursor_sequences=[precursor_cache[str(precursor_types[i])] for i in rows]
+            main=[self.fragmenter._resolve_main_adduct_type(precursor_types[i]) for i in rows]
+            conditions=torch.tensor([[self.adduct_type_strs.index(str(adduct)),collision_energy[i]] for adduct,i in zip(main,rows)],dtype=torch.float32)
+            group_keys={};sample_group=[]
+            for adduct in main:
+                sample_group.append(group_keys.setdefault(str(adduct),len(group_keys)))
+            group_adduct=torch.tensor([self.adduct_type_strs.index(key) for key in group_keys],dtype=torch.long)
             structures.append(prepare_source_actions(source=source,actions=actions,graph_builder=self.mol_encoder.graph_builder,
                 condition_features=conditions,max_action_count=self.feature_model.max_action_count,
-                precursor_sequences=precursor_sequences))
+                sample_branch_group_index=torch.tensor(sample_group),branch_group_adduct_index=group_adduct))
             unique_sources.append(source)
             universes.append(actions)
             ordered_adducts.extend(precursor_types[i] for i in rows)
@@ -154,13 +149,23 @@ class SourceAnchoredFragmentSpectrumGenerator(nn.Module):
         static=self.feature_model.encode_static(data,max_graphs=limit)
         effect_cache={}
         molecular_cache={source.smiles:static[1][i] for i,source in enumerate(unique_sources)}
-        for start in range(0,data.num_samples,limit):
-            stop=min(start+limit,data.num_samples)
-            chunk=select_samples(data,range(start,stop)).to(device)
+        # Never split a branch group across chunks. A group with more spectra
+        # than ``limit`` is processed intact so search and its node budget are
+        # still applied exactly once for (compound, main adduct).
+        chunks=[];current=[]
+        for group in range(data.num_branch_groups):
+            rows=(data.sample_branch_group_index==group).nonzero().flatten().tolist()
+            if current and len(current)+len(rows)>limit:chunks.append(current);current=[]
+            current.extend(rows)
+            if len(current)>=limit:chunks.append(current);current=[]
+        if current:chunks.append(current)
+        for selected in chunks:
+            chunk=select_samples(data,selected).to(device)
             features=self.feature_model(chunk,static_features=static)
-            selection=SourceAnchoredSelectionOutput(features,self.feature_model.decoder(features.pool,features.condition_h))
-            decoded=materialize_action_states(selection.decoded,unique_sources,actions,chunk.sample_tree_index,self.mol_encoder.graph_builder,effect_cache=effect_cache)
-            downstream=prepare_post_materialization(decoded,self.fragmenter,adducts[start:stop],self.tensorizer)
+            selection=SourceAnchoredSelectionOutput(features,self.feature_model.decoder(features.pool,features.branch_main_adduct_h))
+            decoded=materialize_action_states(selection.decoded,unique_sources,actions,chunk.branch_group_tree_index,self.mol_encoder.graph_builder,effect_cache=effect_cache)
+            downstream=prepare_post_materialization(decoded,self.fragmenter,[adducts[i] for i in selected],self.tensorizer,
+                sample_branch_group_index=chunk.sample_branch_group_index,ion_type_strs=self.ion_type_strs)
             downstream=deduplicate_molecular_graphs(downstream,tuple(source.smiles for source in unique_sources))
             graph_keys=[key for key,index in zip(downstream.unique_smiles,downstream.unique_source_index.tolist()) if index<0]
             graphs=downstream.unique_node_graph.to_data_list()
@@ -174,8 +179,9 @@ class SourceAnchoredFragmentSpectrumGenerator(nn.Module):
                     molecular_cache.update((graph_keys[i],embeddings[j]) for j,i in enumerate(ids))
             molecular=torch.stack([molecular_cache[key] for key in downstream.unique_smiles])[downstream.node_graph_inverse.to(device)]
             downstream=downstream.to(device)
-            spectra=self.post_model(downstream,action_h=features.action_h,condition_h=features.condition_h,source_embeddings=features.source_embeddings,molecular_embeddings=molecular)
-            yield SourceAnchoredSpectrumOutput(selection,decoded,spectra,downstream,indices[start:stop])
+            spectra=self.post_model(downstream,action_h=features.action_h,main_adduct_h=features.sample_main_adduct_h,
+                collision_energy_h=features.collision_energy_h,source_embeddings=features.source_embeddings,molecular_embeddings=molecular)
+            yield SourceAnchoredSpectrumOutput(selection,decoded,spectra,downstream,tuple(indices[i] for i in selected))
 
     @torch.no_grad()
     def predict(self, sources, precursor_types, collision_energy, *, precomputed=None):

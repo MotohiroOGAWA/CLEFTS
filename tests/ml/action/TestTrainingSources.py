@@ -6,8 +6,13 @@ from unittest.mock import patch
 
 import torch
 
-from clefts.ml.training.fragment_tree_training.sources import dataset_sources, inherit_model_config
+from clefts.libs.mmkit.mmkit import Adduct, Compound, Formula
+from clefts.ml.data_preparation.fragment_tree.context import create_preparation_context
+from clefts.ml.input.action_batching import select_samples
+from clefts.ml.input.structure_builder import ActionStructureBuilder
+from clefts.ml.training.fragment_tree_training.sources import dataset_model_config, dataset_sources, inherit_model_config
 from clefts.ml.training.fragment_tree_training import training
+from .TestActionPipeline import config
 
 
 class TestTrainingSources(unittest.TestCase):
@@ -19,6 +24,66 @@ class TestTrainingSources(unittest.TestCase):
         self.assertFalse(kwargs['dynamic_ncols'])
         self.assertEqual(kwargs['position'], 1)
         self.assertIn('{bar:36}', kwargs['bar_format'])
+
+    def test_overwrite_removes_previous_run_leftovers(self):
+        # metric_distributions.tsv is appended to across a run, and
+        # spectrum_validation/*.json from a longer previous run is never
+        # cleaned up on its own -- --overwrite must not leave those behind.
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / 'out'
+            (output / 'spectrum_validation').mkdir(parents=True)
+            (output / 'spectrum_validation' / 'epoch_9.json').write_text('{}')
+            (output / 'metric_distributions.tsv').write_text('stale\trow\n')
+            (output / 'last.pt').write_text('stale checkpoint')
+            training.confirm_output_overwrite(output, overwrite=True, resume=None)
+            self.assertFalse(output.exists())
+
+    def test_interactive_yes_also_clears_the_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / 'out'
+            output.mkdir()
+            (output / 'stale.json').write_text('{}')
+            with patch('sys.stdin.isatty', return_value=True), patch('builtins.input', return_value='y'):
+                training.confirm_output_overwrite(output, overwrite=False, resume=None)
+            self.assertFalse(output.exists())
+
+    def test_declining_interactively_raises_without_deleting_anything(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / 'out'
+            output.mkdir()
+            (output / 'stale.json').write_text('{}')
+            with patch('sys.stdin.isatty', return_value=True), patch('builtins.input', return_value='n'):
+                with self.assertRaises(SystemExit):
+                    training.confirm_output_overwrite(output, overwrite=False, resume=None)
+            self.assertTrue((output / 'stale.json').exists())
+
+    def test_resume_never_clears_even_with_overwrite_requested(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / 'out'
+            output.mkdir()
+            (output / 'last.pt').write_text('checkpoint')
+            training.confirm_output_overwrite(output, overwrite=True, resume='last.pt')
+            self.assertTrue((output / 'last.pt').exists())
+
+    def test_empty_or_missing_output_directory_is_a_no_op(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / 'out'
+            output.mkdir()
+            training.confirm_output_overwrite(output, overwrite=True, resume=None)
+            self.assertTrue(output.exists())  # untouched, not recreated
+            missing = Path(directory) / 'missing'
+            training.confirm_output_overwrite(missing, overwrite=True, resume=None)
+            self.assertFalse(missing.exists())
+
+    def test_overwrite_refuses_to_delete_a_protected_input_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / 'out'
+            train_dir = output / 'train_structures'
+            train_dir.mkdir(parents=True)
+            (output / 'stale.json').write_text('{}')
+            with self.assertRaises(ValueError):
+                training.confirm_output_overwrite(output, overwrite=True, resume=None, protected_paths=(str(train_dir),))
+            self.assertTrue(train_dir.exists())
 
     def _dataset(self, root: Path, name: str, symbols: list[str]) -> Path:
         directory = root / name
@@ -55,6 +120,88 @@ class TestTrainingSources(unittest.TestCase):
             validation = self._dataset(root, 'validation', ['C', 'N', 'S'])
             with self.assertRaisesRegex(ValueError, 'different elements'):
                 dataset_sources(train, validation)
+
+    def test_metadata_priority_and_stale_file_conflicts(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            directory = root / 'train'
+            directory.mkdir()
+            fragmenter = {'mass_tolerance': '0.01Da'}
+            model = {'fragmenter_params': fragmenter, 'symbols': ['C', 'O'],
+                     'adduct_type_strs': ['[M+H]+'], 'metadata_source': 'preparation'}
+            (directory / 'preparation_config.json').write_text(json.dumps({'model_config': model}))
+            (directory / 'fragment-tree.pft').write_text(json.dumps({
+                'fragmenterParams': fragmenter, 'symbols': ['O', 'C']}))
+            (directory / 'action_statistics.json').write_text(json.dumps({'model_config': {
+                'fragmenter_params': fragmenter, 'mol_encoder_params': {'symbols': ['C', 'O']},
+                'adduct_type_strs': ['[M+H]+']}}))
+            loaded = dataset_model_config(directory)
+            self.assertEqual(loaded['metadata_source'], 'preparation')
+            self.assertEqual(loaded['adduct_type_strs'], ['[M+H]+'])
+            stale = {'fragmenter_params': {'mass_tolerance': '0.5Da'},
+                     'mol_encoder_params': {'symbols': ['C', 'N']}, 'adduct_type_strs': ['[M+Na]+']}
+            (directory / 'action_statistics.json').write_text(json.dumps({'model_config': stale}))
+            with self.assertRaisesRegex(ValueError, 'Regenerate this dataset'):
+                dataset_model_config(directory)
+
+    def test_molecular_encoder_symbols_must_match_prepared_data(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            train = self._dataset(root, 'train', ['C', 'N', 'O'])
+            validation = self._dataset(root, 'validation', ['O', 'N', 'C'])
+            checkpoint = root / 'encoder.pt'
+            torch.save({
+                'mol_encoder_params': {'symbols': ('C', 'N', 'S')},
+                'mol_encoder_state_dict': {},
+            }, checkpoint)
+            with self.assertRaisesRegex(ValueError, 'molecular encoder checkpoint'):
+                inherit_model_config({}, train, validation, encoder_checkpoint=checkpoint)
+
+    def test_sample_meets_assignment_score_treats_missing_scores_as_passing(self):
+        self.assertTrue(training._sample_meets_assignment_score({'assignmentScore': None, 'assignmentScoreWithoutPrecursor': None}, 0.9, 0.9))
+        self.assertTrue(training._sample_meets_assignment_score({'assignmentScore': 0.9, 'assignmentScoreWithoutPrecursor': None}, 0.5, 0.9))
+        self.assertFalse(training._sample_meets_assignment_score({'assignmentScore': 0.4, 'assignmentScoreWithoutPrecursor': None}, 0.5, 0))
+        self.assertFalse(training._sample_meets_assignment_score({'assignmentScore': 1.0, 'assignmentScoreWithoutPrecursor': 0.2}, 0, 0.5))
+
+    def test_assignment_score_filter_drops_low_scoring_samples_via_select_samples(self):
+        # Data preparation always keeps every sample; training-time loading is
+        # where a below-threshold sample now gets dropped, via select_samples.
+        model = config(); model['fragmenter_params']['fragment_ion_tree_builder']['max_action_count'] = 1
+        builder = ActionStructureBuilder(create_preparation_context(model))
+        source = Compound.from_smiles('CCO'); adduct = Adduct.parse('[M+H]+')
+        precursor_mz = Formula.parse('C2H7O+').exact_mass
+        # Sample 0 is a lone matched precursor peak (assignmentScore 1.0). Sample 1 adds
+        # a large unmatched peak alongside the matched precursor, dragging its score down.
+        data, kept = builder.build(source, [adduct, adduct], [20., 20.],
+            [[precursor_mz], [precursor_mz, 1000.]], [[1.], [1., 100.]])
+        self.assertEqual(len(data.sample_annotations), 2)
+        full_scores = [sample['assignmentScore'] for sample in data.sample_annotations]
+        self.assertAlmostEqual(full_scores[0], 1.0)
+        self.assertLess(full_scores[1], 0.5)
+        surviving = [index for index, sample in enumerate(data.sample_annotations)
+                     if training._sample_meets_assignment_score(sample, 0.5, 0)]
+        self.assertEqual(surviving, [0])
+        filtered = select_samples(data, surviving)
+        self.assertEqual(filtered.num_samples, 1)
+        self.assertAlmostEqual(filtered.sample_annotations[0]['assignmentScore'], 1.0)
+
+    def test_select_samples_keeps_long_dtype_when_no_peak_paths_or_transitions_survive(self):
+        # A lone matched precursor peak has no fragmentation steps, so
+        # select_samples rebuilds teacher_peak_branch_group_index and
+        # state_transition_next_state_index as empty lists. torch.tensor([])
+        # silently defaults to float32, which used to crash a *second*
+        # select_samples call (e.g. chunking by max_samples after assignment
+        # score filtering) with "tensors used as indices must be long, int,
+        # byte or bool tensors".
+        model = config(); model['fragmenter_params']['fragment_ion_tree_builder']['max_action_count'] = 1
+        builder = ActionStructureBuilder(create_preparation_context(model))
+        source = Compound.from_smiles('CCO'); adduct = Adduct.parse('[M+H]+')
+        precursor_mz = Formula.parse('C2H7O+').exact_mass
+        data, kept = builder.build(source, [adduct], [20.], [[precursor_mz]], [[1.]])
+        filtered = select_samples(data, [0])
+        self.assertEqual(filtered.teacher_peak_branch_group_index.dtype, torch.long)
+        self.assertEqual(filtered.state_transition_next_state_index.dtype, torch.long)
+        select_samples(filtered, [0])  # must not raise
 
 
 if __name__ == '__main__':

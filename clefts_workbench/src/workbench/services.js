@@ -3,12 +3,12 @@ const path=require('path');
 const crypto=require('crypto');
 const vscode=require('vscode');
 const {spawn}=require('child_process');
-function backend(context,root,command,payload){return new Promise((resolve,reject)=>{
+function backend(context,root,command,payload,options={}){return new Promise((resolve,reject)=>{
  const python=vscode.workspace.getConfiguration('clefts').get('pythonPath','python');
  const child=spawn(python,[path.join(context.extensionPath,'src/workbench/dataset_backend.py')],{cwd:root,env:{...process.env,PYTHONPATH:[root,process.env.PYTHONPATH].filter(Boolean).join(path.delimiter)}});
- let output='',errors='',settled=false;const finish=(error,result)=>{if(settled)return;settled=true;clearTimeout(timeout);error?reject(error):resolve(result);};
- const timeout=setTimeout(()=>{child.kill();finish(new Error('Dataset inspection timed out. Try a smaller dataset or inspect the Python environment.'));},120000);
- child.stdout.on('data',data=>{output+=data.toString();if(output.length>8000000){child.kill();finish(new Error('Backend response exceeded the preview limit.'));}});child.stderr.on('data',data=>{errors=(errors+data).slice(-8000);});
+ let output='',errors='',progressBuffer='',settled=false;const finish=(error,result)=>{if(settled)return;settled=true;clearTimeout(timeout);error?reject(error):resolve(result);};
+ const timeout=options.timeoutMs===0?null:setTimeout(()=>{child.kill();finish(new Error('Dataset inspection timed out. Inspect the Python environment.'));},options.timeoutMs||120000);
+ child.stdout.on('data',data=>{output+=data.toString();if(output.length>8000000){child.kill();finish(new Error('Backend response exceeded the preview limit.'));}});child.stderr.on('data',data=>{const chunk=data.toString();errors=(errors+chunk.replace(/CLEFTS_PROGRESS \{[^\r\n]+\}\r?\n?/g,'')).slice(-8000);if(options.onProgress){progressBuffer=(progressBuffer+chunk).slice(-4000);let consumed=0;for(const match of progressBuffer.matchAll(/CLEFTS_PROGRESS (\{[^\r\n]+\})/g)){try{options.onProgress(JSON.parse(match[1]));}catch{}consumed=match.index+match[0].length;}if(consumed)progressBuffer=progressBuffer.slice(consumed);}});
  child.on('error',error=>finish(error));child.on('close',code=>{if(settled)return;try{const lines=output.trim().split('\n');const response=JSON.parse(lines.reverse().find(line=>line.startsWith('{'))||'');if(!response.ok)throw new Error(response.error);if(code!==0)throw new Error(errors||'Dataset backend failed.');finish(null,response.result);}catch(error){finish(new Error(error.message||errors));}});
  child.stdin.on('error',()=>{});child.stdin.end(JSON.stringify({command,payload}));
  });}
@@ -53,8 +53,15 @@ function attach(panel,context,projectRoot){
  if(message.type==='library/load')post({type:'library/data',...await library(root)});
  if(message.type==='library/copy'){if(typeof message.path==='string')await vscode.env.clipboard.writeText(message.path);}
  if(message.type==='library/open'){
- if(typeof message.path!=='string')throw new Error('Invalid resource path.');const stat=await fs.promises.stat(message.path);
- if(stat.isDirectory())await vscode.commands.executeCommand('revealInExplorer',vscode.Uri.file(message.path));else if(/\.(pft(?:\.json)?|clefts-result)$/.test(message.path))await vscode.commands.executeCommand('vscode.openWith',vscode.Uri.file(message.path),'clefts.resultViewer');else await vscode.commands.executeCommand('revealInExplorer',vscode.Uri.file(message.path));
+ if(typeof message.path!=='string')throw new Error('Invalid resource path.');
+ // Buttons built from a job's outputDir guess the current filename (e.g.
+ // fragment-tree.pft); a job from before that convention changed only has
+ // the old fragment-tree.pft.json on disk, so fall back to it by content
+ // rather than erroring just because the guessed name doesn't exist.
+ let resolvedPath=message.path;
+ if(!fs.existsSync(resolvedPath)&&resolvedPath.endsWith('.pft')&&fs.existsSync(resolvedPath+'.json'))resolvedPath+='.json';
+ const stat=await fs.promises.stat(resolvedPath);
+ if(stat.isDirectory())await vscode.commands.executeCommand('revealInExplorer',vscode.Uri.file(resolvedPath));else if(/\.(pft(?:\.json)?|clefts-result)$/.test(resolvedPath))await vscode.commands.executeCommand('vscode.openWith',vscode.Uri.file(resolvedPath),'clefts.resultViewer');else await vscode.commands.executeCommand('revealInExplorer',vscode.Uri.file(resolvedPath));
  }
  if(message.type==='library/pick'){
  const allowed=['quickTrainDir','quickValDir','quickTrainOutput','quickCheckpoint','quickPredictModel'];if(!allowed.includes(message.target))return;
@@ -69,12 +76,12 @@ function attach(panel,context,projectRoot){
  // summary or data/check per-record validation finishes on a large dataset.
  const data=message.type==='data/columns'
    ?await backend(context,root,'columns',{path:message.path,mapping:message.mapping})
-   :await backend(context,root,'preview',{path:message.path,mapping:message.mapping,validateValues:message.type==='data/check',fragmenterParams:message.fragmenterParams});
+   :await backend(context,root,'preview',{path:message.path,mapping:message.mapping,validateValues:message.type==='data/check',reportProgress:message.type==='data/check',fragmenterParams:message.fragmenterParams},message.type==='data/check'?{timeoutMs:0,onProgress:progress=>{if(latest.get(message.target)===message.requestId)post({type:'data/check-progress',target:message.target,requestId:message.requestId,...progress});}}:{});
  if(latest.get(message.target)===message.requestId)post({type:message.type,target:message.target,requestId:message.requestId,data});
  }
- if(message.type==='data/preflight')post({type:'data/preflight',requestId:message.requestId,...await backend(context,root,'validate',message.config)});
+ if(message.type==='data/preflight')post({type:'data/preflight',requestId:message.requestId,...await backend(context,root,'validate',message.config,{timeoutMs:0})});
  }catch(error){post({type:'data/error',source:message.type,target:message.target,requestId:message.requestId,error:error.message});}
  });
 }
-async function validateRun(context,root,config){return backend(context,root,'validate-config',config);}
+async function validateRun(context,root,config){return backend(context,root,'validate-config',config,{timeoutMs:0});}
 module.exports={attach,backend,library,inspectFiles,openDocumentation,validateRun};
