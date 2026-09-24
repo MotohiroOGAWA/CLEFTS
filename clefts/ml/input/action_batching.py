@@ -71,9 +71,9 @@ def select_samples(data,indices):
         teacher_node_parent_index=torch.where(data.teacher_node_parent_index[state_ids]>=0,state_map[data.teacher_node_parent_index[state_ids].clamp_min(0)],data.teacher_node_parent_index[state_ids]),
         teacher_node_added_action_index=data.teacher_node_added_action_index[state_ids],teacher_node_ms2_depth=data.teacher_node_ms2_depth[state_ids],
         transition_parent_state_index=state_map[data.transition_parent_state_index[transitions]],transition_child_state_index=state_map[data.transition_child_state_index[transitions]],transition_added_action_index=data.transition_added_action_index[transitions],
-        state_transition_ptr=valid_ptr,state_transition_action_index=valid_actions,state_transition_next_state_index=torch.tensor(valid_next),weak_negative_action_ptr=negative_ptr,weak_negative_action_index=negative_actions,
+        state_transition_ptr=valid_ptr,state_transition_action_index=valid_actions,state_transition_next_state_index=torch.tensor(valid_next,dtype=torch.long),weak_negative_action_ptr=negative_ptr,weak_negative_action_index=negative_actions,
         transition_state_branch_group_index=group_map[data.transition_state_branch_group_index[transition_state_ids]],
         transition_state_action_ptr=transition_state_ptr,transition_state_action_index=transition_state_actions,
         teacher_node_transition_state_index=transition_state_map[data.teacher_node_transition_state_index[state_ids]],
-        teacher_peak_path_ptr=peak_ptr,teacher_peak_branch_group_index=torch.tensor(peak_groups),teacher_path_step_ptr=step_ptr,teacher_path_step_state_index=step_states,teacher_path_step_action_index=step_actions,
+        teacher_peak_path_ptr=peak_ptr,teacher_peak_branch_group_index=torch.tensor(peak_groups,dtype=torch.long),teacher_path_step_ptr=step_ptr,teacher_path_step_state_index=step_states,teacher_path_step_action_index=step_actions,
         state_fragment_node_index=state_nodes,downstream=downstream,sample_annotations=annotations)

@@ -125,6 +125,24 @@ class TestTrainingSources(unittest.TestCase):
         self.assertEqual(filtered.num_samples, 1)
         self.assertAlmostEqual(filtered.sample_annotations[0]['assignmentScore'], 1.0)
 
+    def test_select_samples_keeps_long_dtype_when_no_peak_paths_or_transitions_survive(self):
+        # A lone matched precursor peak has no fragmentation steps, so
+        # select_samples rebuilds teacher_peak_branch_group_index and
+        # state_transition_next_state_index as empty lists. torch.tensor([])
+        # silently defaults to float32, which used to crash a *second*
+        # select_samples call (e.g. chunking by max_samples after assignment
+        # score filtering) with "tensors used as indices must be long, int,
+        # byte or bool tensors".
+        model = config(); model['fragmenter_params']['fragment_ion_tree_builder']['max_action_count'] = 1
+        builder = ActionStructureBuilder(create_preparation_context(model))
+        source = Compound.from_smiles('CCO'); adduct = Adduct.parse('[M+H]+')
+        precursor_mz = Formula.parse('C2H7O+').exact_mass
+        data, kept = builder.build(source, [adduct], [20.], [[precursor_mz]], [[1.]])
+        filtered = select_samples(data, [0])
+        self.assertEqual(filtered.teacher_peak_branch_group_index.dtype, torch.long)
+        self.assertEqual(filtered.state_transition_next_state_index.dtype, torch.long)
+        select_samples(filtered, [0])  # must not raise
+
 
 if __name__ == '__main__':
     unittest.main()
