@@ -58,9 +58,21 @@ const app=path.resolve(__dirname,'../..'),preset=service.defaults(app);
  const neighborhoodRoot=new Element('div'),neighborhoodEditor=createParameterEditor(neighborhoodRoot,{action_model_params:{}},'training');
  const neighborhoodMode=walk(neighborhoodRoot).find(node=>node.dataset.parameterPath==='action_model_params.action_neighborhood_mode');
  assert.equal(neighborhoodMode.tag,'select');assert.deepEqual(neighborhoodMode.children.map(option=>option.value),['hop_pooling','none']);assert.equal(neighborhoodMode.value,'hop_pooling');
+ // Neighborhood Max Hop defaults to 3 and starts enabled alongside hop_pooling.
+ const maxHop=walk(neighborhoodRoot).find(node=>node.dataset.parameterPath==='action_model_params.action_neighborhood_max_hop');
+ assert.equal(maxHop.value,3);assert(!maxHop.disabled);
+ maxHop.value='2';maxHop.oninput();assert.equal(neighborhoodEditor.getValue().action_model_params.action_neighborhood_max_hop,2);
  neighborhoodMode.value='none';neighborhoodMode.onchange();assert.equal(neighborhoodEditor.getValue().action_model_params.action_neighborhood_mode,'none');
+ // Switching to Mode=none re-renders and disables the now-meaningless Max Hop field.
+ assert(walk(neighborhoodRoot).find(node=>node.dataset.parameterPath==='action_model_params.action_neighborhood_max_hop').disabled);
  const neighborhoodArgs=buildTrainingArgs({trainDir:'train',valDir:'val',outputDir:'out',modelConfig:neighborhoodEditor.getValue()});
  assert.equal(neighborhoodArgs[neighborhoodArgs.indexOf('--action-neighborhood-mode')+1],'none');
+ assert.equal(neighborhoodArgs[neighborhoodArgs.indexOf('--action-neighborhood-max-hop')+1],'2');
+ // max_roles is sized from the prepared dataset, never a form field, even
+ // when a resumed/loaded config already carries one.
+ const maxRolesRoot=new Element('div');
+ createParameterEditor(maxRolesRoot,{action_model_params:{max_roles:96}},'training');
+ assert(!walk(maxRolesRoot).some(node=>node.dataset.parameterPath==='action_model_params.max_roles'));
  // Dropout is one shared training-level flag, not a per-component model_config override.
  const dropoutArgs=buildTrainingArgs({trainDir:'train',valDir:'val',outputDir:'out',dropout:0.3});
  assert.equal(dropoutArgs[dropoutArgs.indexOf('--dropout')+1],'0.3');

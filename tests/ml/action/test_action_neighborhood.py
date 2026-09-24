@@ -104,9 +104,10 @@ class TestCsrMeanPool(unittest.TestCase):
 
 
 class TestActionEncoderNeighborhood(unittest.TestCase):
-    def _encoder(self, mode='hop_pooling', seed=0):
+    def _encoder(self, mode='hop_pooling', seed=0, max_hop=3):
         torch.manual_seed(seed)
-        return ActionEncoder(atom_dim=4, mol_dim=6, hidden_dim=8, category_sizes=(2, 2, 2), num_heads=2, max_roles=4, action_neighborhood_mode=mode)
+        return ActionEncoder(atom_dim=4, mol_dim=6, hidden_dim=8, category_sizes=(2, 2, 2), num_heads=2, max_roles=4,
+                              action_neighborhood_mode=mode, action_neighborhood_max_hop=max_hop)
 
     def _base_kwargs(self, source_atom_h):
         return dict(
@@ -116,20 +117,37 @@ class TestActionEncoderNeighborhood(unittest.TestCase):
             action_static_features=torch.zeros(1, 6),
         )
 
-    def _empty_hops(self):
-        kwargs = {}
-        for hop in (1, 2, 3):
-            kwargs[f'action_source_atom_hop{hop}_ptr'] = torch.tensor([0, 0, 0])
-            kwargs[f'action_source_atom_hop{hop}_index'] = torch.empty(0, dtype=torch.long)
-        return kwargs
+    def _empty_hops(self, max_hop=3):
+        return {'action_source_atom_hops': [(torch.tensor([0, 0, 0]), torch.empty(0, dtype=torch.long)) for _ in range(max_hop)]}
 
     def test_invalid_mode_rejected(self):
         with self.assertRaises(ValueError):
             ActionEncoder(atom_dim=4, mol_dim=4, hidden_dim=4, category_sizes=(1, 1, 1), action_neighborhood_mode='gnn')
 
+    def test_invalid_max_hop_rejected(self):
+        with self.assertRaisesRegex(ValueError, 'action_neighborhood_max_hop'):
+            ActionEncoder(atom_dim=4, mol_dim=4, hidden_dim=4, category_sizes=(1, 1, 1), action_neighborhood_max_hop=0)
+
+    def test_projection_count_matches_max_hop(self):
+        for max_hop in (1, 2, 3, 5):
+            encoder = self._encoder(max_hop=max_hop)
+            self.assertEqual(len(encoder.neighborhood_projections), max_hop)
+
+    def test_mismatched_hop_list_length_rejected(self):
+        encoder = self._encoder(max_hop=2)
+        kwargs = {**self._base_kwargs(torch.randn(5, 4)), **self._empty_hops(max_hop=3)}
+        with self.assertRaisesRegex(ValueError, 'Expected 2 hop distances, got 3'):
+            encoder(**kwargs)
+
     def test_output_shape_unaffected_by_reactant_atom_count(self):
         encoder = self._encoder()
         kwargs = {**self._base_kwargs(torch.randn(5, 4)), **self._empty_hops()}
+        out = encoder(**kwargs)
+        self.assertEqual(tuple(out.shape), (1, 8))
+
+    def test_output_shape_with_a_single_hop_distance(self):
+        encoder = self._encoder(max_hop=1)
+        kwargs = {**self._base_kwargs(torch.randn(5, 4)), **self._empty_hops(max_hop=1)}
         out = encoder(**kwargs)
         self.assertEqual(tuple(out.shape), (1, 8))
 
@@ -138,8 +156,7 @@ class TestActionEncoderNeighborhood(unittest.TestCase):
         encoder_none = self._encoder('none', seed=1)
         kwargs = {**self._base_kwargs(torch.randn(6, 4)), **self._empty_hops()}
         # Nonempty neighbors prove 'none' truly ignores them, not that they're empty.
-        kwargs['action_source_atom_hop1_ptr'] = torch.tensor([0, 1, 2])
-        kwargs['action_source_atom_hop1_index'] = torch.tensor([2, 3])
+        kwargs['action_source_atom_hops'][0] = (torch.tensor([0, 1, 2]), torch.tensor([2, 3]))
         with torch.no_grad():
             out_hop = encoder_hop(**kwargs)
             out_none = encoder_none(**kwargs)
@@ -150,11 +167,10 @@ class TestActionEncoderNeighborhood(unittest.TestCase):
         with torch.no_grad():
             nn.init.normal_(encoder.neighborhood_projections[0].weight)
         kwargs = {**self._base_kwargs(torch.randn(6, 4)), **self._empty_hops()}
-        kwargs['action_source_atom_hop1_ptr'] = torch.tensor([0, 1, 1])
-        kwargs['action_source_atom_hop1_index'] = torch.tensor([2])
+        kwargs['action_source_atom_hops'][0] = (torch.tensor([0, 1, 1]), torch.tensor([2]))
         with torch.no_grad():
             out_a = encoder(**kwargs)
-        kwargs['action_source_atom_hop1_index'] = torch.tensor([3])
+        kwargs['action_source_atom_hops'][0] = (torch.tensor([0, 1, 1]), torch.tensor([3]))
         with torch.no_grad():
             out_b = encoder(**kwargs)
         self.assertFalse(torch.allclose(out_a, out_b))
@@ -167,8 +183,7 @@ class TestActionEncoderNeighborhood(unittest.TestCase):
         encoder = self._encoder()
         source_atom_h = torch.randn(6, 4, requires_grad=True)
         kwargs = {**self._base_kwargs(source_atom_h), **self._empty_hops()}
-        kwargs['action_source_atom_hop1_ptr'] = torch.tensor([0, 1, 2])
-        kwargs['action_source_atom_hop1_index'] = torch.tensor([2, 3])
+        kwargs['action_source_atom_hops'][0] = (torch.tensor([0, 1, 2]), torch.tensor([2, 3]))
         weights = torch.randn(1, 8)
         (encoder(**kwargs) * weights).sum().backward()
         self.assertIsNotNone(encoder.neighborhood_projections[0].weight.grad)
@@ -178,8 +193,7 @@ class TestActionEncoderNeighborhood(unittest.TestCase):
     def test_none_mode_neighborhood_projections_receive_no_gradient(self):
         encoder = self._encoder('none')
         kwargs = {**self._base_kwargs(torch.randn(6, 4)), **self._empty_hops()}
-        kwargs['action_source_atom_hop1_ptr'] = torch.tensor([0, 1, 2])
-        kwargs['action_source_atom_hop1_index'] = torch.tensor([2, 3])
+        kwargs['action_source_atom_hops'][0] = (torch.tensor([0, 1, 2]), torch.tensor([2, 3]))
         weights = torch.randn(1, 8)
         (encoder(**kwargs) * weights).sum().backward()
         self.assertIsNone(encoder.neighborhood_projections[0].weight.grad)
@@ -193,6 +207,24 @@ class TestActionNeighborhoodModeConfig(unittest.TestCase):
         self.assertEqual(generator.feature_model.action_encoder.action_neighborhood_mode, 'none')
         generator_default = create_spectrum_generator(config())
         self.assertEqual(generator_default.feature_model.action_encoder.action_neighborhood_mode, 'hop_pooling')
+        self.assertEqual(generator_default.feature_model.action_encoder.action_neighborhood_max_hop, 3)
+
+    def test_action_neighborhood_max_hop_threads_through_model_config(self):
+        model = config()
+        model['action_model_params']['action_neighborhood_max_hop'] = 2
+        generator = create_spectrum_generator(model)
+        self.assertEqual(generator.feature_model.action_encoder.action_neighborhood_max_hop, 2)
+        self.assertEqual(len(generator.feature_model.action_encoder.neighborhood_projections), 2)
+
+    def test_action_neighborhood_max_hop_out_of_range_rejected(self):
+        from clefts.ml.input.source_action_structure import MAX_NEIGHBORHOOD_HOP
+        model = config()
+        model['action_model_params']['action_neighborhood_max_hop'] = MAX_NEIGHBORHOOD_HOP + 1
+        with self.assertRaisesRegex(ValueError, 'action_neighborhood_max_hop'):
+            create_spectrum_generator(model)
+        model['action_model_params']['action_neighborhood_max_hop'] = 0
+        with self.assertRaises(ValueError):
+            create_spectrum_generator(model)
 
 
 class TestNeighborhoodIntegration(unittest.TestCase):
@@ -238,6 +270,22 @@ class TestNeighborhoodIntegration(unittest.TestCase):
 
     def test_forward_and_encode_static_produce_the_same_action_h(self):
         generator, data = self._prepared()
+        generator.eval()
+        with torch.no_grad():
+            forward_action = generator.feature_model(data).action_h
+            static_action, _ = generator.feature_model.encode_static(data)
+        torch.testing.assert_close(forward_action, static_action)
+
+    def test_reduced_max_hop_only_consumes_that_many_prepared_hop_fields(self):
+        # Prepared data always carries all 3 hop fields; a model configured
+        # with a smaller max_hop must use only the first N of them.
+        model = config()
+        model['action_model_params']['action_neighborhood_max_hop'] = 1
+        generator = create_spectrum_generator(model)
+        source = Compound.from_smiles('CC(O)N')
+        adduct = Adduct.parse('[M+H]+')
+        data, _ = ActionStructureBuilder(generator).build(source, [adduct, adduct], [10., 40.],
+            [[18.033826, 44.049476], [18.033826, 44.049476]], [[.5, 1.], [1., .5]])
         generator.eval()
         with torch.no_grad():
             forward_action = generator.feature_model(data).action_h

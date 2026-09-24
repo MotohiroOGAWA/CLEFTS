@@ -78,7 +78,7 @@ def _node_view(structure, samples, source_smiles, file_path):
         original=original_actions[number] if original_actions else None
         pattern=cleavage_patterns.get(category[0])
         reaction=next((item for item in pattern.cleavage_reactions if item.id==category[1]),None) if pattern else None
-        registry.append(dict(id=number,cleavagePatternId=category[0],reactionId=category[1],reactantId=category[1],productMoleculeId=category[2],
+        registry.append(dict(id=number,cleavagePatternId=category[0],reactionId=category[1],productMoleculeId=category[2],
             cleavagePatternName=pattern.name if pattern else '',reactantSmarts=pattern.reactant_smarts if pattern else '',
             reactionName=reaction.source_rule.name if reaction else '',reactionProductSmarts=reaction.source_rule.smarts if reaction else '',
             sourceAtomMaps=list(original.source_atom_maps) if original else [atoms[i].GetAtomMapNum() for i in index[ptr[number]:ptr[number+1]]],
@@ -92,7 +92,7 @@ def _node_view(structure, samples, source_smiles, file_path):
             try:return original_actions.index(action)
             except ValueError:pass
         for entry in registry:
-            if (entry['cleavagePatternId'],entry['reactantId'],entry['productMoleculeId'])==(action.cleavage_pattern_id,action.reaction_id,action.product_molecule_id) and entry['sourceAtomMaps']==list(action.source_atom_maps):return entry['id']
+            if (entry['cleavagePatternId'],entry['reactionId'],entry['productMoleculeId'])==(action.cleavage_pattern_id,action.reaction_id,action.product_molecule_id) and entry['sourceAtomMaps']==list(action.source_atom_maps):return entry['id']
         raise ValueError('Saved transition cannot be matched to an action registry entry.')
     decoded=structure.downstream.decoded if structure.downstream is not None else None
     offset=0

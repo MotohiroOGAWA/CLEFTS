@@ -96,6 +96,24 @@ def dataset_sources(train_dir, val_dir):
             'adduct_type_strs': list(adducts), 'symbols': train_symbols}
 
 
+def prepared_max_action_role_count(train_dir, val_dir) -> int | None:
+    """Largest action_source_atom role count across every prepared .preft.pt file.
+
+    Sizes the shared SMARTS-query role embedding: only the actual prepared
+    action universe (not a user guess) can say how large that ever gets, so
+    this is not a user-configurable model parameter. Returns None if neither
+    directory has a prepared file yet, so the caller can fall back to a
+    pattern-derived estimate instead of failing outright.
+    """
+    from clefts.ml.input.source_action_structure import SourceActionStructure
+    total = None
+    for directory in (train_dir, val_dir):
+        for file in sorted(Path(directory).rglob('*.preft.pt')):
+            count = SourceActionStructure.load(file).max_action_role_count
+            total = count if total is None else max(total, count)
+    return total
+
+
 def inherit_model_config(model_config, train_dir, val_dir, *, encoder_checkpoint=None, saved_model=None):
     import torch
     config = deepcopy(model_config.get('params', model_config))
@@ -118,4 +136,7 @@ def inherit_model_config(model_config, train_dir, val_dir, *, encoder_checkpoint
         raise ValueError('Dataset elements differ from the molecular encoder checkpoint: Dataset symbols do not match the MolEncoder / applicable checkpoint symbols')
     config.update(fragmenter_params=sources['fragmenter_params'], adduct_type_strs=sources['adduct_type_strs'],
                   mol_encoder_params=deepcopy(encoder_params))
+    max_roles = prepared_max_action_role_count(train_dir, val_dir)
+    if max_roles is not None:
+        config.setdefault('action_model_params', {})['max_roles'] = max_roles
     return config

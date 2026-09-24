@@ -391,7 +391,6 @@ MODEL_OPTIONS = {
     'action-hidden-dim': ('action_model_params', 'hidden_dim', int, 128),
     'action-main-adduct-dim': ('action_model_params', 'branch_main_adduct_dim', int, 128),
     'action-num-heads': ('action_model_params', 'num_heads', int, 4),
-    'action-max-roles': ('action_model_params', 'max_roles', int, None),
     'branch-path-threshold': ('action_model_params', 'branch_path_threshold', float, 0.0),
     'max-fragment-nodes': ('action_model_params', 'max_fragment_nodes', int, 100),
     'action-state-layers': ('action_model_params', 'state_num_layers', int, 2),
@@ -411,6 +410,10 @@ MODEL_OPTIONS = {
     'main-adduct-embedding-dim': ('post_model_params', 'main_adduct_dim', int, 128),
     'collision-energy-feature-dim': ('post_model_params', 'collision_energy_dim', int, 16),
 }
+# action_model_params.max_roles is intentionally absent from MODEL_OPTIONS: it
+# sizes the shared SMARTS-query role embedding, and only the actual prepared
+# action universe (not a user guess) can say how large that ever gets. See
+# sources.prepared_max_action_role_count(), applied by inherit_model_config().
 
 
 def training_model_config(args):
@@ -426,6 +429,7 @@ def training_model_config(args):
     # A closed-choice architecture setting, like equivalent_state_aggregation;
     # kept out of the generic int/float MODEL_OPTIONS loop below.
     config['action_model_params']['action_neighborhood_mode'] = args.action_neighborhood_mode
+    config['action_model_params']['action_neighborhood_max_hop'] = args.action_neighborhood_max_hop
     if args.mol_encoder_checkpoint:
         config['mol_encoder_checkpoint'] = args.mol_encoder_checkpoint
     return config
@@ -438,7 +442,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help='Shared dropout applied to every trainable component (action state encoder, post-materialization tree encoder).')
     parser.add_argument('--action-neighborhood-mode', choices=NEIGHBORHOOD_MODES, default='hop_pooling',
         help='How the Primitive Action Encoder folds in atoms outside the reacting site: '
-             '"hop_pooling" pools 1/2/3-hop neighbors into the action; "none" ignores them entirely.')
+             '"hop_pooling" pools hop neighbors into the action; "none" ignores them entirely.')
+    parser.add_argument('--action-neighborhood-max-hop', type=int, default=3,
+        help='Number of hop distances pooled by "hop_pooling" (1..3; ignored by "none"). Changes the number of '
+             'per-hop projection layers; ignored on --resume, which always keeps the checkpoint\'s own value.')
     for flag, (_, _, kind, default) in MODEL_OPTIONS.items():
         parser.add_argument('--'+flag, type=kind, default=default)
     for name in ('train-dir','val-dir','output-dir'):parser.add_argument('--'+name,required=True)

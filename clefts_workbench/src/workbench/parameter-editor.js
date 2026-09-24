@@ -24,12 +24,12 @@ function createParameterEditor(container, initial, kind = "training", editCleava
     branch_main_adduct_dim:'Main-adduct feature width used only by the Branch Scorer.',
     node_dim:'Molecular encoder atom representation dimension.',graph_dim:'Molecular encoder graph representation dimension.',
     dropout:'Fraction of molecular encoder activations dropped during training.',
-    max_roles:'Maximum SMARTS query role embeddings; leave the override unset to infer a safe size from the patterns.',
     num_layers:'Number of transformer layers.',num_heads:'Number of attention heads. Must divide the corresponding hidden dimension.',
     max_degree:'Maximum degree represented in graph structural embeddings.',max_spatial_dist:'Maximum atom graph distance encoded by the molecular encoder.',max_edge_dist:'Maximum bond distance encoded by the molecular encoder.',
     branch_path_threshold:'Minimum cumulative path probability retained by tree search. Zero disables threshold pruning.',
     max_fragment_nodes:'Maximum nodes shared by the complete (compound, main adduct) branch group.',
-    action_neighborhood_mode:'How the Primitive Action Encoder folds in atoms outside the reacting site: hop_pooling pools 1/2/3-hop neighbors into the action; none ignores them entirely.',
+    action_neighborhood_mode:'How the Primitive Action Encoder folds in atoms outside the reacting site: hop_pooling pools hop-distance neighbors into the action; none ignores them entirely.',
+    action_neighborhood_max_hop:'Number of hop distances pooled by hop_pooling (1..3). Disabled when Neighborhood Mode is none. Changes the number of per-hop projection layers; a resumed run always keeps the checkpoint\'s own value.',
     state_num_layers:'Number of Set Transformer layers encoding the current action set.',state_dropout:'Dropout in the action state Set Transformer.',cosine_loss_weight:'Spectrum cosine loss weight, added to log intensity MSE.',
     ion_loss_weight:'Weight of the balanced ion score loss: pushes each candidate ion (node, hydrogen shift, radical, adduct) toward the observed peak match or toward zero, independent of the aggregated intensity loss.',
     ion_prediction_threshold:'Minimum ion confidence (sigmoid probability) kept when generating a spectrum. Below this, a candidate adduct/hydrogen-shift is suppressed instead of appearing as a small peak. Does not affect training loss.',
@@ -41,12 +41,12 @@ function createParameterEditor(container, initial, kind = "training", editCleava
     freeze_mol_encoder:'Freeze the molecular encoder during training.',
   };
   const templates={patterns:{name:'new_pattern',reactant_smarts:'[!#1:1]-[!#1:2]',products:[{name:'product',smarts:'[!#1:1]'}]},products:{name:'product',smarts:'[!#1:1]'},adduct_rules:{name:'new_rule',adduct_type:'[M+H]+',radical:false,unsaturation:0,ion_shifts:[]},ion_shifts:{ion_shift:'[M+H]+'},atoms:'C',symbols:'C'};
-  const optional={action_model_params:{branch_main_adduct_dim:128,num_heads:4,max_roles:64,state_num_layers:2,branch_path_threshold:0,max_fragment_nodes:100,action_neighborhood_mode:'hop_pooling'},mol_encoder_params:{dropout:0},post_model_params:{ion_embedding_dim:32,unsaturation_embedding_dim:16,radical_embedding_dim:8,state_hidden_dim:128,main_adduct_dim:128,collision_energy_dim:16,equivalent_state_aggregation:'attention',cosine_loss_weight:0.5,ion_loss_weight:0.5,ion_prediction_threshold:0.5,peak_intensity_threshold:0,intensity_power:0.5,precursor_free_loss_weight:0.5}};
+  const optional={action_model_params:{branch_main_adduct_dim:128,num_heads:4,state_num_layers:2,branch_path_threshold:0,max_fragment_nodes:100,action_neighborhood_mode:'hop_pooling',action_neighborhood_max_hop:3},mol_encoder_params:{dropout:0},post_model_params:{ion_embedding_dim:32,unsaturation_embedding_dim:16,radical_embedding_dim:8,state_hidden_dim:128,main_adduct_dim:128,collision_energy_dim:16,equivalent_state_aggregation:'attention',cosine_loss_weight:0.5,ion_loss_weight:0.5,ion_prediction_threshold:0.5,peak_intensity_threshold:0,intensity_power:0.5,precursor_free_loss_weight:0.5}};
   // Purely cosmetic sub-headings for the sections with the most fields; any
   // field not listed here (e.g. a newer option) still renders, just ungrouped.
   const fieldGroups={
     action_model_params:{
-      'Architecture':['hidden_dim','branch_main_adduct_dim','num_heads','max_roles','action_neighborhood_mode'],
+      'Architecture':['hidden_dim','branch_main_adduct_dim','num_heads','action_neighborhood_mode','action_neighborhood_max_hop'],
       'Branch Scorer · Architecture':['state_num_layers'],
       'Search':['branch_path_threshold','max_fragment_nodes'],
     },
@@ -62,19 +62,23 @@ function createParameterEditor(container, initial, kind = "training", editCleava
   // them from the single shared --dropout), but they must never be editable
   // here independently of it -- only one dropout value can ever be specified.
   const linkedToSharedDropout=new Set(['action_model_params.state_dropout','post_model_params.dropout']);
+  // max_roles is sized automatically from the prepared dataset (see
+  // sources.prepared_max_action_role_count); a resumed/loaded config may still
+  // carry one, but it is never a field the user edits here.
+  const derivedFromDataset=new Set(['action_model_params.max_roles']);
   // Keep closed-choice architecture settings out of free-form text inputs.
   // The model currently supports only normalized attention, but defining the
   // choices here makes future aggregation strategies appear automatically as
   // explicit options instead of asking users to know their string values.
   const choices={equivalent_state_aggregation:['attention'],action_neighborhood_mode:['hop_pooling','none']};
   const basic=new Set(['fragmenter_params.fragment_ion_tree_builder.max_action_count','fragmenter_params.precursor_candidate_max_action_count','fragmenter_params.mass_tolerance']);
-  const badge=full=>full.endsWith('.max_action_count')?'Dataset inherited':full.endsWith('.branch_path_threshold')||full.endsWith('.max_fragment_nodes')?'Search':/(ion_prediction_threshold|peak_intensity_threshold)$/.test(full)?'Inference only':/(loss_weight|intensity_power)$/.test(full)?'Training only':/(hidden_dim|embedding_dim|main_adduct_dim|collision_energy_dim|branch_main_adduct_dim|num_layers|num_heads|state_num_layers|equivalent_state_aggregation|action_neighborhood_mode)$/.test(full)?'Architecture':'';
+  const badge=full=>full.endsWith('.max_action_count')?'Dataset inherited':full.endsWith('.branch_path_threshold')||full.endsWith('.max_fragment_nodes')?'Search':/(ion_prediction_threshold|peak_intensity_threshold)$/.test(full)?'Inference only':/(loss_weight|intensity_power)$/.test(full)?'Training only':/(hidden_dim|embedding_dim|main_adduct_dim|collision_energy_dim|branch_main_adduct_dim|num_layers|num_heads|state_num_layers|equivalent_state_aggregation|action_neighborhood_mode|action_neighborhood_max_hop)$/.test(full)?'Architecture':'';
   const node=(tag,text)=>{const n=document.createElement(tag);if(text!==undefined)n.textContent=text;return n;};
   const button=(text,fn)=>{const b=node('button',text);b.type='button';b.onclick=fn;return b;};
   const title=key=>String(key).replaceAll('_',' ').replace(/\b\w/g,c=>c.toUpperCase()).replace('Smarts','SMARTS');
   function help(key,path){return descriptions[key]||'Configure '+path.replaceAll('_',' ').replaceAll('.',' / ')+'. This value is passed to the CLEFTS Python workflow.';}
   function renderValue(parent,key,host,path,excludeBasic=false){
-    const full=path?path+'.'+key:String(key),value=parent[key];if(excludeBasic&&basic.has(full))return;if(linkedToSharedDropout.has(full))return;
+    const full=path?path+'.'+key:String(key),value=parent[key];if(excludeBasic&&basic.has(full))return;if(linkedToSharedDropout.has(full)||derivedFromDataset.has(full))return;
     if(key==='cleavage_pattern_set'&&editCleavagePatternSet){const details=node('details'),summary=node('summary','Cleavage Pattern Set · '+(value.name||'(unnamed)')),mount=node('div');mount.className='embedded-set-editor';details.append(summary,mount);details.ontoggle=()=>{if(details.open)editCleavagePatternSet(clone(parent[key]),updated=>{parent[key]=clone(updated);summary.textContent='Cleavage Pattern Set · '+(updated.name||'(unnamed)');},mount);};host.append(details);return;}
     if(key==='fragment_ion_adduct_rule_set'&&editAdductRuleSet){const mainAdducts=set=>[...new Set((set.adduct_rules||[]).map(rule=>rule.adduct_type).filter(Boolean))].join(', ')||'no main adducts',details=node('details'),summary=node('summary','Fragment Ion Adduct Rule Set · '+(value.name||'(unnamed)')+' · '+mainAdducts(value)),mount=node('div');mount.className='embedded-set-editor';details.append(summary,mount);details.ontoggle=()=>{if(details.open)editAdductRuleSet(clone(parent[key]),updated=>{parent[key]=clone(updated);summary.textContent='Fragment Ion Adduct Rule Set · '+(updated.name||'(unnamed)')+' · '+mainAdducts(updated);},mount);};host.append(details);return;}
     if(Array.isArray(value)||value&&typeof value==='object'){
@@ -106,8 +110,12 @@ function createParameterEditor(container, initial, kind = "training", editCleava
       host.append(group);return;
     }
     const fieldKey=typeof key==='number'?path.split('.').at(-1):key;
-    const wrapper=node('label'),label=node('span',typeof key==='number'?title(fieldKey)+' '+(key+1):title(key));label.dataset.help=help(fieldKey,full);const mark=badge(full);if(mark){const tag=node('small',mark);tag.className='parameter-badge';label.append(' ',tag);}const options=choices[fieldKey];if(options&&!options.includes(value))parent[key]=options[0];const input=node(options?'select':'input');input.dataset.parameterPath=full;if(options){for(const choice of options){const option=node('option',title(choice));option.value=choice;input.append(option);}input.value=parent[key];input.onchange=()=>{parent[key]=input.value;};}else input.type=typeof value==='boolean'?'checkbox':typeof value==='number'?'number':'text';
+    const wrapper=node('label'),label=node('span',typeof key==='number'?title(fieldKey)+' '+(key+1):title(key));label.dataset.help=help(fieldKey,full);const mark=badge(full);if(mark){const tag=node('small',mark);tag.className='parameter-badge';label.append(' ',tag);}const options=choices[fieldKey];if(options&&!options.includes(value))parent[key]=options[0];const input=node(options?'select':'input');input.dataset.parameterPath=full;
+    // Neighborhood Max Hop is meaningless once Neighborhood Mode is 'none';
+    // re-render on mode change so its disabled state stays in sync.
+    if(options){for(const choice of options){const option=node('option',title(choice));option.value=choice;input.append(option);}input.value=parent[key];input.onchange=()=>{parent[key]=input.value;if(fieldKey==='action_neighborhood_mode')render();};}else input.type=typeof value==='boolean'?'checkbox':typeof value==='number'?'number':'text';
     if(options){wrapper.append(label,input);if(optional[path]?.[key]!==undefined)wrapper.append(button('Use Default',()=>{delete parent[key];render();}));host.append(wrapper);return;}
+    if(fieldKey==='action_neighborhood_max_hop'&&parent.action_neighborhood_mode==='none')input.disabled=true;
     if(input.type==='number')input.step='any';if(input.type==='checkbox'){input.checked=value;wrapper.className='check';}else input.value=value??'';
     input.oninput=()=>{if(input.type==='number'&&(!input.value.trim()||!Number.isFinite(Number(input.value)))){input.setCustomValidity('Enter a finite number.');return;}input.setCustomValidity('');parent[key]=input.type==='checkbox'?input.checked:input.type==='number'?Number(input.value):input.value;};
     wrapper.append(label,input);if(optional[path]?.[key]!==undefined)wrapper.append(button('Use Default',()=>{delete parent[key];render();}));host.append(wrapper);
