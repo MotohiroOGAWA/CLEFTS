@@ -80,8 +80,8 @@ excluded from these snapshots. You can also edit the three default objects direc
     "normalizeIntensities": true,
     "numWorkers": 4,
     "chunkSize": 1,
-    "maxNode": 10000,
-    "maxEdge": 50000,
+    "maxUniqueFragmentSmiles": 1000,
+    "maxCleavageCombinations": 50000,
     "symbols": ["C", "N", "O", "P", "S"],
     "fragmenterParams": {"mass_tolerance": "0.02Da,10ppm"}
   },

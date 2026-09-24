@@ -19,7 +19,8 @@ def main():
         payload=pickle.load(stream)
     generator=create_preparation_context(payload['model_config'],observed_adducts=payload['observed_adducts'])
     options=payload['options']
-    builder=ActionStructureBuilder(generator,max_node=options['max_node'],max_edge=options['max_edge'])
+    builder=ActionStructureBuilder(generator,max_unique_fragment_smiles=options['max_unique_fragment_smiles'],
+        max_cleavage_combinations=options['max_cleavage_combinations'])
     results=[]
     for task in payload['tasks']:
         result=_prepare_group_safely(task,builder,options)

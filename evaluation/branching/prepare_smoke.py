@@ -36,6 +36,8 @@ for key,name,limit in [('input','train',8),('validation_input','validation',4)]:
 (root/'model_config.json').write_text(json.dumps(config,indent=2))
 main(['--input',str(root/'train.msds'),'--validation-input',str(root/'validation.msds'),
       '--output-dir',str(root/'prepared'),'--params-json',json.dumps(config),
-      '--validation-ratio','0.5','--num-workers','1','--max-node',str(original['max_node']),
-      '--max-edge',str(original['max_edge']),'--normalize-intensities','1','--overwrite','1'])
+      '--validation-ratio','0.5','--num-workers','1',
+      # Older configurations only saved max_node/max_edge, whose meaning differs; those run unlimited.
+      '--max-unique-fragment-smiles',str(original.get('max_unique_fragment_smiles',-1)),
+      '--max-cleavage-combinations',str(original.get('max_cleavage_combinations',-1)),'--normalize-intensities','1','--overwrite','1'])
 (root/'encoder_path.txt').write_text(str(encoder))

@@ -106,7 +106,7 @@ def validate(payload: dict, *, check_datasets: bool = True) -> dict:
     from clefts.ml.data_preparation.fragment_tree.context import create_preparation_context,validate_limits
     config=payload.get('modelConfig') or {'fragmenter_params':payload['fragmenterParams'],'symbols':payload.get('symbols')}
     generator=create_preparation_context(config)
-    validate_limits(payload.get('maxNode',-1),payload.get('maxEdge',-1))
+    validate_limits(payload.get('maxUniqueFragmentSmiles',-1),payload.get('maxCleavageCombinations',-1))
     for key in ('numWorkers','chunkSize'):
         value=payload.get(key,1)
         if type(value) is not int or value<1: raise ValueError('Worker processes and chunk size must be positive integers.')

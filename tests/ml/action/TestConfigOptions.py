@@ -1,5 +1,7 @@
 """Regression checks for GUI/CLI configuration precedence and forwarding."""
 import argparse
+import contextlib
+import io
 import json
 import tempfile
 import unittest
@@ -63,7 +65,7 @@ class TestConfigOptions(unittest.TestCase):
         from clefts.ml.data_preparation.fragment_tree import create_training_data as preparation
         parser=preparation.build_arg_parser()
         args=parser.parse_args(['--input','input.msds','--output-dir','out',
-                               '--max-action-count','2','--max-node','500','--max-edge','1000','--num-workers','2','--chunk-size','3','--symbols-json','["C","O"]','--smiles-column','CanonicalSMILES',
+                               '--max-action-count','2','--max-unique-fragment-smiles','500','--max-cleavage-combinations','1000','--overwrite','1','--num-workers','2','--chunk-size','3','--symbols-json','["C","O"]','--smiles-column','CanonicalSMILES',
                                '--set','action_model_params.max_fragment_nodes=70'])
         import pandas as pd
         with tempfile.TemporaryDirectory() as directory, patch.object(preparation.MSDataset,'load',return_value=preparation_dataset('CanonicalSMILES')), patch.object(preparation,'create_action_training_data') as run:
@@ -71,8 +73,8 @@ class TestConfigOptions(unittest.TestCase):
             CreateFragmentTreeDataCommand().run(args)
         kwargs=run.call_args.kwargs
         self.assertEqual(kwargs['smiles_column'],'CanonicalSMILES')
-        self.assertEqual(kwargs['max_node'],500)
-        self.assertEqual(kwargs['max_edge'],1000)
+        self.assertEqual(kwargs['max_unique_fragment_smiles'],500)
+        self.assertEqual(kwargs['max_cleavage_combinations'],1000)
         self.assertEqual(kwargs['num_workers'],2)
         self.assertEqual(kwargs['chunk_size'],3)
         self.assertEqual(kwargs['model_config']['mol_encoder_params']['symbols'],['C','O'])
@@ -99,13 +101,19 @@ class TestConfigOptions(unittest.TestCase):
     def test_preparation_file_limits_and_symbols_are_overridden_only_explicitly(self):
         from clefts.ml.data_preparation.fragment_tree import create_training_data as preparation
         import pandas as pd
-        raw={'max_node':20,'max_edge':40,'symbols':['C','O']}
+        raw={'max_unique_fragment_smiles':20,'max_cleavage_combinations':40,'symbols':['C','O']}
         with tempfile.TemporaryDirectory() as directory, patch.object(preparation,'load_spectrum_dataset',return_value=preparation_dataset()), patch.object(preparation,'create_action_training_data') as run:
-            preparation.main(['--input','test.msds','--output-dir',directory,'--params-json',json.dumps(raw)])
-            self.assertEqual(run.call_args.kwargs['max_node'],20)
-            self.assertEqual(run.call_args.kwargs['max_edge'],40)
+            preparation.main(['--input','test.msds','--output-dir',directory,'--params-json',json.dumps(raw),'--overwrite','1'])
+            self.assertEqual(run.call_args.kwargs['max_unique_fragment_smiles'],20)
+            self.assertEqual(run.call_args.kwargs['max_cleavage_combinations'],40)
+            self.assertNotIn('max_unique_fragment_smiles',run.call_args.kwargs['model_config'])
             self.assertEqual(run.call_args.kwargs['model_config']['mol_encoder_params']['symbols'],['C','O'])
-            preparation.main(['--input','test.msds','--output-dir',directory,'--params-json',json.dumps(raw),'--max-node','10','--max-edge','15','--symbols-json','["C","N"]'])
-            self.assertEqual(run.call_args.kwargs['max_node'],10)
-            self.assertEqual(run.call_args.kwargs['max_edge'],15)
-            self.assertEqual(run.call_args.kwargs['model_config']['mol_encoder_params']['symbols'],['C','N'])
+            preparation.main(['--input','test.msds','--output-dir',directory,'--params-json',json.dumps(raw),'--max-unique-fragment-smiles','10','--max-cleavage-combinations','15','--symbols-json','["C","N","O"]','--overwrite','1'])
+            self.assertEqual(run.call_args.kwargs['max_unique_fragment_smiles'],10)
+            self.assertEqual(run.call_args.kwargs['max_cleavage_combinations'],15)
+            self.assertEqual(run.call_args.kwargs['model_config']['mol_encoder_params']['symbols'],['C','N','O'])
+            # The old node/edge limits had different semantics and are rejected, not converted.
+            with self.assertRaisesRegex(ValueError,'max_node is no longer supported'):
+                preparation.main(['--input','test.msds','--output-dir',directory,'--params-json',json.dumps({'max_node':20}),'--overwrite','1'])
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            preparation.build_arg_parser().parse_args(['--input','x','--output-dir','y','--max-node','10'])

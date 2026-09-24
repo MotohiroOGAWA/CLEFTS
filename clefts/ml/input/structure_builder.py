@@ -5,7 +5,7 @@ from collections.abc import Sequence
 from types import SimpleNamespace
 import torch
 from clefts.libs.mmkit.mmkit import Compound, Adduct
-from clefts.domain.fragment.cleavage import CleavageActionSequence
+from clefts.domain.fragment.cleavage import CleavageActionSequence, FragmentTreeLimitExceeded
 from .source_action_structure import SourceActionStructure, prepare_source_actions, UnresolvedPrecursorError
 from ..specgen.source_anchored_spectrum_predictor import SourceAnchoredFragmentSpectrumGenerator
 from ..specgen.components.action.action_decoder import ActionDecoderOutput
@@ -40,10 +40,15 @@ def _walk_pathway(tree,fragmenter,pathway):
 
 
 class ActionStructureBuilder:
-    def __init__(self, generator: SourceAnchoredFragmentSpectrumGenerator, *, max_node: int = -1, max_edge: int = -1) -> None:
+    def __init__(self, generator: SourceAnchoredFragmentSpectrumGenerator, *,
+                 max_unique_fragment_smiles: int = -1, max_cleavage_combinations: int = -1) -> None:
         self.generator = generator
-        self.max_node = max_node
-        self.max_edge = max_edge
+        self.max_unique_fragment_smiles = max_unique_fragment_smiles
+        self.max_cleavage_combinations = max_cleavage_combinations
+        # Fragment-tree search statistics of the most recent build() call,
+        # including one that stopped at a search limit or failed after the
+        # tree was built; None when the tree search never ran.
+        self.last_search_stats: dict[str, int] | None = None
 
     def build(self, source: Compound, precursor_types: Sequence[Adduct], collision_energy: Sequence[float],
               peaks_mz: Sequence[Sequence[float]], peaks_intensity: Sequence[Sequence[float]]) -> tuple[SourceActionStructure, tuple[int, ...]]:
@@ -61,11 +66,18 @@ class ActionStructureBuilder:
         for mz,intensity in zip(peaks_mz,peaks_intensity):
             if len(mz)!=len(intensity):
                 raise ValueError("Peak m/z and intensity lengths differ")
+        self.last_search_stats=None
         generator=self.generator
         fragmenter=generator.fragmenter
         actions=fragmenter.fragment_ion_tree_builder.create_cleavage_actions(source)
         # Full chemistry is permitted here, never inside neural forward.
-        tree=fragmenter.build_fragment_ion_tree(source,max_node=self.max_node,max_edge=self.max_edge,_include_fragment_compound_cache=True)
+        try:
+            tree=fragmenter.build_fragment_ion_tree(source,max_unique_fragment_smiles=self.max_unique_fragment_smiles,
+                max_cleavage_combinations=self.max_cleavage_combinations,_include_fragment_compound_cache=True)
+        except FragmentTreeLimitExceeded as error:
+            self.last_search_stats=error.stats
+            raise
+        self.last_search_stats=getattr(tree,'_search_stats',None)
         # Resolve the observed precursor against the same already-built tree so
         # unreachable records can be dropped before teacher assignment. These
         # paths are validation metadata, not decoder seeds: branching starts at

@@ -111,7 +111,8 @@ class TestPreparationWorkflow(unittest.TestCase):
             self.assertEqual(len(list((root/'cli').rglob('*.preft.pt'))),1)
             saved=json.loads((root/'cli/preparation_config.json').read_text())
             self.assertEqual(saved['input'],str(file))
-            self.assertEqual(saved['max_node'],-1)
+            self.assertEqual(saved['max_unique_fragment_smiles'],-1)
+            self.assertEqual(saved['max_cleavage_combinations'],-1)
 
     def test_tree_limits_skip_only_the_source_and_continue_serial_and_parallel(self):
         from clefts.ml.data_preparation.fragment_tree.create_training_data import create_action_training_data
@@ -121,7 +122,7 @@ class TestPreparationWorkflow(unittest.TestCase):
         model=config();model['fragmenter_params']['fragment_ion_tree_builder']['max_action_count']=1
         with tempfile.TemporaryDirectory() as directory:
             for workers in (1,2):
-                for limit in ({'max_node':1},{'max_edge':0}):
+                for limit in ({'max_unique_fragment_smiles':1},{'max_cleavage_combinations':1}):
                     with self.subTest(workers=workers,limit=limit):
                         output=Path(directory)/f'{workers}-{next(iter(limit))}'
                         stderr=io.StringIO()
@@ -138,8 +139,30 @@ class TestPreparationWorkflow(unittest.TestCase):
                         self.assertEqual(rejected.num_edges,0)
                         self.assertTrue((output/rejected.rejection_log).is_file())
                         self.assertEqual(skipped[0]['record_indexes'],[0,1])
-                        self.assertIn('limit exceeded',skipped[0]['reason'])
+                        name=next(iter(limit))
+                        # A limit skip is its own category, distinct from ordinary errors.
+                        self.assertEqual(skipped[0]['reason'],f'{name} exceeded: limit=1, observed>1')
+                        self.assertEqual(skipped[0]['category'],'limit_exceeded')
+                        self.assertEqual(skipped[0]['limit'],name)
+                        self.assertEqual(rejected.skip_category,'limit_exceeded')
+                        self.assertEqual(rejected.reason,skipped[0]['reason'])
+                        # Statistics up to the moment of the stop are kept for diagnosis.
+                        partial=skipped[0]['search_stats']
+                        observed=partial['num_unique_fragment_smiles' if name=='max_unique_fragment_smiles' else 'num_raw_combinations']
+                        self.assertEqual(observed,2)
+                        for field in ('num_primitive_actions','num_raw_combinations','num_compiled_sequences',
+                                      'num_rdkit_run_reactants','num_generated_fragments','num_unique_fragment_smiles'):
+                            self.assertEqual(rejected[field],partial[field])
+                        completed=manifest[manifest.status=='completed'].iloc[0]
+                        self.assertEqual(completed.num_primitive_actions,0)
+                        self.assertTrue(pd.isna(completed.skip_category))
                         stats=json.loads((output/'action_statistics.json').read_text())
+                        self.assertEqual(stats['search_limits'],{'max_unique_fragment_smiles':-1,'max_cleavage_combinations':-1,**limit})
+                        self.assertEqual(stats['num_skipped_sources_by_category'],{'limit_exceeded':1})
+                        self.assertEqual(stats['num_limit_skipped_sources'],{name:1})
+                        # Maxima cover completed sources only; methane has no cleavage actions.
+                        self.assertEqual(stats['max_primitive_actions'],0)
+                        self.assertEqual(stats['max_primitive_actions_smiles'],'C')
                         self.assertEqual(stats['num_samples'],1)
                         self.assertEqual(stats['num_metadata_valid_records'],3)
                         self.assertEqual(stats['num_skipped_sources'],1)
@@ -187,7 +210,7 @@ class TestPreparationWorkflow(unittest.TestCase):
             model=config();model['fragmenter_params']['fragment_ion_tree_builder']['max_action_count']=1
             with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()):
                 main(['--input',str(input_file),'--validation-input',str(validation_file),'--output-dir',str(output),
-                    '--params-json',json.dumps(model),'--max-node','100','--max-edge','200','--overwrite','1',
+                    '--params-json',json.dumps(model),'--max-unique-fragment-smiles','100','--max-cleavage-combinations','200','--overwrite','1',
                     '--normalize-intensities','0','--minimum-relative-intensity','0.2','--validation-seed','7'])
             self.assertFalse((output/'orphan.txt').exists())
             self.assertFalse((output/'train_structures/stale').exists())
@@ -195,8 +218,13 @@ class TestPreparationWorkflow(unittest.TestCase):
             self.assertEqual(saved['validationInput'],str(validation_file))
             self.assertEqual(saved['validationRatio'],0.25)
             self.assertEqual(saved['validationSeed'],7)
-            self.assertEqual(saved['maxNode'],100)
-            self.assertEqual(saved['maxEdge'],200)
+            self.assertEqual(saved['maxUniqueFragmentSmiles'],100)
+            self.assertEqual(saved['maxCleavageCombinations'],200)
+            self.assertNotIn('maxNode',saved)
+            self.assertNotIn('maxEdge',saved)
+            prepared=json.loads((output/'preparation_config.json').read_text())
+            self.assertEqual(prepared['max_unique_fragment_smiles'],100)
+            self.assertEqual(prepared['max_cleavage_combinations'],200)
             self.assertFalse(saved['normalizeIntensities'])
             self.assertEqual(saved['minimumRelativeIntensity'],0.2)
             self.assertFalse(list(output.glob('*/preparation_config.json')))
@@ -351,10 +379,12 @@ class TestPreparationWorkflow(unittest.TestCase):
 
     def test_preflight_accepts_fragmenter_and_symbols_without_a_model(self):
         model=config()
-        result=backend.validate({'fragmenterParams':model['fragmenter_params'],'symbols':model['mol_encoder_params']['symbols'],'maxNode':20,'maxEdge':40})
+        result=backend.validate({'fragmenterParams':model['fragmenter_params'],'symbols':model['mol_encoder_params']['symbols'],'maxUniqueFragmentSmiles':20,'maxCleavageCombinations':40})
         self.assertTrue(result['valid'])
-        with self.assertRaisesRegex(ValueError,'Max node'):
-            backend.validate({'fragmenterParams':model['fragmenter_params'],'symbols':['C'],'maxNode':0})
+        with self.assertRaisesRegex(ValueError,'Max unique fragment SMILES'):
+            backend.validate({'fragmenterParams':model['fragmenter_params'],'symbols':['C'],'maxUniqueFragmentSmiles':0})
+        with self.assertRaisesRegex(ValueError,'Max cleavage combinations'):
+            backend.validate({'fragmenterParams':model['fragmenter_params'],'symbols':['C'],'maxCleavageCombinations':0})
 
     def test_parallel_preparation_matches_serial_outputs(self):
         from clefts.ml.data_preparation.fragment_tree.create_training_data import create_action_training_data,build_arg_parser
@@ -438,4 +468,113 @@ class TestPreparationWorkflow(unittest.TestCase):
         self.assertEqual(len(files),3)
         self.assertEqual([source['smiles'] for source in skipped],['CCN'])
         self.assertIn('status 3',skipped[0]['reason'])
+        self.assertEqual(skipped[0]['category'],'worker_crash')
         self.assertEqual(leftovers,[])
+
+    def test_manifest_and_action_statistics_record_search_statistics(self):
+        from clefts.ml.data_preparation.fragment_tree.create_training_data import create_action_training_data,SEARCH_STAT_FIELDS
+        from clefts.ml.data_preparation.fragment_tree.context import create_preparation_context
+        model=config();model['fragmenter_params']['fragment_ion_tree_builder']['max_action_count']=2
+        fragmenter=create_preparation_context(model).fragmenter
+        expected={smiles:fragmenter.build_fragment_ion_tree(Compound.from_smiles(smiles))._search_stats
+                  for smiles in ('CCO','CCN','CCC','COC')}
+        with tempfile.TemporaryDirectory() as directory:
+            for workers in (1,2):
+                with self.subTest(workers=workers):
+                    output=Path(directory)/str(workers)
+                    with contextlib.redirect_stderr(io.StringIO()):
+                        create_action_training_data(dataset=self.dataset(),model_config=model,output_dir=output,num_workers=workers,chunk_size=1)
+                    manifest=pd.read_csv(output/'manifest.tsv',sep='\t').set_index('smiles')
+                    self.assertTrue(set(SEARCH_STAT_FIELDS)<={*manifest.columns})
+                    self.assertIn('skip_category',manifest.columns)
+                    for smiles,stats in expected.items():
+                        for field in SEARCH_STAT_FIELDS:
+                            self.assertEqual(manifest.loc[smiles,field],stats[field],(smiles,field))
+                    summary=json.loads((output/'action_statistics.json').read_text())
+                    for field,key in (('num_primitive_actions','max_primitive_actions'),('num_raw_combinations','max_raw_combinations'),
+                                      ('num_compiled_sequences','max_compiled_sequences'),('num_rdkit_run_reactants','max_rdkit_run_reactants'),
+                                      ('num_generated_fragments','max_generated_fragments'),('num_unique_fragment_smiles','max_observed_unique_fragment_smiles')):
+                        best=max(stats[field] for stats in expected.values())
+                        self.assertEqual(summary[key],best)
+                        # Ties resolve to the smallest SMILES, independent of worker order.
+                        self.assertEqual(summary[key+'_smiles'],min(smiles for smiles,stats in expected.items() if stats[field]==best))
+                    self.assertEqual(summary['search_limits'],{'max_unique_fragment_smiles':-1,'max_cleavage_combinations':-1})
+                    self.assertEqual(summary['num_skipped_sources_by_category'],{})
+                    self.assertEqual(summary['num_limit_skipped_sources'],{})
+
+    def test_other_skip_reasons_are_distinguished_from_limits(self):
+        import clefts.ml.data_preparation.fragment_tree.create_training_data as create_training_data_module
+        from clefts.ml.data_preparation.fragment_tree.create_training_data import create_action_training_data
+        from clefts.ml.input.structure_builder import ActionStructureBuilder
+        real_build=ActionStructureBuilder.build
+        def build(builder,source,*args):
+            if source.smiles=='CCN':
+                real_build(builder,Compound.from_smiles('CCN'),*args)
+                raise RuntimeError('after the tree search')
+            return real_build(builder,source,*args)
+        model=config();model['fragmenter_params']['fragment_ion_tree_builder']['max_action_count']=1
+        with tempfile.TemporaryDirectory() as directory,unittest.mock.patch.object(ActionStructureBuilder,'build',build):
+            output=Path(directory)
+            with contextlib.redirect_stderr(io.StringIO()):
+                create_action_training_data(dataset=self.dataset(),model_config=model,output_dir=output,max_cleavage_combinations=1)
+            skipped={source['smiles']:source for source in json.loads((output/'skipped_sources.json').read_text())}
+            manifest=pd.read_csv(output/'manifest.tsv',sep='\t').set_index('smiles')
+            summary=json.loads((output/'action_statistics.json').read_text())
+        # Every source has more than one raw combination and exceeds a budget of one.
+        for smiles in ('CCO','CCC','COC'):
+            self.assertEqual(skipped[smiles]['category'],'limit_exceeded')
+            self.assertEqual(manifest.loc[smiles,'skip_category'],'limit_exceeded')
+        self.assertEqual(skipped['CCN']['category'],'limit_exceeded')
+        self.assertEqual(summary['num_limit_skipped_sources'],{'max_cleavage_combinations':4})
+        with tempfile.TemporaryDirectory() as directory,unittest.mock.patch.object(ActionStructureBuilder,'build',build):
+            output=Path(directory)
+            with contextlib.redirect_stderr(io.StringIO()):
+                create_action_training_data(dataset=self.dataset(),model_config=model,output_dir=output)
+            skipped={source['smiles']:source for source in json.loads((output/'skipped_sources.json').read_text())}
+            manifest=pd.read_csv(output/'manifest.tsv',sep='\t').set_index('smiles')
+            summary=json.loads((output/'action_statistics.json').read_text())
+        self.assertEqual(list(skipped),['CCN'])
+        self.assertEqual(skipped['CCN']['category'],'error')
+        self.assertEqual(manifest.loc['CCN','skip_category'],'error')
+        self.assertNotIn('limit',skipped['CCN'])
+        # Statistics of a tree search that finished before a later error are still reported.
+        from clefts.ml.data_preparation.fragment_tree.context import create_preparation_context
+        expected=create_preparation_context(model).fragmenter.build_fragment_ion_tree(Compound.from_smiles('CCN'))._search_stats
+        self.assertEqual(skipped['CCN']['search_stats'],expected)
+        self.assertEqual(manifest.loc['CCN','num_primitive_actions'],expected['num_primitive_actions'])
+        self.assertEqual(summary['num_skipped_sources_by_category'],{'error':1})
+        self.assertEqual(summary['num_limit_skipped_sources'],{})
+
+    def test_cli_and_workbench_share_limit_names_and_saved_settings(self):
+        import shutil,subprocess
+        from clefts.ml.data_preparation.fragment_tree.create_training_data import build_arg_parser
+        node=shutil.which('node')
+        if node is None: self.skipTest('node is required to load the Workbench extension module')
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);input_file=root/'train.msds';self.dataset().save(str(input_file))
+            model=config();model['fragmenter_params']['fragment_ion_tree_builder']['max_action_count']=1
+            with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()):
+                main(['--input',str(input_file),'--output-dir',str(root/'out'),'--params-json',json.dumps(model),
+                      '--max-unique-fragment-smiles','30','--max-cleavage-combinations','400','--overwrite','1'])
+            saved=json.loads((root/'out/preparation_config.json').read_text())
+            legacy={**saved,'workbench_config':{**saved['workbench_config'],'maxNode':5,'maxEdge':6}}
+            script="""
+const Module=require('module'),load=Module._load;
+Module._load=function(name,...rest){return name==='vscode'?{window:{},Uri:{file:fsPath=>({fsPath})}}:load.call(this,name,...rest);};
+const {normalizeConfig,buildArgs}=require(process.argv[1]);
+const [saved,legacy]=JSON.parse(require('fs').readFileSync(0,'utf8'));
+const config=normalizeConfig(saved);
+process.stdout.write(JSON.stringify({config,legacy:normalizeConfig(legacy),args:buildArgs(config)}));
+"""
+            extension=str(Path('clefts_workbench/src/extension.js').resolve())
+            completed=subprocess.run([node,'-e',script,extension],input=json.dumps([saved,legacy]),capture_output=True,text=True,check=True)
+            result=json.loads(completed.stdout)
+        config_=result['config']
+        self.assertEqual((config_['maxUniqueFragmentSmiles'],config_['maxCleavageCombinations']),(30,400))
+        for key in ('maxNode','maxEdge','max_node','max_edge'):
+            self.assertNotIn(key,config_)
+            self.assertNotIn(key,result['legacy'])
+        self.assertEqual(result['legacy']['maxUniqueFragmentSmiles'],30)
+        # The Workbench command line is accepted by the CLI parser with the same values.
+        args=build_arg_parser().parse_args(result['args'][result['args'].index('create-fragment-tree-data')+1:])
+        self.assertEqual((args.max_unique_fragment_smiles,args.max_cleavage_combinations),(30,400))

@@ -294,9 +294,11 @@ function normalizeConfig(config) {
     precursor_mz_column:'precursorMzColumn',validation_smiles_column:'validationSmilesColumn',validation_adduct_type_column:'validationAdductTypeColumn',
     validation_collision_energy_column:'validationCollisionEnergyColumn',validation_precursor_mz_column:'validationPrecursorMzColumn',
     minimum_relative_intensity:'minimumRelativeIntensity',normalize_intensities:'normalizeIntensities',
-    num_workers:'numWorkers',chunk_size:'chunkSize',max_node:'maxNode',max_edge:'maxEdge',model_config:'modelConfig'};
+    num_workers:'numWorkers',chunk_size:'chunkSize',max_unique_fragment_smiles:'maxUniqueFragmentSmiles',max_cleavage_combinations:'maxCleavageCombinations',model_config:'modelConfig'};
   for(const [from,to] of Object.entries(aliases)){if(result[from]!==undefined&&result[to]===undefined)result[to]=result[from];delete result[from];}
-  if(result.modelConfig){const model=result.modelConfig.params||result.modelConfig;result.fragmenterParams??=model.fragmenter_params;result.symbols??=model.symbols||model.mol_encoder_params?.symbols;result.maxNode??=model.max_node;result.maxEdge??=model.max_edge;if(result.fragmenterParams)delete result.modelConfig;}
+  // Legacy node/edge limits measured something else; they are dropped, never converted.
+  for(const legacy of ['max_node','max_edge','maxNode','maxEdge'])delete result[legacy];
+  if(result.modelConfig){const model=result.modelConfig.params||result.modelConfig;result.fragmenterParams??=model.fragmenter_params;result.symbols??=model.symbols||model.mol_encoder_params?.symbols;result.maxUniqueFragmentSmiles??=model.max_unique_fragment_smiles;result.maxCleavageCombinations??=model.max_cleavage_combinations;if(result.fragmenterParams)delete result.modelConfig;}
   if(result.validationRatio==null)delete result.validationRatio;
   if(result.validationInput==null)result.validationInput='';
   if (result.modelConfig || result.fragmenterParams) delete result.params;
@@ -376,7 +378,7 @@ function buildArgs(c) {
   if(c.modelConfig || c.fragmenterParams) args.push('--params-json',JSON.stringify(c.modelConfig || c.fragmenterParams));
   else if(c.params) args.push('--params',c.params);
   if(c.symbols)args.push('--symbols-json',JSON.stringify(c.symbols));
-  for(const [key,flag]of Object.entries({maxNode:'--max-node',maxEdge:'--max-edge'}))if(c[key]!==undefined)args.push(flag,String(c[key]));
+  for(const [key,flag]of Object.entries({maxUniqueFragmentSmiles:'--max-unique-fragment-smiles',maxCleavageCombinations:'--max-cleavage-combinations'}))if(c[key]!==undefined)args.push(flag,String(c[key]));
   for(const [key,flag] of Object.entries({smilesColumn:'--smiles-column',adductTypeColumn:'--adduct-type-column',collisionEnergyColumn:'--collision-energy-column',precursorMzColumn:'--precursor-mz-column'}))if(c[key])args.push(flag,c[key]);
   // Only emitted when the validation dataset genuinely needs a different column name than training.
   if(c.validationInput)for(const [key,flag,trainKey] of [['validationSmilesColumn','--validation-smiles-column','smilesColumn'],['validationAdductTypeColumn','--validation-adduct-type-column','adductTypeColumn'],['validationCollisionEnergyColumn','--validation-collision-energy-column','collisionEnergyColumn'],['validationPrecursorMzColumn','--validation-precursor-mz-column','precursorMzColumn']])if(c[key]&&c[key]!==c[trainKey])args.push(flag,c[key]);
@@ -624,7 +626,7 @@ function datasetStatisticsHtml(stats) {
 }
 
 function manifestTableHtml(manifest, index) {
-  const columns = ['file', 'status', 'smiles', 'num_input_records', 'num_valid_samples', 'rejected_sample_count', 'rejection_log', 'num_branch_groups', 'num_teacher_nodes', 'num_transition_states', 'num_positive_transitions', 'num_physical_ion_candidates', 'num_ion_explanations', 'max_ms2_depth', 'num_nodes', 'num_edges', 'assignment_score', 'assignment_score_without_precursor'];
+  const columns = ['file', 'status', 'smiles', 'num_input_records', 'num_valid_samples', 'rejected_sample_count', 'rejection_log', 'num_branch_groups', 'num_teacher_nodes', 'num_transition_states', 'num_positive_transitions', 'num_physical_ion_candidates', 'num_ion_explanations', 'max_ms2_depth', 'num_nodes', 'num_edges', 'assignment_score', 'assignment_score_without_precursor', 'num_primitive_actions', 'num_raw_combinations', 'num_compiled_sequences', 'num_rdkit_run_reactants', 'num_generated_fragments', 'num_unique_fragment_smiles', 'skip_category', 'reason'];
   const rows = manifest.rows.map(row => `<tr>${columns.map(column => { const value = row[column] ?? ''; if(column.startsWith('assignment_score')) return `<td data-value="${escapeHtml(value)}" title="Mean per-sample intensity coverage">${value!==''&&Number.isFinite(Number(value))?(Number(value)*100).toFixed(2)+'%':'Unavailable'}</td>`; if(column==='rejection_log'&&!value)return '<td data-value="">—</td>'; if (column === 'file' && value && row.exists) return `<td data-value="${escapeHtml(value)}"><button class="manifest-file" data-open-file="${encodeURIComponent(row.relative)}">${escapeHtml(value)}</button></td>`; if (column === 'file' && value) return `<td data-value="${escapeHtml(value)}"><span>${escapeHtml(value)}</span><small class="missing-file">not generated (${escapeHtml(row.status || 'missing')})</small></td>`; if (column === 'rejection_log' && value) return `<td data-value="${escapeHtml(value)}"><button class="manifest-file" data-open-file="${encodeURIComponent(path.join(manifest.relativeBase || '', value))}">${escapeHtml(value)}</button></td>`; return `<td data-value="${escapeHtml(value)}">${escapeHtml(value)}</td>`; }).join('')}</tr>`).join('');
   return `<div class="manifest-grid" data-manifest-grid="${index}"><h3>${escapeHtml(manifest.directory)}</h3><div class="manifest-controls"><input type="search" data-manifest-search placeholder="Filter all columns…"><label>Rows <select data-page-size><option>20</option><option selected>50</option><option>100</option><option>250</option></select></label><button data-page-prev>Previous</button><span data-page-label></span><button data-page-next>Next</button></div><div class="table-scroll manifest-scroll"><table><thead><tr>${columns.map((column,columnIndex) => `<th class="sortable" data-manifest-sort="${columnIndex}" data-label="${escapeHtml(column)}">${escapeHtml(column)} ↕</th>`).join('')}</tr><tr class="column-filters">${columns.map((column,columnIndex) => `<th><input data-column-filter="${columnIndex}" placeholder="Filter…" aria-label="Filter ${escapeHtml(column)}"></th>`).join('')}</tr></thead><tbody>${rows}</tbody></table></div></div>`;
 }
@@ -666,7 +668,7 @@ const HELP = {
   trainInput: 'Training input MSDataset path. Required.', validationInput: 'Optional validation input MSDataset path.',
   params: 'Fragmenter parameter JSON used for preprocessing. Required.', outputDir: 'Output root directory. Required.',
   symbols: 'Element symbols that define atom-feature columns. Required and immutable for generated data.',
-  maxNode: 'Maximum fragment-tree nodes. Use -1 for no limit.', maxEdge: 'Maximum fragment-tree edges. Use -1 for no limit.',
+  maxUniqueFragmentSmiles: 'Skip a source molecule once its generated fragments exceed this many distinct canonical SMILES (source not counted). Use -1 for no limit.', maxCleavageCombinations: 'Skip a source molecule once its cleavage action search examines more than this many raw action combinations, before RDKit runs them. Use -1 for no limit.',
   smilesColumn: 'Metadata column containing SMILES strings. Default: SMILES.', precursorMzColumn: 'Metadata column containing precursor m/z values. Default: PrecursorMZ.',
   adductTypeColumn: 'Metadata column containing adduct types. Default: AdductType.', collisionEnergyColumn: 'Metadata column containing collision energies. Default: CollisionEnergy.',
   instrumentColumn: 'Optional metadata column containing instrument names. Leave blank when unavailable; for NIST-style data it is commonly InstrumentType.', validationSmilesRatio: 'Target validation SMILES count relative to unique training SMILES. Default: 0.1.',

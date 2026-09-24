@@ -14,7 +14,7 @@ __all__ = [
 
 from .CleavageActionResult import CleavageActionResult
 from .CleavageActionGenerator import create_cleavage_actions
-from .CleavageActionSearch import CleavageActionSearchStats
+from .CleavageActionSearch import CleavageActionSearchStats, FragmentTreeLimitExceeded, validate_search_limits
 
 from .CleavageActionRelations import CleavageActionRelations
 __all__.append("CleavageActionRelations")

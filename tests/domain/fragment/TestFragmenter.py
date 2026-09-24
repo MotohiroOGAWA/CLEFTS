@@ -89,8 +89,8 @@ class TestFragmenter(unittest.TestCase):
 
                     fragment_tree = fragmenter.build_fragment_tree(
                         compound,
-                        max_node=-1,
-                        max_edge=-1,
+                        max_unique_fragment_smiles=-1,
+                        max_cleavage_combinations=-1,
                         print_info=False,
                     )
 
@@ -119,8 +119,8 @@ class TestFragmenter(unittest.TestCase):
 
                     fragment_ion_tree = fragmenter.build_fragment_ion_tree(
                         compound,
-                        max_node=-1,
-                        max_edge=-1,
+                        max_unique_fragment_smiles=-1,
+                        max_cleavage_combinations=-1,
                         print_info=False,
                     )
 
@@ -135,7 +135,11 @@ class TestFragmenter(unittest.TestCase):
                         case.expected_num_edges,
                     )
 
-    def test_build_fragment_tree_raises_when_max_node_is_exceeded_for_all_cases(self) -> None:
+    def test_search_limits_skip_only_above_the_observed_value_for_all_cases(self) -> None:
+        # A limit equal to a source's own unlimited statistic keeps the tree
+        # identical; one below it stops that source with a limit error.
+        limits = (("max_unique_fragment_smiles", "num_unique_fragment_smiles"),
+                  ("max_cleavage_combinations", "num_raw_combinations"))
         for question in make_fragment_tree_builder_questions():
             if question.fragment_ion_adduct_rule_set is None:
                 continue
@@ -144,88 +148,29 @@ class TestFragmenter(unittest.TestCase):
             fragmenter = self._make_fragmenter(builder)
 
             for case in question.cases:
-                with self.subTest(question=question.name, case=case.name):
-                    compound = Compound.from_smiles(case.smiles)
-
-                    with self.assertRaisesRegex(
-                        ValueError,
-                        "Fragment tree node limit exceeded",
-                    ):
-                        fragmenter.build_fragment_tree(
-                            compound,
-                            max_node=1,
-                            max_edge=-1,
-                            print_info=False,
-                        )
-
-    def test_build_fragment_tree_raises_when_max_edge_is_exceeded_for_all_cases(self) -> None:
-        for question in make_fragment_tree_builder_questions():
-            if question.fragment_ion_adduct_rule_set is None:
-                continue
-
-            builder = self._make_fragment_ion_tree_builder(question)
-            fragmenter = self._make_fragmenter(builder)
-
-            for case in question.cases:
-                with self.subTest(question=question.name, case=case.name):
-                    compound = Compound.from_smiles(case.smiles)
-
-                    with self.assertRaisesRegex(
-                        ValueError,
-                        "Fragment tree edge limit exceeded",
-                    ):
-                        fragmenter.build_fragment_tree(
-                            compound,
-                            max_node=-1,
-                            max_edge=0,
-                            print_info=False,
-                        )
-
-    def test_build_fragment_ion_tree_raises_when_max_node_is_exceeded_for_all_cases(self) -> None:
-        for question in make_fragment_tree_builder_questions():
-            if question.fragment_ion_adduct_rule_set is None:
-                continue
-
-            builder = self._make_fragment_ion_tree_builder(question)
-            fragmenter = self._make_fragmenter(builder)
-
-            for case in question.cases:
-                with self.subTest(question=question.name, case=case.name):
-                    compound = Compound.from_smiles(case.smiles)
-
-                    with self.assertRaisesRegex(
-                        ValueError,
-                        "Fragment tree node limit exceeded",
-                    ):
-                        fragmenter.build_fragment_ion_tree(
-                            compound,
-                            max_node=1,
-                            max_edge=-1,
-                            print_info=False,
-                        )
-
-    def test_build_fragment_ion_tree_raises_when_max_edge_is_exceeded_for_all_cases(self) -> None:
-        for question in make_fragment_tree_builder_questions():
-            if question.fragment_ion_adduct_rule_set is None:
-                continue
-
-            builder = self._make_fragment_ion_tree_builder(question)
-            fragmenter = self._make_fragmenter(builder)
-
-            for case in question.cases:
-                with self.subTest(question=question.name, case=case.name):
-                    compound = Compound.from_smiles(case.smiles)
-
-                    with self.assertRaisesRegex(
-                        ValueError,
-                        "Fragment tree edge limit exceeded",
-                    ):
-                        fragmenter.build_fragment_ion_tree(
-                            compound,
-                            max_node=-1,
-                            max_edge=0,
-                            print_info=False,
-                        )
+                compound = Compound.from_smiles(case.smiles)
+                unlimited = fragmenter.build_fragment_ion_tree(compound)
+                stats = unlimited._search_stats
+                for limit_name, stat_name in limits:
+                    observed = stats[stat_name]
+                    with self.subTest(question=question.name, case=case.name, limit=limit_name):
+                        if observed == 0:
+                            continue
+                        signature = lambda tree: (tree.node_smiles.tolist(), tree.source_indices.tolist(),
+                                                  tree.target_indices.tolist(), tree.num_transitions)
+                        exact = fragmenter.build_fragment_ion_tree(compound, **{limit_name: observed})
+                        self.assertEqual(signature(exact), signature(unlimited))
+                        self.assertEqual(exact._search_stats, stats)
+                        self.assertEqual(signature(fragmenter.build_fragment_tree(compound, **{limit_name: observed})),
+                                         signature(unlimited))
+                        if observed == 1:
+                            continue
+                        for build in (fragmenter.build_fragment_tree, fragmenter.build_fragment_ion_tree):
+                            with self.assertRaisesRegex(
+                                ValueError,
+                                rf"^{limit_name} exceeded: limit={observed - 1}, observed>{observed - 1}$",
+                            ):
+                                build(compound, **{limit_name: observed - 1})
 
     def test_to_dict(self) -> None:
         for question in make_fragment_tree_builder_questions():
@@ -334,8 +279,8 @@ class TestFragmenter(unittest.TestCase):
                 fragment_ion_tree = fragmenter.build_fragment_ion_tree(
                     compound,
                     seed_action_sequences=seeds,
-                    max_node=-1,
-                    max_edge=-1,
+                    max_unique_fragment_smiles=-1,
+                    max_cleavage_combinations=-1,
                     print_info=False,
                     _include_fragment_compound_cache=True,
                 )
@@ -380,8 +325,8 @@ class TestFragmenter(unittest.TestCase):
                 fragment_ion_tree = fragmenter.build_fragment_ion_tree(
                     compound,
                     seed_action_sequences=seeds,
-                    max_node=-1,
-                    max_edge=-1,
+                    max_unique_fragment_smiles=-1,
+                    max_cleavage_combinations=-1,
                     print_info=False,
                     _include_fragment_compound_cache=True,
                 )

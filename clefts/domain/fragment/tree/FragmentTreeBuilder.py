@@ -13,15 +13,12 @@ from ..cleavage.CleavageAction import CleavageAction, mapped_source
 from ..cleavage.CleavageActionGenerator import create_cleavage_actions
 from ..cleavage.CleavageActionSequence import CleavageActionSequence
 from ..cleavage.CleavageActionResult import CleavageActionResult
-from ..cleavage.CleavageActionSearch import CleavageActionSearch, _ActionSequenceCandidate
+from ..cleavage.CleavageActionSearch import (CleavageActionSearch, FragmentTreeLimitExceeded,
+                                              _ActionSequenceCandidate, validate_search_limits)
 from .CleavageActionTransition import CleavageActionTransition
 from .FragmentEdge import FragmentEdge
 from .FragmentNode import FragmentNode
 from .FragmentTree import FragmentTree
-
-
-class FragmentTreeLimitExceeded(ValueError):
-    """A single source tree exceeds configured size limits."""
 
 
 @dataclass(frozen=True)
@@ -76,6 +73,7 @@ class FragmentTreeBuilder:
         *,
         seed_action_sequences: Sequence[CleavageActionSequence] | None,
         max_action_count: int | None,
+        max_cleavage_combinations: int = -1,
     ) -> tuple[CleavageActionSearch, Iterable[_ActionSequenceCandidate]]:
         if not isinstance(source_compound, Compound):
             raise TypeError("source_compound must be a Compound.")
@@ -91,7 +89,8 @@ class FragmentTreeBuilder:
                 raise ValueError("Seed action universe differs from Original Source")
         actions = self.create_cleavage_actions(source_compound)
         search = CleavageActionSearch(actions, max_action_count=limit,
-                                      seed_action_sequences=seeds)
+                                      seed_action_sequences=seeds,
+                                      max_cleavage_combinations=max_cleavage_combinations)
         return search, search.iter_candidates()
 
     def _materialize(self, source_compound, search, candidates):
@@ -103,9 +102,19 @@ class FragmentTreeBuilder:
         source_compound: Compound,
         search: CleavageActionSearch,
         candidates: Iterable[_ActionSequenceCandidate],
+        *,
+        max_unique_fragment_smiles: int = -1,
     ):
-        """Compile/run each unique effect once, retaining every action history."""
+        """Compile/run each unique effect once, retaining every action history.
+
+        Every newly generated fragment's canonical SMILES joins a set that
+        excludes the Source SMILES. Once that set grows beyond
+        max_unique_fragment_smiles the source is abandoned immediately, before
+        the next candidate is requested from the lazy combination search.
+        """
         results: dict[CleavageActionSequence, CleavageActionResult] = {}
+        unique_fragment_smiles: set[str] = set()
+        source_smiles = source_compound.smiles
         effect_cache: dict[tuple[object, ...], tuple[Compound, str] | None] = {}
         visited_effect_keys: set[tuple[object, ...]] = set()
         for candidate in candidates:
@@ -128,6 +137,12 @@ class FragmentTreeBuilder:
                         raise ValueError("Source-specific reaction must generate exactly one target")
                     cached = (Compound(products[0]), reaction.smirks)
                     search.stats.num_generated_fragments += 1
+                    smiles = cached[0].smiles
+                    if smiles != source_smiles and smiles not in unique_fragment_smiles:
+                        unique_fragment_smiles.add(smiles)
+                        search.stats.num_unique_fragment_smiles = len(unique_fragment_smiles)
+                        if 0 <= max_unique_fragment_smiles < len(unique_fragment_smiles):
+                            raise FragmentTreeLimitExceeded("max_unique_fragment_smiles", max_unique_fragment_smiles)
                 except Chem.rdchem.MolSanitizeException:
                     # A graph-valid collection can still violate chemical valence.
                     if candidate.is_seed:
@@ -158,13 +173,14 @@ class FragmentTreeBuilder:
         compound: Compound,
         *,
         seed_action_sequences: Sequence[CleavageActionSequence] | None = None,
-        max_node: int = -1,
-        max_edge: int = -1,
+        max_unique_fragment_smiles: int = -1,
+        max_cleavage_combinations: int = -1,
         max_action_count: int | None = None,
         print_info: bool = False,
     ) -> FragmentTree:
         return self._build_result(compound, seed_action_sequences=seed_action_sequences,
-            max_node=max_node, max_edge=max_edge, max_action_count=max_action_count,
+            max_unique_fragment_smiles=max_unique_fragment_smiles,
+            max_cleavage_combinations=max_cleavage_combinations, max_action_count=max_action_count,
             print_info=print_info)["fragment_tree"]
 
     def _build_result(
@@ -172,27 +188,46 @@ class FragmentTreeBuilder:
         compound: Compound,
         *,
         seed_action_sequences: Sequence[CleavageActionSequence] | None = None,
-        max_node: int = -1,
-        max_edge: int = -1,
+        max_unique_fragment_smiles: int = -1,
+        max_cleavage_combinations: int = -1,
         max_action_count: int | None = None,
         print_info: bool = False,
     ) -> dict[str, Any]:
-        if type(max_node) is not int or not (max_node == -1 or max_node > 0):
-            raise ValueError("max_node must be -1 or a positive integer.")
-        if type(max_edge) is not int or max_edge < -1:
-            raise ValueError("max_edge must be -1 or a non-negative integer.")
+        """Build one source tree; -1 disables either search limit.
+
+        max_cleavage_combinations bounds search.stats.num_raw_combinations and
+        is enforced inside CleavageActionSearch before RDKit runs.
+        max_unique_fragment_smiles bounds distinct generated fragment SMILES,
+        excluding the Source itself, and is enforced as each fragment is
+        materialized. A FragmentTreeLimitExceeded carries the statistics
+        observed up to that point in ``stats``.
+        """
+        validate_search_limits(max_unique_fragment_smiles, max_cleavage_combinations)
         started = time.monotonic()
         source_compound = compound
         search, candidates = self._search(source_compound,
-            seed_action_sequences=seed_action_sequences, max_action_count=max_action_count)
-        state = _FragmentTreeBuildState(source_compound.smiles, max_node=max_node, max_edge=max_edge,
+            seed_action_sequences=seed_action_sequences, max_action_count=max_action_count,
+            max_cleavage_combinations=max_cleavage_combinations)
+        try:
+            return self._build_from_candidates(source_compound, search, candidates,
+                seed_action_sequences=seed_action_sequences,
+                max_unique_fragment_smiles=max_unique_fragment_smiles,
+                print_info=print_info, started=started)
+        except FragmentTreeLimitExceeded as error:
+            error.stats = search.stats.to_dict()
+            raise
+
+    def _build_from_candidates(self, source_compound, search, candidates, *, seed_action_sequences,
+                               max_unique_fragment_smiles, print_info, started) -> dict[str, Any]:
+        state = _FragmentTreeBuildState(source_compound.smiles,
                                         only_add_min_action_count=self.only_add_min_action_count)
         compounds = {0: source_compound.copy()}
         expansion_by_sequence: dict[CleavageActionSequence | None, _FragmentExpansionState] = {
             None: _FragmentExpansionState(0, None)}
         processed_states: set[tuple[int, tuple[tuple[object, ...], ...] | None]] = set()
         pending_predecessors = {}
-        for candidate, result in self._materialize_iter(source_compound, search, candidates):
+        for candidate, result in self._materialize_iter(source_compound, search, candidates,
+                max_unique_fragment_smiles=max_unique_fragment_smiles):
             sequence = candidate.action_sequence
             parent_sequence = candidate.parent_action_sequence
             added_action = candidate.added_action
@@ -277,13 +312,9 @@ class _FragmentTreeBuildState:
         self,
         root_smiles: str,
         *,
-        max_node: int = -1,
-        max_edge: int = -1,
         only_add_min_action_count: bool = True,
     ) -> None:
         self.root_smiles = root_smiles
-        self.max_node = max_node
-        self.max_edge = max_edge
         self.only_add_min_action_count = only_add_min_action_count
         self.nodes: dict[int, FragmentNode] = {}
         self.edges: dict[tuple[int, int], FragmentEdge] = {}
@@ -297,8 +328,6 @@ class _FragmentTreeBuildState:
             index = self.smiles_to_node_index[smiles]
             self.node_action_counts[index] = min(self.node_action_counts[index], action_count)
             return index
-        if self.max_node >= 0 and len(self.nodes) >= self.max_node:
-            raise FragmentTreeLimitExceeded(f"Fragment tree node limit exceeded: max_node={self.max_node}")
         index = len(self.nodes)
         self.nodes[index] = FragmentNode(index, -1, smiles)
         self.smiles_to_node_index[smiles] = index
@@ -319,8 +348,6 @@ class _FragmentTreeBuildState:
             return
         if key in self.edges and transition in self.edges[key].transitions:
             return
-        if self.max_edge >= 0 and self.transition_count >= self.max_edge:
-            raise FragmentTreeLimitExceeded(f"Fragment tree edge limit exceeded: max_edge={self.max_edge}")
         self.transition_count += 1
         if key in self.edges:
             self.edges[key] = self.edges[key].with_transition(transition)

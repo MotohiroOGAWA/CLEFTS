@@ -24,8 +24,10 @@ const app=path.resolve(__dirname,'../..'),preset=service.defaults(app);
  const root=new Element('div'),editor=createParameterEditor(root,preset,'data');
  assert(!walk(root).some(node=>node.dataset.parameterPath?.includes('hidden_dim')));assert(!walk(root).some(node=>node.dataset.parameterPath?.includes('adduct_type_strs')));assert.equal(walk(root).filter(node=>node.dataset.symbol).length,118);
  const hydrogen=walk(root).find(node=>node.dataset.symbol==='H');hydrogen.onclick();assert(editor.getValue().symbols.includes('H'));
- const maxNode=walk(root).find(node=>node.dataset.parameterPath==='max_node');maxNode.value='500';maxNode.oninput();assert.equal(editor.getValue().max_node,500);
- const maxEdge=walk(root).find(node=>node.dataset.parameterPath==='max_edge');maxEdge.value='1000';maxEdge.oninput();assert.equal(editor.getValue().max_edge,1000);
+ assert.equal(editor.getValue().max_unique_fragment_smiles,-1);assert.equal(editor.getValue().max_cleavage_combinations,-1);
+ assert(!walk(root).some(node=>['max_node','max_edge'].includes(node.dataset.parameterPath)));
+ const maxUnique=walk(root).find(node=>node.dataset.parameterPath==='max_unique_fragment_smiles');maxUnique.value='500';maxUnique.oninput();assert.equal(editor.getValue().max_unique_fragment_smiles,500);
+ const maxCombinations=walk(root).find(node=>node.dataset.parameterPath==='max_cleavage_combinations');maxCombinations.value='1000';maxCombinations.oninput();assert.equal(editor.getValue().max_cleavage_combinations,1000);
  const find=predicate=>walk(root).find(predicate);
  const mass=find(node=>node.dataset.parameterPath==='fragmenter_params.mass_tolerance');mass.value='0.03Da';mass.oninput();assert.equal(editor.getValue().fragmenter_params.mass_tolerance,'0.03Da');assert.equal(preset.fragmenter_params.mass_tolerance,'0.01Da,10ppm');
  const basic=find(node=>node.dataset.parameterPath==='fragmenter_params.fragment_ion_tree_builder.max_action_count');basic.value='';basic.oninput();assert(basic.validationMessage);assert.equal(editor.getValue().fragmenter_params.fragment_ion_tree_builder.max_action_count,3);
@@ -33,7 +35,7 @@ const app=path.resolve(__dirname,'../..'),preset=service.defaults(app);
  const fragmenterHtml=importHtml('data');assert(fragmenterHtml.includes('dataParameterLoad'));assert(fragmenterHtml.includes('dataParameterSave'));assert(!fragmenterHtml.includes('Import Parameters'));assert(!fragmenterHtml.includes('model JSON'));assert(!fragmenterHtml.includes('dataParameterFile'));
  find(node=>node.tag==='button'&&node.textContent==='Add Adduct Rules').onclick();assert.equal(editor.getValue().fragmenter_params.fragment_ion_tree_builder.fragment_ion_adduct_rule_set.adduct_rules.length,5);
  const current=editor.getValue(),args=buildArgs({input:'input.msds',outputDir:'output',modelConfig:current,params:'ignored.json'});assert(!args.includes('--params'));assert.deepEqual(JSON.parse(args[args.indexOf('--params-json')+1]),current);
- const dataArgs=buildArgs({input:'input.msds',outputDir:'out',fragmenterParams:current.fragmenter_params,symbols:current.symbols,maxNode:500,maxEdge:1000});assert(dataArgs.includes('--symbols-json'));assert.equal(dataArgs[dataArgs.indexOf('--max-edge')+1],'1000');
+ const dataArgs=buildArgs({input:'input.msds',outputDir:'out',fragmenterParams:current.fragmenter_params,symbols:current.symbols,maxUniqueFragmentSmiles:500,maxCleavageCombinations:1000});assert(dataArgs.includes('--symbols-json'));assert.equal(dataArgs[dataArgs.indexOf('--max-unique-fragment-smiles')+1],'500');assert.equal(dataArgs[dataArgs.indexOf('--max-cleavage-combinations')+1],'1000');assert(!dataArgs.includes('--max-node')&&!dataArgs.includes('--max-edge'));
  const trainingArgs=buildTrainingArgs({trainDir:'train',valDir:'val',outputDir:'out',modelConfig:current});assert(!trainingArgs.includes('--params'));assert(!trainingArgs.includes('--params-json'));
  // A resumed config always carries action_model_params.state_dropout and
  // post_model_params.dropout (training_model_config writes both from the one

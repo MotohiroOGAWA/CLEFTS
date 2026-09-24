@@ -21,9 +21,35 @@ class CleavageActionSearchStats:
     num_compiled_sequences: int = 0
     num_rdkit_run_reactants: int = 0
     num_generated_fragments: int = 0
+    num_unique_fragment_smiles: int = 0
 
     def to_dict(self) -> dict[str, int]:
         return dict(vars(self))
+
+
+class FragmentTreeLimitExceeded(ValueError):
+    """A single source tree exceeds a configured search limit.
+
+    ``stats`` holds the search statistics observed up to the moment the limit
+    was hit (the builder attaches them), so a skipped source stays diagnosable.
+    """
+
+    def __init__(self, limit_name: str, limit: int, stats: dict[str, int] | None = None) -> None:
+        self.limit_name = limit_name
+        self.limit = limit
+        self.stats = stats
+        super().__init__(f"{limit_name} exceeded: limit={limit}, observed>{limit}")
+
+    def __reduce__(self):
+        return type(self), (self.limit_name, self.limit, self.stats)
+
+
+def validate_search_limits(max_unique_fragment_smiles: int = -1, max_cleavage_combinations: int = -1) -> None:
+    """Both limits are -1 (unlimited) or a positive integer."""
+    for name, value in (("max_unique_fragment_smiles", max_unique_fragment_smiles),
+                        ("max_cleavage_combinations", max_cleavage_combinations)):
+        if type(value) is not int or not (value == -1 or value > 0):
+            raise ValueError(f"{name} must be -1 or a positive integer.")
 
 
 # Compatibility for legacy imports; chemistry rules live in one public utility.
@@ -55,7 +81,9 @@ class CleavageActionSearch:
         *,
         max_action_count: int,
         seed_action_sequences: Sequence[CleavageActionSequence] | None = None,
+        max_cleavage_combinations: int = -1,
     ) -> None:
+        validate_search_limits(max_cleavage_combinations=max_cleavage_combinations)
         seeds = tuple(sorted(set(seed_action_sequences or ()), key=lambda s: s.key))
         if any(len(seed.actions) > max_action_count for seed in seeds):
             raise ValueError("Seed exceeds max_action_count")
@@ -65,6 +93,7 @@ class CleavageActionSearch:
         self.relations = _ActionRelations.from_actions(self.actions)
         self.max_action_count = max_action_count
         self.seeds = seeds
+        self.max_cleavage_combinations = max_cleavage_combinations
         self.stats = CleavageActionSearchStats(num_primitive_actions=len(actions))
         self.visited_sequence_keys: set[tuple[tuple[object, ...], ...]] = set()
 
@@ -72,7 +101,13 @@ class CleavageActionSearch:
         return tuple(self.iter_candidates())
 
     def iter_candidates(self):
-        """Yield each connection lazily so tree limits can stop combination search."""
+        """Yield each connection lazily so tree limits can stop combination search.
+
+        Raises FragmentTreeLimitExceeded as soon as num_raw_combinations
+        exceeds max_cleavage_combinations. The count spans every size, from
+        one action up to max_action_count, and is checked before a candidate
+        is yielded, so no further candidate reaches RDKit materialization.
+        """
         connections: set[_ActionSequenceCandidate] = set()
         # Heap prioritizes the normalized action count, with a stable serial tie-break.
         frontier: list[tuple[int, int, CleavageActionSequence | None, int]] = []
@@ -105,6 +140,8 @@ class CleavageActionSearch:
                 if action in previous:
                     continue
                 self.stats.num_raw_combinations += 1
+                if 0 <= self.max_cleavage_combinations < self.stats.num_raw_combinations:
+                    raise FragmentTreeLimitExceeded("max_cleavage_combinations", self.max_cleavage_combinations)
                 indices = tuple(self.index_by_action[a] for a in previous) + (i,)
                 rejection = self.relations.rejection(indices)
                 if rejection:
