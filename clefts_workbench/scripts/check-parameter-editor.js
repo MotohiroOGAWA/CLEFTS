@@ -4,7 +4,8 @@ const path=require('path');
 const os=require('os');
 const Module=require('module');
 const load=Module._load;
-Module._load=function(name,parent,main){if(name==='vscode')return {};return load.call(this,name,parent,main);};
+const vscodeMock={window:{},Uri:{file:fsPath=>({fsPath})}};
+Module._load=function(name,parent,main){if(name==='vscode')return vscodeMock;return load.call(this,name,parent,main);};
 class Element {
  constructor(tag){this.tag=tag;this.children=[];this.dataset={};this.hidden=false;}
  append(...items){this.children.push(...items);}
@@ -15,7 +16,7 @@ class Element {
 }
 function walk(node){return [node,...(node.children||[]).filter(child=>child&&typeof child==='object').flatMap(walk)];}
 global.document={createElement:tag=>new Element(tag)};
-const {createParameterEditor}=require('../src/workbench/parameter-editor');
+const {createParameterEditor,importHtml}=require('../src/workbench/parameter-editor');
 const service=require('../src/workbench/parameter-service');
 const {buildArgs,buildTrainingArgs}=require('../src/extension');
 const app=path.resolve(__dirname,'../..'),preset=service.defaults(app);
@@ -29,6 +30,7 @@ const app=path.resolve(__dirname,'../..'),preset=service.defaults(app);
  const mass=find(node=>node.dataset.parameterPath==='fragmenter_params.mass_tolerance');mass.value='0.03Da';mass.oninput();assert.equal(editor.getValue().fragmenter_params.mass_tolerance,'0.03Da');assert.equal(preset.fragmenter_params.mass_tolerance,'0.01Da,10ppm');
  const basic=find(node=>node.dataset.parameterPath==='fragmenter_params.fragment_ion_tree_builder.max_action_count');basic.value='';basic.oninput();assert(basic.validationMessage);assert.equal(editor.getValue().fragmenter_params.fragment_ion_tree_builder.max_action_count,3);
  assert(!find(node=>node.dataset.advanced==='fragmenter_params'));assert(!find(node=>node.tag==='button'&&node.textContent==='Advanced Fragmenter Params'));
+ const fragmenterHtml=importHtml('data');assert(fragmenterHtml.includes('dataParameterLoad'));assert(fragmenterHtml.includes('dataParameterSave'));assert(!fragmenterHtml.includes('Import Parameters'));assert(!fragmenterHtml.includes('model JSON'));assert(!fragmenterHtml.includes('dataParameterFile'));
  find(node=>node.tag==='button'&&node.textContent==='Add Adduct Rules').onclick();assert.equal(editor.getValue().fragmenter_params.fragment_ion_tree_builder.fragment_ion_adduct_rule_set.adduct_rules.length,5);
  const current=editor.getValue(),args=buildArgs({input:'input.msds',outputDir:'output',modelConfig:current,params:'ignored.json'});assert(!args.includes('--params'));assert.deepEqual(JSON.parse(args[args.indexOf('--params-json')+1]),current);
  const dataArgs=buildArgs({input:'input.msds',outputDir:'out',fragmenterParams:current.fragmenter_params,symbols:current.symbols,maxNode:500,maxEdge:1000});assert(dataArgs.includes('--symbols-json'));assert.equal(dataArgs[dataArgs.indexOf('--max-edge')+1],'1000');
@@ -60,6 +62,8 @@ const app=path.resolve(__dirname,'../..'),preset=service.defaults(app);
  const file=path.join(temp,'fragmenter config.json');fs.writeFileSync(file,JSON.stringify({fragment_ion_tree_builder:{max_action_count:2},mass_tolerance:'0.04Da'}));let handler;const messages=[];service.attach({webview:{onDidReceiveMessage:fn=>handler=fn,postMessage:data=>messages.push(data)}},{},()=>app);
  await handler({type:'parameters/load',target:'data',path:file});assert.equal(messages.at(-1).type,'parameters/loaded');assert.equal(messages.at(-1).modelConfig.fragmenter_params.mass_tolerance,'0.04Da');assert.equal(messages.at(-1).modelConfig.fragmenter_params.fragment_ion_tree_builder.max_action_count,2);assert(messages.at(-1).modelConfig.fragmenter_params.fragment_ion_tree_builder.cleavage_pattern_set);
  await handler({type:'parameters/import',target:'data',name:'dropped.json',json:JSON.stringify({cleavage_pattern_set:{name:'imported',patterns:[]},fragment_ion_adduct_rule_set:{name:'imported rules',adduct_rules:[]}})});assert.equal(messages.at(-1).modelConfig.fragmenter_params.fragment_ion_tree_builder.cleavage_pattern_set.name,'imported');assert.equal(messages.at(-1).modelConfig.fragmenter_params.fragment_ion_tree_builder.fragment_ion_adduct_rule_set.name,'imported rules');
+ await handler({type:'parameters/import',target:'data',name:'model.json',json:JSON.stringify({fragmenter_params:{fragment_ion_tree_builder:{}},mol_encoder_params:{hidden_dim:128}})});assert.equal(messages.at(-1).type,'parameters/error');assert.match(messages.at(-1).error,/not a model config/);
+ const saved=path.join(temp,'saved.fragmenter.json');vscodeMock.window.showSaveDialog=async()=>({fsPath:saved});await handler({type:'parameters/save',target:'data',fragmenterParams:{fragment_ion_tree_builder:{max_action_count:4},mass_tolerance:'0.02Da'}});assert.equal(messages.at(-1).type,'parameters/saved');assert.deepEqual(JSON.parse(fs.readFileSync(saved,'utf8')),{fragment_ion_tree_builder:{max_action_count:4},mass_tolerance:'0.02Da'});
  await handler({type:'parameters/load',target:'training',path:file+'missing'});assert.equal(messages.at(-1).type,'parameters/error');
  }finally{fs.rmSync(temp,{recursive:true,force:true});}
  console.log('Parameter form editing, array updates, advanced settings, execution snapshots and file expansion checks passed.');

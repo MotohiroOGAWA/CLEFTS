@@ -28,9 +28,11 @@ export type ParameterRequest =
   | { type: 'training/sources'; requestId: string; config: { trainDir: string; valDir: string; molEncoderCheckpoint?: string; resume?: string; fineTuneCheckpoint?: string } }
   | { type: 'parameters/pick'; target: 'data' | 'training' }
   | { type: 'parameters/import'; target: 'data' | 'training'; name: string; json: string }
-  | { type: 'parameters/load'; target: 'data' | 'training'; path: string };
+  | { type: 'parameters/load'; target: 'data' | 'training'; path: string }
+  | { type: 'parameters/save'; target: 'data'; fragmenterParams: Record<string, unknown> };
 export type ParameterEvent =
   | { type: 'parameters/loaded'; target: 'data' | 'training'; path: string; modelConfig: Record<string, unknown> }
+  | { type: 'parameters/saved'; target: 'data'; path: string }
   | { type: 'parameters/error'; target: 'data' | 'training'; error: string };
 
 export type DataRequest =

@@ -14,6 +14,8 @@ Quick training requires prepared train/validation structure directories, output,
 
 The tabs are **Input Dataset**, **Fragmentation**, **Assignment**, **Output** and **Run**. Dataset inspection displays file size, record counts, unique SMILES, adduct distribution and bounded record/spectrum previews. Column validation checks train and validation datasets. When validation input is omitted, select the unique-SMILES split ratio and seed.
 
+On **Fragmentation**, the compact right-aligned **Load** / **Save** row directly below the tabs manages the fragmenter config only and also accepts drag-and-drop. It does not accept model configuration JSON.
+
 The fixed bottom-right **Run** button is always clickable. Clicking it checks dataset validation and required settings; red text explains any unmet requirements and processing does not start. Clicking during an active job also displays a message and prevents duplicate runs. The backend validates settings again before launching processing.
 
 ## Cleavage patterns
