@@ -28,6 +28,7 @@ const cleavagePatternSetEditor = require('./features/cleavage-pattern-set/editor
 const adductUi = require('./features/adduct-rule-set/ui');
 const adductRuleSetEditor = require('./features/adduct-rule-set/editor');
 const cleavageHost = require('./features/cleavage-pattern-set/host');
+const fileBadges = require('./workbench/file-badges');
 const { projectRoot, isCleftsRoot, runChemistryBackend, showElementPicker, readCleavageImport, safeFileStem, ensureFileSuffix } = cleavageHost;
 
 const RESULT_NAME = 'fragment-tree.pft';
@@ -50,6 +51,7 @@ function activate(context) {
   cleavagePatternSetEditor.register(context);
   adductRuleSetEditor.register(context);
   workbench.register(context, output, projectRoot, openWorkbench);
+  fileBadges.register(context);
   enableDevelopmentReload(context, output);
 }
 
