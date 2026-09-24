@@ -397,3 +397,45 @@ class TestPreparationWorkflow(unittest.TestCase):
                 create_action_training_data(dataset=self.dataset(),model_config=model,output_dir=root/'parallel',num_workers=2,chunk_size=1)
         self.assertGreater(max_seen,0)
         self.assertLessEqual(max_seen,2)
+
+    def test_unexpected_error_in_one_source_is_skipped_not_fatal(self):
+        import clefts.ml.data_preparation.fragment_tree.create_training_data as create_training_data_module
+        from clefts.ml.data_preparation.fragment_tree.create_training_data import create_action_training_data
+        real_prepare_group=create_training_data_module._prepare_group
+        def failing_prepare_group(task,builder,options):
+            if task[1]=='CCN': raise ValueError("Unsupported atom symbol: 'As'")
+            return real_prepare_group(task,builder,options)
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);model=config();model['fragmenter_params']['fragment_ion_tree_builder']['max_action_count']=1
+            with unittest.mock.patch.object(create_training_data_module,'_prepare_group',failing_prepare_group):
+                files=create_action_training_data(dataset=self.dataset(),model_config=model,output_dir=root/'serial')
+            skipped=json.loads((root/'serial/skipped_sources.json').read_text())
+        self.assertEqual(len(files),3)
+        self.assertEqual([source['smiles'] for source in skipped],['CCN'])
+        self.assertIn('ValueError',skipped[0]['reason'])
+        self.assertIn('Traceback',skipped[0]['error'])
+
+    def test_crashed_worker_only_skips_the_source_that_crashes(self):
+        # A worker process dying outright (native crash, OOM kill) used to
+        # abort the whole run. Its chunk is now re-run one source per
+        # process, so only the source that still crashes on its own is lost.
+        import pickle,sys
+        import clefts.ml.data_preparation.fragment_tree.create_training_data as create_training_data_module
+        from clefts.ml.data_preparation.fragment_tree.create_training_data import create_action_training_data
+        real_run_parallel_subprocesses=create_training_data_module.run_parallel_subprocesses
+        crash=[sys.executable,'-c','import sys; sys.exit(3)']
+        def spy(commands_list,*args,**kwargs):
+            def sources(command):
+                with open(command[command.index('--task')+1],'rb') as stream: return [task[1] for task in pickle.load(stream)['tasks']]
+            patched=[crash+command[3:] if 'CCN' in sources(command) else command for command in commands_list]
+            return real_run_parallel_subprocesses(patched,*args,**kwargs)
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);model=config();model['fragmenter_params']['fragment_ion_tree_builder']['max_action_count']=1
+            with unittest.mock.patch.object(create_training_data_module,'run_parallel_subprocesses',spy),contextlib.redirect_stderr(io.StringIO()):
+                files=create_action_training_data(dataset=self.dataset(),model_config=model,output_dir=root/'parallel',num_workers=2,chunk_size=2)
+            skipped=json.loads((root/'parallel/skipped_sources.json').read_text())
+            leftovers=[path.name for path in (root/'parallel').glob('clefts-preparation-*/*')]
+        self.assertEqual(len(files),3)
+        self.assertEqual([source['smiles'] for source in skipped],['CCN'])
+        self.assertIn('status 3',skipped[0]['reason'])
+        self.assertEqual(leftovers,[])
