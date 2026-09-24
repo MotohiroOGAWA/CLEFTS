@@ -15,7 +15,8 @@ const { readRun } = require('../src/features/training-metrics/editor');
       'global_step\tepoch\tsplit\tmetric\tvalue\n' +
       '10\t1\tvalidation\tcosine_similarity@main_adduct:[M+H]+_q10\t0.2\n' +
       '10\t1\tvalidation\tcosine_similarity@main_adduct:[M+H]+_median\t0.3\n' +
-      '10\t1\tvalidation\tcosine_similarity@main_adduct:[M+Na]+_median\t0.5\n');
+      '10\t1\tvalidation\tcosine_similarity@main_adduct:[M+Na]+_median\t0.5\n' +
+      '10\t1\tvalidation\tpeak_recall_top5_mean\t0.6\n');
     const spectrum = { main_adduct:'[M+H]+', collision_energy:20, generated_peaks:[{mz:100,intensity:1,precursor:true}], original_peaks:[{mz:100,intensity:1,precursor:true}] };
     await fs.writeFile(path.join(directory, 'spectrum_validation', 'epoch_1.json'), JSON.stringify({
       summary: { samples: 1 }, spectra: [spectrum], representatives: { cosine_similarity: { q10: { spectrum_index: 0, value: 1, target: 1 } } },
@@ -77,6 +78,7 @@ const { readRun } = require('../src/features/training-metrics/editor');
       dom.window.document.getElementById('metricsAddAll').click();
       const groupHeaders = [...dom.window.document.querySelectorAll('#metricsCharts > div')].filter(node => node.style.textTransform === 'uppercase');
       assert.ok(groupHeaders.some(node => node.textContent === 'Spectrum similarity'), 'expected a Spectrum similarity group header');
+      assert.ok(groupHeaders.some(node => node.textContent === 'Peak assignment (top N)'), 'expected a Peak assignment (top N) group header');
       assert.ok(groupHeaders.some(node => node.textContent === 'Loss'), 'expected a Loss group header');
       assert.ok(groupHeaders.some(node => node.textContent === 'Performance & resources'), 'expected a Performance & resources group header');
 

@@ -44,7 +44,7 @@ PROGRESS_FORMAT = '{desc:<18} {percentage:3.0f}%|{bar:36}| {n_fmt:>5}/{total_fmt
 
 
 def progress_bar(*, total, description, position, leave):
-    """Create one of the three fixed-position training progress bars."""
+    """Create one of the four fixed-position training progress bars."""
     return tqdm(total=total, desc=description, position=position, leave=leave,
                 ncols=PROGRESS_WIDTH, dynamic_ncols=False, bar_format=PROGRESS_FORMAT,
                 mininterval=0.1, maxinterval=1.0)
@@ -262,7 +262,7 @@ def train_actions(*, model_config: dict, train_dir: str | Path, val_dir: str | P
         append_metric_distributions(output,global_step,'intermediate_validation',batch_metrics,epoch=epoch)
         stage_progress.set_postfix_str('generate spectrum',refresh=True)
         row.update({'validation/'+k:v for k,v in validate_spectra(generator,intermediate_pieces,output,f'step_{global_step}',global_step=global_step,
-            progress=lambda _,phase:stage_progress.update(1) if phase=='end' else None,epoch=epoch).items()})
+            progress=lambda _,phase,*rest:stage_progress.update(1) if phase=='end' else None,epoch=epoch).items()})
         row['validation_seconds']=time.perf_counter()-validation_started
         intermediate_history.append(row)
         (output/'intermediate_validation.json').write_text(json.dumps({'history':intermediate_history},indent=2))
@@ -279,8 +279,14 @@ def train_actions(*, model_config: dict, train_dir: str | Path, val_dir: str | P
             epoch_start=time.perf_counter();torch.cuda.reset_peak_memory_stats(device)
             row={'epoch':epoch+1};gradient_values=[]
             epoch_groups=[batch_groups(datasets[0],True),batch_groups(datasets[1],False)]
-            iteration_progress=progress_bar(total=sum(map(len,epoch_groups))+len(datasets[1]),description='Iteration',position=1,leave=False)
-            stage_progress=progress_bar(total=1,description='Stage',position=2,leave=False)
+            # Train and validation each get their own 0->100% bar (validation's
+            # includes the free-running spectrum-generation pass below), so
+            # neither one looks stalled while the other is what's actually running.
+            iteration_progress={
+                'train':progress_bar(total=len(epoch_groups[0]),description='Iteration(Train)',position=1,leave=False),
+                'validation':progress_bar(total=len(epoch_groups[1])+len(datasets[1]),description='Iteration(Validation)',position=2,leave=False),
+            }
+            stage_progress=progress_bar(total=1,description='Stage',position=3,leave=False)
             for name,pieces,groups in zip(('train','validation'),datasets,epoch_groups):
                 model.train(name=='train');totals={};sample_count=0;batch_count=0;batch_metrics={}
                 with torch.set_grad_enabled(name=='train'):
@@ -313,28 +319,38 @@ def train_actions(*, model_config: dict, train_dir: str | Path, val_dir: str | P
                             stage_progress.update(1)
                         stage_progress.set_postfix_str('metrics',refresh=True)
                         values=metric_values(result)
+                        live={}
                         for key,value in values.items():
                             scalar=float(value.detach())
                             if not math.isfinite(scalar):raise FloatingPointError(f'Non-finite metric {name}/{key}')
                             totals[key]=totals.get(key,0.)+scalar*data.num_samples
                             batch_metrics.setdefault(key,[]).append(scalar)
+                            # A quick read on how training is actually going, right on
+                            # the bar; the full picture still lives in the report.
+                            if key=='loss':live['loss']=f'{scalar:.4g}'
+                            elif key=='full_spectrum_cosine':live['cos']=f'{scalar:.3f}'
+                        iteration_progress[name].set_postfix(live,refresh=False)
                         sample_count+=data.num_samples;batch_count+=1
                         # Release the training graph before evaluating a subset.
                         del values,result,data,value
-                        stage_progress.update(1);iteration_progress.update(1)
+                        stage_progress.update(1);iteration_progress[name].update(1)
                         if name=='train' and validation_interval_steps and global_step%validation_interval_steps==0:
                             intermediate_validation(epoch+1)
                 row[name+'_loss']=totals.pop('loss')/max(sample_count,1)
                 row.update({name+'/'+key:value/max(sample_count,1) for key,value in totals.items()})
                 row[name+'/samples']=sample_count;row[name+'/batches']=batch_count
                 append_metric_distributions(output,global_step,name,batch_metrics,epoch=epoch+1)
-            def spectrum_progress(_,phase):
+            cosine_so_far=[]
+            def spectrum_progress(_,phase,mean_cosine=None):
                 if phase=='start':
                     stage_progress.reset(total=1);stage_progress.set_description_str('Stage inference');stage_progress.set_postfix_str('generate spectrum',refresh=True)
                 else:
-                    stage_progress.update(1);iteration_progress.update(1)
+                    stage_progress.update(1);iteration_progress['validation'].update(1)
+                    if mean_cosine is not None:
+                        cosine_so_far.append(mean_cosine)
+                        iteration_progress['validation'].set_postfix(cos=f'{sum(cosine_so_far)/len(cosine_so_far):.3f}',refresh=False)
             row.update({'validation/'+k:v for k,v in validate_spectra(generator,datasets[1],output,f'epoch_{epoch+1}',global_step=global_step,progress=spectrum_progress,epoch=epoch+1).items()})
-            stage_progress.close();iteration_progress.close()
+            stage_progress.close();iteration_progress['train'].close();iteration_progress['validation'].close()
             row['global_step']=global_step;row['learning_rate']=optimizer.param_groups[0]['lr']
             row['gradient_norm']=sum(gradient_values)/max(len(gradient_values),1)
             row['epoch_seconds']=time.perf_counter()-epoch_start;row['cuda_peak_memory_mb']=torch.cuda.max_memory_allocated(device)/2**20
@@ -381,7 +397,8 @@ def train_actions(*, model_config: dict, train_dir: str | Path, val_dir: str | P
         raise
     finally:
         if 'stage_progress' in locals():stage_progress.close()
-        if 'iteration_progress' in locals():iteration_progress.close()
+        if 'iteration_progress' in locals():
+            for bar in iteration_progress.values():bar.close()
         if 'epoch_progress' in locals():epoch_progress.close()
         writer.close();iteration_writer.close()
 

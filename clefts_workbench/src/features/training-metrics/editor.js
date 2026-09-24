@@ -144,6 +144,7 @@ function client(groupSeries) {
   const categoryColors=['#e76f51','#2a9d8f','#e9c46a','#264653','#8ab17d','#f4a261','#577590','#b56576','#6d597a','#ee6c4d'];
   const METRIC_GROUPS=[
     ['Spectrum similarity',/cosine_similarity|assignment_score|spectrum_nonempty_fraction|teacher_spectrum/],
+    ['Peak assignment (top N)',/^peak_(recall|precision)_top\d+/],
     ['Loss',/loss/],
     ['Branch supervision',/branch_(positive|negative|recall)|num_training_states_depth/],
     ['Optimization',/^(learning_rate|gradient_norm)$/],
